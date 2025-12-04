@@ -1,0 +1,25 @@
+cfd:
+  cell_increment: 1000
+  convergence_tol: 1e-5
+  docker_image: openfoam/openfoam11-paraview510
+  increment_type: logarithmic
+  low_cells: 1000
+  max_iterations: 3000
+environment:
+  air_density_kgm3: 1.225
+  air_viscosity_pas: 1.81e-05
+  temperature_k: 288.15
+goals:
+  angle_of_attack_deg: 5.0
+  target_range_m: 27.45
+  throw_speed_mps: 10.0
+project:
+  max_cells_cfd: 1000000
+  n_folds: 6
+  sheet_height_mm: 297.0
+  sheet_width_mm: 210.0
+  surrogate_threshold: 0.8
+training:
+  batch_size: 32
+  episodes: 100
+  surrogate_ratio: 0.8
