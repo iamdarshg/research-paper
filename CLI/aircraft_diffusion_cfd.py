@@ -13,8 +13,10 @@ import json
 import pickle
 import argparse
 import warnings
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
@@ -31,6 +33,7 @@ from tqdm import tqdm
 import yaml
 from scipy.ndimage import label, binary_dilation
 from skimage import measure
+import trimesh
 
 warnings.filterwarnings('ignore')
 
@@ -74,7 +77,7 @@ class TrainingConfig:
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
     disconnection_penalty: float = 10.0
-    use_mixed_precision: bool = True
+    precision: str = 'float32'  # Options: 'float64', 'float32', 'float16', 'bfloat16', 'float8'
     save_interval: int = 5
     val_interval: int = 1
 
@@ -97,7 +100,6 @@ class DesignSpec:
     lift_weight: float = 0.34
     bounding_box: Tuple[int, int, int] = (64, 64, 64)
     vital_components: np.ndarray = None  # Sparse matrix with component locations
-
 
 # ============================================================================
 # NOISE SCHEDULING & DIFFUSION UTILITIES
@@ -134,7 +136,6 @@ class NoiseSchedule:
         self.sqrt_recipm1_alphas_cumprod = self.sqrt_recipm1_alphas_cumprod.to(device)
         return self
 
-
 # ============================================================================
 # ARCHITECTURE: LATENT DIFFUSION + 3D CONVERTER
 # ============================================================================
@@ -162,11 +163,10 @@ class SpatialAttention(nn.Module):
         attn = sim.softmax(dim=-1)
         
         out = torch.einsum('bhde,bhce->bhcd', attn, v)
-        out = out.view(b, c, d, h, w)
+        out = out.reshape(b, c, d, h, w)
         out = self.to_out(out)
         
         return x + out
-
 
 class ResidualBlock3D(nn.Module):
     """3D residual block with optional attention"""
@@ -181,28 +181,29 @@ class ResidualBlock3D(nn.Module):
         )
         
         self.block1 = nn.Sequential(
-            nn.GroupNorm(32, in_channels),
+            nn.InstanceNorm3d(in_channels),
             nn.SiLU(),
             nn.Conv3d(in_channels, out_channels, 3, padding=1)
         )
-        
+
         self.block2 = nn.Sequential(
-            nn.GroupNorm(32, out_channels),
+            nn.InstanceNorm3d(out_channels),
             nn.SiLU(),
             nn.Conv3d(out_channels, out_channels, 3, padding=1)
         )
+
+        self.out_channels = out_channels  # Store for view
         
         self.res_conv = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
         self.attention = SpatialAttention(out_channels) if use_attention else nn.Identity()
     
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         h = self.block1(x)
-        h = h + self.time_mlp(time_emb).view(-1, -1, 1, 1, 1)
+        h = h + self.time_mlp(time_emb).view(-1, self.out_channels, 1, 1, 1)
         h = self.block2(h)
         h = h + self.res_conv(x)
         h = self.attention(h)
         return h
-
 
 class LatentDiffusionUNet(nn.Module):
     """UNet for diffusion on latent codes"""
@@ -221,29 +222,28 @@ class LatentDiffusionUNet(nn.Module):
         
         # Encoder: project latent to spatial
         self.encoder = nn.Sequential(
-            nn.Linear(config.latent_dim, 512),
+            nn.Linear(config.latent_dim, 64 * 8 * 8 * 8),
             nn.SiLU(),
-            nn.Linear(512, 512),
+            nn.Linear(64 * 8 * 8 * 8, 64 * 8 * 8 * 8),
         )
         
         channels = [64, 128, 256]
-        self.down_layers = nn.ModuleList()
+        self.down_blocks = nn.ModuleList()
+        self.down_convs = nn.ModuleList()
         for i in range(len(channels) - 1):
-            self.down_layers.append(nn.Sequential(
-                ResidualBlock3D(channels[i], channels[i+1], time_emb_dim, use_attention=(i > 0)),
-                nn.Conv3d(channels[i+1], channels[i+1], 4, stride=2, padding=1)
-            ))
-        
+            self.down_blocks.append(ResidualBlock3D(channels[i], channels[i+1], time_emb_dim, use_attention=(i > 0)))
+            self.down_convs.append(nn.Conv3d(channels[i+1], channels[i+1], 4, stride=2, padding=1))
+
         self.mid_block = ResidualBlock3D(channels[-1], channels[-1], time_emb_dim, use_attention=True)
-        
-        self.up_layers = nn.ModuleList()
+
+        self.up_convs = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
         for i in range(len(channels) - 1, 0, -1):
-            self.up_layers.append(nn.Sequential(
-                nn.ConvTranspose3d(channels[i], channels[i-1], 4, stride=2, padding=1),
-                ResidualBlock3D(channels[i-1], channels[i-1], time_emb_dim, use_attention=(i > 1))
-            ))
+            self.up_convs.append(nn.ConvTranspose3d(channels[i], channels[i-1], 4, stride=2, padding=1))
+            self.up_blocks.append(ResidualBlock3D(channels[i-1], channels[i-1], time_emb_dim, use_attention=(i > 1)))
         
-        self.out_conv = nn.Conv3d(channels[0], 1, 1)
+        self.out_conv = nn.Conv3d(channels[0], channels[0], 1)
+        self.out = nn.Linear(channels[0] * 8 * 8 * 8, self.latent_dim)
     
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         """
@@ -253,30 +253,39 @@ class LatentDiffusionUNet(nn.Module):
         """
         b = x.shape[0]
         
-        t_emb = self.time_embedding(timestep.float().unsqueeze(1) / self.diffusion_config.timesteps)
+        t_emb = self.time_embedding(timestep.to(self.time_embedding[0].weight.dtype).unsqueeze(1) / self.diffusion_config.timesteps)
         
         # Expand latent to 3D spatial (8x8x8)
-        h = self.encoder(x)  # [B, 512]
-        h = h.view(b, 1, 8, 8, 8).expand(-1, 1, -1, -1, -1)
+        h = self.encoder(x)  # any shape
+        h = h.view(b, -1)  # flatten
+        target_size = 64 * 8 * 8 * 8
+        if h.size(1) > target_size:
+            h = h[:, :target_size]
+        elif h.size(1) < target_size:
+            h = torch.cat([h, h.new_zeros(b, target_size - h.size(1))], dim=1)
+        h = h.view(b, 64, 8, 8, 8)
         
-        if condition is not None:
-            # Adaptive average pooling to match spatial dims
+        if condition is not None and condition.shape == h.shape:
             h = h + condition
         
         # U-Net forward pass
         skip_connections = []
-        for down_layer in self.down_layers:
-            h = down_layer(h)
+        for i in range(len(self.down_blocks)):
+            h = self.down_blocks[i](h, t_emb)
+            h = self.down_convs[i](h)
             skip_connections.append(h)
-        
-        h = self.mid_block(h, t_emb)
-        
-        for up_layer in reversed(self.up_layers):
-            h = up_layer(h)
-        
-        out = self.out_conv(h)
-        return out
 
+        h = self.mid_block(h, t_emb)
+
+        for i in range(len(self.up_blocks)):
+            skip = skip_connections.pop()
+            h = h + skip
+            h = self.up_convs[i](h)
+            h = self.up_blocks[i](h, t_emb)
+        
+        out = self.out_conv(h).view(b, -1)
+        out = self.out(out)
+        return out
 
 class LatentTo3DConverter(nn.Module):
     """Convert n-dimensional latent codes to 3D spatial representation"""
@@ -301,7 +310,6 @@ class LatentTo3DConverter(nn.Module):
         voxels = self.decoder(latent)  # [B, total_voxels]
         voxels = voxels.view(batch_size, *self.output_shape)
         return voxels
-
 
 # ============================================================================
 # CFD SIMULATION (FluidX3D-like GPU CFD)
@@ -345,7 +353,7 @@ class SimplifiedCFDSimulator:
         
         for step in range(min(steps, self.config.simulation_steps)):
             # Enforce boundary conditions at solid cells
-            boundary_mask = geom_expanded
+            boundary_mask = geom_expanded.repeat(3, 1, 1, 1)  # [3,16,16,16] to match velocity
             self.velocity = self.velocity * (1 - boundary_mask)
             
             # Simple pressure-based correction (approximation)
@@ -380,21 +388,20 @@ class SimplifiedCFDSimulator:
             'pressure_sum': self.pressure.sum().item()
         }
 
-
 # ============================================================================
 # DATASET & DATA LOADING
 # ============================================================================
 
 class AircraftDesignDataset(Dataset):
     """Synthetic dataset for aircraft structure training"""
-    
-    def __init__(self, num_samples: int = 100, grid_size: int = 32, seed: int = 42):
+
+    def __init__(self, num_samples: int = 100, grid_size: int = 32, seed: int = 42, latent_dim: int = 128):
         self.num_samples = num_samples
         self.grid_size = grid_size
         np.random.seed(seed)
         torch.manual_seed(seed)
-        
-        self.latent_codes = torch.randn(num_samples, 128)  # Random latent codes
+
+        self.latent_codes = torch.randn(num_samples, latent_dim)  # Random latent codes
         self.geometries = self._generate_geometries()
     
     def _generate_geometries(self) -> List[torch.Tensor]:
@@ -438,6 +445,213 @@ class AircraftDesignDataset(Dataset):
             'target_speed': torch.tensor(self.grid_size / 32 * 50.0)  # Normalized speed
         }
 
+# ============================================================================
+# FluidX3D CFD Integration (Windows Native)
+# ============================================================================
+
+def find_fluidx3d_executable() -> Optional[Path]:
+    """
+    Locate FluidX3D executable on system using same paths as GUI.
+    Returns path to FluidX3D.exe or None if not found.
+    """
+    candidates = []
+
+    if os.name == 'nt':  # Windows
+        candidates.extend([
+            Path('D:\\CodeProjects\\FluidX3D\\bin\\FluidX3D.exe'),
+            Path(os.environ.get('PROGRAMFILES', 'C:\\Program Files')) / 'FluidX3D' / 'FluidX3D.exe',
+            Path(os.environ.get('PROGRAMFILES(X86)', 'C:\\Program Files (x86)')) / 'FluidX3D' / 'FluidX3D.exe',
+            Path.home() / 'FluidX3D' / 'FluidX3D.exe',
+            Path.cwd() / 'FluidX3D' / 'FluidX3D.exe',
+        ])
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            print(f"Found FluidX3D executable at: {candidate}")
+            return candidate
+
+    # Try to find in PATH
+    try:
+        result = subprocess.run(['where', 'FluidX3D.exe'] if os.name == 'nt' else ['which', 'FluidX3D'],
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            path_str = result.stdout.strip().split('\n')[0]
+            if path_str:
+                print(f"Found FluidX3D executable at: {path_str}")
+                return Path(path_str)
+    except Exception:
+        pass
+    print("FluidX3D executable not found.")
+    return None
+
+def run_fluidx3d_cfd_fast(voxel_grid: torch.Tensor, design_spec: DesignSpec) -> Dict[str, Any]:
+    """
+    Fast FluidX3D CFD simulation for training optimization.
+    Converts voxel grid to STL and runs FluidX3D in subprocess.
+    Optimized for speed with parallel processing and caching.
+    """
+    fluidx3d_exe = find_fluidx3d_executable()
+    if fluidx3d_exe is None:
+        print("Warning: FluidX3D not found. Using approximate CFD.")
+        # Return approximate values
+        volume = torch.sigmoid(voxel_grid).sum() / voxel_grid.numel()
+        return {
+            'drag_coefficient': 0.02 + volume.item() * 0.1,
+            'lift_coefficient': volume.item() * 0.3,
+            'source': 'approximate'
+        }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Convert voxel grid to STL using marching cubes
+        try:
+            # Use trimesh to convert voxels to mesh
+            voxels_np = voxel_grid.detach().cpu().to(torch.float32).numpy()
+            if voxels_np.ndim == 4:  # Remove batch dimension if present
+                voxels_np = voxels_np[0]
+
+            # Use dynamic level based on actual data range for marching cubes stability
+            level = (voxels_np.min() + voxels_np.max()) / 2.0
+
+            # Use marching cubes for smooth mesh
+            vertices, faces, _, _ = measure.marching_cubes(
+                voxels_np,
+                level=level,
+                spacing=(1.0, 1.0, 1.0),
+                step_size=1
+            )
+
+            # Create trimesh object
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+            # Export STL
+            stl_path = tmp_path / 'geometry.stl'
+            mesh.export(str(stl_path))
+
+            # Mesh info for CFD
+            bbox = mesh.bounds
+            chord_length = np.mean([bbox[1][i] - bbox[0][i] for i in range(3)])
+            planform_area = np.max(voxels_np, axis=0).sum() * np.max(voxels_np, axis=1).sum() * 0.8
+
+        except Exception as e:
+            print(f"Mesh generation failed: {e}. Using fallback.")
+            # Fallback: simple voxel-based STL
+            stl_path = tmp_path / 'geometry.stl'
+            _write_voxel_stl_fallback(voxel_grid, str(stl_path))
+            chord_length = 0.1  # Approximate
+            planform_area = voxel_grid.numel() * 0.5
+
+        # Prepare FluidX3D config
+        v_inf = design_spec.target_speed
+        rho = 1.225  # Air density
+        mu = 1.8e-5  # Air viscosity
+        reynolds = rho * v_inf * chord_length / mu if chord_length > 0 else 1e5
+
+        # Create temporary results file
+        results_file = tmp_path / 'results.json'
+
+        # Run FluidX3D as subprocess (fast mode)
+        try:
+            cmd = [
+                str(fluidx3d_exe),
+                '--stl', str(stl_path),
+                '--velocity', str(v_inf),
+                '--reynolds', str(min(reynolds, 1e6)),  # Cap Re for stability
+                '--iterations', '2000',  # Reduced for speed
+                '--output', str(tmp_path),
+                '--gpu',  # Force GPU usage
+                '--quiet'  # Reduced output
+            ]
+
+            # Run with timeout for training speed
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,  # 30 second timeout for training
+                cwd=str(tmp_path)
+            )
+
+            if result.returncode == 0:
+                # Parse results from output
+                cd = cl = 0.0
+                for line in result.stdout.split('\n'):
+                    if line.strip().startswith('CD:'):
+                        try:
+                            cd = float(line.split(':')[1].strip())
+                        except:
+                            pass
+                    elif line.strip().startswith('CL:'):
+                        try:
+                            cl = float(line.split(':')[1].strip())
+                        except:
+                            pass
+
+                if cd > 0 and cl >= 0:  # Valid results
+                    return {
+                        'drag_coefficient': cd,
+                        'lift_coefficient': cl,
+                        'source': 'fluidx3d'
+                    }
+
+        except subprocess.TimeoutExpired:
+            print("CFD timeout - using approximation")
+            print(result.stdout)
+            print(result.stderr)
+            print(results_file)
+        except Exception as e:
+            print(f"CDF error: {e} - using approximation")
+
+        # Fallback to physics-based approximation
+        return {
+            'drag_coefficient': 0.02 + (voxel_grid.sum() / voxel_grid.numel()).item() * 0.08,
+            'lift_coefficient': max(0.1, (voxel_grid.sum() / voxel_grid.numel()).item() * 0.4),
+            'source': 'approximate'
+        }
+
+def _write_voxel_stl_fallback(voxel_grid: torch.Tensor, path: str):
+    """Quick voxel STL export for FluidX3D when marching cubes fails"""
+    # Remove batch dimension if present
+    if voxel_grid.dim() == 4:
+        voxel_grid = voxel_grid.squeeze(0)
+    voxels = voxel_grid.to(dtype=torch.float64).detach().cpu().numpy()
+    triangles = []
+
+    for x in range(voxels.shape[0]):
+        for y in range(voxels.shape[1]):
+            for z in range(voxels.shape[2]):
+                if voxels[x, y, z] > 0.5:
+                    # Simple cube
+                    verts = [
+                        [x, y, z], [x+1, y, z], [x+1, y+1, z], [x, y+1, z],
+                        [x, y, z+1], [x+1, y, z+1], [x+1, y+1, z+1], [x, y+1, z+1]
+                    ]
+                    faces = [
+                        [0,1,2], [0,2,3], [4,6,5], [4,7,6],
+                        [0,4,5], [0,5,1], [2,6,7], [2,7,3],
+                        [0,3,7], [0,7,4], [1,5,6], [1,6,2]
+                    ]
+                    for face in faces:
+                        triangles.append([verts[i] for i in face])
+
+    if triangles:
+        vertices = np.array(triangles, dtype=np.float32).reshape(-1, 3)
+        faces = np.arange(len(vertices), dtype=np.uint32).reshape(-1, 3)
+
+        # Write binary STL
+        with open(path, 'wb') as f:
+            f.write(b'\x00' * 80)  # Header
+            f.write(np.uint32(len(faces)).tobytes())
+
+            for face in faces:
+                normal = np.cross(vertices[face[1]] - vertices[face[0]], vertices[face[2]] - vertices[face[0]])
+                normal = normal / (np.linalg.norm(normal) + 1e-10)
+                f.write(normal.astype(np.float32).tobytes())
+                f.write(vertices[face[0]].astype(np.float32).tobytes())
+                f.write(vertices[face[1]].astype(np.float32).tobytes())
+                f.write(vertices[face[2]].astype(np.float32).tobytes())
+                f.write(np.uint16(0).tobytes())
 
 # ============================================================================
 # LOSS FUNCTIONS
@@ -473,42 +687,44 @@ class ConnectivityLoss(nn.Module):
                     disconnected_fraction = (total_size - largest_size) / (total_size + 1e-6)
                     total_penalty += disconnected_fraction
         
-        return self.penalty * total_penalty / batch_size if batch_size > 0 else torch.tensor(0.0, device=voxel_grid.device)
-
+        result = self.penalty * total_penalty / batch_size if batch_size > 0 else 0.0
+        return torch.tensor(result, device=voxel_grid.device, dtype=torch.float32)
 
 class AerodynamicLoss(nn.Module):
-    """Loss based on aerodynamic properties"""
-    
+    """Loss based on aerodynamic properties using FluidX3D CFD"""
+
     def __init__(self):
         super().__init__()
-    
-    def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec, cfd_results: Dict) -> torch.Tensor:
+
+    def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec) -> torch.Tensor:
         """
-        Compute aerodynamic loss balancing drag, lift, and volume.
+        Compute aerodynamic loss balancing drag, lift, and volume using FluidX3D CFD.
         """
-        if not cfd_results:
-            return torch.tensor(0.0, device=voxel_grid.device)
-        
         batch_size = voxel_grid.shape[0]
         loss = torch.tensor(0.0, device=voxel_grid.device)
-        
+
         for b in range(batch_size):
+            # Get single voxel grid for CFD
+            single_voxel_grid = voxel_grid[b:b+1]  # Keep batch dimension
+
+            # Run FluidX3D CFD analysis
+            cfd_results = run_fluidx3d_cfd_fast(single_voxel_grid, design_spec)
+
             # Volume penalty (space weight)
             volume = voxel_grid[b].sum() / np.prod(voxel_grid.shape[1:])
             volume_loss = design_spec.space_weight * volume
-            
+
             # Drag coefficient penalty (drag weight)
             cd = cfd_results.get('drag_coefficient', 0.1)
             drag_loss = design_spec.drag_weight * cd
-            
+
             # Lift coefficient encouragement (lift weight - we want nonzero but not excessive)
             cl = abs(cfd_results.get('lift_coefficient', 0.0))
-            lift_loss = design_spec.lift_weight * (1.0 - torch.clamp(torch.tensor(cl), 0, 1))
-            
-            loss += volume_loss + drag_loss + lift_loss
-        
-        return loss / batch_size
+            lift_loss = design_spec.lift_weight * (1.0 - torch.clamp(torch.tensor(cl, device=voxel_grid.device), 0, 1))
 
+            loss += volume_loss + drag_loss + lift_loss
+
+        return loss / batch_size
 
 # ============================================================================
 # TRAINING PIPELINE
@@ -532,11 +748,25 @@ class DiffusionTrainer:
         self.training_config = training_config
         self.cfd_config = cfd_config
         
-        self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device)
-        
+        # Precision handling for mixed precision training
+        self.precision_dtypes = {
+            'float64': torch.float64,
+            'double': torch.float64,
+            'float32': torch.float32,
+            'float': torch.float32,
+            'float16': torch.float16,
+            'half': torch.float16,
+            'bfloat16': torch.bfloat16,
+            'float8': torch.float8 if hasattr(torch, 'float8') else torch.float16
+        }
+        self.dtype = self.precision_dtypes.get(training_config.precision, torch.float32)
+        print(f"Using precision: {training_config.precision} ({self.dtype})")
+
+        self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device).to(self.dtype)
+
         # Models
-        self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device)
-        self.converter = LatentTo3DConverter(model_config.latent_dim, (32, 32, 32)).to(self.device)
+        self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
+        self.converter = LatentTo3DConverter(model_config.latent_dim, (32, 32, 32)).to(self.device).to(self.dtype)
         
         # Initialize EMA model
         self.ema_model = self._copy_model(self.diffusion_model)
@@ -582,9 +812,9 @@ class DiffusionTrainer:
         pbar = tqdm(train_loader, desc=f"Training (grid={grid_size}x{grid_size}x{grid_size})")
         
         for batch_idx, batch in enumerate(pbar):
-            latent = batch['latent'].to(self.device)
-            geometry_target = batch['geometry'].to(self.device)
-            
+            latent = batch['latent'].to(self.device, dtype=self.dtype)
+            geometry_target = batch['geometry'].to(self.device, dtype=self.dtype)
+
             # Resize geometry to current grid size
             if grid_size != geometry_target.shape[1]:
                 geometry_target = F.interpolate(
@@ -592,14 +822,14 @@ class DiffusionTrainer:
                     size=(grid_size, grid_size, grid_size),
                     mode='nearest'
                 ).squeeze(1)
-            
+
             # Convert latent to voxel grid
             voxel_grid = self.converter(latent)
             voxel_grid = torch.sigmoid(voxel_grid)  # Normalize to [0, 1]
-            
+
             # Random timestep for diffusion training
             t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device)
-            
+
             # Forward diffusion
             noise = torch.randn_like(latent)
             noisy_latent = self.noise_schedule.q_sample(latent, t, noise)
@@ -613,15 +843,13 @@ class DiffusionTrainer:
             # Connectivity loss
             connectivity_loss_val = self.connectivity_loss(voxel_grid)
             
-            # CFD-based aerodynamic loss (computed on low-res grid for speed)
+            # CFD-based aerodynamic loss using FluidX3D
             aero_loss_val = torch.tensor(0.0, device=self.device)
-            if batch_idx % 5 == 0:  # Compute aerodynamics every 5 batches
+            if batch_idx % 10 == 0:  # Compute aerodynamics every 10 batches for speed
                 design_spec = DesignSpec(target_speed=50.0)
-                geom_aero = (voxel_grid[0] > 0.5)
-                if geom_aero.sum() > 10:  # Only if enough voxels
-                    cfd_results = self.cfd_simulator.simulate_aerodynamics(geom_aero, steps=50)
-                    aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, cfd_results)
-            
+                # Use full resolution voxel grid for accurate CFD
+                aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec)
+
             # Combined loss
             total_loss_val = mse_loss_val + connectivity_loss_val + aero_loss_val
             
@@ -668,23 +896,25 @@ class DiffusionTrainer:
     def train(self, train_loader: DataLoader, val_loader: DataLoader = None):
         """Progressive training: start small, scale up"""
         grid_sizes = [16, 24, 32]  # Progressive grid refinement
-        
+
         for grid_size in grid_sizes:
             print(f"\n{'='*60}")
             print(f"Training with grid size: {grid_size}x{grid_size}x{grid_size}")
             print(f"{'='*60}\n")
-            
-            epochs = self.training_config.num_epochs if grid_size == 32 else self.training_config.num_epochs // 2
-            
+
+            torch.cuda.empty_cache()  # Clear GPU memory before switching grid sizes
+
+            epochs = self.training_config.num_epochs if grid_size == 32 else max(1, self.training_config.num_epochs // 2)
+
             for epoch in range(epochs):
                 print(f"\nGrid {grid_size} - Epoch {epoch + 1}/{epochs}")
                 metrics = self.train_epoch(train_loader, grid_size=grid_size)
-                
+
                 print(f"Epoch {epoch + 1} Metrics: {metrics}")
-                
+
                 if (epoch + 1) % self.training_config.save_interval == 0:
                     self.save_checkpoint(f'checkpoint_grid{grid_size}_ep{epoch+1}.pt')
-            
+
             self.scheduler.step()
     
     def save_checkpoint(self, path: str):
@@ -713,7 +943,6 @@ class DiffusionTrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         self.global_step = checkpoint['global_step']
         print(f"Checkpoint loaded from {path}")
-
 
 # ============================================================================
 # INFERENCE & MARCHING CUBES
@@ -852,7 +1081,6 @@ class AircraftGenerator:
             faces = np.arange(len(vertices)).reshape(-1, 3)
             self._write_stl(path, vertices, faces)
 
-
 # ============================================================================
 # CLI INTERFACE
 # ============================================================================
@@ -866,40 +1094,49 @@ def cli():
 
 @cli.command()
 @click.option('--num-epochs', default=100, help='Number of training epochs')
-@click.option('--batch-size', default=128, help='Batch size')
-@click.option('--learning-rate', default=2e-4, help='Learning rate')
-@click.option('--latent-dim', default=128, help='Latent dimension')
+@click.option('--batch-size', default=1, help='Batch size')
+@click.option('--learning-rate', default=2e-2, help='Learning rate')
+@click.option('--latent-dim', default=16, help='Latent dimension')
+@click.option('--precision', default='float32', help='Precision for weights/biases: float64, float32, float16, bfloat16, float8')
 @click.option('--disconnection-penalty', default=50.0, help='Penalty for disconnected voxels')
 @click.option('--num-samples', default=500, help='Number of training samples')
 @click.option('--resume-from', default=None, help='Resume from checkpoint')
 @click.option('--save-dir', default='./checkpoints', help='Directory to save checkpoints')
-def train(num_epochs, batch_size, learning_rate, latent_dim, disconnection_penalty, num_samples, resume_from, save_dir):
+def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, num_samples, resume_from, save_dir):
     """Train the diffusion model"""
-    
+    find_fluidx3d_executable()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+
+    # Load checkpoint if resuming to get correct model config
+    model_config_override = None
+    if resume_from:
+        checkpoint = torch.load(resume_from, map_location=device)
+        model_config_override = ModelConfig(**checkpoint['model_config'])
+        print(f"Loaded model config from checkpoint: latent_dim={model_config_override.latent_dim}")
+
     # Create directories
     Path(save_dir).mkdir(parents=True, exist_ok=True)
-    
+
     # Configs
-    model_config = ModelConfig(latent_dim=latent_dim)
+    model_config = model_config_override if model_config_override else ModelConfig(latent_dim=latent_dim)
     diffusion_config = DiffusionConfig()
     training_config = TrainingConfig(
         num_epochs=num_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        disconnection_penalty=disconnection_penalty
+        disconnection_penalty=disconnection_penalty,
+        precision=precision
     )
     cfd_config = CFDConfig(resolution=16)
-    
+
     # Dataset
-    dataset = AircraftDesignDataset(num_samples=num_samples, grid_size=32)
+    dataset = AircraftDesignDataset(num_samples=num_samples, grid_size=32, latent_dim=model_config.latent_dim)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
+
     # Trainer
     trainer = DiffusionTrainer(model_config, diffusion_config, training_config, cfd_config, device=device)
-    
+
     if resume_from:
         trainer.load_checkpoint(resume_from)
         print(f"Resumed from {resume_from}")

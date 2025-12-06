@@ -1,2 +1,8 @@
 .vscode/
 data/
+<<<<<<< HEAD
+runs/
+checkpoints/
+=======
+runs/
+>>>>>>> a90ce8b (CLI better)

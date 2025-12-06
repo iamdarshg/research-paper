@@ -25,6 +25,7 @@ def find_fluidx3d_executable() -> Optional[Path]:
     
     if platform.system() == 'Windows':
         candidates.extend([
+            Path('D:\\CodeProjects\\FluidX3D\\bin\\FluidX3D.exe'),
             Path(os.environ.get('PROGRAMFILES', 'C:\\Program Files')) / 'FluidX3D' / 'FluidX3D.exe',
             Path(os.environ.get('PROGRAMFILES(X86)', 'C:\\Program Files (x86)')) / 'FluidX3D' / 'FluidX3D.exe',
             Path.home() / 'FluidX3D' / 'FluidX3D.exe',
