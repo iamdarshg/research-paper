@@ -11,11 +11,11 @@ environment:
   temperature_k: 288.15
 goals:
   angle_of_attack_deg: 5.0
-  target_range_m: 27.45
+  target_range_m: 50.0
   throw_speed_mps: 10.0
 project:
   max_cells_cfd: 1000000
-  n_folds: 6
+  n_folds: 10
   sheet_height_mm: 297.0
   sheet_width_mm: 210.0
   surrogate_threshold: 0.8

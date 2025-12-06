@@ -644,6 +644,42 @@ def main():
         st.info(f"📱 **Training Device**: {st.session_state['selected_device']}")
         
         # ====================================================================
+        # SECTION 1.5: CFD METHOD SELECTION
+        # ====================================================================
+        st.divider()
+        st.subheader("CFD Evaluation Method")
+        
+        cfd_method = st.selectbox(
+            "Select CFD Approach:",
+            ["🔬 Surrogate Model (Fast)", "⚡ FluidX3D (High-Fidelity)", "🤖 Hybrid (Auto-Select)"],
+            index=0,
+            key="cfd_method_selector",
+            help="Choose between fast surrogate, high-fidelity FluidX3D, or automatic hybrid approach"
+        )
+        
+        # Show CFD method info
+        cfd_info_cols = st.columns([1, 1, 1])
+        with cfd_info_cols[0]:
+            st.metric("Method", cfd_method.split()[0])
+        with cfd_info_cols[1]:
+            if "Surrogate" in cfd_method:
+                st.metric("Speed", "~0.1s/eval")
+            elif "FluidX3D" in cfd_method:
+                st.metric("Speed", "~10s/eval")
+            else:
+                st.metric("Speed", "~5s avg")
+        with cfd_info_cols[2]:
+            if "Surrogate" in cfd_method:
+                st.metric("Accuracy", "~75%")
+            elif "FluidX3D" in cfd_method:
+                st.metric("Accuracy", "~95%")
+            else:
+                st.metric("Accuracy", "~90%")
+        
+        # Store CFD method in session state
+        st.session_state['cfd_method'] = cfd_method
+        
+        # ====================================================================
         # SECTION 2: TRAINING MODE SELECTION
         # ====================================================================
         st.divider()

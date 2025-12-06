@@ -1,0 +1,58 @@
+# Configuration Template for Aircraft Diffusion Model
+# Copy this file and modify as needed, then load in your training script
+
+model:
+  latent_dim: 128
+  xyz_dim: 3
+  encoder_channels: [64, 128, 256]
+  decoder_channels: [256, 128, 64]
+  attention_heads: 8
+  num_attention_layers: 4
+
+diffusion:
+  timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  sampling_timesteps: 250
+  guidance_scale: 7.5
+
+training:
+  batch_size: 4
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  num_epochs: 100
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  ema_decay: 0.999
+  disconnection_penalty: 10.0
+  use_mixed_precision: true
+  save_interval: 5
+  val_interval: 1
+
+cfd:
+  resolution: 32
+  mach_number: 0.3
+  reynolds_number: 1000000.0
+  simulation_steps: 500
+  output_interval: 50
+  device_id: 0
+
+design:
+  target_speed: 50.0
+  space_weight: 0.33
+  drag_weight: 0.33
+  lift_weight: 0.34
+  bounding_box: [64, 64, 64]
+
+# Load this config in Python:
+#
+# import yaml
+# 
+# with open('config.yaml', 'r') as f:
+#     config = yaml.safe_load(f)
+# 
+# model_cfg = ModelConfig(**config['model'])
+# diff_cfg = DiffusionConfig(**config['diffusion'])
+# train_cfg = TrainingConfig(**config['training'])
+# cfd_cfg = CFDConfig(**config['cfd'])
+# design_cfg = DesignSpec(**config['design'])
