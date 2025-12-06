@@ -1,6 +1,7 @@
 """
 Batch parallel surrogate model evaluator with GPU acceleration.
 Enables efficient evaluation of multiple folded configurations simultaneously.
+Supports FluidX3D CFD integration for high-fidelity aerodynamics.
 """
 import torch
 import numpy as np
@@ -9,12 +10,15 @@ from pathlib import Path
 from tqdm import tqdm
 import trimesh # Re-adding missing import
 from ..folding.folder import fold_sheet
-from .aero_model import compute_aero_features, surrogate_cfd_batch
+from .aero_model import compute_aero_features, surrogate_cfd_batch, run_fluidx3d_cfd
 import yaml
 from typing import Dict, Any, Union, List, Optional
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 CONFIG_PATH = Path(__file__).parent.parent.parent / 'config.yaml'
+
+# FluidX3D configuration
+USE_FLUIDX3D_BATCH = False  # Set to True to enable FluidX3D for batch evaluation
 
 def load_config() -> Dict[str, Any]:
     """Loads the configuration from config.yaml."""
@@ -46,9 +50,9 @@ def _autodetect_batch_size(device: torch.device) -> int:
     return 32 # Default for CPU or if auto-detection is off
 
 class SurrogateBatchEvaluator:
-    """GPU-accelerated batch evaluator for surrogate model predictions."""
+    """GPU-accelerated batch evaluator for surrogate model predictions with optional FluidX3D."""
     
-    def __init__(self, device: torch.device = DEVICE, max_workers: int = 4, auto_batch_size: bool = True):
+    def __init__(self, device: torch.device = DEVICE, max_workers: int = 4, auto_batch_size: bool = True, use_fluidx3d: bool = False):
         """
         Initialize batch evaluator.
         
@@ -56,16 +60,22 @@ class SurrogateBatchEvaluator:
             device (torch.device): The torch device (cuda or cpu) to perform computations on.
             max_workers (int): Number of parallel threads for CPU-bound mesh generation.
             auto_batch_size (bool): If True, automatically detect GPU batch size based on VRAM.
+            use_fluidx3d (bool): If True, use FluidX3D CFD for high-fidelity aerodynamics.
         """
         self.device = device
         self.max_workers = max_workers
         self.config = load_config()
         self.auto_batch_size = auto_batch_size
+        self.use_fluidx3d = use_fluidx3d
         self.recommended_batch_size: int
         if self.device.type == 'cuda' and self.auto_batch_size:
             self.recommended_batch_size = _autodetect_batch_size(self.device)
         else:
             self.recommended_batch_size = 32 # Default for CPU or if auto-detection is off
+    
+    def enable_fluidx3d(self, enable: bool = True):
+        """Enable or disable FluidX3D CFD integration."""
+        self.use_fluidx3d = enable
         
     def evaluate_batch(self, actions: Union[np.ndarray, List[np.ndarray]], 
                        state: Dict[str, Any], show_progress: bool = True, 

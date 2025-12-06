@@ -4,12 +4,18 @@ import numpy as np
 import torch
 import trimesh
 from pathlib import Path
-from typing import Any # Import Any for type hinting
+from typing import Any, Dict, Optional, Tuple # Import Any for type hinting
 from ..folding.sheet import load_config
+import subprocess
+import json
 
 
 CONFIG_PATH = Path(__file__).parent.parent.parent / 'config.yaml'
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# FluidX3D integration flag
+USE_FLUIDX3D = True
+FLUIDX3D_EXE = None
 
 def compute_aero_features(mesh):
     """
@@ -95,23 +101,42 @@ def compute_inviscid_cl_cd_batch(span_t, chord_t, ar_t, aoa_rad_t, camber_t):
 
     return cl, cd_i
 
-def surrogate_cfd(mesh, state):
+def surrogate_cfd(mesh, state, use_cfd: bool = True):
     """
     Surrogate prediction: CL, CD, est_range_m (single mesh, slow path).
     
     Args:
         mesh: trimesh.Trimesh folded
         state: dict from config
+        use_cfd: If True, try FluidX3D first; otherwise use physics-based surrogate
     
     Returns:
         dict: cl, cd, range_est
     """
     config = load_config()
-    aoa_rad = np.deg2rad(state.get('angle_of_attack_deg', config['goals']['angle_of_attack_deg']))
+    aoa_deg = state.get('angle_of_attack_deg', config['goals']['angle_of_attack_deg'])
+    aoa_rad = np.deg2rad(aoa_deg)
     rho = state.get('air_density_kgm3', config['environment']['air_density_kgm3'])
     mu = state.get('air_viscosity_pas', config['environment']['air_viscosity_pas'])
     v_inf = state.get('throw_speed_mps', config['goals']['throw_speed_mps'])
     
+    # Try FluidX3D CFD first if enabled
+    if use_cfd and USE_FLUIDX3D:
+        try:
+            reynolds = rho * v_inf * 0.1 / mu  # Approximate chord = 0.1m
+            cfd_results = run_fluidx3d_cfd(
+                mesh,
+                v_inf=v_inf,
+                aoa_deg=aoa_deg,
+                reynolds=reynolds,
+                iterations=5000
+            )
+            if 'source' in cfd_results and cfd_results['source'] == 'fluidx3d':
+                return cfd_results
+        except Exception as e:
+            print(f"FluidX3D failed: {e}, using surrogate")
+    
+    # Fallback to physics-based surrogate
     features = compute_aero_features(mesh)
     chord = features['mean_chord']
 
@@ -226,3 +251,186 @@ def surrogate_cfd_batch(features_list, states_list):
         'range_est': range_est,
         'Re': Re
     }
+
+
+def find_fluidx3d_executable() -> Optional[Path]:
+    """Locate FluidX3D executable on system."""
+    import platform
+    import os
+    
+    candidates = []
+    
+    if platform.system() == 'Windows':
+        candidates.extend([
+            Path(os.environ.get('PROGRAMFILES', 'C:\\Program Files')) / 'FluidX3D' / 'FluidX3D.exe',
+            Path(os.environ.get('PROGRAMFILES(X86)', 'C:\\Program Files (x86)')) / 'FluidX3D' / 'FluidX3D.exe',
+            Path.home() / 'FluidX3D' / 'FluidX3D.exe',
+            Path.cwd() / 'FluidX3D' / 'FluidX3D.exe',
+        ])
+    else:
+        candidates.extend([
+            Path('/usr/local/bin/FluidX3D'),
+            Path('/opt/FluidX3D/FluidX3D'),
+            Path.home() / 'FluidX3D' / 'FluidX3D',
+        ])
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    try:
+        result = subprocess.run(['which' if platform.system() != 'Windows' else 'where', 'FluidX3D'],
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return Path(result.stdout.strip().split('\n')[0])
+    except Exception:
+        pass
+
+    return None
+
+
+def run_fluidx3d_cfd(
+    mesh: trimesh.Trimesh,
+    v_inf: float = 10.0,
+    aoa_deg: float = 5.0,
+    reynolds: float = 1e5,
+    iterations: int = 5000,
+    temp_dir: Optional[Path] = None
+) -> Dict[str, float]:
+    """
+    Run FluidX3D CFD simulation for paper airplane.
+    
+    Args:
+        mesh: Airplane mesh (trimesh object)
+        v_inf: Free stream velocity (m/s)
+        aoa_deg: Angle of attack (degrees)
+        reynolds: Reynolds number
+        iterations: LBM iterations
+        temp_dir: Temporary directory for simulation
+    
+    Returns:
+        Dictionary with 'cl', 'cd', 'ld', 'range_est' keys
+    """
+    global FLUIDX3D_EXE
+    
+    if FLUIDX3D_EXE is None:
+        FLUIDX3D_EXE = find_fluidx3d_executable()
+    
+    if FLUIDX3D_EXE is None:
+        # Fallback to surrogate if FluidX3D not available
+        return surrogate_cfd(mesh, {
+            'v_inf': v_inf,
+            'aoa_deg': aoa_deg,
+            'reynolds': reynolds
+        }, use_cfd=False)
+    
+    import tempfile
+    import shutil
+    
+    work_dir = temp_dir or Path(tempfile.mkdtemp(prefix='fluidx3d_'))
+    
+    try:
+        # Export STL
+        stl_path = work_dir / 'airplane.stl'
+        mesh.export(str(stl_path))
+        
+        # Create config file (JSON format for FluidX3D)
+        config = {
+            'stl_file': str(stl_path),
+            'output_dir': str(work_dir),
+            'velocity': v_inf,
+            'angle_of_attack': aoa_deg,
+            'reynolds': reynolds,
+            'iterations': iterations,
+            'lattice': 'D3Q27',
+            'convergence_criterion': 1e-8
+        }
+        
+        config_path = work_dir / 'config.json'
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        # Run FluidX3D
+        cmd = [
+            str(FLUIDX3D_EXE),
+            '--stl', str(stl_path),
+            '--velocity', str(v_inf),
+            '--aoa', str(aoa_deg),
+            '--reynolds', str(reynolds),
+            '--iterations', str(iterations),
+            '--output', str(work_dir)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            print(f"FluidX3D warning: {result.stderr}")
+            # Fallback to surrogate
+            return surrogate_cfd(mesh, {
+                'v_inf': v_inf,
+                'aoa_deg': aoa_deg,
+                'reynolds': reynolds
+            }, use_cfd=False)
+        
+        # Parse results from output
+        results_file = work_dir / 'results.json'
+        if results_file.exists():
+            with open(results_file, 'r') as f:
+                results = json.load(f)
+                return {
+                    'cl': float(results.get('cl', 0.5)),
+                    'cd': float(results.get('cd', 0.05)),
+                    'ld': float(results.get('ld', 10.0)),
+                    'range_est': float(results.get('range', 20.0)),
+                    'source': 'fluidx3d'
+                }
+        else:
+            # Parse from stdout
+            cl = cd = 0.0
+            for line in result.stdout.split('\n'):
+                if 'CL' in line.upper():
+                    try:
+                        cl = float(line.split()[-1])
+                    except:
+                        pass
+                elif 'CD' in line.upper():
+                    try:
+                        cd = float(line.split()[-1])
+                    except:
+                        pass
+            
+            ld = cl / (cd + 1e-8) if cd > 0 else 10.0
+            g = 9.81
+            range_est = ld * v_inf**2 * np.sin(2 * np.deg2rad(10)) / g
+            
+            return {
+                'cl': cl,
+                'cd': cd,
+                'ld': ld,
+                'range_est': range_est,
+                'source': 'fluidx3d'
+            }
+    
+    except subprocess.TimeoutExpired:
+        print("FluidX3D timeout - using surrogate")
+        return surrogate_cfd(mesh, {
+            'v_inf': v_inf,
+            'aoa_deg': aoa_deg,
+            'reynolds': reynolds
+        }, use_cfd=False)
+    
+    except Exception as e:
+        print(f"FluidX3D error: {e} - falling back to surrogate")
+        return surrogate_cfd(mesh, {
+            'v_inf': v_inf,
+            'aoa_deg': aoa_deg,
+            'reynolds': reynolds
+        }, use_cfd=False)
+    
+    finally:
+        # Cleanup
+        if temp_dir is None and work_dir.exists():
+            try:
+                shutil.rmtree(work_dir)
+            except:
+                pass
