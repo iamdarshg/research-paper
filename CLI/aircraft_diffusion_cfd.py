@@ -132,6 +132,7 @@ class NoiseSchedule:
         self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
         self.sqrt_recip_alphas_cumprod = self.sqrt_recip_alphas_cumprod.to(device)
         self.sqrt_recipm1_alphas_cumprod = self.sqrt_recipm1_alphas_cumprod.to(device)
+        return self
 
 
 # ============================================================================
