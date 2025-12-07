@@ -45,6 +45,7 @@ import yaml
 from scipy.ndimage import label, binary_dilation
 from skimage import measure
 import trimesh
+from advanced_lbm_solver import GPULBMSolver as AdvancedGPULBMSolver
 
 warnings.filterwarnings('ignore')
 
@@ -80,6 +81,8 @@ class ModelConfig:
     attention_groups: int = 8  # 4 groups instead of 8 heads (50% KV-cache reduction)
     attention_kv_groups: int = 8  # Groups for key/value
     num_attention_layers: int = 4
+    # Grid resolution - single resolution for all components
+    base_grid_resolution: int = 32  # Consistent grid resolution for voxel, CFD, etc.
     # Memory optimization
     enable_gradient_checkpointing: bool = True  # 60% VRAM savings
     use_torch_compile: bool = False  # Kernel fusion
@@ -109,32 +112,80 @@ class TrainingConfig:
     num_pipeline_stages: int = 4  # CFD + Diffusion stages
 
 @dataclass
-class LBMConfig:
-    """Lattice Boltzmann Method configuration parameters"""
-    grid_spacing: float = 1.0      # Grid spacing (h) - lattice units
-    time_step: float = 0.10         # Time step (dt) - lattice units
-    relaxation_time: float = 0.01  # Relaxation time for viscosity calculation
-    block_size: int = 512          # GPU thread block size
-    use_soa_layout: bool = True    # Structure of Arrays layout for GPU efficiency
+class LBMPhysicsConfig:
+    """Easy-to-update configuration for LBM physics constants"""
+    # Turbulence modeling
+    turbulence_model="dynamic_smagorinsky" # Options: 'smagorinsky', 'dynamic_smagorinsky', 'none'
+    smagorinsky_constant: float = 0.17  # Cs for LES turbulence model
+    use_les_turbulence: bool = True
+    physical_length_scale: float = 1.0  # Physical length of the voxel grid (m)
+    grid_spacing: float = 0.01  # Physical spacing per grid cell (m) - calculated from physical_length_scale
+    time_step: float = 0.001  # Time step size (s)
+    test_filter_ratio:float=2.0  # Ratio for test filter in dynamic Smagorinsky model
+    dynamic_cs_clip_min:float=0.0  # Minimum Cs value for dynamic model
+    dynamic_cs_clip_max:float=0.2  # Maximum Cs value for dynamic model
+    use_vorticity_confinement: bool = True  # Enable vorticity confinement
+    vc_adaptive_strength: float = 0.1  # Adaptive vorticity confinement strength
+    vc_adaptive: bool = True  # Adaptive strength factor
+    vorticity_confinement_epsilon: float = 0.1  # Vorticity confinement parameter
+    compute_q_criterion: bool = True  # Compute Q-criterion for vortex identification
+    q_threshold: float = 0.0  # Threshold for Q-criterion visualization
 
+
+    # MRT relaxation times (for different moment components)
+    # s0-s18 correspond to different moments in MRT collision
+    # Lower values = more dissipation, higher stability
+    s_nu: float = None  # Set from Reynolds number (kinematic viscosity)
+    s_bulk: float = 1.0  # Bulk viscosity relaxation (density fluctuations)
+    s_energy: float = 1.2  # Energy mode relaxation
+    s_higher: float = 1.4  # Higher order moments relaxation
+
+    # Boundary conditions
+    inlet_velocity_relaxation: float = 0.5  # For Zou-He BC smoothing
+    convergence_tolerance: float = 1e-5  # Velocity change threshold
+    max_iterations: int = 50000  # Safety limit
+    check_convergence_every: int = 250  # Steps between convergence checks
+
+    # Stability
+    max_mach: float = 0.3  # Maximum Mach number for stability
+    cfl_safety_factor: float = 0.8  # CFL condition safety margin
+
+    # Low-Mach corrections
+    use_incompressible_correction: bool = True  # Use rho0=1 for incompressible
+
+    # Force computation
+    momentum_exchange_correction: bool = True  # Apply momentum-exchange method
+    
 @dataclass
 class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
-    resolution: int = 128  # Will be adaptively refined to ~5k cells
+    base_grid_resolution: int = 32  # Consistent grid resolution - no resizing needed
     mach_number: float = 0.025
     reynolds_number: float = 1e6
-    simulation_steps: int = 500
+    simulation_steps: int = 1000
     output_interval: int = 50
     device_id: int = 0
-    # Adaptive mesh refinement
-    adaptive_cells_target: int = int(1e5)  # Target ~5k cells vs uniform 32³ (32k cells)
+    # Adaptive mesh refinement - for compatibility with older code, resolution maps to base_grid_resolution
+    adaptive_cells_target: int = int(1e5)  # Target ~5k cells (for simulations that use refinement)
     refinement_levels: int = 3
     # LBM configuration
-    lbm_config: LBMConfig = None   # LBM parameters
+    lbm_config: LBMPhysicsConfig = None   # LBM parameters
+    # Backwards compatibility parameter - default to base_grid_resolution
+    resolution: int = None  # If provided, sets base_grid_resolution
 
     def __post_init__(self):
+        # Set default resolution if not provided
+        if self.resolution is None:
+            self.resolution = self.base_grid_resolution
+
+        # Handle backwards compatibility for resolution parameter
+        if self.resolution is not None:
+            self.base_grid_resolution = self.resolution
+
         if self.lbm_config is None:
-            self.lbm_config = LBMConfig()
+            # Calculate physical grid spacing: physical_length / resolution
+            self.lbm_config = LBMPhysicsConfig()
+            self.lbm_config.grid_spacing = self.lbm_config.physical_length_scale / self.base_grid_resolution
 
 @dataclass
 class DesignSpec:
@@ -324,127 +375,7 @@ class AdaptiveMeshRefinement:
 # ============================================================================
 # GPU-RESIDENT LBM SOLVER WITH SOA LAYOUT
 # ============================================================================
-
-class GPULBMSolver:
-    """GPU-resident Lattice Boltzmann Method solver with SoA layout"""
-    
-    def __init__(self, config: CFDConfig, device: torch.device):
-        self.config = config
-        self.device = device
-        self.resolution = config.resolution
-        self.block_size = config.lbm_config.block_size  # 256-thread blocks from LBM config
-        
-        # Structure of Arrays (SoA) layout for GPU efficiency
-        self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        
-        # LBM populations (D3Q19 lattice)
-        self.f = torch.zeros(19, self.resolution, self.resolution, self.resolution, device=device)
-        
-        # Initialize equilibrium distribution
-        self._initialize_equilibrium()
-    
-    def _initialize_equilibrium(self):
-        """Initialize equilibrium distribution for LBM"""
-        rho = 1.0  # Density
-        ux = self.config.mach_number * 343.0  # Freestream velocity
-        uy, uz = 0.0, 0.0
-        
-        # D3Q19 velocity vectors
-        self.ex = torch.tensor([0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1], device=self.device)
-        self.ey = torch.tensor([0, 0, 0, 1, -1, 0, 0, 1, 1, -1, -1, 1, -1, 0, 0, 0, 0, 0, 0], device=self.device)
-        self.ez = torch.tensor([0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 1, -1, -1, -1, 1, 1], device=self.device)
-        
-        # LBM weights
-        self.w = torch.tensor([1/3, 1/18, 1/18, 1/18, 1/18, 1/18, 1/18, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36], device=self.device)
-        
-        # Compute equilibrium distribution
-        u_squared = ux**2 + uy**2 + uz**2
-        for i in range(19):
-            eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
-            self.f[i] = self.w[i] * rho * (1 + 3*eu + 4.5*eu**2 - 1.5*u_squared)
-    
-    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
-        """Perform LBM collision and streaming steps"""
-        h = self.config.lbm_config.grid_spacing
-        dt = self.config.lbm_config.time_step
-        omega = 1.0 / (3.0 * self.config.lbm_config.relaxation_time + 0.5)  # Relaxation parameter (viscosity)
-        
-        for step in range(steps):
-            # Collision step
-            # Compute macroscopic variables
-            rho = torch.sum(self.f, dim=0)
-            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0) / rho
-            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0) / rho
-            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0) / rho
-            
-            # Equilibrium distribution
-            for i in range(19):
-                eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
-                u_squared = ux**2 + uy**2 + uz**2
-                feq = self.w[i] * rho * (1 + 3*eu + 4.5*eu**2 - 1.5*u_squared)
-                
-                # Collision
-                self.f[i] += omega * (feq - self.f[i])
-            
-            # Streaming with bounce-back boundary conditions
-            f_streamed = self.f.clone()
-            
-            # Streaming directions
-            streaming_dirs = [
-                (0, 1, 2), (1, 0, 3), (2, 0, 4), (3, 1, 5), (4, 2, 6),
-                (5, 3, 7), (6, 4, 8), (7, 5, 9), (8, 6, 10), (9, 7, 11),
-                (10, 8, 12), (11, 9, 13), (12, 10, 14), (13, 11, 15),
-                (14, 12, 16), (15, 13, 17), (16, 14, 18), (17, 15, 0), (18, 16, 0)
-            ]
-            
-            for i, (f_in, f_out, bounce_dir) in enumerate(streaming_dirs):
-                if bounce_dir < len(streaming_dirs):
-                    # Streaming
-                    f_streamed[bounce_dir] = torch.roll(self.f[f_in], shifts=(0, 0, 0), dims=(0, 1, 2))
-            
-            # Bounce-back at solid boundaries
-            for i in range(19):
-                bounce_idx = (i + (19 // 2)) % 19
-                f_streamed[i][geometry_mask > 0.5] = f_streamed[bounce_idx][geometry_mask > 0.5]
-            
-            self.f = f_streamed
-            
-            # Update macroscopic variables
-            self.velocity_x = ux
-            self.velocity_y = uy
-            self.velocity_z = uz
-            self.pressure = rho / 3.0  # Equation of state
-    
-    def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
-        """Compute drag and lift coefficients from LBM results"""
-        rho = 1.0
-        v_inf = self.config.mach_number * 343.0
-        q_inf = 0.5 * rho * v_inf**2
-        h = self.config.lbm_config.grid_spacing  # Grid spacing from config
-
-        # Reference area (planform area)
-        ref_area = torch.sum(geometry_mask.float()).item() * h**2
-
-        # Compute forces from momentum change
-        # Drag (x-direction)
-        drag_force = torch.sum(self.velocity_x[geometry_mask > 0.5] * geometry_mask[geometry_mask > 0.5])
-
-        # Lift (z-direction) - assuming aircraft flies in x, lift in z
-        lift_force = torch.sum(self.velocity_z[geometry_mask > 0.5] * geometry_mask[geometry_mask > 0.5])
-
-        # Normalize by reference area
-        cd = abs(drag_force.item()) / (q_inf * ref_area + 1e-6)
-        cl = abs(lift_force.item()) / (q_inf * ref_area + 1e-6)
-
-        return {
-            'drag_coefficient': min(cd, 1.0),
-            'lift_coefficient': min(cl, 2.0),
-            'pressure_sum': self.pressure.sum().item()
-        }
-
+# (See advanced_lbm_solver.py for full implementation)
 # ============================================================================
 # 4-STEP CONSISTENCY MODEL
 # ============================================================================
@@ -938,7 +869,7 @@ class PipelineParallelism:
         # Simple conversion for pipeline testing
         return torch.sigmoid(latent).view(1, 32, 32, 32)
     
-    async def _run_cfd_async(self, cfd_solver: GPULBMSolver, voxel_grid: torch.Tensor) -> Dict[str, float]:
+    async def _run_cfd_async(self, cfd_solver: AdvancedGPULBMSolver, voxel_grid: torch.Tensor) -> Dict[str, float]:
         """Run CFD simulation asynchronously"""
         # Convert voxel grid to geometry mask
         geometry_mask = (voxel_grid > 0.5).float()
@@ -961,17 +892,18 @@ class AdvancedCFDSimulator:
     def __init__(self, config: CFDConfig, device: torch.device):
         self.config = config
         self.device = device
-        self.resolution = config.resolution
-        
+        self.resolution = config.base_grid_resolution
+
         # Adaptive mesh refinement
         self.mesh_refinement = AdaptiveMeshRefinement(
             target_cells=config.adaptive_cells_target,
             refinement_levels=config.refinement_levels
         )
-        
-        # GPU LBM solver with SoA layout
-        self.lbm_solver = GPULBMSolver(config, device)
-        
+
+        # GPU LBM solver with SoA layout - use advanced solver with CFD config
+        # The AdvancedGPULBMSolver expects the same interface as the CFD config
+        self.lbm_solver = AdvancedGPULBMSolver(self.config, device, LBMPhysicsConfig)
+
         # Initialize flow field
         self.init_flow_field()
     
