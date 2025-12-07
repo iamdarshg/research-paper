@@ -53,18 +53,18 @@ class DiffusionConfig:
 @dataclass
 class ModelConfig:
     """Model architecture parameters"""
-    latent_dim: int = 128
+    latent_dim: int = 16  # Reduced default for memory efficiency
     xyz_dim: int = 3
     encoder_channels: List[int] = None
     decoder_channels: List[int] = None
-    attention_heads: int = 8
-    num_attention_layers: int = 4
-    
+    attention_heads: int = 4  # Reduced attention heads
+    num_attention_layers: int = 2  # Reduced layers
+
     def __post_init__(self):
         if self.encoder_channels is None:
-            self.encoder_channels = [64, 128, 256]
+            self.encoder_channels = [24, 32, 48]  # Much smaller channels
         if self.decoder_channels is None:
-            self.decoder_channels = [256, 128, 64]
+            self.decoder_channels = [48, 32, 24]  # Matching smaller channels
 
 @dataclass
 class TrainingConfig:
@@ -207,43 +207,46 @@ class ResidualBlock3D(nn.Module):
 
 class LatentDiffusionUNet(nn.Module):
     """UNet for diffusion on latent codes"""
-    
+
     def __init__(self, config: ModelConfig, diffusion_config: DiffusionConfig):
         super().__init__()
         self.latent_dim = config.latent_dim
         self.diffusion_config = diffusion_config
-        
+        self.encoder_out_dim = 24 * 4 * 4 * 4  # Match first channel: 24x4x4x4 = 1536
+
         time_emb_dim = config.latent_dim
         self.time_embedding = nn.Sequential(
             nn.Linear(1, time_emb_dim),
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim)
         )
-        
+
         # Encoder: project latent to spatial
         self.encoder = nn.Sequential(
-            nn.Linear(config.latent_dim, 64 * 8 * 8 * 8),
+            nn.Linear(config.latent_dim, self.encoder_out_dim),
             nn.SiLU(),
-            nn.Linear(64 * 8 * 8 * 8, 64 * 8 * 8 * 8),
+            nn.Linear(self.encoder_out_dim, self.encoder_out_dim),
         )
-        
-        channels = [64, 128, 256]
+
+        channels = config.encoder_channels + [config.decoder_channels[-1]]
         self.down_blocks = nn.ModuleList()
         self.down_convs = nn.ModuleList()
-        for i in range(len(channels) - 1):
-            self.down_blocks.append(ResidualBlock3D(channels[i], channels[i+1], time_emb_dim, use_attention=(i > 0)))
-            self.down_convs.append(nn.Conv3d(channels[i+1], channels[i+1], 4, stride=2, padding=1))
 
-        self.mid_block = ResidualBlock3D(channels[-1], channels[-1], time_emb_dim, use_attention=True)
+        # Remove aggressive downsampling - just use simple convs without reducing spatial dims
+        for i in range(len(channels) - 1):
+            self.down_blocks.append(ResidualBlock3D(channels[i], channels[i+1], time_emb_dim, use_attention=False))
+            self.down_convs.append(nn.Conv3d(channels[i+1], channels[i+1], 3, stride=1, padding=1))  # Keep spatial size same
+
+        self.mid_block = ResidualBlock3D(channels[-1], channels[-1], time_emb_dim, use_attention=False)  # Remove attention
 
         self.up_convs = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         for i in range(len(channels) - 1, 0, -1):
-            self.up_convs.append(nn.ConvTranspose3d(channels[i], channels[i-1], 4, stride=2, padding=1))
-            self.up_blocks.append(ResidualBlock3D(channels[i-1], channels[i-1], time_emb_dim, use_attention=(i > 1)))
-        
+            self.up_convs.append(nn.Conv3d(channels[i], channels[i-1], 3, stride=1, padding=1))  # No transpose
+            self.up_blocks.append(ResidualBlock3D(channels[i-1], channels[i-1], time_emb_dim, use_attention=False))
+
         self.out_conv = nn.Conv3d(channels[0], channels[0], 1)
-        self.out = nn.Linear(channels[0] * 8 * 8 * 8, self.latent_dim)
+        self.out = nn.Linear(self.encoder_out_dim, self.latent_dim)
     
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         """
@@ -255,15 +258,15 @@ class LatentDiffusionUNet(nn.Module):
         
         t_emb = self.time_embedding(timestep.to(self.time_embedding[0].weight.dtype).unsqueeze(1) / self.diffusion_config.timesteps)
         
-        # Expand latent to 3D spatial (8x8x8)
+        # Expand latent to 3D spatial (4x4x4)
         h = self.encoder(x)  # any shape
         h = h.view(b, -1)  # flatten
-        target_size = 64 * 8 * 8 * 8
+        target_size = self.encoder_out_dim
         if h.size(1) > target_size:
             h = h[:, :target_size]
         elif h.size(1) < target_size:
             h = torch.cat([h, h.new_zeros(b, target_size - h.size(1))], dim=1)
-        h = h.view(b, 64, 8, 8, 8)
+        h = h.view(b, 24, 4, 4, 4)
         
         if condition is not None and condition.shape == h.shape:
             h = h + condition
@@ -525,6 +528,20 @@ def run_fluidx3d_cfd_fast(voxel_grid: torch.Tensor, design_spec: DesignSpec) -> 
             # Create trimesh object
             mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
 
+            # Simplify mesh if too complex
+            if len(mesh.faces) > 50000:
+                print(f"Simplifying mesh from {len(mesh.faces)} faces to reduce complexity")
+                try:
+                    target_faces = min(10000, len(mesh.faces)//4)
+                    if target_faces >= 10:  # Ensure enough faces remain
+                        import fast_simplification
+                        mesh = fast_simplification.simplify_mesh(mesh, target_count=target_faces)
+                        print(f"Simplified mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+                    else:
+                        print(f"Skipping simplification: target_faces {target_faces} too small")
+                except Exception as simplify_error:
+                    print(f"Mesh simplification failed: {simplify_error}")
+
             # Export STL
             stl_path = tmp_path / 'geometry.stl'
             mesh.export(str(stl_path))
@@ -552,6 +569,7 @@ def run_fluidx3d_cfd_fast(voxel_grid: torch.Tensor, design_spec: DesignSpec) -> 
         results_file = tmp_path / 'results.json'
 
         # Run FluidX3D as subprocess (fast mode)
+        result = None  # Initialize result to avoid UnboundLocalError
         try:
             cmd = [
                 str(fluidx3d_exe),
@@ -597,9 +615,6 @@ def run_fluidx3d_cfd_fast(voxel_grid: torch.Tensor, design_spec: DesignSpec) -> 
 
         except subprocess.TimeoutExpired:
             print("CFD timeout - using approximation")
-            print(result.stdout)
-            print(result.stderr)
-            print(results_file)
         except Exception as e:
             print(f"CDF error: {e} - using approximation")
 
