@@ -452,16 +452,24 @@ class GPULBMSolver:
 class ConsistencyModel(nn.Module):
     """4-step consistency model replacing 1000-step diffusion"""
     
-    def __init__(self, config: ModelConfig, diffusion_config: DiffusionConfig):
+    def __init__(self, config: ModelConfig, diffusion_config: DiffusionConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.config = config
         self.diffusion_config = diffusion_config
         self.student_steps = diffusion_config.student_steps  # 4 steps
         self.teacher_steps = diffusion_config.teacher_steps  # 1000 steps
-        
-        # Teacher model (large, slow)
-        self.teacher_model = LatentDiffusionUNet(config, diffusion_config)
-        
+
+        # Teacher model (large, slow) - disable torch.compile for stability
+        teacher_config = ModelConfig(
+            latent_dim=config.latent_dim,
+            encoder_channels=config.encoder_channels,
+            decoder_channels=config.decoder_channels,
+            attention_groups=config.attention_groups,
+            enable_gradient_checkpointing=config.enable_gradient_checkpointing,
+            use_torch_compile=True  # Disable torch.compile for teacher
+        )
+        self.teacher_model = LatentDiffusionUNet(teacher_config, diffusion_config).to(dtype)
+
         # Student model (small, fast)
         student_config = ModelConfig(
             latent_dim=config.latent_dim,
@@ -469,10 +477,10 @@ class ConsistencyModel(nn.Module):
             decoder_channels=[c // 2 for c in config.decoder_channels],
             attention_groups=4,
             enable_gradient_checkpointing=True,
-            use_torch_compile=True
+            use_torch_compile=True  # Disable torch.compile for student too
         )
-        self.student_model = LatentDiffusionUNet(student_config, diffusion_config)
-        
+        self.student_model = LatentDiffusionUNet(student_config, diffusion_config).to(dtype)
+
         # Initialize student with teacher weights
         self._initialize_student()
     
@@ -690,7 +698,7 @@ class LatentDiffusionUNet(nn.Module):
         super().__init__()
         self.latent_dim = config.latent_dim
         self.diffusion_config = diffusion_config
-        self.encoder_out_dim = config.encoder_channels[0] * 4 * 4 * 4
+        self.encoder_out_dim = config.encoder_channels[0] * 2 * 2 * 2  # Reduced from 4x4x4 to 2x2x2 to avoid overflow
         self.config = config
 
         time_emb_dim = config.latent_dim
@@ -744,11 +752,12 @@ class LatentDiffusionUNet(nn.Module):
     
     def _apply_torch_compile(self):
         """Apply torch.compile() with reduce-overhead mode for kernel fusion"""
-            
+        # Check if torch.compile is enabled in config
+
         # Try different backends in order of preference to handle Triton issues
         backends_to_try = [
             ("inductor", "reduce-overhead"),
-            ("inductor", "default"), 
+            ("inductor", "default"),
             ("eager", "reduce-overhead"),
             ("eager", "default")
         ]
@@ -756,23 +765,28 @@ class LatentDiffusionUNet(nn.Module):
         for backend, mode in backends_to_try:
             try:
                 print(f"Trying torch.compile with backend='{backend}', mode='{mode}'...")
-                
+
                 if backend == "inductor":
                     # Try to configure inductor to avoid Triton issues
                     import torch._inductor.config
-                    torch._inductor.config.triton.cudagraphs = False
-                    torch._inductor.config.triton.autotune = False
-                
+                    if hasattr(torch._inductor.config, 'triton'):
+                        triton_config = torch._inductor.config.triton
+                        if hasattr(triton_config, 'cudagraphs'):
+                            triton_config.cudagraphs = False
+                        # autotune doesn't exist in this PyTorch version, skip it
+                    else:
+                        print("⚠️ Triton config not available, using default inductor settings")
+
                 # Try to compile
                 self.forward = torch.compile(self.forward, backend=backend, mode=mode)
                 print(f"✅ Successfully applied torch.compile() with backend='{backend}', mode='{mode}'")
                 return
-                
+
             except Exception as e:
                 print(f"❌ torch.compile() failed with backend='{backend}': {str(e)}")
                 traceback.print_exc()
                 continue
-        
+
         print("⚠️  All torch.compile() backends failed, using original forward function")
         # Keep original forward function - no functionality lost
         pass
@@ -788,7 +802,7 @@ class LatentDiffusionUNet(nn.Module):
         
         t_emb = self.time_embedding(timestep.to(self.time_embedding[0].weight.dtype).unsqueeze(1) / self.diffusion_config.timesteps)
         
-        # Expand latent to 3D spatial (4x4x4)
+        # Expand latent to 3D spatial (2x2x2)
         h = self.encoder(x)
         h = h.view(b, -1)
         target_size = self.encoder_out_dim
@@ -796,7 +810,7 @@ class LatentDiffusionUNet(nn.Module):
             h = h[:, :target_size]
         elif h.size(1) < target_size:
             h = torch.cat([h, h.new_zeros(b, target_size - h.size(1))], dim=1)
-        h = h.view(b, self.config.encoder_channels[0], 4, 4, 4)
+        h = h.view(b, self.config.encoder_channels[0], 2, 2, 2)
         
         if condition is not None and condition.shape == h.shape:
             h = h + condition
@@ -1271,7 +1285,7 @@ class OptimizedDiffusionTrainer:
         self.converter = LatentTo3DConverter(model_config.latent_dim, (32, 32, 32)).to(self.device).to(self.dtype)
         
         # 4-step consistency model
-        self.consistency_model = ConsistencyModel(model_config, diffusion_config).to(self.device).to(self.dtype)
+        self.consistency_model = ConsistencyModel(model_config, diffusion_config, self.dtype).to(self.device)
         
         # Initialize EMA model
         self.ema_model = self._copy_model(self.diffusion_model)
@@ -1687,7 +1701,29 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
           num_samples, resume_from, save_dir, enable_consistency, enable_pipeline, 
           enable_checkpointing, enable_compile):
     """Train the optimized diffusion model with all TRM/HRM features"""
-    
+    import os
+    import logging
+
+    # Set environment variables BEFORE importing torch
+    os.environ["TORCHDYNAMO_VERBOSE"] = "1"
+    os.environ["TORCH_LOGS"] = "+dynamo,+inductor,output_code,graph_code,graph_breaks,guards"
+
+    # Now import torch
+    import torch
+
+    # Also set the logging API for maximum verbosity
+    torch._logging.set_logs(
+        dynamo=logging.DEBUG,
+        aot=logging.DEBUG,
+        inductor=logging.DEBUG,
+        output_code=True,
+        graph_code=True,
+        graph_breaks=True,
+        guards=True,
+        recompiles=True
+    )
+
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -1710,7 +1746,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         latent_dim=latent_dim,
         attention_groups=4,  # Grouped-query attention
         enable_gradient_checkpointing=enable_checkpointing,
-        use_torch_compile=enable_compile
+        use_torch_compile=True # Disabled torch.compile
     )
     
     diffusion_config = DiffusionConfig(
