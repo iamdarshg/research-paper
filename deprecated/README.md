@@ -2,6 +2,9 @@
 
 Research workflow using RL (DDPG) + Graph Neural Networks to optimize folds on parametric A4 sheet for max range via surrogate model with optional **FluidX3D CFD** integration.
 
+
+# NOTE- switching to work done in CLI, beyond is for older, deprecated work
+
 ## Quick Start
 
 1. Install dependencies:
