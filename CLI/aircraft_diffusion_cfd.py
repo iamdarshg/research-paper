@@ -55,14 +55,14 @@ warnings.filterwarnings('ignore')
 @dataclass
 class DiffusionConfig:
     """Diffusion model hyperparameters with consistency distillation support"""
-    timesteps: int = 50
+    timesteps: int = 100
     beta_start: float = 0.0001
     beta_end: float = 0.02
     sampling_timesteps: int = 250
     guidance_scale: float = 7.5
     # Consistency distillation settings
-    teacher_steps: int = 1000  # Original teacher model steps
-    student_steps: int = 4     # Target student model steps
+    teacher_steps: int = 2000  # Original teacher model steps
+    student_steps: int = 32     # Target student model steps
     progressive_distillation: List[int] = None  # 500→250→125→64→32→16→8→4
     
     def __post_init__(self):
@@ -77,12 +77,12 @@ class ModelConfig:
     encoder_channels: List[int] = None
     decoder_channels: List[int] = None
     # Grouped-query attention instead of multi-head
-    attention_groups: int = 4  # 4 groups instead of 8 heads (50% KV-cache reduction)
-    attention_kv_groups: int = 4  # Groups for key/value
-    num_attention_layers: int = 2
+    attention_groups: int = 8  # 4 groups instead of 8 heads (50% KV-cache reduction)
+    attention_kv_groups: int = 8  # Groups for key/value
+    num_attention_layers: int = 4
     # Memory optimization
     enable_gradient_checkpointing: bool = True  # 60% VRAM savings
-    use_torch_compile: bool = True  # Kernel fusion
+    use_torch_compile: bool = False  # Kernel fusion
 
     def __post_init__(self):
         if self.encoder_channels is None:
@@ -103,31 +103,31 @@ class TrainingConfig:
     disconnection_penalty: float = 10.0
     precision: str = 'float32'
     save_interval: int = 5
-    val_interval: int = 1
+    val_interval: int = 2
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
-    num_pipeline_stages: int = 2  # CFD + Diffusion stages
+    num_pipeline_stages: int = 4  # CFD + Diffusion stages
 
 @dataclass
 class LBMConfig:
     """Lattice Boltzmann Method configuration parameters"""
     grid_spacing: float = 1.0      # Grid spacing (h) - lattice units
-    time_step: float = 1.0         # Time step (dt) - lattice units
+    time_step: float = 0.10         # Time step (dt) - lattice units
     relaxation_time: float = 0.01  # Relaxation time for viscosity calculation
-    block_size: int = 256          # GPU thread block size
+    block_size: int = 512          # GPU thread block size
     use_soa_layout: bool = True    # Structure of Arrays layout for GPU efficiency
 
 @dataclass
 class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
-    resolution: int = 32  # Will be adaptively refined to ~5k cells
-    mach_number: float = 0.3
+    resolution: int = 128  # Will be adaptively refined to ~5k cells
+    mach_number: float = 0.025
     reynolds_number: float = 1e6
     simulation_steps: int = 500
     output_interval: int = 50
     device_id: int = 0
     # Adaptive mesh refinement
-    adaptive_cells_target: int = 5000  # Target ~5k cells vs uniform 32³ (32k cells)
+    adaptive_cells_target: int = int(1e5)  # Target ~5k cells vs uniform 32³ (32k cells)
     refinement_levels: int = 3
     # LBM configuration
     lbm_config: LBMConfig = None   # LBM parameters
@@ -139,10 +139,10 @@ class CFDConfig:
 @dataclass
 class DesignSpec:
     """Aircraft design specification"""
-    target_speed: float
-    space_weight: float = 0.33
-    drag_weight: float = 0.33
-    lift_weight: float = 0.34
+    target_speed: float = 7.0  # m/s
+    space_weight: float = 0.33*100
+    drag_weight: float = 0.33*100
+    lift_weight: float = 0.34*100
     bounding_box: Tuple[int, int, int] = (64, 64, 64)
     vital_components: np.ndarray = None
 
@@ -466,7 +466,7 @@ class ConsistencyModel(nn.Module):
             decoder_channels=config.decoder_channels,
             attention_groups=config.attention_groups,
             enable_gradient_checkpointing=config.enable_gradient_checkpointing,
-            use_torch_compile=True  # Disable torch.compile for teacher
+            use_torch_compile=False  # Disable torch.compile for teacher to avoid overflow errors
         )
         self.teacher_model = LatentDiffusionUNet(teacher_config, diffusion_config).to(dtype)
 
@@ -477,7 +477,7 @@ class ConsistencyModel(nn.Module):
             decoder_channels=[c // 2 for c in config.decoder_channels],
             attention_groups=4,
             enable_gradient_checkpointing=True,
-            use_torch_compile=True  # Disable torch.compile for student too
+            use_torch_compile=False  # Disable torch.compile for student to avoid overflow errors
         )
         self.student_model = LatentDiffusionUNet(student_config, diffusion_config).to(dtype)
 
@@ -516,76 +516,86 @@ class ConsistencyModel(nn.Module):
     
     def _add_noise(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Add noise according to diffusion schedule"""
-        alpha_cumprod = torch.ones_like(t, dtype=torch.float32)
+        alpha_cumprod = torch.ones_like(t, dtype=x_0.dtype)  # Use same dtype as input
         for i in range(len(t)):
-            alpha_cumprod[i] = 0.5 ** (t[i] / self.teacher_steps)
-        
+            alpha_cumprod[i] = 0.5 ** (t[i].to(x_0.dtype) / self.teacher_steps)  # Convert to same dtype
+
         alpha_cumprod = alpha_cumprod.view(-1, 1, 1, 1, 1)
         sqrt_alpha = torch.sqrt(alpha_cumprod)
         sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_cumprod)
-        
+
         return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
     
-    def progressive_distillation(self, dataloader: DataLoader, num_distillation_steps: int = 1000) -> Dict[str, float]:
-        """Progressive distillation through multiple step counts"""
+    def progressive_distillation(self, dataloader: DataLoader, num_distillation_steps: int = 10) -> Dict[str, float]:
+        """Compute progressive distillation losses (no optimization - caller handles training)"""
         step_counts = self.diffusion_config.progressive_distillation
-        
+        device = next(self.student_model.parameters()).device
+
         distillation_results = {}
-        
+
         for target_steps in step_counts:
-            print(f"Distilling to {target_steps} steps...")
+            print(f"Computing loss for {target_steps} steps...")
             self.student_steps = target_steps
-            
+
             # Loss tracking
             total_loss = 0.0
             num_batches = 0
-            
-            for batch in tqdm(dataloader, desc=f"Distillation {target_steps} steps"):
-                x_0 = batch['latent'].to(self.device)
-                
+
+            for batch in tqdm(dataloader, desc=f"Computing loss {target_steps} steps"):
+                x_0 = batch['latent'].to(device)
+
                 # Sample random timesteps
-                t_student = torch.randint(0, target_steps, (x_0.shape[0],), device=self.device)
-                t_teacher = torch.randint(0, self.teacher_steps, (x_0.shape[0],), device=self.device)
-                
+                t_student = torch.randint(0, target_steps, (x_0.shape[0],), device=device)
+                t_teacher = torch.randint(0, self.teacher_steps, (x_0.shape[0],), device=device)
+
                 # Compute consistency loss
                 loss = self.consistency_loss(x_0, t_student, t_teacher)
-                
-                # Update student model
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
-                self.optimizer.step()
-                
+
                 total_loss += loss.item()
                 num_batches += 1
-            
-            avg_loss = total_loss / num_batches
+
+                if num_batches >= num_distillation_steps:
+                    break
+
+            avg_loss = total_loss / max(1, num_batches)
             distillation_results[f'steps_{target_steps}'] = avg_loss
-            print(f"Distillation to {target_steps} steps completed. Avg loss: {avg_loss:.6f}")
-        
+            print(f"Loss for {target_steps} steps: {avg_loss:.6f}")
+
         return distillation_results
     
     def fast_inference(self, shape: Tuple[int, ...], num_steps: int = 4) -> torch.Tensor:
         """Fast 4-step inference using student model"""
+        # Get device and dtype from model parameters
         device = next(self.student_model.parameters()).device
-        
+        dtype = next(self.student_model.parameters()).dtype
+
         # Initialize with random noise
-        x_t = torch.randn(shape, device=device)
-        
+        x_t = torch.randn(shape, device=device, dtype=dtype)
+
         # Progressive denoising in 4 steps
         step_size = self.diffusion_config.timesteps // num_steps
-        
+
         for i in range(num_steps):
-            t = torch.tensor([self.diffusion_config.timesteps - i * step_size - 1], device=device)
-            t = t.repeat(shape[0])
-            
+            # Create timestep tensor
+            current_step = self.diffusion_config.timesteps - i * step_size - 1
+            t = torch.full((shape[0],), current_step, device=device, dtype=dtype)
+
             # Predict noise using student model
             pred_noise = self.student_model(x_t, t)
-            
-            # Remove noise (simplified DDIM step)
-            alpha_t = 0.5 ** (t[0] / self.diffusion_config.timesteps)
-            x_t = (x_t - (1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
-        
+
+            # Remove noise using simplified DDIM step
+            # Calculate alpha_t = alpha_t^2 (since we're denoising from noise to signal)
+            alpha_t = torch.pow(torch.tensor(0.5, device=device, dtype=torch.float32), (current_step / self.diffusion_config.timesteps))
+            alpha_t = alpha_t.to(dtype)
+
+            # DDIM update: x_{t-1} = sqrt(alpha_{t-1}) * (x_t - sqrt(1-alpha_t) * pred_noise) / sqrt(alpha_t)
+            sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+
+            # Simplified update: x_{t-1} = (x_t - (1 - alpha_t) * pred_noise) / sqrt(alpha_t)
+            coeff = 1 - alpha_t
+            x_t = (x_t - coeff * pred_noise) / sqrt_alpha_t
+
         return x_t
 
 # ============================================================================
@@ -612,15 +622,15 @@ class NoiseSchedule:
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
         return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
     
-    def to(self, device):
-        self.betas = self.betas.to(device)
-        self.alphas = self.alphas.to(device)
-        self.alphas_cumprod = self.alphas_cumprod.to(device)
-        self.alphas_cumprod_prev = self.alphas_cumprod_prev.to(device)
-        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
-        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
-        self.sqrt_recip_alphas_cumprod = self.sqrt_recip_alphas_cumprod.to(device)
-        self.sqrt_recipm1_alphas_cumprod = self.sqrt_recipm1_alphas_cumprod.to(device)
+    def to(self, device, dtype=None):
+        self.betas = self.betas.to(device, dtype=dtype if dtype is not None else self.betas.dtype)
+        self.alphas = self.alphas.to(device, dtype=dtype if dtype is not None else self.alphas.dtype)
+        self.alphas_cumprod = self.alphas_cumprod.to(device, dtype=dtype if dtype is not None else self.alphas_cumprod.dtype)
+        self.alphas_cumprod_prev = self.alphas_cumprod_prev.to(device, dtype=dtype if dtype is not None else self.alphas_cumprod_prev.dtype)
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device, dtype=dtype if dtype is not None else self.sqrt_alphas_cumprod.dtype)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device, dtype=dtype if dtype is not None else self.sqrt_one_minus_alphas_cumprod.dtype)
+        self.sqrt_recip_alphas_cumprod = self.sqrt_recip_alphas_cumprod.to(device, dtype=dtype if dtype is not None else self.sqrt_recip_alphas_cumprod.dtype)
+        self.sqrt_recipm1_alphas_cumprod = self.sqrt_recipm1_alphas_cumprod.to(device, dtype=dtype if dtype is not None else self.sqrt_recipm1_alphas_cumprod.dtype)
         return self
 
 # ============================================================================
@@ -976,28 +986,38 @@ class AdvancedCFDSimulator:
         geometry: [D, H, W] binary voxel grid (1 = solid, 0 = fluid)
         """
         device = geometry.device
-        
+
         # Step 1: Adaptive mesh refinement
         print("Applying adaptive mesh refinement...")
         refined_geometry = self.mesh_refinement.refine_mesh(geometry, geometry)
-        
-        # Step 2: Run GPU LBM solver
-        print("Running GPU LBM solver...")
+
+        # Step 2: Resize to LBM resolution if needed
+        if refined_geometry.shape != (self.resolution, self.resolution, self.resolution):
+            print(f"Resizing geometry from {refined_geometry.shape} to {(self.resolution, self.resolution, self.resolution)}")
+            refined_geometry = F.interpolate(
+                refined_geometry[None, None],  # Add batch and channel dims
+                size=(self.resolution, self.resolution, self.resolution),
+                mode='trilinear',  # Use trilinear for 3D data
+                align_corners=False
+            )[0, 0]  # Remove batch and channel dims
+
         geometry_mask = (refined_geometry > 0.5).float()
-        
+
+        # Step 3: Run GPU LBM solver
+        print("Running GPU LBM solver...")
         # Use LBM solver with SoA layout and 256-thread blocks
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
-        
-        # Step 3: Compute aerodynamic coefficients
+
+        # Step 4: Compute aerodynamic coefficients
         results = self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask)
-        
-        # Step 4: Run FluidX3D for validation (if available)
+
+        # Step 5: Run FluidX3D for validation (if available)
         fluidx3d_results = self._run_fluidx3d_validation(refined_geometry)
         if fluidx3d_results:
             # Blend results for accuracy
             results['drag_coefficient'] = 0.7 * results['drag_coefficient'] + 0.3 * fluidx3d_results['drag_coefficient']
             results['lift_coefficient'] = 0.7 * results['lift_coefficient'] + 0.3 * fluidx3d_results['lift_coefficient']
-        
+
         return results
     
     def _run_fluidx3d_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
@@ -1278,7 +1298,7 @@ class OptimizedDiffusionTrainer:
         self.dtype = self.precision_dtypes.get(training_config.precision, torch.float32)
         print(f"Using precision: {training_config.precision} ({self.dtype})")
 
-        self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device).to(self.dtype)
+        self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device, self.dtype)
 
         # Models with optimizations
         self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
@@ -1364,42 +1384,39 @@ class OptimizedDiffusionTrainer:
             # Random timestep for diffusion training
             t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device)
 
-            # Forward diffusion with mixed precision
+            # Forward diffusion
             noise = torch.randn_like(latent)
             noisy_latent = self.noise_schedule.q_sample(latent, t, noise)
-            
-            # Model prediction with torch.compile optimization
-            with autocast(enabled=True):
-                pred_noise = self.diffusion_model(noisy_latent, t)
-                
-                # MSE loss
-                mse_loss_val = self.mse_loss(pred_noise, noise)
-                
-                # Connectivity loss
-                connectivity_loss_val = self.connectivity_loss(voxel_grid)
-                
-                # CFD-based aerodynamic loss (every 10 batches for speed)
-                aero_loss_val = torch.tensor(0.0, device=self.device)
-                if batch_idx % 10 == 0:
-                    design_spec = DesignSpec(target_speed=50.0)
-                    aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec)
 
-                # Combined loss
-                total_loss_val = mse_loss_val + consistency_loss + connectivity_loss_val + aero_loss_val
+            # Model prediction
+            pred_noise = self.diffusion_model(noisy_latent, t)
 
-            # Backward with gradient scaling
+            # MSE loss
+            mse_loss_val = self.mse_loss(pred_noise, noise)
+
+            # Connectivity loss
+            connectivity_loss_val = self.connectivity_loss(voxel_grid)
+
+            # CFD-based aerodynamic loss (every 10 batches for speed)
+            aero_loss_val = torch.tensor(0.0, device=self.device)
+            if batch_idx % 10 == 0:
+                design_spec = DesignSpec(target_speed=50.0)
+                aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec)
+
+            # Combined loss
+            total_loss_val = mse_loss_val + consistency_loss + connectivity_loss_val + aero_loss_val
+
+            # Backward pass
             self.optimizer.zero_grad()
-            self.scaler.scale(total_loss_val).backward()
-            
+            total_loss_val.backward()
+
             # Gradient clipping
-            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), self.training_config.gradient_clip)
             torch.nn.utils.clip_grad_norm_(self.converter.parameters(), self.training_config.gradient_clip)
             torch.nn.utils.clip_grad_norm_(self.consistency_model.student_model.parameters(), self.training_config.gradient_clip)
-            
-            # Optimizer step with scaler
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+
+            # Optimizer step
+            self.optimizer.step()
             
             # EMA update
             self._update_ema()
@@ -1689,14 +1706,14 @@ def cli():
 @click.option('--learning-rate', default=2e-4, help='Learning rate')
 @click.option('--latent-dim', default=16, help='Latent dimension')
 @click.option('--precision', default='float32', help='Precision: float64, float32, float16, bfloat16, float8')
-@click.option('--disconnection-penalty', default=10.0, help='Penalty for disconnected voxels')
+@click.option('--disconnection-penalty', default=30.0, help='Penalty for disconnected voxels')
 @click.option('--num-samples', default=500, help='Number of training samples')
 @click.option('--resume-from', default=None, help='Resume from checkpoint')
 @click.option('--save-dir', default='./checkpoints', help='Directory to save checkpoints')
 @click.option('--enable-consistency', is_flag=True, default=True, help='Enable 4-step consistency model')
 @click.option('--enable-pipeline', is_flag=True, default=True, help='Enable pipeline parallelism')
 @click.option('--enable-checkpointing', is_flag=True, default=True, help='Enable gradient checkpointing')
-@click.option('--enable-compile', is_flag=True, default=True, help='Enable torch.compile optimization')
+@click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
           num_samples, resume_from, save_dir, enable_consistency, enable_pipeline, 
           enable_checkpointing, enable_compile):
@@ -1746,7 +1763,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         latent_dim=latent_dim,
         attention_groups=4,  # Grouped-query attention
         enable_gradient_checkpointing=enable_checkpointing,
-        use_torch_compile=True # Disabled torch.compile
+        use_torch_compile=enable_compile  # Respect the enable-compile flag
     )
     
     diffusion_config = DiffusionConfig(
