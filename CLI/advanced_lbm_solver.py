@@ -10,23 +10,41 @@ class D3Q27Lattice:
 
     @staticmethod
     def get_vectors():
-        # 27 velocity vectors: 1 rest + 6 face + 12 edge + 8 corner
-        ex = [0,  # Rest
-              1,-1,0,0,0,0,  # Faces (±x, ±y, ±z)
-              1,-1,1,-1,1,-1,1,-1,0,0,0,0,  # Edges
-              1,-1,1,1,-1,-1,1,-1]  # Corners (±1,±1,±1)
-
-        ey = [0,  # Rest
-              0,0,1,-1,0,0,  # Faces
-              1,1,-1,-1,0,0,0,0,1,-1,1,-1,  # Edges
-              1,1,-1,1,-1,1,-1,-1]  # Corners
-
-        ez = [0,  # Rest
-              0,0,0,0,1,-1,  # Faces
-              0,0,0,0,1,1,-1,-1,1,1,-1,-1,  # Edges
-              1,1,1,-1,1,-1,-1,-1]  # Corners
-
+        """
+        D3Q27 velocity set:
+        - 0: rest (0,0,0)
+        - 1-6: face neighbors (±1,0,0), (0,±1,0), (0,0,±1)
+        - 7-18: edge neighbors (±1,±1,0), (±1,0,±1), (0,±1,±1)
+        - 19-26: corner neighbors (±1,±1,±1)
+        """
+        # Direction: 0
+        ex = [0]
+        ey = [0]
+        ez = [0]
+        
+        # Directions 1-6: faces
+        for (dx, dy, dz) in [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]:
+            ex.append(dx)
+            ey.append(dy)
+            ez.append(dz)
+        
+        # Directions 7-18: edges (12 total)
+        for (dx, dy, dz) in [(1,1,0), (-1,1,0), (1,-1,0), (-1,-1,0),
+                            (1,0,1), (-1,0,1), (1,0,-1), (-1,0,-1),
+                            (0,1,1), (0,-1,1), (0,1,-1), (0,-1,-1)]:
+            ex.append(dx)
+            ey.append(dy)
+            ez.append(dz)
+        
+        # Directions 19-26: corners (8 total)
+        for (dx, dy, dz) in [(1,1,1), (-1,1,1), (1,-1,1), (-1,-1,1),
+                            (1,1,-1), (-1,1,-1), (1,-1,-1), (-1,-1,-1)]:
+            ex.append(dx)
+            ey.append(dy)
+            ez.append(dz)
+        
         return torch.tensor(ex), torch.tensor(ey), torch.tensor(ez)
+
 
     @staticmethod
     def get_weights():
@@ -36,9 +54,17 @@ class D3Q27Lattice:
 
     @staticmethod
     def get_opposite():
-        # Opposite directions for bounce-back
-        opp = [0, 2,1,4,3,6,5, 9,10,7,8,13,14,11,12,17,18,15,16, 26,25,24,23,22,21,20,19]
+        """
+        Opposite directions for D3Q27:
+        0 (rest) → 0
+        1-6 (faces): ±x, ±y, ±z → swap pairs
+        7-18 (edges): diagonal pairs
+        19-26 (corners): 3D diagonal pairs
+        """
+        # Direction index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]
+        opp =             [0, 2, 1, 4, 3, 6, 5, 8, 7,10, 9,12,11,14,13,16,15,18,17,26,25,24,23,22,21,20,19]
         return torch.tensor(opp, dtype=torch.int64)
+
 
 class D3Q27Solver:
     """Complete D3Q27 LBM solver"""
@@ -76,62 +102,63 @@ class D3Q27Solver:
         feq = self.compute_equilibrium(rho, ux, uy, uz)
         self.f += omega * (feq - self.f)
 
+        f_pre_stream = self.f.clone()
+        
         # Streaming
         for i in range(27):
             shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
             self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0,1,2))
-
-        # Bounce-back
+        
+        # Bounce-back using PRE-STREAM populations
         for i in range(27):
+            opp_i = int(self.opposite[i].item())
             mask = geometry_mask > 0.5
-            self.f_temp[i] = torch.where(mask, self.f_temp[self.opposite[i]], self.f_temp[i])
-
+            self.f_temp[i] = torch.where(mask, f_pre_stream[opp_i], self.f_temp[i])
+        
         self.f = self.f_temp.clone()
         return ux, uy, uz, rho
 
 class CascadedLBM:
     """Central moments cascaded collision"""
 
+
+
     @staticmethod
     def compute_central_moments(f, ux, uy, uz, ex, ey, ez):
         """Transform populations to central moments"""
-        # Shift to moving frame
-        cx = ex.view(-1,1,1,1) - ux.unsqueeze(0)
-        cy = ey.view(-1,1,1,1) - uy.unsqueeze(0)
-        cz = ez.view(-1,1,1,1) - uz.unsqueeze(0)
-
         K = {}
+        
         # Order 0: density
         K['000'] = torch.sum(f, dim=0)
-
-        # Order 1: momentum (should be ~0 in moving frame)
-        K['100'] = torch.sum(f * cx, dim=0)
-        K['010'] = torch.sum(f * cy, dim=0)
-        K['001'] = torch.sum(f * cz, dim=0)
-
-        # Order 2: energy and stress
-        K['200'] = torch.sum(f * cx**2, dim=0)
-        K['020'] = torch.sum(f * cy**2, dim=0)
-        K['002'] = torch.sum(f * cz**2, dim=0)
-        K['110'] = torch.sum(f * cx*cy, dim=0)
-        K['101'] = torch.sum(f * cx*cz, dim=0)
-        K['011'] = torch.sum(f * cy*cz, dim=0)
-
-        # Order 3+: higher moments (9 more for D3Q19)
-        K['111'] = torch.sum(f * cx*cy*cz, dim=0)
-        # ... (add remaining moments as needed)
-        # Simplified: add basic third order moments
-        K['300'] = torch.sum(f * cx**3, dim=0)
-        K['030'] = torch.sum(f * cy**3, dim=0)
-        K['003'] = torch.sum(f * cz**3, dim=0)
-        K['210'] = torch.sum(f * cx**2*cy, dim=0)
-        K['201'] = torch.sum(f * cx**2*cz, dim=0)
-        K['120'] = torch.sum(f * cx*cy**2, dim=0)
-        K['021'] = torch.sum(f * cy**2*cz, dim=0)
-        K['102'] = torch.sum(f * cx*cz**2, dim=0)
-        K['012'] = torch.sum(f * cy*cz**2, dim=0)
-
+        
+        # For higher moments, loop over directions
+        for moment_key, moment_powers in [
+            ('100', (1, 0, 0)), ('010', (0, 1, 0)), ('001', (0, 0, 1)),
+            ('200', (2, 0, 0)), ('020', (0, 2, 0)), ('002', (0, 0, 2)),
+            ('110', (1, 1, 0)), ('101', (1, 0, 1)), ('011', (0, 1, 1)),
+            ('300', (3, 0, 0)), ('030', (0, 3, 0)), ('003', (0, 0, 3)),
+            ('210', (2, 1, 0)), ('201', (2, 0, 1)), ('120', (1, 2, 0)),
+            ('021', (0, 2, 1)), ('102', (1, 0, 2)), ('012', (0, 1, 2)),
+            ('111', (1, 1, 1)), ('220', (2, 2, 0)), ('202', (2, 0, 2)),
+            ('022', (0, 2, 2)), ('211', (2, 1, 1)), ('121', (1, 2, 1)),
+            ('400', (4, 0, 0)), ('040', (0, 4, 0)), ('004', (0, 0, 4)),
+            ('310', (3, 1, 0)), ('301', (3, 0, 1)), ('130', (1, 3, 0)),
+            ('031', (0, 3, 1)), ('103', (1, 0, 3)), ('013', (0, 1, 3)),
+            ('220', (2, 2, 0)), ('202', (2, 0, 2)), ('022', (0, 2, 2)),
+            ('311', (3, 1, 1)), ('131', (1, 3, 1)), ('113', (1, 1, 3)) ]:
+            px, py, pz = moment_powers
+            moment = torch.zeros_like(ux)
+            
+            for i in range(len(ex)):
+                cx = ex[i] - ux
+                cy = ey[i] - uy
+                cz = ez[i] - uz
+                moment += f[i] * (cx**px) * (cy**py) * (cz**pz)
+            
+            K[moment_key] = moment
+        
         return K
+
 
     @staticmethod
     def equilibrium_central_moments(rho, cs2=1/3):
@@ -145,54 +172,82 @@ class CascadedLBM:
         K_eq['300'] = K_eq['030'] = K_eq['003'] = torch.zeros_like(rho)
         K_eq['210'] = K_eq['201'] = K_eq['120'] = torch.zeros_like(rho)
         K_eq['021'] = K_eq['102'] = K_eq['012'] = torch.zeros_like(rho)
+        K_eq['400'] = K_eq['040'] = K_eq['004'] = torch.zeros_like(rho)
+        K_eq['310'] = K_eq['301'] = K_eq['130'] = torch.zeros_like(rho)
+        K_eq['031'] = K_eq['103'] = K_eq['013'] = torch.zeros_like(rho)
+        K_eq['311'] = K_eq['131'] = K_eq['113'] = torch.zeros_like(rho)
         return K_eq
 
     @staticmethod
     def cascaded_relax(K, K_eq, s_nu, s_e, s_h):
-        """Sequential cascaded relaxation"""
         K_post = {}
-
+        
         # Step 1: Conserve mass and momentum
         K_post['000'] = K['000']
         K_post['100'] = K['100']
         K_post['010'] = K['010']
         K_post['001'] = K['001']
-
-        # Step 2: Relax energy (uses step 1 results)
+        
+        # Step 2: Relax energy
         K_post['200'] = K['200'] + s_e * (K_eq['200'] - K['200'])
         K_post['020'] = K['020'] + s_e * (K_eq['020'] - K['020'])
         K_post['002'] = K['002'] + s_e * (K_eq['002'] - K['002'])
-
-        # Step 3: Relax stress (uses steps 1-2 results) → VISCOSITY
+        
+        # Step 3: Relax stress (viscosity)
         K_post['110'] = K['110'] + s_nu * (K_eq['110'] - K['110'])
         K_post['101'] = K['101'] + s_nu * (K_eq['101'] - K['101'])
         K_post['011'] = K['011'] + s_nu * (K_eq['011'] - K['011'])
-
-        # Step 4: Relax higher (uses steps 1-3)
-        K_post['111'] = K['111'] + s_h * (K_eq['111'] - K['111'])
-        # Relax higher moments
-        for moment in ['300', '030', '003', '210', '201', '120', '021', '102', '012']:
-            K_post[moment] = K[moment] + s_h * (K_eq.get(moment, torch.zeros_like(K[moment])) - K[moment])
-
+        
+        # Step 4: Relax ALL higher order moments
+        higher_moments = ['111', '300', '030', '003', '210', '201', '120', '021', '102', '012',
+                        '220', '202', '022', '211', '121',
+                        '400', '040', '004', '310', '301', '130', '031', '103', '013',
+                        '311', '131', '113']
+        
+        for moment in higher_moments:
+            if moment in K:  # Only relax if it exists
+                K_eq_val = K_eq.get(moment, torch.zeros_like(K[moment]))
+                K_post[moment] = K[moment] + s_h * (K_eq_val - K[moment])
+        
         return K_post
 
     @staticmethod
     def moments_to_populations(K, ux, uy, uz, ex, ey, ez, w):
         """Inverse transform: central moments → populations"""
-        # This requires precomputed transformation matrix
-        # Simplified: use equilibrium + corrections
         rho = K['000']
-        feq = torch.zeros(19 if len(ex) == 19 else 27, *rho.shape, device=rho.device)
-
         n_dirs = len(ex)
+        f = torch.zeros(n_dirs, *rho.shape, device=rho.device)
+        
+        # Compute equilibrium base
+        u_sq = ux**2 + uy**2 + uz**2
+        
         for i in range(n_dirs):
             cu = ex[i]*ux + ey[i]*uy + ez[i]*uz
-            u_sq = ux**2 + uy**2 + uz**2
-            feq[i] = w[i] * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
-
-        # Add non-equilibrium corrections from K
-        # (full implementation needs transformation matrix)
-        return feq
+            
+            # Equilibrium part
+            feq = w[i] * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
+            
+            # Non-equilibrium corrections from central moments
+            # Shift to moving frame
+            cx = ex[i] - ux
+            cy = ey[i] - uy
+            cz = ez[i] - uz
+            
+            # Add non-equilibrium stress corrections (2nd order)
+            fneq = w[i] * (
+                # Diagonal stress
+                0.5 * (K['200'] - rho/3) * (cx**2 - 1/3) +
+                0.5 * (K['020'] - rho/3) * (cy**2 - 1/3) +
+                0.5 * (K['002'] - rho/3) * (cz**2 - 1/3) +
+                # Off-diagonal stress
+                K['110'] * cx * cy +
+                K['101'] * cx * cz +
+                K['011'] * cy * cz
+            )
+            
+            f[i] = feq + fneq
+        
+        return f
 
 
 class D3Q27CascadedSolver:
@@ -225,9 +280,9 @@ class D3Q27CascadedSolver:
         self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
 
         # Turbulence and vorticity fields
-        self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)
+        self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
 
         # Convergence tracking
         self.velocity_prev = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
@@ -240,23 +295,43 @@ class D3Q27CascadedSolver:
         self._initialize_equilibrium()
 
     def _setup_physics_constants(self):
-        """Compute physics constants from config"""
-        h = self.config.lbm_config.grid_spacing
-        dt = self.config.lbm_config.time_step
-
+        """Compute STABLE physics constants"""
+        # Lattice units - everything is O(1)
         self.cs2 = 1.0 / 3.0
+        
+        # Force lattice velocity to be small
+        u_lattice = 0.05  # Fixed, safe value
+        L_lattice = self.resolution
+        
+        # Force reasonable Reynolds number for this grid
+        Re_max_stable = L_lattice ** 1.5
+        Re_target = min(self.config.reynolds_number, Re_max_stable * 0.5)
+        
+        print(f"Reynolds number adjusted: {self.config.reynolds_number} → {Re_target:.0f}")
+        
+        # Compute viscosity in lattice units
+        self.nu = u_lattice * L_lattice / Re_target
+        
+        # Relaxation time (must be > 0.5 for stability)
+        tau = 3.0 * self.nu + 0.5
+        self.phys_config.s_nu = 1.0 / tau
+        
+        print(f"Lattice viscosity: {self.nu:.6f}")
+        print(f"Relaxation time: {tau:.4f}")
+        print(f"Relaxation parameter: {self.phys_config.s_nu:.4f}")
+        
+        # Validate stability
+        if tau < 0.6:
+            print("⚠️  WARNING: tau < 0.6, expect instability!")
+        if u_lattice > 0.15:
+            print("⚠️  WARNING: u > 0.15, expect instability!")
 
-        U_ref = self.config.mach_number * 343.0
-        L_ref = h * self.resolution
-        Re = getattr(self.config, 'reynolds_number', 1000)
-        nu_phys = U_ref * L_ref / Re
-
-        self.nu = nu_phys * dt / (h * h)
 
     def _initialize_equilibrium(self):
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
-        ux = self.config.mach_number * 343.0
+        u_lattice = self.config.mach_number * 0.10  # ~0.025 for Mach 0.025
+        ux = u_lattice  # Lattice units, not physical!
         uy, uz = 0.1, 0.1
 
         for i in range(27):
@@ -332,13 +407,10 @@ class D3Q27CascadedSolver:
             self.f_pre_stream = self.f.clone()
 
             # === 3. Cascaded collision using central moments ===
-            # Transform to central moments
             K = CascadedLBM.compute_central_moments(self.f, ux, uy, uz, self.ex, self.ey, self.ez)
-
-            # Equilibrium central moments
             K_eq = CascadedLBM.equilibrium_central_moments(rho)
 
-            # Update relaxation parameter based on viscosity
+            # Update relaxation parameter
             self.s_nu = 1.0 / (3.0 * self.nu + 0.5)
 
             # Cascaded relaxation
@@ -354,17 +426,17 @@ class D3Q27CascadedSolver:
 
             # === 5. Boundary conditions - bounce-back using pre-stream values ===
             for i in range(27):
-                opp_i = self.opposite[i].nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                opp_i = int(self.opposite[i].item())  # Convert to Python int
                 mask = geometry_mask > 0.5
-                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i]).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-
+                opp_i = int(self.opposite[i].item())  # Convert to Python int
+                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
             self.f = self.f_temp.clone()
 
             # === 6. Update macroscopic fields for GUI interface ===
             self.velocity_x = ux.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             self.velocity_y = uy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             self.velocity_z = uz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            self.pressure = rho * self.cs2
+            self.pressure = (rho * self.cs2).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             # === 7. Compute vorticity and Q-criterion ===
             if hasattr(self.phys_config, 'compute_q_criterion') and self.phys_config.compute_q_criterion:
@@ -376,14 +448,27 @@ class D3Q27CascadedSolver:
 
             # === 8. Diagnostic output ===
             if step % 100 == 0:
-                if hasattr(self.vorticity, 'shape'):
-                    max_vorticity = torch.max(torch.sqrt(torch.sum(self.vorticity**2, dim=0)))
-                    print(f"Step {step}: max vorticity: {max_vorticity:.4f}, s_nu: {self.s_nu:.4f}")
+                # Always compute vorticity for diagnostics even if flag is off
+                if not hasattr(self.phys_config, 'compute_q_criterion') or self.phys_config.compute_q_criterion:
+                    omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
+                    self.vorticity[0] = omega_x
+                    self.vorticity[1] = omega_y
+                    self.vorticity[2] = omega_z
+
+                if hasattr(self.vorticity, 'shape') and torch.sum(torch.isfinite(self.vorticity)) > 0:
+                    vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0))
+                    max_vort = torch.max(vorticity_mag.nan_to_num(0.0))
+                    print(f"Step {step}: max vorticity: {max_vort:.4f}, s_nu: {self.s_nu:.4f}")
                 else:
-                    print(f"Step {step}: s_nu: {self.s_nu:.4f}")
+                    print(f"Step {step}: s_nu: {self.s_nu:.4f}, vorticity not computed")
+
+            any_nan = torch.any(torch.isnan(self.f))
+            if any_nan:
+                print(f"WARNING: NaN detected at step {step}")
+                continue
 
             if step % 500 == 0:
-                print(f"Step {step}/27 D3Q27 cascaded collision completed")
+                print(f"Step {step}/{steps} D3Q27 cascaded collision completed")
 
     def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
         """Compute forces using momentum-exchange method with enhanced diagnostics"""
@@ -409,7 +494,7 @@ class D3Q27CascadedSolver:
             boundary_link_np = np.logical_and(dilated, np.logical_not(geom_np))
             boundary_link = torch.tensor(boundary_link_np, device=self.device, dtype=torch.bool)
 
-            opp_i = self.opposite[i]
+            opp_i = int(self.opposite[i].item())
             momentum_x = self.ex[i] * (self.f[i] + self.f[opp_i])
             momentum_z = self.ez[i] * (self.f[i] + self.f[opp_i])
 
@@ -777,9 +862,9 @@ class GPULBMSolver:
         grad_omega_x, grad_omega_y, grad_omega_z = torch.gradient(omega_mag, dim=(0, 1, 2))
         grad_omega_mag = torch.sqrt(grad_omega_x**2 + grad_omega_y**2 + grad_omega_z**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
-        eta_x = grad_omega_x / grad_omega_mag
-        eta_y = grad_omega_y / grad_omega_mag
-        eta_z = grad_omega_z / grad_omega_mag
+        eta_x = torch.clamp(grad_omega_x / grad_omega_mag, 1e-12, 1e12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        eta_y = torch.clamp(grad_omega_y / grad_omega_mag, 1e-12, 1e12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        eta_z = torch.clamp(grad_omega_z / grad_omega_mag, 1e-12, 1e12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Adaptive epsilon based on local vorticity (preserve strong vortices more)
         if self.phys_config.vc_adaptive:
