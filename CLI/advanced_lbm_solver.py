@@ -208,29 +208,29 @@ class D3Q27CascadedSolver:
 
         # D3Q27 lattice
         self.ex, self.ey, self.ez = D3Q27Lattice.get_vectors()
-        self.ex = self.ex.to(device)
-        self.ey = self.ey.to(device)
-        self.ez = self.ez.to(device)
-        self.w = D3Q27Lattice.get_weights().to(device)
-        self.opposite = D3Q27Lattice.get_opposite().to(device)
+        self.ex = self.ex.to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        self.ey = self.ey.to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        self.ez = self.ez.to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        self.w = D3Q27Lattice.get_weights().to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        self.opposite = D3Q27Lattice.get_opposite().to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Populations (27 for D3Q27)
-        self.f = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=device)
-        self.f_temp = torch.zeros_like(self.f)
+        self.f = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.f_temp = torch.zeros_like(self.f)+1e-12
 
         # Structure of Arrays (SoA) layout matching GPULBMSolver interface
-        self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
 
         # Turbulence and vorticity fields
-        self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
-        self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)
-        self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
 
         # Convergence tracking
-        self.velocity_prev = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.velocity_prev = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
 
         # Cascaded relaxation parameters (these could be made configurable)
         self.s_nu = 1.0 / 0.6    # Viscosity relaxation
@@ -257,7 +257,7 @@ class D3Q27CascadedSolver:
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
         ux = self.config.mach_number * 343.0
-        uy, uz = 0.0, 0.0
+        uy, uz = 0.1, 0.1
 
         for i in range(27):
             eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
@@ -282,7 +282,7 @@ class D3Q27CascadedSolver:
         omega_y = dux_dz - duz_dx  # ∂u/∂z - ∂w/∂x
         omega_z = duy_dx - dux_dy  # ∂v/∂x - ∂u/∂y
 
-        return omega_x, omega_y, omega_z
+        return omega_x.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_y.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_z.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
     def _compute_q_criterion(self, ux, uy, uz):
         """Compute Q-criterion for vortex identification"""
@@ -295,7 +295,7 @@ class D3Q27CascadedSolver:
         omega_mag_sq = omega_x**2 + omega_y**2 + omega_z**2
 
         # Q-criterion: Q > 0 indicates vortex regions
-        Q = 0.5 * (omega_mag_sq - S_mag_sq)
+        Q = 0.5 * (omega_mag_sq - S_mag_sq).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         return Q
 
@@ -307,12 +307,12 @@ class D3Q27CascadedSolver:
         duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2))
 
         # Strain rate tensor (symmetric)
-        S11 = dux_dx
-        S22 = duy_dy
-        S33 = duz_dz
-        S12 = 0.5 * (dux_dy + duy_dx)
-        S13 = 0.5 * (dux_dz + duz_dx)
-        S23 = 0.5 * (duy_dz + duz_dy)
+        S11 = dux_dx.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S22 = duy_dy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S33 = duz_dz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S12 = 0.5 * (dux_dy + duy_dx).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S13 = 0.5 * (dux_dz + duz_dx).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S23 = 0.5 * (duy_dz + duz_dy).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         return S11, S22, S33, S12, S13, S23
 
@@ -323,10 +323,10 @@ class D3Q27CascadedSolver:
 
         for step in range(steps):
             # === 1. Compute macroscopic variables ===
-            rho = torch.sum(self.f, dim=0)
-            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
-            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
-            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+            rho = torch.sum(self.f, dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12)
+            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12)
+            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12)
 
             # === 2. Store pre-stream populations for bounce-back ===
             self.f_pre_stream = self.f.clone()
@@ -350,20 +350,20 @@ class D3Q27CascadedSolver:
             # === 4. Streaming ===
             for i in range(27):
                 shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
-                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2))
+                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             # === 5. Boundary conditions - bounce-back using pre-stream values ===
             for i in range(27):
-                opp_i = self.opposite[i]
+                opp_i = self.opposite[i].nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
                 mask = geometry_mask > 0.5
-                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i]).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             self.f = self.f_temp.clone()
 
             # === 6. Update macroscopic fields for GUI interface ===
-            self.velocity_x = ux
-            self.velocity_y = uy
-            self.velocity_z = uz
+            self.velocity_x = ux.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            self.velocity_y = uy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            self.velocity_z = uz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             self.pressure = rho * self.cs2
 
             # === 7. Compute vorticity and Q-criterion ===
@@ -372,7 +372,7 @@ class D3Q27CascadedSolver:
                 self.vorticity[0] = omega_x
                 self.vorticity[1] = omega_y
                 self.vorticity[2] = omega_z
-                self.q_criterion = self._compute_q_criterion(ux, uy, uz)
+                self.q_criterion = self._compute_q_criterion(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             # === 8. Diagnostic output ===
             if step % 100 == 0:
@@ -392,14 +392,14 @@ class D3Q27CascadedSolver:
         q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
 
-        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()) * h**2
+        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) * h**2
 
-        drag_force = torch.tensor(0.0, device=self.device)
-        lift_force = torch.tensor(0.0, device=self.device)
+        drag_force = torch.tensor(1e-13, device=self.device)
+        lift_force = torch.tensor(1e-13, device=self.device)
 
         geom_np = geometry_mask.cpu().numpy().astype(bool)
         dilated = binary_dilation(geom_np, iterations=1)
-        boundary_fluid = torch.tensor(dilated & ~geom_np, device=self.device, dtype=torch.bool)
+        boundary_fluid = torch.tensor(dilated & ~geom_np, device=self.device, dtype=torch.bool).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         for i in range(27):  # D3Q27 has 27 directions
             shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
