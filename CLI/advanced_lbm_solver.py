@@ -332,7 +332,7 @@ class D3Q27CascadedSolver:
         rho = 1.0
         u_lattice = self.config.mach_number * 0.10  # ~0.025 for Mach 0.025
         ux = u_lattice  # Lattice units, not physical!
-        uy, uz = 0.1, 0.1
+        uy, uz = 0.0, 0.0
 
         for i in range(27):
             eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz

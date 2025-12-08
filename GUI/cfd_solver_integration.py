@@ -105,7 +105,9 @@ class CFDSolverWorker(QObject):
             # Ensure LBMPhysicsConfig is properly initialized with new grid spacing
             cfd_config.lbm_config = LBMPhysicsConfig()
             cfd_config.lbm_config.grid_spacing = cfd_config.lbm_config.physical_length_scale / cfd_config.base_grid_resolution
-
+            cfd_config.lbm_config.compute_q_criterion = True  # Enable vorticity/Q-criterion computation
+            cfd_config.lbm_config.use_vorticity_confinement = True
+            
             # Choose solver based on type
             if self.solver_type == "d3q27_cascaded":
                 # Use D3Q27 Cascaded solver directly
