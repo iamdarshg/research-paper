@@ -5,6 +5,195 @@ from typing import Dict
 from scipy.ndimage import binary_dilation
 from typing import TYPE_CHECKING
 
+class D3Q27Lattice:
+    """D3Q27 velocity vectors and weights"""
+
+    @staticmethod
+    def get_vectors():
+        # 27 velocity vectors: 1 rest + 6 face + 12 edge + 8 corner
+        ex = [0,  # Rest
+              1,-1,0,0,0,0,  # Faces (±x, ±y, ±z)
+              1,-1,1,-1,1,-1,1,-1,0,0,0,0,  # Edges
+              1,-1,1,1,-1,-1,1,-1]  # Corners (±1,±1,±1)
+
+        ey = [0,  # Rest
+              0,0,1,-1,0,0,  # Faces
+              1,1,-1,-1,0,0,0,0,1,-1,1,-1,  # Edges
+              1,1,-1,1,-1,1,-1,-1]  # Corners
+
+        ez = [0,  # Rest
+              0,0,0,0,1,-1,  # Faces
+              0,0,0,0,1,1,-1,-1,1,1,-1,-1,  # Edges
+              1,1,1,-1,1,-1,-1,-1]  # Corners
+
+        return torch.tensor(ex), torch.tensor(ey), torch.tensor(ez)
+
+    @staticmethod
+    def get_weights():
+        # Weights: 8/27 (rest), 2/27 (face), 1/54 (edge), 1/216 (corner)
+        w = [8/27] + [2/27]*6 + [1/54]*12 + [1/216]*8
+        return torch.tensor(w, dtype=torch.float32)
+
+    @staticmethod
+    def get_opposite():
+        # Opposite directions for bounce-back
+        opp = [0, 2,1,4,3,6,5, 9,10,7,8,13,14,11,12,17,18,15,16, 26,25,24,23,22,21,20,19]
+        return torch.tensor(opp, dtype=torch.int64)
+
+class D3Q27Solver:
+    """Complete D3Q27 LBM solver"""
+    def __init__(self, resolution, device):
+        self.res = resolution
+        self.device = device
+
+        self.ex, self.ey, self.ez = D3Q27Lattice.get_vectors()
+        self.ex = self.ex.to(device, dtype=torch.long)
+        self.ey = self.ey.to(device, dtype=torch.long)
+        self.ez = self.ez.to(device, dtype=torch.long)
+        self.w = D3Q27Lattice.get_weights().to(device)
+        self.opposite = D3Q27Lattice.get_opposite().to(device)
+
+        # 27 populations instead of 19
+        self.f = torch.zeros(27, resolution, resolution, resolution, device=device)
+        self.f_temp = torch.zeros_like(self.f)
+
+    def compute_equilibrium(self, rho, ux, uy, uz):
+        feq = torch.zeros_like(self.f)
+        for i in range(27):
+            cu = self.ex[i]*ux + self.ey[i]*uy + self.ez[i]*uz
+            u_sq = ux**2 + uy**2 + uz**2
+            feq[i] = self.w[i] * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
+        return feq
+
+    def collide_and_stream(self, omega, geometry_mask):
+        # Macroscopic variables
+        rho = torch.sum(self.f, dim=0)
+        ux = torch.sum(self.f * self.ex.view(-1,1,1,1), dim=0) / (rho + 1e-12)
+        uy = torch.sum(self.f * self.ey.view(-1,1,1,1), dim=0) / (rho + 1e-12)
+        uz = torch.sum(self.f * self.ez.view(-1,1,1,1), dim=0) / (rho + 1e-12)
+
+        # Collision
+        feq = self.compute_equilibrium(rho, ux, uy, uz)
+        self.f += omega * (feq - self.f)
+
+        # Streaming
+        for i in range(27):
+            shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
+            self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0,1,2))
+
+        # Bounce-back
+        for i in range(27):
+            mask = geometry_mask > 0.5
+            self.f_temp[i] = torch.where(mask, self.f_temp[self.opposite[i]], self.f_temp[i])
+
+        self.f = self.f_temp.clone()
+        return ux, uy, uz, rho
+
+class CascadedLBM:
+    """Central moments cascaded collision"""
+
+    @staticmethod
+    def compute_central_moments(f, ux, uy, uz, ex, ey, ez):
+        """Transform populations to central moments"""
+        # Shift to moving frame
+        cx = ex.view(-1,1,1,1) - ux.unsqueeze(0)
+        cy = ey.view(-1,1,1,1) - uy.unsqueeze(0)
+        cz = ez.view(-1,1,1,1) - uz.unsqueeze(0)
+
+        K = {}
+        # Order 0: density
+        K['000'] = torch.sum(f, dim=0)
+
+        # Order 1: momentum (should be ~0 in moving frame)
+        K['100'] = torch.sum(f * cx, dim=0)
+        K['010'] = torch.sum(f * cy, dim=0)
+        K['001'] = torch.sum(f * cz, dim=0)
+
+        # Order 2: energy and stress
+        K['200'] = torch.sum(f * cx**2, dim=0)
+        K['020'] = torch.sum(f * cy**2, dim=0)
+        K['002'] = torch.sum(f * cz**2, dim=0)
+        K['110'] = torch.sum(f * cx*cy, dim=0)
+        K['101'] = torch.sum(f * cx*cz, dim=0)
+        K['011'] = torch.sum(f * cy*cz, dim=0)
+
+        # Order 3+: higher moments (9 more for D3Q19)
+        K['111'] = torch.sum(f * cx*cy*cz, dim=0)
+        # ... (add remaining moments as needed)
+        # Simplified: add basic third order moments
+        K['300'] = torch.sum(f * cx**3, dim=0)
+        K['030'] = torch.sum(f * cy**3, dim=0)
+        K['003'] = torch.sum(f * cz**3, dim=0)
+        K['210'] = torch.sum(f * cx**2*cy, dim=0)
+        K['201'] = torch.sum(f * cx**2*cz, dim=0)
+        K['120'] = torch.sum(f * cx*cy**2, dim=0)
+        K['021'] = torch.sum(f * cy**2*cz, dim=0)
+        K['102'] = torch.sum(f * cx*cz**2, dim=0)
+        K['012'] = torch.sum(f * cy*cz**2, dim=0)
+
+        return K
+
+    @staticmethod
+    def equilibrium_central_moments(rho, cs2=1/3):
+        """Equilibrium central moments"""
+        K_eq = {}
+        K_eq['000'] = rho
+        K_eq['100'] = K_eq['010'] = K_eq['001'] = torch.zeros_like(rho)
+        K_eq['200'] = K_eq['020'] = K_eq['002'] = rho * cs2
+        K_eq['110'] = K_eq['101'] = K_eq['011'] = torch.zeros_like(rho)
+        K_eq['111'] = torch.zeros_like(rho)
+        K_eq['300'] = K_eq['030'] = K_eq['003'] = torch.zeros_like(rho)
+        K_eq['210'] = K_eq['201'] = K_eq['120'] = torch.zeros_like(rho)
+        K_eq['021'] = K_eq['102'] = K_eq['012'] = torch.zeros_like(rho)
+        return K_eq
+
+    @staticmethod
+    def cascaded_relax(K, K_eq, s_nu, s_e, s_h):
+        """Sequential cascaded relaxation"""
+        K_post = {}
+
+        # Step 1: Conserve mass and momentum
+        K_post['000'] = K['000']
+        K_post['100'] = K['100']
+        K_post['010'] = K['010']
+        K_post['001'] = K['001']
+
+        # Step 2: Relax energy (uses step 1 results)
+        K_post['200'] = K['200'] + s_e * (K_eq['200'] - K['200'])
+        K_post['020'] = K['020'] + s_e * (K_eq['020'] - K['020'])
+        K_post['002'] = K['002'] + s_e * (K_eq['002'] - K['002'])
+
+        # Step 3: Relax stress (uses steps 1-2 results) → VISCOSITY
+        K_post['110'] = K['110'] + s_nu * (K_eq['110'] - K['110'])
+        K_post['101'] = K['101'] + s_nu * (K_eq['101'] - K['101'])
+        K_post['011'] = K['011'] + s_nu * (K_eq['011'] - K['011'])
+
+        # Step 4: Relax higher (uses steps 1-3)
+        K_post['111'] = K['111'] + s_h * (K_eq['111'] - K['111'])
+        # Relax higher moments
+        for moment in ['300', '030', '003', '210', '201', '120', '021', '102', '012']:
+            K_post[moment] = K[moment] + s_h * (K_eq.get(moment, torch.zeros_like(K[moment])) - K[moment])
+
+        return K_post
+
+    @staticmethod
+    def moments_to_populations(K, ux, uy, uz, ex, ey, ez, w):
+        """Inverse transform: central moments → populations"""
+        # This requires precomputed transformation matrix
+        # Simplified: use equilibrium + corrections
+        rho = K['000']
+        feq = torch.zeros(19 if len(ex) == 19 else 27, *rho.shape, device=rho.device)
+
+        n_dirs = len(ex)
+        for i in range(n_dirs):
+            cu = ex[i]*ux + ey[i]*uy + ez[i]*uz
+            u_sq = ux**2 + uy**2 + uz**2
+            feq[i] = w[i] * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
+
+        # Add non-equilibrium corrections from K
+        # (full implementation needs transformation matrix)
+        return feq
+
 
 class GPULBMSolver:
     """GPU-resident LBM solver with Dynamic Smagorinsky, Vorticity Confinement, and improved vorticity resolution"""
@@ -288,7 +477,7 @@ class GPULBMSolver:
             self.cs_dynamic = Cs  # Store for diagnostics
             Delta = self.config.lbm_config.grid_spacing
             nu_turb = (Cs * Delta)**2 * S_mag
-
+            
         elif self.phys_config.turbulence_model == "wale":
             # WALE model
             nu_turb = self._compute_wale_model(ux, uy, uz)
@@ -438,10 +627,12 @@ class GPULBMSolver:
             boundary_fluid = torch.tensor(dilated & ~geom_np, device=self.device, dtype=torch.bool)
 
             for i in range(19):
-                shifts = (self.ex[i].item(), self.ey[i].item(), self.ez[i].item())
+                shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
                 geom_shifted = torch.roll(geometry_mask, shifts=shifts, dims=(0,1,2))
 
-                boundary_link = (boundary_fluid > 0) & (geom_shifted > 0.5)
+                # Fix bitwise AND to logical operations for numpy arrays
+                boundary_link_np = np.logical_and(dilated, np.logical_not(geom_np))
+                boundary_link = torch.tensor(boundary_link_np, device=self.device, dtype=torch.bool)
 
                 opp_i = self.opposite[i]
                 momentum_x = self.ex[i] * (self.f[i] + self.f[opp_i])

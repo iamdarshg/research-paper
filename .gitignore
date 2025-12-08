@@ -3,3 +3,4 @@ data/
 runs/
 checkpoints/
 checkpoint*
+test_checkpoints/

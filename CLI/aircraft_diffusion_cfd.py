@@ -68,7 +68,7 @@ class DiffusionConfig:
     
     def __post_init__(self):
         if self.progressive_distillation is None:
-            self.progressive_distillation = [500, 250, 125, 64, 32, 16, 8, 4]
+            self.progressive_distillation = [500, 250, 125, 64, 32]
     
 @dataclass
 class ModelConfig:
@@ -101,36 +101,36 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     num_epochs: int = 100
     warmup_steps: int = 1000
-    gradient_clip: float = 1.0
-    ema_decay: float = 0.999
-    disconnection_penalty: float = 10.0
+    gradient_clip: float = 0.99
+    ema_decay: float = 0.99
+    disconnection_penalty: float = 50.0
     precision: str = 'float32'
     save_interval: int = 5
     val_interval: int = 2
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
-    num_pipeline_stages: int = 4  # CFD + Diffusion stages
+    num_pipeline_stages: int = 8  # CFD + Diffusion stages
 
 @dataclass
 class LBMPhysicsConfig:
     """Easy-to-update configuration for LBM physics constants"""
     # Turbulence modeling
-    turbulence_model="dynamic_smagorinsky" # Options: 'smagorinsky', 'dynamic_smagorinsky', 'none'
+    turbulence_model: str = "dynamic_smagorinsky"  # Options: 'smagorinsky', 'dynamic_smagorinsky', 'wale', 'none'
     smagorinsky_constant: float = 0.17  # Cs for LES turbulence model
+    wale_constant: float = 0.5  # Cw for WALE model
     use_les_turbulence: bool = True
     physical_length_scale: float = 1.0  # Physical length of the voxel grid (m)
     grid_spacing: float = 0.01  # Physical spacing per grid cell (m) - calculated from physical_length_scale
     time_step: float = 0.001  # Time step size (s)
-    test_filter_ratio:float=2.0  # Ratio for test filter in dynamic Smagorinsky model
-    dynamic_cs_clip_min:float=0.0  # Minimum Cs value for dynamic model
-    dynamic_cs_clip_max:float=0.2  # Maximum Cs value for dynamic model
+    test_filter_ratio: float = 2.0  # Ratio for test filter in dynamic Smagorinsky model
+    dynamic_cs_clip_min: float = 0.0  # Minimum Cs value for dynamic model
+    dynamic_cs_clip_max: float = 0.2  # Maximum Cs value for dynamic model
     use_vorticity_confinement: bool = True  # Enable vorticity confinement
     vc_adaptive_strength: float = 0.1  # Adaptive vorticity confinement strength
     vc_adaptive: bool = True  # Adaptive strength factor
     vorticity_confinement_epsilon: float = 0.1  # Vorticity confinement parameter
     compute_q_criterion: bool = True  # Compute Q-criterion for vortex identification
     q_threshold: float = 0.0  # Threshold for Q-criterion visualization
-
 
     # MRT relaxation times (for different moment components)
     # s0-s18 correspond to different moments in MRT collision
@@ -1006,11 +1006,11 @@ class AdvancedCFDSimulator:
 # ============================================================================
 # DATASET & DATA LOADING
 # ============================================================================
-
+import random
 class AircraftDesignDataset(Dataset):
     """Synthetic dataset for aircraft structure training"""
 
-    def __init__(self, num_samples: int = 100, grid_size: int = 32, seed: int = 42, latent_dim: int = 128):
+    def __init__(self, num_samples: int = 10000, grid_size: int = 32, seed: int = random.randint(0,100), latent_dim: int = 128):
         self.num_samples = num_samples
         self.grid_size = grid_size
         np.random.seed(seed)
@@ -1305,8 +1305,8 @@ class OptimizedDiffusionTrainer:
                 ).squeeze(1)
 
             # Convert latent to voxel grid
-            voxel_grid = self.converter(latent)
-            voxel_grid = torch.sigmoid(voxel_grid)
+            voxel_grid = self.converter(latent).nan_to_num(0.0)
+            voxel_grid = torch.sigmoid(voxel_grid).nan_to_num(0.0)
 
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
@@ -1314,26 +1314,26 @@ class OptimizedDiffusionTrainer:
                 consistency_loss = self._compute_consistency_loss(latent)
 
             # Random timestep for diffusion training
-            t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device)
+            t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device).nan_to_num(0.0)
 
             # Forward diffusion
             noise = torch.randn_like(latent)
-            noisy_latent = self.noise_schedule.q_sample(latent, t, noise)
+            noisy_latent = self.noise_schedule.q_sample(latent, t, noise).nan_to_num(0.0)
 
             # Model prediction
-            pred_noise = self.diffusion_model(noisy_latent, t)
+            pred_noise = self.diffusion_model(noisy_latent, t).nan_to_num(0.0)
 
             # MSE loss
-            mse_loss_val = self.mse_loss(pred_noise, noise)
+            mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
 
             # Connectivity loss
-            connectivity_loss_val = self.connectivity_loss(voxel_grid)
+            connectivity_loss_val = self.connectivity_loss(voxel_grid).nan_to_num(0.0)
 
             # CFD-based aerodynamic loss (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
             if batch_idx % 10 == 0:
                 design_spec = DesignSpec(target_speed=50.0)
-                aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec)
+                aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec).nan_to_num(0.0)
 
             # Combined loss
             total_loss_val = mse_loss_val + consistency_loss + connectivity_loss_val + aero_loss_val
@@ -1519,7 +1519,7 @@ class OptimizedAircraftGenerator:
         # Use fast 4-step consistency model
         voxel_grid = self.consistency_model.fast_inference(latent_shape, num_steps=num_steps)
         voxel_grid = torch.sigmoid(self.converter(voxel_grid))
-        
+        print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
     
     def voxels_to_stl(self, voxel_grid: torch.Tensor, output_path: str, use_marching_cubes: bool = True):
@@ -1753,7 +1753,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 @cli.command()
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')
 @click.option('--output', default='aircraft_optimized.stl', help='Output STL file path')
-@click.option('--target-speed', default=50.0, help='Target aircraft speed (m/s)')
+@click.option('--target-speed', default=7.0, help='Target aircraft speed (m/s)')
 @click.option('--num-steps', default=4, help='Number of diffusion steps for generation (4 for consistency)')
 @click.option('--use-marching-cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
 def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes):
