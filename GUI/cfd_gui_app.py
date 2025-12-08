@@ -340,6 +340,19 @@ class CFD_GUI(QMainWindow):
         self.output_interval_input.setValue(50)
         advanced_layout.addRow("Output Interval:", self.output_interval_input)
 
+        # Solver selection
+        solver_selection_group = QGroupBox("Solver Selection")
+        solver_selection_layout = QFormLayout()
+        solver_selection_group.setLayout(solver_selection_layout)
+        advanced_layout.addRow(solver_selection_group)
+
+        self.solver_selector = QComboBox()
+        self.solver_selector.addItems(["d3q19_mrt", "d3q27_cascaded"])
+        self.solver_selector.setCurrentText("d3q19_mrt")
+        self.solver_selector.setToolTip("d3q19_mrt: D3Q19 MRT collision with turbulence models\n"
+                                      "d3q27_cascaded: D3Q27 cascaded collision with central moments")
+        solver_selection_layout.addRow("CFD Solver:", self.solver_selector)
+
         # LBM Physics parameters
         lbm_group = QGroupBox("LBM Physics Configuration")
         lbm_layout = QFormLayout()
@@ -469,6 +482,7 @@ class CFD_GUI(QMainWindow):
         reynolds = self.reynolds_input.value()
         mach = self.mach_input.value()
         steps = self.steps_input.value()
+        solver_type = self.solver_selector.currentText()
 
         self.status_label.setText("Starting CFD simulation...")
         self.progress_bar.setValue(0)
@@ -477,7 +491,7 @@ class CFD_GUI(QMainWindow):
 
         # Create the worker and thread for real CFD simulation
         self.cfd_thread = QThread()
-        self.cfd_solver_worker = CFDSolverWorker(self.current_stl_path, reynolds, mach, steps)
+        self.cfd_solver_worker = CFDSolverWorker(self.current_stl_path, reynolds, mach, steps, solver_type)
         self.cfd_solver_worker.moveToThread(self.cfd_thread)
 
         # Connect signals

@@ -45,7 +45,7 @@ import yaml
 from scipy.ndimage import label, binary_dilation
 from skimage import measure
 import trimesh
-from advanced_lbm_solver import GPULBMSolver as AdvancedGPULBMSolver
+from advanced_lbm_solver import GPULBMSolver as AdvancedGPULBMSolver, D3Q27CascadedSolver
 
 warnings.filterwarnings('ignore')
 

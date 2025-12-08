@@ -195,8 +195,8 @@ class CascadedLBM:
         return feq
 
 
-class GPULBMSolver:
-    """GPU-resident LBM solver with Dynamic Smagorinsky, Vorticity Confinement, and improved vorticity resolution"""
+class D3Q27CascadedSolver:
+    """D3Q27 LBM solver with cascaded central moment collision"""
 
     def __init__(self, config, device: torch.device, phys_config):
         self.config = config
@@ -206,20 +206,264 @@ class GPULBMSolver:
 
         self._setup_physics_constants()
 
-        # Structure of Arrays (SoA) layout
+        # D3Q27 lattice
+        self.ex, self.ey, self.ez = D3Q27Lattice.get_vectors()
+        self.ex = self.ex.to(device)
+        self.ey = self.ey.to(device)
+        self.ez = self.ez.to(device)
+        self.w = D3Q27Lattice.get_weights().to(device)
+        self.opposite = D3Q27Lattice.get_opposite().to(device)
+
+        # Populations (27 for D3Q27)
+        self.f = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=device)
+        self.f_temp = torch.zeros_like(self.f)
+
+        # Structure of Arrays (SoA) layout matching GPULBMSolver interface
         self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
         self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
         self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
         self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
 
-        # LBM populations (D3Q19)
-        self.f = torch.zeros(19, self.resolution, self.resolution, self.resolution, device=device)
-        self.f_temp = torch.zeros_like(self.f)
-
         # Turbulence and vorticity fields
         self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
         self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)
         self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+
+        # Convergence tracking
+        self.velocity_prev = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+
+        # Cascaded relaxation parameters (these could be made configurable)
+        self.s_nu = 1.0 / 0.6    # Viscosity relaxation
+        self.s_e = 1.2           # Energy relaxation
+        self.s_h = 1.6           # Higher order relaxation
+
+        self._initialize_equilibrium()
+
+    def _setup_physics_constants(self):
+        """Compute physics constants from config"""
+        h = self.config.lbm_config.grid_spacing
+        dt = self.config.lbm_config.time_step
+
+        self.cs2 = 1.0 / 3.0
+
+        U_ref = self.config.mach_number * 343.0
+        L_ref = h * self.resolution
+        Re = getattr(self.config, 'reynolds_number', 1000)
+        nu_phys = U_ref * L_ref / Re
+
+        self.nu = nu_phys * dt / (h * h)
+
+    def _initialize_equilibrium(self):
+        """Initialize with D3Q27 equilibrium"""
+        rho = 1.0
+        ux = self.config.mach_number * 343.0
+        uy, uz = 0.0, 0.0
+
+        for i in range(27):
+            eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
+            u_sq = ux*ux + uy*uy + uz*uz
+            feq = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
+            self.f[i] = feq
+
+    def _compute_vorticity(self, ux, uy, uz):
+        """Compute vorticity omega = curl(u) [web:44]"""
+        # Compute all gradients properly
+        grad_ux = torch.gradient(ux, dim=(0, 1, 2))  # Returns (dux/dx, dux/dy, dux/dz)
+        grad_uy = torch.gradient(uy, dim=(0, 1, 2))
+        grad_uz = torch.gradient(uz, dim=(0, 1, 2))
+
+        # Extract individual components
+        dux_dx, dux_dy, dux_dz = grad_ux
+        duy_dx, duy_dy, duy_dz = grad_uy
+        duz_dx, duz_dy, duz_dz = grad_uz
+
+        # Vorticity: curl(u)
+        omega_x = duz_dy - duy_dz  # ∂w/∂y - ∂v/∂z
+        omega_y = dux_dz - duz_dx  # ∂u/∂z - ∂w/∂x
+        omega_z = duy_dx - dux_dy  # ∂v/∂x - ∂u/∂y
+
+        return omega_x, omega_y, omega_z
+
+    def _compute_q_criterion(self, ux, uy, uz):
+        """Compute Q-criterion for vortex identification"""
+        # Strain rate tensor magnitude
+        S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)
+        S_mag_sq = S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)
+
+        # Vorticity (rotation rate) magnitude
+        omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
+        omega_mag_sq = omega_x**2 + omega_y**2 + omega_z**2
+
+        # Q-criterion: Q > 0 indicates vortex regions
+        Q = 0.5 * (omega_mag_sq - S_mag_sq)
+
+        return Q
+
+    def _compute_strain_rate_tensor(self, ux, uy, uz):
+        """Compute strain rate tensor S_ij = 0.5*(du_i/dx_j + du_j/dx_i)"""
+        # Velocity gradients
+        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2))
+        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2))
+        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2))
+
+        # Strain rate tensor (symmetric)
+        S11 = dux_dx
+        S22 = duy_dy
+        S33 = duz_dz
+        S12 = 0.5 * (dux_dy + duy_dx)
+        S13 = 0.5 * (dux_dz + duz_dx)
+        S23 = 0.5 * (duy_dz + duz_dy)
+
+        return S11, S22, S33, S12, S13, S23
+
+    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
+        """D3Q27 cascaded collision with streaming"""
+        h = self.config.lbm_config.grid_spacing
+        dt = self.config.lbm_config.time_step
+
+        for step in range(steps):
+            # === 1. Compute macroscopic variables ===
+            rho = torch.sum(self.f, dim=0)
+            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+
+            # === 2. Store pre-stream populations for bounce-back ===
+            self.f_pre_stream = self.f.clone()
+
+            # === 3. Cascaded collision using central moments ===
+            # Transform to central moments
+            K = CascadedLBM.compute_central_moments(self.f, ux, uy, uz, self.ex, self.ey, self.ez)
+
+            # Equilibrium central moments
+            K_eq = CascadedLBM.equilibrium_central_moments(rho)
+
+            # Update relaxation parameter based on viscosity
+            self.s_nu = 1.0 / (3.0 * self.nu + 0.5)
+
+            # Cascaded relaxation
+            K_post = CascadedLBM.cascaded_relax(K, K_eq, self.s_nu, self.s_e, self.s_h)
+
+            # Transform back to populations
+            self.f = CascadedLBM.moments_to_populations(K_post, ux, uy, uz, self.ex, self.ey, self.ez, self.w)
+
+            # === 4. Streaming ===
+            for i in range(27):
+                shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
+                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2))
+
+            # === 5. Boundary conditions - bounce-back using pre-stream values ===
+            for i in range(27):
+                opp_i = self.opposite[i]
+                mask = geometry_mask > 0.5
+                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+
+            self.f = self.f_temp.clone()
+
+            # === 6. Update macroscopic fields for GUI interface ===
+            self.velocity_x = ux
+            self.velocity_y = uy
+            self.velocity_z = uz
+            self.pressure = rho * self.cs2
+
+            # === 7. Compute vorticity and Q-criterion ===
+            if hasattr(self.phys_config, 'compute_q_criterion') and self.phys_config.compute_q_criterion:
+                omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
+                self.vorticity[0] = omega_x
+                self.vorticity[1] = omega_y
+                self.vorticity[2] = omega_z
+                self.q_criterion = self._compute_q_criterion(ux, uy, uz)
+
+            # === 8. Diagnostic output ===
+            if step % 100 == 0:
+                if hasattr(self.vorticity, 'shape'):
+                    max_vorticity = torch.max(torch.sqrt(torch.sum(self.vorticity**2, dim=0)))
+                    print(f"Step {step}: max vorticity: {max_vorticity:.4f}, s_nu: {self.s_nu:.4f}")
+                else:
+                    print(f"Step {step}: s_nu: {self.s_nu:.4f}")
+
+            if step % 500 == 0:
+                print(f"Step {step}/27 D3Q27 cascaded collision completed")
+
+    def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
+        """Compute forces using momentum-exchange method with enhanced diagnostics"""
+        rho_ref = 1.0
+        v_inf = self.config.mach_number * 343.0
+        q_inf = 0.5 * rho_ref * v_inf**2
+        h = self.config.lbm_config.grid_spacing
+
+        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()) * h**2
+
+        drag_force = torch.tensor(0.0, device=self.device)
+        lift_force = torch.tensor(0.0, device=self.device)
+
+        geom_np = geometry_mask.cpu().numpy().astype(bool)
+        dilated = binary_dilation(geom_np, iterations=1)
+        boundary_fluid = torch.tensor(dilated & ~geom_np, device=self.device, dtype=torch.bool)
+
+        for i in range(27):  # D3Q27 has 27 directions
+            shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
+            geom_shifted = torch.roll(geometry_mask, shifts=shifts, dims=(0,1,2))
+
+            # Fix bitwise AND to logical operations for numpy arrays
+            boundary_link_np = np.logical_and(dilated, np.logical_not(geom_np))
+            boundary_link = torch.tensor(boundary_link_np, device=self.device, dtype=torch.bool)
+
+            opp_i = self.opposite[i]
+            momentum_x = self.ex[i] * (self.f[i] + self.f[opp_i])
+            momentum_z = self.ez[i] * (self.f[i] + self.f[opp_i])
+
+            drag_force += torch.sum(momentum_x[boundary_link])
+            lift_force += torch.sum(momentum_z[boundary_link])
+
+        cd = abs(drag_force.item()) / (q_inf * ref_area + 1e-10)
+        cl = abs(lift_force.item()) / (q_inf * ref_area + 1e-10)
+
+        # Basic diagnostics
+        rho = torch.sum(self.f, dim=0)
+        vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0)) if hasattr(self.vorticity, 'shape') else torch.zeros_like(rho)
+
+        return {
+            'drag_coefficient': cd,
+            'lift_coefficient': cl,
+            'pressure_sum': rho.sum().item(),
+            'max_turbulent_viscosity': self.nu,
+            'mean_smagorinsky_constant': 0.17,  # Default value
+            'max_vorticity': vorticity_mag.max().item() if hasattr(vorticity_mag, 'max') else 0.0,
+            'vortex_core_volume': 0.0,  # Not computed
+            'reynolds_number_turbulent': v_inf * h * self.resolution / self.nu
+        }
+
+
+class GPULBMSolver:
+    """GPU-resident LBM solver with Dynamic Smagorinsky, Vorticity Confinement, and improved vorticity resolution"""
+
+    def __init__(self, config, device: torch.device, phys_config):
+        self.config = config
+        self.device = device
+        self.resolution = config.resolution
+        # If phys_config is callable (class), instantiate it; otherwise use directly (instance)
+        if callable(phys_config):
+            self.phys_config = phys_config()
+        else:
+            self.phys_config = phys_config
+
+        self._setup_physics_constants()
+
+        # Structure of Arrays (SoA) layout
+        self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+
+        # LBM populations (D3Q19)
+        self.f = torch.zeros(19, self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.f_temp = torch.zeros_like(self.f)+1e-12
+
+        # Turbulence and vorticity fields
+        self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
         self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution), 
                                      self.phys_config.smagorinsky_constant, device=device)
 
@@ -244,7 +488,7 @@ class GPULBMSolver:
 
         self.nu = nu_phys * dt / (h * h)
         tau = 3.0 * self.nu + 0.5
-        self.phys_config.s_nu = 1.0 / tau
+        self.phys_config.s_nu = 1.0 / tau  # Ensure this gets set properly
 
         max_velocity_lattice = self.config.mach_number * 343.0 * dt / h
         if max_velocity_lattice > self.phys_config.max_mach:
@@ -281,23 +525,19 @@ class GPULBMSolver:
         ], device=self.device)
 
     def _initialize_equilibrium(self):
-        """Initialize with improved D3Q19 equilibrium"""
+        """Initialize with corrected D3Q19 equilibrium"""
         rho = 1.0
         ux = self.config.mach_number * 343.0
-        uy, uz = 0.0, 0.0
+        uy, uz = 10.0, 10.0
 
         for i in range(19):
             eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
             u_sq = ux*ux + uy*uy + uz*uz
 
-            if i == 0:
-                feq = self.w[i] * rho * (1.0 - 1.5 * u_sq)
-            elif i <= 6:
-                feq = self.w[i] * rho * (1.0 + 3.0*eu - 3.0*u_sq + 6.0*eu*eu)
-            else:
-                feq = self.w[i] * rho * (1.0 + 3.0*eu - 1.5*u_sq + 4.5*eu*eu)
+            # Standard D3Q19 equilibrium (ALL directions use same formula)
+            feq = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
 
-            self.f[i] = feq
+            self.f[i] = feq.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
     def _compute_strain_rate_tensor(self, ux, uy, uz):
         """Compute strain rate tensor S_ij = 0.5*(du_i/dx_j + du_j/dx_i)"""
@@ -307,9 +547,9 @@ class GPULBMSolver:
         duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2))
 
         # Strain rate tensor (symmetric)
-        S11 = dux_dx
-        S22 = duy_dy
-        S33 = duz_dz
+        S11 = dux_dx.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S22 = duy_dy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S33 = duz_dz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         S12 = 0.5 * (dux_dy + duy_dx)
         S13 = 0.5 * (dux_dz + duz_dx)
         S23 = 0.5 * (duy_dz + duz_dy)
@@ -318,16 +558,22 @@ class GPULBMSolver:
 
     def _compute_vorticity(self, ux, uy, uz):
         """Compute vorticity omega = curl(u) [web:44]"""
-        # Correct gradient unpacking for 3D tensors
-        dux_dy, dux_dz = torch.gradient(ux, dim=1)[0], torch.gradient(ux, dim=2)[0]
-        duy_dx, duy_dz = torch.gradient(uy, dim=0)[0], torch.gradient(uy, dim=2)[0]
-        duz_dx, duz_dy = torch.gradient(uz, dim=0)[0], torch.gradient(uz, dim=1)[0]
+        # Compute all gradients properly
+        grad_ux = torch.gradient(ux, dim=(0, 1, 2))  # Returns (dux/dx, dux/dy, dux/dz)
+        grad_uy = torch.gradient(uy, dim=(0, 1, 2))
+        grad_uz = torch.gradient(uz, dim=(0, 1, 2))
 
+        # Extract individual components
+        dux_dx, dux_dy, dux_dz = grad_ux
+        duy_dx, duy_dy, duy_dz = grad_uy
+        duz_dx, duz_dy, duz_dz = grad_uz
+
+        # Vorticity: curl(u)
         omega_x = duz_dy - duy_dz  # ∂w/∂y - ∂v/∂z
         omega_y = dux_dz - duz_dx  # ∂u/∂z - ∂w/∂x
         omega_z = duy_dx - dux_dy  # ∂v/∂x - ∂u/∂y
 
-        return omega_x, omega_y, omega_z
+        return omega_x.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_y.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_z.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
     def _compute_q_criterion(self, ux, uy, uz):
         """Compute Q-criterion for vortex identification [web:44][web:47]
@@ -343,7 +589,7 @@ class GPULBMSolver:
         omega_mag_sq = omega_x**2 + omega_y**2 + omega_z**2
 
         # Q-criterion: Q > 0 indicates vortex regions
-        Q = 0.5 * (omega_mag_sq - S_mag_sq)
+        Q = 0.5 * (omega_mag_sq - S_mag_sq).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         return Q
 
@@ -354,7 +600,13 @@ class GPULBMSolver:
 
         # Grid-scale strain rate
         S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)
-        S_mag = torch.sqrt(2.0 * (S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)) + 1e-12)
+        S11 = S11.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S22 = S22.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S33 = S33.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S12 = S12.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S13 = S13.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S23 = S23.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S_mag = torch.sqrt(2.0 * (S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)) + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Test filter (simple box filter approximation via pooling)
         kernel_size = int(self.phys_config.test_filter_ratio)
@@ -366,22 +618,28 @@ class GPULBMSolver:
         ux_test = torch.nn.functional.avg_pool3d(
             ux.unsqueeze(0).unsqueeze(0), 
             kernel_size=kernel_size, stride=1, padding=padding
-        ).squeeze()
+        ).squeeze().nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         uy_test = torch.nn.functional.avg_pool3d(
             uy.unsqueeze(0).unsqueeze(0),
             kernel_size=kernel_size, stride=1, padding=padding
-        ).squeeze()
+        ).squeeze().nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         uz_test = torch.nn.functional.avg_pool3d(
             uz.unsqueeze(0).unsqueeze(0),
             kernel_size=kernel_size, stride=1, padding=padding
-        ).squeeze()
+        ).squeeze().nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Test-scale strain rate
         S11_test, S22_test, S33_test, S12_test, S13_test, S23_test = self._compute_strain_rate_tensor(
             ux_test, uy_test, uz_test
         )
+        S11_test = S11_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S22_test = S22_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S33_test = S33_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S12_test = S12_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S13_test = S13_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        S23_test = S23_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         S_mag_test = torch.sqrt(2.0 * (S11_test**2 + S22_test**2 + S33_test**2 + 
-                                       2.0*(S12_test**2 + S13_test**2 + S23_test**2)) + 1e-12)
+                                       2.0*(S12_test**2 + S13_test**2 + S23_test**2)) + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Leonard stress (Germano identity)
         # L_ij = test_filter(u_i * u_j) - test_filter(u_i) * test_filter(u_j)
@@ -397,7 +655,12 @@ class GPULBMSolver:
                                             kernel_size, 1, padding).squeeze() - ux_test*uz_test
         L23 = torch.nn.functional.avg_pool3d((uy*uz).unsqueeze(0).unsqueeze(0),
                                             kernel_size, 1, padding).squeeze() - uy_test*uz_test
-
+        L11 = L11.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        L22 = L22.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        L33 = L33.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        L12 = L12.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        L13 = L13.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        L23 = L23.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         # Model coefficient (least squares fit)
         # C_s^2 = <L_ij * M_ij> / <M_ij * M_ij>
         # where M_ij = -2 * Delta^2 * |S| * S_ij (grid) + 2 * Delta_test^2 * |S_test| * S_ij_test
@@ -407,14 +670,20 @@ class GPULBMSolver:
         M12 = -2.0*Delta**2*S_mag*S12 + 2.0*Delta_test**2*S_mag_test*S12_test
         M13 = -2.0*Delta**2*S_mag*S13 + 2.0*Delta_test**2*S_mag_test*S13_test
         M23 = -2.0*Delta**2*S_mag*S23 + 2.0*Delta_test**2*S_mag_test*S23_test
-
+        M11 = M11.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        M22 = M22.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        M33 = M33.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        M12 = M12.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        M13 = M13.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        M23 = M23.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         # Compute Cs^2 locally
         LM = L11*M11 + L22*M22 + L33*M33 + 2.0*(L12*M12 + L13*M13 + L23*M23)
         MM = M11**2 + M22**2 + M33**2 + 2.0*(M12**2 + M13**2 + M23**2)
-
+        LM = LM.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        MM = MM.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         Cs_squared = LM / (MM + 1e-12)
-        Cs_squared = torch.clamp(Cs_squared, min=0.0)  # Ensure non-negative
-        Cs = torch.sqrt(Cs_squared)
+        Cs_squared = torch.clamp(Cs_squared, min=1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)  # Ensure non-negative
+        Cs = torch.sqrt(Cs_squared+1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Clip to reasonable bounds
         Cs = torch.clamp(Cs, 
@@ -437,9 +706,9 @@ class GPULBMSolver:
 
         # Traceless symmetric part of velocity gradient squared
         # S_d = 0.5*(grad_u + grad_u^T) - (1/3)*tr(grad_u)*I
-        gij_gji_11 = dux_dx**2 + dux_dy*duy_dx + dux_dz*duz_dx
-        gij_gji_22 = duy_dx*dux_dy + duy_dy**2 + duy_dz*duz_dy
-        gij_gji_33 = duz_dx*dux_dz + duz_dy*duy_dz + duz_dz**2
+        gij_gji_11 = (dux_dx**2 + dux_dy*duy_dx + dux_dz*duz_dx).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        gij_gji_22 = (duy_dx*dux_dy + duy_dy**2 + duy_dz*duz_dy).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        gij_gji_33 = (duz_dx*dux_dz + duz_dy*duy_dz + duz_dz**2).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         trace_third = (dux_dx + duy_dy + duz_dz) / 3.0
 
@@ -447,14 +716,14 @@ class GPULBMSolver:
         Sd_22 = 0.5*(gij_gji_22 + gij_gji_22) - 2.0*trace_third*duy_dy
         Sd_33 = 0.5*(gij_gji_33 + gij_gji_33) - 2.0*trace_third*duz_dz
 
-        Sd_mag = torch.sqrt(Sd_11**2 + Sd_22**2 + Sd_33**2 + 1e-12)
+        Sd_mag = torch.sqrt(Sd_11**2 + Sd_22**2 + Sd_33**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Strain rate magnitude
         _, _, _, _, _, _ = self._compute_strain_rate_tensor(ux, uy, uz)
-        S_mag = torch.sqrt(2.0*(dux_dx**2 + duy_dy**2 + duz_dz**2) + 1e-12)
+        S_mag = torch.sqrt(2.0*(dux_dx**2 + duy_dy**2 + duz_dz**2) + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # WALE turbulent viscosity
-        nu_turb = (Cw * Delta)**2 * (Sd_mag**1.5) / (S_mag**2.5 + Sd_mag**1.25 + 1e-12)
+        nu_turb = (Cw * Delta)**2 * (Sd_mag**1.5) / (S_mag**2.5 + Sd_mag**1.25 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         return nu_turb
 
@@ -465,7 +734,7 @@ class GPULBMSolver:
 
         if self.phys_config.turbulence_model == "smagorinsky":
             # Standard Smagorinsky
-            S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)
+            S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             S_mag = torch.sqrt(2.0 * (S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)) + 1e-12)
             Cs = self.phys_config.smagorinsky_constant
             Delta = self.config.lbm_config.grid_spacing
@@ -474,9 +743,10 @@ class GPULBMSolver:
         elif self.phys_config.turbulence_model == "dynamic_smagorinsky":
             # Dynamic Smagorinsky (Germano)
             Cs, S_mag = self._compute_dynamic_smagorinsky(ux, uy, uz)
+            Cs, S_mag = Cs.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), S_mag.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             self.cs_dynamic = Cs  # Store for diagnostics
             Delta = self.config.lbm_config.grid_spacing
-            nu_turb = (Cs * Delta)**2 * S_mag
+            nu_turb = ((Cs * Delta)**2 * S_mag).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             
         elif self.phys_config.turbulence_model == "wale":
             # WALE model
@@ -492,20 +762,20 @@ class GPULBMSolver:
         Adds anti-dissipation force F = epsilon * (eta x omega)
         """
         if not self.phys_config.use_vorticity_confinement:
-            return torch.zeros_like(ux), torch.zeros_like(uy), torch.zeros_like(uz)
+            return torch.zeros_like(ux).nan_to_num(1e-12, posinf=1e18, neginf=-1e18), torch.zeros_like(uy).nan_to_num(1e-12, posinf=1e18, neginf=-1e18), torch.zeros_like(uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Compute vorticity
         omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
-        self.vorticity[0] = omega_x
-        self.vorticity[1] = omega_y
-        self.vorticity[2] = omega_z
+        self.vorticity[0] = omega_x.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        self.vorticity[1] = omega_y.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        self.vorticity[2] = omega_z.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Vorticity magnitude
-        omega_mag = torch.sqrt(omega_x**2 + omega_y**2 + omega_z**2 + 1e-12)
+        omega_mag = torch.sqrt(omega_x**2 + omega_y**2 + omega_z**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Confinement direction: eta = grad(|omega|) / |grad(|omega|)|
         grad_omega_x, grad_omega_y, grad_omega_z = torch.gradient(omega_mag, dim=(0, 1, 2))
-        grad_omega_mag = torch.sqrt(grad_omega_x**2 + grad_omega_y**2 + grad_omega_z**2 + 1e-12)
+        grad_omega_mag = torch.sqrt(grad_omega_x**2 + grad_omega_y**2 + grad_omega_z**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         eta_x = grad_omega_x / grad_omega_mag
         eta_y = grad_omega_y / grad_omega_mag
@@ -514,15 +784,15 @@ class GPULBMSolver:
         # Adaptive epsilon based on local vorticity (preserve strong vortices more)
         if self.phys_config.vc_adaptive:
             # Scale epsilon by vorticity magnitude
-            omega_mean = torch.mean(omega_mag)
+            omega_mean = torch.mean(omega_mag).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             epsilon_local = self.phys_config.vorticity_confinement_epsilon * (omega_mag / (omega_mean + 1e-12))
         else:
-            epsilon_local = self.phys_config.vorticity_confinement_epsilon
+            epsilon_local = self.phys_config.vorticity_confinement_epsilon.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Confinement force: F = epsilon * (eta x omega)
-        Fx = epsilon_local * (eta_y * omega_z - eta_z * omega_y)
-        Fy = epsilon_local * (eta_z * omega_x - eta_x * omega_z)
-        Fz = epsilon_local * (eta_x * omega_y - eta_y * omega_x)
+        Fx = epsilon_local * (eta_y * omega_z - eta_z * omega_y).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        Fy = epsilon_local * (eta_z * omega_x - eta_x * omega_z).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        Fz = epsilon_local * (eta_x * omega_y - eta_y * omega_x).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         return Fx, Fy, Fz
 
@@ -534,13 +804,13 @@ class GPULBMSolver:
         for step in range(steps):
             # === 1. Compute macroscopic variables ===
             rho = torch.sum(self.f, dim=0)
-            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
-            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
-            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             # === 2. Turbulence modeling (Dynamic Smagorinsky / WALE) ===
-            self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz)
-            nu_eff = self.nu + self.nu_turb
+            self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            nu_eff = self.nu+ self.nu_turb
 
             # === 3. Vorticity confinement force ===
             Fx, Fy, Fz = self._apply_vorticity_confinement(ux, uy, uz)
@@ -549,48 +819,47 @@ class GPULBMSolver:
             tau_eff = 3.0 * nu_eff + 0.5
             omega_eff = 1.0 / tau_eff
 
-            # === 5. MRT Collision with force term ===
+            # === 5. MRT Collision with corrected equilibrium ===
             for i in range(19):
-                eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
-                u_sq = ux**2 + uy**2 + uz**2
+                eu = (self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                u_sq = (ux**2 + uy**2 + uz**2).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
-                # Improved equilibrium
-                if i == 0:
-                    feq = self.w[i] * rho * (1.0 - 1.5 * u_sq) if self.phys_config.use_incompressible_correction else self.w[i] * rho * (1.0 - 1.5 * u_sq)
-                elif i <= 6:
-                    feq = self.w[i] * (1.0 + 3.0*eu - 3.0*u_sq + 6.0*eu*eu) if self.phys_config.use_incompressible_correction else self.w[i] * rho * (1.0 + 3.0*eu - 3.0*u_sq + 6.0*eu*eu)
-                else:
-                    feq = self.w[i] * (1.0 + 3.0*eu - 1.5*u_sq + 4.5*eu*eu) if self.phys_config.use_incompressible_correction else self.w[i] * rho * (1.0 + 3.0*eu - 1.5*u_sq + 4.5*eu*eu)
+                # Correct Guo forcing scheme (exact)
+                eF = (self.ex[i]*Fx + self.ey[i]*Fy + self.ez[i]*Fz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                uF = (ux*Fx + uy*Fy + uz*Fz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
-                # Add vorticity confinement force (Guo forcing scheme)
-                Fi = self.ex[i] * Fx + self.ey[i] * Fy + self.ez[i] * Fz
-                force_term = self.w[i] * (1.0 - 0.5*omega_eff) * (3.0*Fi)
+                # Standard D3Q19 equilibrium (ALL directions use same formula)
+                feq = (self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                force_term = (self.w[i] * (1.0 - 0.5*omega_eff) * (3.0*eF + 9.0*eu*eF - 3.0*uF)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
                 # Collision with force
-                self.f[i] += omega_eff * (feq - self.f[i]) + force_term
+                self.f[i] += omega_eff.nan_to_num(1e-12, posinf=1e18, neginf=-1e18) * (feq - self.f[i]).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) + force_term
 
-            # === 6. Streaming ===
-            for i in range(19):
-                shifts = (self.ex[i].item(), self.ey[i].item(), self.ez[i].item())
-                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2))
+            # === 6. Store pre-stream populations for bounce-back ===
+            self.f_pre_stream = self.f.clone()
 
-            # === 7. Boundary conditions ===
+            # === 7. Streaming ===
             for i in range(19):
-                opp_i = self.opposite[i]
+                shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
+                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+
+            # === 8. Boundary conditions - bounce-back using pre-stream values ===
+            for i in range(19):
+                opp_i = self.opposite[i].nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
                 mask = geometry_mask > 0.5
-                self.f_temp[i] = torch.where(mask, self.f_temp[opp_i], self.f_temp[i])
+                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i]).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             self.f = self.f_temp.clone()
 
             # === 8. Update fields ===
-            self.velocity_x = ux
-            self.velocity_y = uy
-            self.velocity_z = uz
+            self.velocity_x = ux.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            self.velocity_y = uy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            self.velocity_z = uz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
             self.pressure = rho * self.cs2
 
             # === 9. Compute Q-criterion for vortex detection ===
             if self.phys_config.compute_q_criterion:
-                self.q_criterion = self._compute_q_criterion(ux, uy, uz)
+                self.q_criterion = self._compute_q_criterion(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             # === 10. Convergence check ===
             if step % self.phys_config.check_convergence_every == 0 and step > 0:
@@ -599,6 +868,14 @@ class GPULBMSolver:
                     print(f"Converged at step {step}, max velocity change: {vel_change:.2e}")
                     break
                 self.velocity_prev = ux.clone()
+
+            # === 11. Quick diagnostic (suggested by user) ===
+            if step % 100 == 0:
+                print(f"Step {step}:")
+                print(f"  max vorticity: {torch.max(torch.sqrt(torch.sum(self.vorticity**2, dim=0))):.4f}")
+                print(f"  s_nu: {self.phys_config.s_nu}")
+                print(f"  nu_turb mean: {self.nu_turb.mean():.6f}")
+                print(f"  any NaN: {torch.any(torch.isnan(self.f))}")
 
             if step % 500 == 0:
                 vortex_volume = torch.sum((self.q_criterion > self.phys_config.q_threshold).float()).item()

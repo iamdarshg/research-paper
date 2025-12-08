@@ -9,7 +9,7 @@ sys.path.append(r"D:\research-paper\CLI")
 
 try:
     from aircraft_diffusion_cfd import AdvancedCFDSimulator, CFDConfig, LBMPhysicsConfig
-    from advanced_lbm_solver import GPULBMSolver # Direct import of the solver
+    from advanced_lbm_solver import GPULBMSolver, D3Q27CascadedSolver # Direct import of the solvers
     IMPORTS_SUCCESSFUL = True
 except Exception as e:
     print(f"Warning: Could not import CFD modules: {e}")
@@ -25,12 +25,13 @@ class CFDSolverWorker(QObject):
     simulation_finished = pyqtSignal(dict) # Dictionary of all CFD results
     simulation_error = pyqtSignal(str)
 
-    def __init__(self, stl_path, reynolds, mach, steps):
+    def __init__(self, stl_path, reynolds, mach, steps, solver_type="d3q19_mrt"):
         super().__init__()
         self.stl_path = stl_path
         self.reynolds = reynolds
         self.mach = mach
         self.steps = steps
+        self.solver_type = solver_type
         self._is_interrupted = False
 
     def run_simulation(self):
@@ -105,18 +106,17 @@ class CFDSolverWorker(QObject):
             cfd_config.lbm_config = LBMPhysicsConfig()
             cfd_config.lbm_config.grid_spacing = cfd_config.lbm_config.physical_length_scale / cfd_config.base_grid_resolution
 
-            simulator = AdvancedCFDSimulator(cfd_config, device)
+            # Choose solver based on type
+            if self.solver_type == "d3q27_cascaded":
+                # Use D3Q27 Cascaded solver directly
+                self.update_progress.emit(10, "Using D3Q27 Cascaded solver...")
+                lbm_solver = D3Q27CascadedSolver(cfd_config, device, LBMPhysicsConfig)
+            else:
+                # Default to D3Q19 MRT solver
+                simulator = AdvancedCFDSimulator(cfd_config, device)
+                lbm_solver: GPULBMSolver = simulator.lbm_solver
 
             self.update_progress.emit(10, "Running CFD simulation...")
-
-            # Run simulation steps
-            # The simulate_aerodynamics method only returns final coefficients.
-            # We need to modify it or the solver to get intermediate field data.
-            # For now, I'll directly interact with the LBM solver to extract data.
-            
-            # Initialize LBM solver within simulator
-            # The simulator already has an lbm_solver instance
-            lbm_solver: GPULBMSolver = simulator.lbm_solver
             geometry_mask = (voxel_grid_tensor > 0.5).float() # Binary mask for solid
             
             # Create placeholders to store max/min of fields for dynamic range adjustment
