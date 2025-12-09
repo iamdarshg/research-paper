@@ -3,5 +3,6 @@ data/
 runs/
 checkpoints/
 checkpoint*
-test_checkpoints/
-GUI/__pycache__/
+test_checkpoints
+GUI/__pycache__
+*/__pycache__

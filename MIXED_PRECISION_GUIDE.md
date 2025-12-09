@@ -113,6 +113,7 @@ This keeps stored values small → fits in FP16 range.
 | RTX 3090         | 2.5x    | 50%            |
 | A100             | 3.0x    | 50%            |
 | RTX 2080 Ti      | 1.8x    | 50%            |
+| RTX 4060         | 2.2x    | 50%            |
 | CPU (no benefit) | 1.0x    | 50%            |
 
 **Why speedup varies**: Modern GPUs have dedicated tensor cores optimized for FP16.
