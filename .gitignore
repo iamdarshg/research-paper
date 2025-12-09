@@ -4,3 +4,4 @@ runs/
 checkpoints/
 checkpoint*
 test_checkpoints/
+GUI/__pycache__/
