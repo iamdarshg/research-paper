@@ -25,13 +25,16 @@ class CFDSolverWorker(QObject):
     simulation_finished = pyqtSignal(dict) # Dictionary of all CFD results
     simulation_error = pyqtSignal(str)
 
-    def __init__(self, stl_path, reynolds, mach, steps, solver_type="d3q19_mrt"):
+    def __init__(self, stl_path, reynolds, mach, steps, solver_type="d3q19_mrt", 
+                 grid_resolution=32, cfd_domain_params=None):
         super().__init__()
         self.stl_path = stl_path
         self.reynolds = reynolds
         self.mach = mach
         self.steps = steps
         self.solver_type = solver_type
+        self.grid_resolution = grid_resolution
+        self.cfd_domain_params = cfd_domain_params or {}
         self._is_interrupted = False
 
     def run_simulation(self):
@@ -44,84 +47,99 @@ class CFDSolverWorker(QObject):
             # Convert STL to voxel grid
             mesh = trimesh.load_mesh(self.stl_path)
             
+            # Get CFD domain parameters from GUI
+            domain_size = self.cfd_domain_params.get('domain_size', [1.0, 1.0, 1.0])
+            body_size = self.cfd_domain_params.get('body_size', 1.0)
+            padding_front = self.cfd_domain_params.get('padding_front', 1.0)
+            padding_back = self.cfd_domain_params.get('padding_back', 2.0)
+            padding_sides = self.cfd_domain_params.get('padding_sides', 1.0)
+            padding_vertical = self.cfd_domain_params.get('padding_vertical', 1.0)
+            offset = self.cfd_domain_params.get('offset', [0, 0, 0])
+            
+            # Use grid_resolution from GUI
+            grid_resolution = self.grid_resolution
+            
+            # Calculate grid spacing based on domain size
+            grid_spacing_x = domain_size[0] / grid_resolution
+            grid_spacing_y = domain_size[1] / grid_resolution
+            grid_spacing_z = domain_size[2] / grid_resolution
+            
+            print(f"CFD Domain: {domain_size}, Body Size: {body_size}, Grid: {grid_resolution}^3")
+            print(f"Grid Spacing: [{grid_spacing_x:.4f}, {grid_spacing_y:.4f}, {grid_spacing_z:.4f}]")
+            
             # Estimate bounding box and voxelize
-            # For simplicity, we'll assume a fixed grid size for the solver
-            # A more advanced approach would dynamically size or pad the grid
-            grid_resolution = 32 # Consistent with the CFDConfig default
-            
-            # Scale mesh to fit within a 0-1 unit cube for voxelization, then scale to grid_resolution
-            # Find the max dimension of the mesh
             bounds = mesh.bounds
-            max_extent = np.max(bounds[1] - bounds[0])
+            mesh_extent = bounds[1] - bounds[0]
+            max_mesh_extent = np.max(mesh_extent)
             
-            # Scale and translate mesh to fit in a unit cube from 0 to 1
-            if max_extent > 1e-6: # Avoid division by zero
-                scale_factor = 1.0 / max_extent
+            # Scale mesh to physical body size
+            if max_mesh_extent > 1e-6:
+                scale_factor = body_size / max_mesh_extent
                 mesh.vertices = (mesh.vertices - bounds[0]) * scale_factor
             
-            # Voxelize the mesh
-            # Use `fill_distance` to create a solid object
-            voxel_grid_trimesh = mesh.voxelized(0.01).fill() # Smaller pitch for better resolution
-            voxel_grid_np = voxel_grid_trimesh.matrix.view(np.ndarray)
+            # Center the mesh in the domain
+            mesh_center = np.mean(mesh.vertices, axis=0)
+            domain_center = np.array(domain_size) / 2
+            mesh.vertices = mesh.vertices - mesh_center + domain_center + np.array(offset)
+            
+            # Calculate appropriate voxel pitch based on grid resolution
+            voxel_pitch = min(grid_spacing_x, grid_spacing_y, grid_spacing_z)
+            
+            self.update_progress.emit(5, f"Voxelizing mesh (pitch={voxel_pitch:.4f})...")
+            # Voxelize with calculated pitch
+            try:
+                voxel_grid_trimesh = mesh.voxelized(voxel_pitch).fill()
+                voxel_grid_np = voxel_grid_trimesh.matrix.view(np.ndarray)
+            except Exception as e:
+                print(f"Voxelization error: {e}, using coarser pitch")
+                voxel_pitch *= 2
+                voxel_grid_trimesh = mesh.voxelized(voxel_pitch).fill()
+                voxel_grid_np = voxel_grid_trimesh.matrix.view(np.ndarray)
 
-            # The voxel_grid_np will have its own dimensions based on the mesh and pitch.
-            # We need to resize it to a fixed resolution for the LBM solver (e.g., 32x32x32)
-            # Pad or crop and then interpolate to the target resolution
+            # Resize voxel grid to target resolution
             current_shape = voxel_grid_np.shape
             target_shape = (grid_resolution, grid_resolution, grid_resolution)
             
-            # Create an empty target grid
-            resized_voxel_grid_np = np.zeros(target_shape, dtype=np.float32)
-
-            # Calculate scaling factors
-            scale_factors = np.array(target_shape) / np.array(current_shape)
+            self.update_progress.emit(8, f"Resizing voxel grid: {current_shape} -> {target_shape}...")
             
-            # Simple nearest-neighbor resize for demonstration, could use more advanced interpolation
-            for x in range(target_shape[0]):
-                for y in range(target_shape[1]):
-                    for z in range(target_shape[2]):
-                        src_x = int(x / scale_factors[0])
-                        src_y = int(y / scale_factors[1])
-                        src_z = int(z / scale_factors[2])
-                        
-                        if 0 <= src_x < current_shape[0] and \
-                           0 <= src_y < current_shape[1] and \
-                           0 <= src_z < current_shape[2]:
-                            resized_voxel_grid_np[x, y, z] = voxel_grid_np[src_x, src_y, src_z]
+            # Use scipy for better interpolation
+            from scipy.ndimage import zoom
+            zoom_factors = np.array(target_shape) / np.array(current_shape)
+            resized_voxel_grid_np = zoom(voxel_grid_np.astype(np.float32), zoom_factors, order=1)
+            
+            # Ensure binary mask
+            resized_voxel_grid_np = (resized_voxel_grid_np > 0.5).astype(np.float32)
 
-            # Convert to torch tensor, add batch and channel dimensions as expected by AdvancedCFDSimulator
+            # Convert to torch tensor
             voxel_grid_tensor = torch.from_numpy(resized_voxel_grid_np).float().to(device)
-            # The AdvancedCFDSimulator expects [D, H, W] for the geometry parameter
-            # The voxel_grid in _voxel_to_stl_path is also [D, H, W]
-            # So no unsqueeze needed here, just make sure it's 3D
 
-            # Setup CFD configuration
+            # Setup CFD configuration with proper physical scaling
             cfd_config = CFDConfig(
                 base_grid_resolution=grid_resolution,
                 reynolds_number=self.reynolds,
                 mach_number=self.mach,
                 simulation_steps=self.steps
             )
-            # Ensure LBMPhysicsConfig is properly initialized with new grid spacing
+            
+            # Initialize LBM physics config with proper grid spacing
             cfd_config.lbm_config = LBMPhysicsConfig()
-            cfd_config.lbm_config.grid_spacing = cfd_config.lbm_config.physical_length_scale / cfd_config.base_grid_resolution
-            cfd_config.lbm_config.compute_q_criterion = True  # Enable vorticity/Q-criterion computation
+            cfd_config.lbm_config.physical_length_scale = body_size
+            cfd_config.lbm_config.grid_spacing = grid_spacing_x  # Use actual calculated spacing
+            cfd_config.lbm_config.compute_q_criterion = True
             cfd_config.lbm_config.use_vorticity_confinement = True
             
             # Choose solver based on type
             if self.solver_type == "d3q27_cascaded":
-                # Use D3Q27 Cascaded solver directly
                 self.update_progress.emit(10, "Using D3Q27 Cascaded solver...")
                 lbm_solver = D3Q27CascadedSolver(cfd_config, device, LBMPhysicsConfig)
             else:
-                # Default to D3Q19 MRT solver
                 simulator = AdvancedCFDSimulator(cfd_config, device)
                 lbm_solver: GPULBMSolver = simulator.lbm_solver
 
             self.update_progress.emit(10, "Running CFD simulation...")
-            geometry_mask = (voxel_grid_tensor > 0.5).float() # Binary mask for solid
+            geometry_mask = (voxel_grid_tensor > 0.5).float()
             
-            # Create placeholders to store max/min of fields for dynamic range adjustment
+            # Tracking for dynamic range
             max_pressure = -float("inf")
             min_pressure = float("inf")
             max_vel_mag = -float("inf")
@@ -133,32 +151,32 @@ class CFDSolverWorker(QObject):
             max_q_crit = -float("inf")
             min_q_crit = float("inf")
 
-            # Run steps and collect data
+            # Data collection
             all_pressure_data = []
             all_velocity_x = []
             all_velocity_y = []
             all_velocity_z = []
-            all_density_data = [] # Rho is density
+            all_density_data = []
             all_vorticity_magnitude_data = []
             all_q_criterion_data = []
 
-            output_data_interval = max(1, self.steps // 10) # Collect data ~10 times during simulation
+            output_data_interval = max(1, self.steps // 10)
 
             for step in range(self.steps):
                 if self._is_interrupted:
                     self.update_progress.emit(0, "Simulation interrupted.")
                     return
 
-                lbm_solver.collide_stream(geometry_mask, steps=1) # Run one step
+                lbm_solver.collide_stream(geometry_mask, steps=1)
 
-                # Extract data after each step
-                rho = torch.sum(lbm_solver.f, dim=0) # Rho is sum of populations
+                # Extract data
+                rho = torch.sum(lbm_solver.f, dim=0)
                 ux, uy, uz = lbm_solver.velocity_x, lbm_solver.velocity_y, lbm_solver.velocity_z
                 pressure = lbm_solver.pressure
                 vorticity_mag = torch.sqrt(torch.sum(lbm_solver.vorticity**2, dim=0))
                 q_criterion = lbm_solver.q_criterion
                 
-                # Update max/min for dynamic range
+                # Update ranges
                 max_pressure = max(max_pressure, pressure.max().item())
                 min_pressure = min(min_pressure, pressure.min().item())
                 
@@ -184,10 +202,10 @@ class CFDSolverWorker(QObject):
                     all_vorticity_magnitude_data.append(vorticity_mag.cpu().numpy())
                     all_q_criterion_data.append(q_criterion.cpu().numpy())
 
-                progress_percent = int((step + 1) / self.steps * 100)
-                self.update_progress.emit(progress_percent, f"CFD progress: {step+1}/{self.steps} steps.")
+                progress_percent = int(10 + (step + 1) / self.steps * 90)
+                self.update_progress.emit(progress_percent, f"CFD: {step+1}/{self.steps} steps.")
             
-            # Take the last collected data for final visualization
+            # Final data
             final_pressure = all_pressure_data[-1] if all_pressure_data else np.zeros(target_shape)
             final_velocity_x = all_velocity_x[-1] if all_velocity_x else np.zeros(target_shape)
             final_velocity_y = all_velocity_y[-1] if all_velocity_y else np.zeros(target_shape)
@@ -196,15 +214,14 @@ class CFDSolverWorker(QObject):
             final_vorticity_magnitude = all_vorticity_magnitude_data[-1] if all_vorticity_magnitude_data else np.zeros(target_shape)
             final_q_criterion = all_q_criterion_data[-1] if all_q_criterion_data else np.zeros(target_shape)
             
-            # Calculate final velocity magnitude from its components
             final_velocity_magnitude = np.sqrt(final_velocity_x**2 + final_velocity_y**2 + final_velocity_z**2)
 
             results = {
                 "Pressure": final_pressure,
                 "Velocity Magnitude": final_velocity_magnitude,
-                "Velocity_X": final_velocity_x, # For streamlines
-                "Velocity_Y": final_velocity_y, # For streamlines
-                "Velocity_Z": final_velocity_z, # For streamlines
+                "Velocity_X": final_velocity_x,
+                "Velocity_Y": final_velocity_y,
+                "Velocity_Z": final_velocity_z,
                 "Density": final_density,
                 "Vorticity Magnitude": final_vorticity_magnitude,
                 "Q-Criterion": final_q_criterion,
@@ -212,7 +229,10 @@ class CFDSolverWorker(QObject):
                 "VelocityMagnitude_MinMax": (min_vel_mag, max_vel_mag),
                 "Density_MinMax": (min_density, max_density),
                 "VorticityMagnitude_MinMax": (min_vort_mag, max_vort_mag),
-                "Q_Criterion_MinMax": (min_q_crit, max_q_crit)
+                "Q_Criterion_MinMax": (min_q_crit, max_q_crit),
+                "domain_size": domain_size,
+                "grid_spacing": [grid_spacing_x, grid_spacing_y, grid_spacing_z],
+                "geometry_mask": resized_voxel_grid_np
             }
             self.simulation_finished.emit(results)
 
