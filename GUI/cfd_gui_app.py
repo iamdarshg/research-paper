@@ -46,6 +46,7 @@ class CFDVisualizationWidget(gl.GLViewWidget):
         self.mesh_item = None
         self.volume_item = None
         self.streamline_items = []
+        self.surface_pressure_item = None
         
         # Parameters
         self.threshold = 0.1
@@ -53,28 +54,31 @@ class CFDVisualizationWidget(gl.GLViewWidget):
         self.contrast = 1.0
         self.streamline_count = 50
         self.streamline_length = 100
+        self.streamline_step = 0.01  # Smaller step for smoother integration
         
         # Mesh transform
         self.mesh_rotation = [0, 0, 0]
         self.mesh_scale_factor = 1.0
         self.mesh_physical_size = 1.0
         
-        # CFD domain
+        # CFD domain (CRITICAL for proper scaling)
         self.cfd_padding_front = 1.0
         self.cfd_padding_back = 2.0
         self.cfd_padding_sides = 1.0
         self.cfd_padding_vertical = 1.0
         self.cfd_domain_size = [1.0, 1.0, 1.0]
         self.cfd_offset = [0, 0, 0]
+        self.grid_resolution = 32  # Match solver grid
         
         # Timer for smooth rendering
         self.render_timer = QTimer()
         self.render_timer.timeout.connect(self.update)
         self.render_timer.start(33)  # 30 FPS
 
-    def set_streamline_params(self, count, length):
+    def set_streamline_params(self, count, length, step=0.01):
         self.streamline_count = count
         self.streamline_length = length
+        self.streamline_step = step
 
     def set_cfd_padding(self, front, back, sides, vertical):
         self.cfd_padding_front = front
@@ -111,7 +115,7 @@ class CFDVisualizationWidget(gl.GLViewWidget):
         return vertices @ R.T
 
     def display_stl(self, vertices, faces, physical_size=1.0):
-        """Display STL mesh"""
+        """Display STL mesh with proper physical scaling"""
         if self.mesh_item is not None:
             self.removeItem(self.mesh_item)
         
@@ -147,7 +151,7 @@ class CFDVisualizationWidget(gl.GLViewWidget):
         )
         self.addItem(self.mesh_item)
         
-        # Calculate CFD domain
+        # Calculate CFD domain with same logic as solver
         body_length = physical_size
         self.cfd_domain_size = [
             body_length * (self.cfd_padding_front + 1.0 + self.cfd_padding_back),
@@ -178,7 +182,7 @@ class CFDVisualizationWidget(gl.GLViewWidget):
             self.opts['distance'] = max(domain_extent * 1.5, 3.0)
 
     def get_cfd_domain_params(self):
-        """Return CFD domain parameters"""
+        """Return CFD domain parameters for solver"""
         return {
             'domain_size': self.cfd_domain_size,
             'body_size': self.mesh_physical_size,
@@ -190,7 +194,7 @@ class CFDVisualizationWidget(gl.GLViewWidget):
         }
 
     def display_volume_data(self, data, color_map='viridis', smooth=True):
-        """GPU-accelerated volume rendering"""
+        """GPU-accelerated volume rendering in lockstep with physical units"""
         from matplotlib import cm
         import matplotlib.colors as mcolors
         
@@ -255,6 +259,7 @@ class CFDVisualizationWidget(gl.GLViewWidget):
         try:
             self.volume_item = gl.GLVolumeItem(data_rgba_uint8, glOptions='translucent')
             
+            # CRITICAL: Match physical units exactly
             nx, ny, nz = data.shape
             voxel_size = [
                 self.cfd_domain_size[0] / nx,
@@ -262,8 +267,12 @@ class CFDVisualizationWidget(gl.GLViewWidget):
                 self.cfd_domain_size[2] / nz
             ]
             
+            print(f"Volume voxel size (physical): {voxel_size}")
+            print(f"CFD domain size: {self.cfd_domain_size}")
+            
             self.volume_item.scale(*voxel_size)
             
+            # Position volume to align with domain
             offset = [
                 self.cfd_offset[0] - self.cfd_domain_size[0] / 2,
                 self.cfd_offset[1] - self.cfd_domain_size[1] / 2,
@@ -279,77 +288,108 @@ class CFDVisualizationWidget(gl.GLViewWidget):
             traceback.print_exc()
 
     def generate_streamlines(self, vx, vy, vz):
-        """Generate streamlines"""
-        from scipy.integrate import odeint
+        """Generate streamlines with proper forward integration using RK4"""
         
-        def velocity_field(point, t):
-            i, j, k = int(point[0]), int(point[1]), int(point[2])
-            if not (0 <= i < vx.shape[0]-1 and 
-                    0 <= j < vx.shape[1]-1 and 
-                    0 <= k < vx.shape[2]-1):
-                return [0, 0, 0]
+        def velocity_at_point(point):
+            """Trilinear interpolation of velocity field"""
+            x, y, z = point
             
-            dx, dy, dz = point[0]-i, point[1]-j, point[2]-k
+            # Clamp to valid range
+            x = np.clip(x, 0, vx.shape[0] - 1.001)
+            y = np.clip(y, 0, vx.shape[1] - 1.001)
+            z = np.clip(z, 0, vx.shape[2] - 1.001)
+            
+            i, j, k = int(x), int(y), int(z)
+            dx, dy, dz = x - i, y - j, z - k
             
             # Trilinear interpolation
-            v = [0, 0, 0]
+            v = np.zeros(3)
             for vi, vel in enumerate([vx, vy, vz]):
                 v[vi] = (
                     vel[i,j,k]*(1-dx)*(1-dy)*(1-dz) +
-                    vel[i+1,j,k]*dx*(1-dy)*(1-dz) +
-                    vel[i,j+1,k]*(1-dx)*dy*(1-dz) +
-                    vel[i+1,j+1,k]*dx*dy*(1-dz) +
-                    vel[i,j,k+1]*(1-dx)*(1-dy)*dz +
-                    vel[i+1,j,k+1]*dx*(1-dy)*dz +
-                    vel[i,j+1,k+1]*(1-dx)*dy*dz +
-                    vel[i+1,j+1,k+1]*dx*dy*dz
+                    vel[min(i+1,vel.shape[0]-1),j,k]*dx*(1-dy)*(1-dz) +
+                    vel[i,min(j+1,vel.shape[1]-1),k]*(1-dx)*dy*(1-dz) +
+                    vel[min(i+1,vel.shape[0]-1),min(j+1,vel.shape[1]-1),k]*dx*dy*(1-dz) +
+                    vel[i,j,min(k+1,vel.shape[2]-1)]*(1-dx)*(1-dy)*dz +
+                    vel[min(i+1,vel.shape[0]-1),j,min(k+1,vel.shape[2]-1)]*dx*(1-dy)*dz +
+                    vel[i,min(j+1,vel.shape[1]-1),min(k+1,vel.shape[2]-1)]*(1-dx)*dy*dz +
+                    vel[min(i+1,vel.shape[0]-1),min(j+1,vel.shape[1]-1),min(k+1,vel.shape[2]-1)]*dx*dy*dz
                 )
             return v
         
+        def rk4_step(point, dt):
+            """4th order Runge-Kutta integration step"""
+            k1 = velocity_at_point(point)
+            k2 = velocity_at_point(point + 0.5*dt*k1)
+            k3 = velocity_at_point(point + 0.5*dt*k2)
+            k4 = velocity_at_point(point + dt*k3)
+            return point + (dt/6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        
         nx, ny, nz = vx.shape
+        
+        # Generate seed points in a grid pattern
         seeds = []
         grid = int(np.sqrt(self.streamline_count))
         for y in np.linspace(ny*0.3, ny*0.7, grid):
             for z in np.linspace(nz*0.3, nz*0.7, grid):
-                seeds.append([nx*0.15, y, z])
+                seeds.append(np.array([nx*0.15, y, z]))
         
         streamlines = []
         for seed in seeds[:self.streamline_count]:
             try:
-                t = np.linspace(0, 0.5*self.streamline_length, self.streamline_length)
-                sol = odeint(velocity_field, seed, t)
+                line = [seed.copy()]
+                current_point = seed.copy()
                 
-                mask = ((sol[:,0]>=0) & (sol[:,0]<nx) &
-                        (sol[:,1]>=0) & (sol[:,1]<ny) &
-                        (sol[:,2]>=0) & (sol[:,2]<nz))
+                # Forward integration using RK4
+                for _ in range(self.streamline_length):
+                    next_point = rk4_step(current_point, self.streamline_step)
+                    
+                    # Check bounds
+                    if not (0 <= next_point[0] < nx-1 and 
+                            0 <= next_point[1] < ny-1 and 
+                            0 <= next_point[2] < nz-1):
+                        break
+                    
+                    # Check velocity magnitude (terminate in stagnant regions)
+                    vel = velocity_at_point(next_point)
+                    if np.linalg.norm(vel) < 1e-6:
+                        break
+                    
+                    line.append(next_point.copy())
+                    current_point = next_point
                 
-                filtered = sol[mask]
-                if len(filtered) > 2:
-                    phys = np.zeros_like(filtered)
-                    phys[:,0] = (filtered[:,0]/nx)*self.cfd_domain_size[0] + self.cfd_offset[0] - self.cfd_domain_size[0]/2
-                    phys[:,1] = (filtered[:,1]/ny)*self.cfd_domain_size[1] + self.cfd_offset[1] - self.cfd_domain_size[1]/2
-                    phys[:,2] = (filtered[:,2]/nz)*self.cfd_domain_size[2] + self.cfd_offset[2] - self.cfd_domain_size[2]/2
+                if len(line) > 5:  # Only keep streamlines with sufficient points
+                    # Convert grid indices to physical coordinates
+                    line_array = np.array(line)
+                    phys = np.zeros_like(line_array)
+                    phys[:,0] = (line_array[:,0]/nx)*self.cfd_domain_size[0] + self.cfd_offset[0] - self.cfd_domain_size[0]/2
+                    phys[:,1] = (line_array[:,1]/ny)*self.cfd_domain_size[1] + self.cfd_offset[1] - self.cfd_domain_size[1]/2
+                    phys[:,2] = (line_array[:,2]/nz)*self.cfd_domain_size[2] + self.cfd_offset[2] - self.cfd_domain_size[2]/2
                     streamlines.append(phys)
-            except:
-                pass
+                    
+            except Exception as e:
+                print(f"Streamline error: {e}")
+                continue
         
+        print(f"Generated {len(streamlines)} streamlines")
         return streamlines
 
     def display_streamlines(self, streamlines):
-        """Display streamlines"""
+        """Display streamlines with color gradient"""
         for item in self.streamline_items:
             self.removeItem(item)
         self.streamline_items = []
         
         if not streamlines:
+            print("No streamlines to display")
             return
         
         for streamline in streamlines[:self.streamline_count]:
             if len(streamline) > 1:
                 t = np.linspace(0, 1, len(streamline))
                 colors = np.zeros((len(streamline), 4))
-                colors[:,0] = t
-                colors[:,1] = 1-t
+                colors[:,0] = t  # Red increases
+                colors[:,1] = 1-t  # Green decreases
                 colors[:,2] = 0.2
                 colors[:,3] = 0.9
                 
@@ -357,6 +397,8 @@ class CFDVisualizationWidget(gl.GLViewWidget):
                                         width=2.5, antialias=True)
                 self.streamline_items.append(item)
                 self.addItem(item)
+        
+        print(f"Displayed {len(self.streamline_items)} streamlines")
 
     def clear_all(self):
         """Clear all items"""
@@ -369,12 +411,15 @@ class CFDVisualizationWidget(gl.GLViewWidget):
         for item in self.streamline_items:
             self.removeItem(item)
         self.streamline_items = []
+        if self.surface_pressure_item:
+            self.removeItem(self.surface_pressure_item)
+            self.surface_pressure_item = None
 
 
 class CFD_GUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CFD Solver GUI - GPU Accelerated")
+        self.setWindowTitle("CFD Solver GUI - OpenFOAM/ParaView Style")
         self.setGeometry(100, 100, 1600, 1000)
 
         # Main widget
@@ -539,6 +584,7 @@ class CFD_GUI(QMainWindow):
         self.grid_resolution_input = QSpinBox()
         self.grid_resolution_input.setRange(8, 512)
         self.grid_resolution_input.setValue(32)
+        self.grid_resolution_input.valueChanged.connect(self.update_grid_resolution)
         adv_form.addRow("Grid Resolution:", self.grid_resolution_input)
 
         self.solver_selector = QComboBox()
@@ -615,6 +661,14 @@ class CFD_GUI(QMainWindow):
         self.streamline_length_slider.setValue(100)
         self.streamline_length_slider.valueChanged.connect(self.update_streamline_params)
         stream_layout.addWidget(self.streamline_length_slider)
+        
+        self.streamline_step_label = QLabel("Step: 0.01")
+        stream_layout.addWidget(self.streamline_step_label)
+        self.streamline_step_slider = QSlider(Qt.Horizontal)
+        self.streamline_step_slider.setRange(1, 100)
+        self.streamline_step_slider.setValue(10)  # 0.01 * 10 = 0.1
+        self.streamline_step_slider.valueChanged.connect(self.update_streamline_params)
+        stream_layout.addWidget(self.streamline_step_slider)
 
         self.control_panel.addStretch()
 
@@ -622,6 +676,10 @@ class CFD_GUI(QMainWindow):
         """Setup visualization panel"""
         self.viewer = CFDVisualizationWidget()
         self.main_layout.addWidget(self.viewer, stretch=1)
+    
+    def update_grid_resolution(self):
+        """Update viewer grid resolution when changed"""
+        self.viewer.grid_resolution = self.grid_resolution_input.value()
     
     def update_cfd_padding(self):
         self.viewer.set_cfd_padding(
@@ -671,17 +729,20 @@ class CFD_GUI(QMainWindow):
     def update_streamline_params(self):
         count = self.streamline_count_slider.value()
         length = self.streamline_length_slider.value()
+        step = self.streamline_step_slider.value() / 1000.0  # Convert to 0.001-0.1 range
         
         self.streamline_count_label.setText(f"Count: {count}")
         self.streamline_length_label.setText(f"Length: {length}")
+        self.streamline_step_label.setText(f"Step: {step:.3f}")
         
-        self.viewer.set_streamline_params(count, length)
+        self.viewer.set_streamline_params(count, length, step)
         
         if hasattr(self, 'cfd_results') and self.field_selector.currentText() == "Streamlines":
             self.regenerate_streamlines()
 
     def regenerate_streamlines(self):
         if all(k in self.cfd_results for k in ["Velocity_X", "Velocity_Y", "Velocity_Z"]):
+            print("Regenerating streamlines...")
             sl = self.viewer.generate_streamlines(
                 self.cfd_results["Velocity_X"],
                 self.cfd_results["Velocity_Y"],
@@ -721,13 +782,18 @@ class CFD_GUI(QMainWindow):
         self.run_cfd_button.setEnabled(False)
         self.viewer.clear_all()
 
+        # Get CFD domain parameters from viewer
+        cfd_domain_params = self.viewer.get_cfd_domain_params()
+        
         self.cfd_thread = QThread()
         self.cfd_solver_worker = CFDSolverWorker(
             self.current_stl_path,
             self.reynolds_input.value(),
             self.mach_input.value(),
             self.steps_input.value(),
-            self.solver_selector.currentText()
+            self.solver_selector.currentText(),
+            self.grid_resolution_input.value(),  # Pass grid resolution
+            cfd_domain_params  # Pass domain parameters
         )
         self.cfd_solver_worker.moveToThread(self.cfd_thread)
 
@@ -746,6 +812,11 @@ class CFD_GUI(QMainWindow):
         self.status_label.setText("Simulation complete!")
         self.run_cfd_button.setEnabled(True)
         self.cfd_results = results
+        
+        # Update viewer domain parameters from solver results
+        if 'domain_size' in results:
+            self.viewer.cfd_domain_size = results['domain_size']
+            print(f"Updated domain size from results: {results['domain_size']}")
         
         print("\n=== Results ===")
         for key, val in results.items():
@@ -791,7 +862,7 @@ class CFD_GUI(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')  # Use Fusion style for consistent rendering
+    app.setStyle('Fusion')  # Fusion style for consistent rendering
     window = CFD_GUI()
     window.show()
     sys.exit(app.exec_())
