@@ -78,6 +78,23 @@ class MixedPrecisionWrapper:
             self.solver.velocity_y = uy
             self.solver.velocity_z = uz
             self.solver.pressure = rho * self.solver.cs2
+    
+    def compute_macroscopic(self):
+        """Compute density and velocity"""
+        f_compute = self.solver.f.float()
+        if self.ddf_shift:
+            f_compute = f_compute + self.f_eq_ref.float()
+        
+        rho = torch.sum(f_compute, dim=0)
+        ux = torch.sum(f_compute * self.solver.ex.view(-1,1,1,1), dim=0) / (rho + 1e-12)
+        uy = torch.sum(f_compute * self.solver.ey.view(-1,1,1,1), dim=0) / (rho + 1e-12)
+        uz = torch.sum(f_compute * self.solver.ez.view(-1,1,1,1), dim=0) / (rho + 1e-12)
+        u = torch.stack([ux, uy, uz], dim=0)
+        return rho, u
+    
+    def __getattr__(self, name):
+        """Proxy all other attributes to the wrapped solver"""
+        return getattr(self.solver, name)
 
 def wrap_solver_mixed_precision(solver, enable_fp16=True):
     return MixedPrecisionWrapper(solver, enable_fp16=enable_fp16)
