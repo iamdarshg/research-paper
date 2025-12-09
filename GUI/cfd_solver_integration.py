@@ -1,4 +1,4 @@
-# UPDATED: Fixed mesh expansion issue - mesh stays at specified physical size
+# UPDATED: Fixed mesh expansion + mixed precision compatibility
 import numpy as np
 import trimesh
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -86,8 +86,6 @@ class CFDSolverWorker(QObject):
             resized_voxel = zoom(voxel_np.astype(np.float32), zoom_factors, order=1)
             resized_voxel = (resized_voxel > 0.5).astype(np.float32)
             
-            # Position voxel grid in domain space correctly
-            # The voxel grid should span the entire domain, with mesh occupying only body_size
             voxel_tensor = torch.from_numpy(resized_voxel).float().to(device)
             
             # Setup CFD
@@ -133,24 +131,40 @@ class CFDSolverWorker(QObject):
                     progress = int(10 + (step / self.steps) * 90)
                     self.update_progress.emit(progress, f"Step {step}/{self.steps}")
             
-            # Extract results
-            rho, _ = lbm_solver.compute_macroscopic() if hasattr(lbm_solver, 'compute_macroscopic') else (torch.sum(lbm_solver.solver.f, dim=0), None)
+            # Extract results - FIXED to handle both wrapped and unwrapped solvers
+            if hasattr(lbm_solver, 'compute_macroscopic'):
+                # Has compute_macroscopic method (works with wrapper too via __getattr__)
+                rho, u = lbm_solver.compute_macroscopic()
+            else:
+                # Fallback: compute directly from f
+                f_data = lbm_solver.f if hasattr(lbm_solver, 'f') else lbm_solver.solver.f
+                rho = torch.sum(f_data, dim=0)
+                u = None
+            
+            # Get velocity components
+            velocity_x = lbm_solver.velocity_x.cpu().numpy()
+            velocity_y = lbm_solver.velocity_y.cpu().numpy()
+            velocity_z = lbm_solver.velocity_z.cpu().numpy()
             
             results = {
                 "Pressure": lbm_solver.pressure.cpu().numpy() if hasattr(lbm_solver, 'pressure') else rho.cpu().numpy(),
-                "Velocity_X": lbm_solver.velocity_x.cpu().numpy(),
-                "Velocity_Y": lbm_solver.velocity_y.cpu().numpy(),
-                "Velocity_Z": lbm_solver.velocity_z.cpu().numpy(),
-                "Velocity Magnitude": np.sqrt(
-                    lbm_solver.velocity_x.cpu().numpy()**2 +
-                    lbm_solver.velocity_y.cpu().numpy()**2 +
-                    lbm_solver.velocity_z.cpu().numpy()**2
-                ),
+                "Velocity_X": velocity_x,
+                "Velocity_Y": velocity_y,
+                "Velocity_Z": velocity_z,
+                "Velocity Magnitude": np.sqrt(velocity_x**2 + velocity_y**2 + velocity_z**2),
                 "Density": rho.cpu().numpy(),
                 "domain_size": domain_size,
                 "grid_spacing": [grid_spacing_x, grid_spacing_y, grid_spacing_z],
                 "geometry_mask": resized_voxel
             }
+            
+            # Add optional fields if available
+            if hasattr(lbm_solver, 'vorticity'):
+                vorticity_mag = torch.sqrt(torch.sum(lbm_solver.vorticity**2, dim=0))
+                results["Vorticity Magnitude"] = vorticity_mag.cpu().numpy()
+            
+            if hasattr(lbm_solver, 'q_criterion'):
+                results["Q-Criterion"] = lbm_solver.q_criterion.cpu().numpy()
             
             self.simulation_finished.emit(results)
             
