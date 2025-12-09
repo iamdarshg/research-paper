@@ -4,312 +4,385 @@ sys.path.insert(0, os.path.dirname(__file__))
 import torch
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QLineEdit, QFileDialog, QSlider, QComboBox,
-    QProgressBar, QGroupBox, QRadioButton, QTabWidget, QFormLayout,
-    QSpinBox, QDoubleSpinBox, QCheckBox
+    QPushButton, QLabel, QFileDialog, QSlider, QComboBox,
+    QProgressBar, QGroupBox, QTabWidget, QFormLayout,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QDoubleValidator, QVector3D
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QVector3D
 
 import pyqtgraph.opengl as gl
 import numpy as np
 import trimesh
-import os
 import traceback
 from cfd_solver_integration import CFDSolverWorker
+from scipy.ndimage import gaussian_filter
 
 
 class CFDVisualizationWidget(gl.GLViewWidget):
-    """
-    A PyQtGraph GLViewWidget for displaying 3D CFD visualizations.
-    """
+    """GPU-accelerated PyQtGraph GLViewWidget for 3D CFD visualizations"""
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # Set minimum size to prevent collapse
+        self.setMinimumSize(800, 600)
+        
+        # Camera setup
         self.opts['distance'] = 100
-        self.opts['elevation'] = 20  # Look down from slightly above
-        self.opts['azimuth'] = 45    # Rotate 45 degrees
-        self.addItem(gl.GLGridItem())
+        self.opts['elevation'] = 20
+        self.opts['azimuth'] = 45
+        self.opts['fov'] = 60
+        
+        # Background color
+        self.setBackgroundColor((20, 20, 30))
+        
+        # Grid
+        self.grid_item = gl.GLGridItem()
+        self.grid_item.setSize(20, 20, 1)
+        self.grid_item.setSpacing(1, 1, 1)
+        self.addItem(self.grid_item)
+        
+        # Items
         self.mesh_item = None
         self.volume_item = None
-        self.streamline_item = None
-        self.threshold = 0.0
+        self.streamline_items = []
+        
+        # Parameters
+        self.threshold = 0.1
+        self.brightness = 1.0
+        self.contrast = 1.0
+        self.streamline_count = 50
+        self.streamline_length = 100
+        
+        # Mesh transform
+        self.mesh_rotation = [0, 0, 0]
+        self.mesh_scale_factor = 1.0
+        self.mesh_physical_size = 1.0
+        
+        # CFD domain
+        self.cfd_padding_front = 1.0
+        self.cfd_padding_back = 2.0
+        self.cfd_padding_sides = 1.0
+        self.cfd_padding_vertical = 1.0
+        self.cfd_domain_size = [1.0, 1.0, 1.0]
+        self.cfd_offset = [0, 0, 0]
+        
+        # Timer for smooth rendering
+        self.render_timer = QTimer()
+        self.render_timer.timeout.connect(self.update)
+        self.render_timer.start(33)  # 30 FPS
 
-    def display_stl(self, vertices, faces):
-        """
-        Displays an STL mesh with proper centering and orientation.
-        """
+    def set_streamline_params(self, count, length):
+        self.streamline_count = count
+        self.streamline_length = length
+
+    def set_cfd_padding(self, front, back, sides, vertical):
+        self.cfd_padding_front = front
+        self.cfd_padding_back = back
+        self.cfd_padding_sides = sides
+        self.cfd_padding_vertical = vertical
+
+    def set_mesh_rotation(self, rx, ry, rz):
+        self.mesh_rotation = [rx, ry, rz]
+        
+    def set_brightness_contrast(self, brightness, contrast):
+        self.brightness = brightness
+        self.contrast = contrast
+
+    def _apply_rotation(self, vertices, rx, ry, rz):
+        """Apply rotation to vertices"""
+        rx_rad = np.radians(rx)
+        ry_rad = np.radians(ry)
+        rz_rad = np.radians(rz)
+        
+        Rx = np.array([[1, 0, 0],
+                       [0, np.cos(rx_rad), -np.sin(rx_rad)],
+                       [0, np.sin(rx_rad), np.cos(rx_rad)]])
+        
+        Ry = np.array([[np.cos(ry_rad), 0, np.sin(ry_rad)],
+                       [0, 1, 0],
+                       [-np.sin(ry_rad), 0, np.cos(ry_rad)]])
+        
+        Rz = np.array([[np.cos(rz_rad), -np.sin(rz_rad), 0],
+                       [np.sin(rz_rad), np.cos(rz_rad), 0],
+                       [0, 0, 1]])
+        
+        R = Rz @ Ry @ Rx
+        return vertices @ R.T
+
+    def display_stl(self, vertices, faces, physical_size=1.0):
+        """Display STL mesh"""
         if self.mesh_item is not None:
             self.removeItem(self.mesh_item)
         
-        # Center the mesh at origin
+        self.mesh_physical_size = physical_size
+        
+        # Center mesh
         center = np.mean(vertices, axis=0)
-        centered_vertices = vertices - center
+        centered = vertices - center
         
-        # Compute bounding box for scaling
-        bbox_min = np.min(centered_vertices, axis=0)
-        bbox_max = np.max(centered_vertices, axis=0)
-        bbox_size = bbox_max - bbox_min
-        max_extent = np.max(bbox_size)
+        # Scale to physical units
+        bbox = np.max(centered, axis=0) - np.min(centered, axis=0)
+        max_extent = np.max(bbox)
         
-        # Scale to fit within [-25, 25] range for good visibility
         if max_extent > 0:
-            scale_factor = 50.0 / max_extent
-            normalized_vertices = centered_vertices * scale_factor
+            scale = physical_size / max_extent
+            normalized = centered * scale
         else:
-            normalized_vertices = centered_vertices
+            normalized = centered
         
-        # Create mesh item with proper orientation
-        # Most STLs are in Z-up convention, but PyQtGraph uses Y-up
-        # Rotate -90 degrees around X to convert Z-up to Y-up
-        rotation_matrix = np.array([
-            [1,  0,  0],
-            [0,  0, -1],
-            [0,  1,  0]
-        ])
-        rotated_vertices = normalized_vertices @ rotation_matrix.T
-
+        self.mesh_scale_factor = scale if max_extent > 0 else 1.0
+        
+        # Apply rotation
+        rotated = self._apply_rotation(normalized, *self.mesh_rotation)
+        
+        # Create mesh item
         self.mesh_item = gl.GLMeshItem(
-            vertexes=rotated_vertices,
+            vertexes=rotated,
             faces=faces,
             shader='shaded',
             smooth=True,
-            color=(0.8, 0.8, 0.8, 0.6),
+            color=(0.7, 0.7, 0.7, 0.7),
             glOptions='translucent'
         )
         self.addItem(self.mesh_item)
-        self.center_view_on_mesh(rotated_vertices)
+        
+        # Calculate CFD domain
+        body_length = physical_size
+        self.cfd_domain_size = [
+            body_length * (self.cfd_padding_front + 1.0 + self.cfd_padding_back),
+            body_length * (2 * self.cfd_padding_sides + 1.0),
+            body_length * (2 * self.cfd_padding_vertical + 1.0)
+        ]
+        
+        self.cfd_offset = [
+            -body_length * (self.cfd_padding_front - self.cfd_padding_back) / 2,
+            0, 0
+        ]
+        
+        # Center view
+        self.center_view_on_mesh(rotated)
 
     def center_view_on_mesh(self, vertices):
-        """
-        Adjusts the camera to center the view on the loaded mesh.
-        """
+        """Center camera on mesh"""
         if vertices.size > 0:
             center = np.mean(vertices, axis=0)
-            bbox_size = np.max(vertices, axis=0) - np.min(vertices, axis=0)
-            max_extent = np.max(bbox_size)
+            bbox = np.max(vertices, axis=0) - np.min(vertices, axis=0)
+            max_extent = np.max(bbox)
             
-            # Set camera center to mesh center
             self.opts['center'] = QVector3D(
-                float(center[0]), 
-                float(center[1]), 
-                float(center[2])
+                float(center[0]), float(center[1]), float(center[2])
             )
             
-            # Set distance based on mesh size (1.8x for good framing)
-            self.opts['distance'] = max(max_extent * 1.8, 50.0)
+            domain_extent = max(self.cfd_domain_size)
+            self.opts['distance'] = max(domain_extent * 1.5, 3.0)
 
-    def display_volume_data(self, data, color_map='viridis'):
-        """
-        Displays 3D volumetric data with proper transparency and scaling.
-        """
+    def get_cfd_domain_params(self):
+        """Return CFD domain parameters"""
+        return {
+            'domain_size': self.cfd_domain_size,
+            'body_size': self.mesh_physical_size,
+            'padding_front': self.cfd_padding_front,
+            'padding_back': self.cfd_padding_back,
+            'padding_sides': self.cfd_padding_sides,
+            'padding_vertical': self.cfd_padding_vertical,
+            'offset': self.cfd_offset
+        }
+
+    def display_volume_data(self, data, color_map='viridis', smooth=True):
+        """GPU-accelerated volume rendering"""
         from matplotlib import cm
         import matplotlib.colors as mcolors
         
         if self.volume_item is not None:
             self.removeItem(self.volume_item)
         
-        # Clean data
         data_clean = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Check if data is all zeros or garbage
         if np.std(data_clean) < 1e-12:
-            print("Warning: Volume data appears to be uniform/empty")
+            print("Warning: Volume data uniform/empty")
             return
         
-        # Robust normalization using percentiles
-        vmin = np.percentile(data_clean, 5)   # 5th percentile
-        vmax = np.percentile(data_clean, 95)  # 95th percentile
+        # GPU processing if available
+        if torch.cuda.is_available():
+            try:
+                data_torch = torch.from_numpy(data_clean).cuda()
+                data_flat = data_torch.flatten()
+                data_sorted = torch.sort(data_flat)[0]
+                n = len(data_sorted)
+                vmin = data_sorted[int(n * 0.02)].item()
+                vmax = data_sorted[int(n * 0.98)].item()
+                
+                if vmax - vmin > 1e-10:
+                    data_norm = torch.clamp((data_torch - vmin) / (vmax - vmin), 0, 1)
+                else:
+                    data_norm = torch.zeros_like(data_torch)
+                
+                data_adj = data_norm * self.contrast + (self.brightness - 1.0)
+                data_adj = torch.clamp(data_adj, 0, 1).cpu().numpy()
+                
+            except Exception as e:
+                print(f"GPU failed: {e}")
+                vmin = np.percentile(data_clean, 2)
+                vmax = np.percentile(data_clean, 98)
+                if vmax - vmin < 1e-10:
+                    return
+                data_norm = np.clip((data_clean - vmin) / (vmax - vmin), 0, 1)
+                data_adj = np.clip(data_norm * self.contrast + (self.brightness - 1.0), 0, 1)
+        else:
+            vmin = np.percentile(data_clean, 2)
+            vmax = np.percentile(data_clean, 98)
+            if vmax - vmin < 1e-10:
+                return
+            data_norm = np.clip((data_clean - vmin) / (vmax - vmin), 0, 1)
+            data_adj = np.clip(data_norm * self.contrast + (self.brightness - 1.0), 0, 1)
         
-        if vmax - vmin < 1e-10:
-            print("Warning: Volume data has no variation")
-            return
+        if smooth:
+            data_adj = gaussian_filter(data_adj, sigma=0.8)
         
-        # Normalize to [0, 1]
-        data_normalized = np.clip((data_clean - vmin) / (vmax - vmin), 0, 1)
+        data_thresh = np.where(data_adj < self.threshold, 0.0, data_adj)
         
-        # Apply threshold: values below threshold become transparent
-        data_thresholded = np.where(
-            data_normalized < self.threshold,
-            0.0,
-            data_normalized
-        )
-        
-        # Apply colormap
         colormap = cm.get_cmap(color_map)
         norm = mcolors.Normalize(vmin=0, vmax=1)
-        data_rgba = colormap(norm(data_thresholded))
+        data_rgba = colormap(norm(data_thresh))
         
-        # CRITICAL: Make alpha proportional to data magnitude
-        # This creates proper transparency for low-value regions
-        alpha = np.power(data_thresholded, 0.5)  # Gamma correction for better visibility
-        alpha = np.clip(alpha, 0.0, 0.8)  # Limit max opacity to 0.8 for translucency
+        alpha = np.power(data_thresh, 0.25)
+        alpha = np.clip(alpha * 0.95, 0.0, 0.95)
         data_rgba[..., 3] = alpha
         
-        # Convert to uint8
         data_rgba_uint8 = (data_rgba * 255).astype(np.uint8)
         
         try:
             self.volume_item = gl.GLVolumeItem(data_rgba_uint8, glOptions='translucent')
             
-            # Match coordinate system with mesh
-            # If your grid is 32x32x32 and mesh is scaled to fit [-25, 25]:
-            mesh_extent = 50.0  # From -25 to +25
-            grid_size = max(data.shape)
-            voxel_size = mesh_extent / grid_size
-            
-            # Apply scaling
-            self.volume_item.scale(voxel_size, voxel_size, voxel_size)
-            
-            # Center at origin
             nx, ny, nz = data.shape
-            offset_x = -nx * voxel_size / 2.0
-            offset_y = -ny * voxel_size / 2.0
-            offset_z = -nz * voxel_size / 2.0
-            self.volume_item.translate(offset_x, offset_y, offset_z)
+            voxel_size = [
+                self.cfd_domain_size[0] / nx,
+                self.cfd_domain_size[1] / ny,
+                self.cfd_domain_size[2] / nz
+            ]
+            
+            self.volume_item.scale(*voxel_size)
+            
+            offset = [
+                self.cfd_offset[0] - self.cfd_domain_size[0] / 2,
+                self.cfd_offset[1] - self.cfd_domain_size[1] / 2,
+                self.cfd_offset[2] - self.cfd_domain_size[2] / 2
+            ]
+            self.volume_item.translate(*offset)
             
             self.addItem(self.volume_item)
-            
-            print(f"Volume displayed: shape={data.shape}, range=[{vmin:.3e}, {vmax:.3e}]")
+            print(f"Volume: {data.shape}, range=[{vmin:.3e}, {vmax:.3e}]")
             
         except Exception as e:
-            print(f"Failed to display volume data: {e}")
+            print(f"Volume display failed: {e}")
             traceback.print_exc()
 
-
-
-    def generate_streamlines(self, velocity_x, velocity_y, velocity_z, num_seeds=50, step_size=0.5):
-        """
-        Generates streamlines from 3D velocity fields.
-        """
+    def generate_streamlines(self, vx, vy, vz):
+        """Generate streamlines"""
         from scipy.integrate import odeint
         
         def velocity_field(point, t):
-            i, j, k = point
-            i_int, j_int, k_int = int(i), int(j), int(k)
-            
-            # Boundary check
-            if not (0 <= i_int < velocity_x.shape[0]-1 and 
-                    0 <= j_int < velocity_x.shape[1]-1 and 
-                    0 <= k_int < velocity_x.shape[2]-1):
+            i, j, k = int(point[0]), int(point[1]), int(point[2])
+            if not (0 <= i < vx.shape[0]-1 and 
+                    0 <= j < vx.shape[1]-1 and 
+                    0 <= k < vx.shape[2]-1):
                 return [0, 0, 0]
             
-            dx = i - i_int
-            dy = j - j_int
-            dz = k - k_int
-
+            dx, dy, dz = point[0]-i, point[1]-j, point[2]-k
+            
             # Trilinear interpolation
-            vx = (velocity_x[i_int, j_int, k_int] * (1-dx)*(1-dy)*(1-dz) +
-                  velocity_x[i_int+1, j_int, k_int] * dx*(1-dy)*(1-dz) +
-                  velocity_x[i_int, j_int+1, k_int] * (1-dx)*dy*(1-dz) +
-                  velocity_x[i_int+1, j_int+1, k_int] * dx*dy*(1-dz) +
-                  velocity_x[i_int, j_int, k_int+1] * (1-dx)*(1-dy)*dz +
-                  velocity_x[i_int+1, j_int, k_int+1] * dx*(1-dy)*dz +
-                  velocity_x[i_int, j_int+1, k_int+1] * (1-dx)*dy*dz +
-                  velocity_x[i_int+1, j_int+1, k_int+1] * dx*dy*dz)
-
-            vy = (velocity_y[i_int, j_int, k_int] * (1-dx)*(1-dy)*(1-dz) +
-                  velocity_y[i_int+1, j_int, k_int] * dx*(1-dy)*(1-dz) +
-                  velocity_y[i_int, j_int+1, k_int] * (1-dx)*dy*(1-dz) +
-                  velocity_y[i_int+1, j_int+1, k_int] * dx*dy*(1-dz) +
-                  velocity_y[i_int, j_int, k_int+1] * (1-dx)*(1-dy)*dz +
-                  velocity_y[i_int+1, j_int, k_int+1] * dx*(1-dy)*dz +
-                  velocity_y[i_int, j_int+1, k_int+1] * (1-dx)*dy*dz +
-                  velocity_y[i_int+1, j_int+1, k_int+1] * dx*dy*dz)
-
-            vz = (velocity_z[i_int, j_int, k_int] * (1-dx)*(1-dy)*(1-dz) +
-                  velocity_z[i_int+1, j_int, k_int] * dx*(1-dy)*(1-dz) +
-                  velocity_z[i_int, j_int+1, k_int] * (1-dx)*dy*(1-dz) +
-                  velocity_z[i_int+1, j_int+1, k_int] * dx*dy*(1-dz) +
-                  velocity_z[i_int, j_int, k_int+1] * (1-dx)*(1-dy)*dz +
-                  velocity_z[i_int+1, j_int, k_int+1] * dx*(1-dy)*dz +
-                  velocity_z[i_int, j_int+1, k_int+1] * (1-dx)*dy*dz +
-                  velocity_z[i_int+1, j_int+1, k_int+1] * dx*dy*dz)
-
-            return [vx, vy, vz]
-
-        nx, ny, nz = velocity_x.shape
-        center_x, center_y, center_z = nx / 2, ny / 2, nz / 2
-
-        # Generate seeds in a plane upstream of the mesh
+            v = [0, 0, 0]
+            for vi, vel in enumerate([vx, vy, vz]):
+                v[vi] = (
+                    vel[i,j,k]*(1-dx)*(1-dy)*(1-dz) +
+                    vel[i+1,j,k]*dx*(1-dy)*(1-dz) +
+                    vel[i,j+1,k]*(1-dx)*dy*(1-dz) +
+                    vel[i+1,j+1,k]*dx*dy*(1-dz) +
+                    vel[i,j,k+1]*(1-dx)*(1-dy)*dz +
+                    vel[i+1,j,k+1]*dx*(1-dy)*dz +
+                    vel[i,j+1,k+1]*(1-dx)*dy*dz +
+                    vel[i+1,j+1,k+1]*dx*dy*dz
+                )
+            return v
+        
+        nx, ny, nz = vx.shape
         seeds = []
-        grid_size = int(np.sqrt(num_seeds))
-        for y in np.linspace(center_y - 10, center_y + 10, grid_size):
-            for z in np.linspace(center_z - 10, center_z + 10, grid_size):
-                seeds.append([5, y, z])  # Start from x=5 (upstream)
-
+        grid = int(np.sqrt(self.streamline_count))
+        for y in np.linspace(ny*0.3, ny*0.7, grid):
+            for z in np.linspace(nz*0.3, nz*0.7, grid):
+                seeds.append([nx*0.15, y, z])
+        
         streamlines = []
-        max_steps = 100
-
-        for seed in seeds[:num_seeds]:
+        for seed in seeds[:self.streamline_count]:
             try:
-                t = np.linspace(0, step_size * max_steps, max_steps)
+                t = np.linspace(0, 0.5*self.streamline_length, self.streamline_length)
                 sol = odeint(velocity_field, seed, t)
-
-                # Filter out-of-bounds points
-                mask = ((sol[:, 0] >= 0) & (sol[:, 0] < nx) &
-                        (sol[:, 1] >= 0) & (sol[:, 1] < ny) &
-                        (sol[:, 2] >= 0) & (sol[:, 2] < nz))
-
+                
+                mask = ((sol[:,0]>=0) & (sol[:,0]<nx) &
+                        (sol[:,1]>=0) & (sol[:,1]<ny) &
+                        (sol[:,2]>=0) & (sol[:,2]<nz))
+                
                 filtered = sol[mask]
                 if len(filtered) > 2:
-                    # Center streamline coordinates to match mesh
-                    centered = filtered - np.array([nx/2, ny/2, nz/2])
-                    streamlines.append(centered)
-
-            except Exception as e:
-                print(f"Failed to generate streamline from seed {seed}: {e}")
-
+                    phys = np.zeros_like(filtered)
+                    phys[:,0] = (filtered[:,0]/nx)*self.cfd_domain_size[0] + self.cfd_offset[0] - self.cfd_domain_size[0]/2
+                    phys[:,1] = (filtered[:,1]/ny)*self.cfd_domain_size[1] + self.cfd_offset[1] - self.cfd_domain_size[1]/2
+                    phys[:,2] = (filtered[:,2]/nz)*self.cfd_domain_size[2] + self.cfd_offset[2] - self.cfd_domain_size[2]/2
+                    streamlines.append(phys)
+            except:
+                pass
+        
         return streamlines
 
     def display_streamlines(self, streamlines):
-        """
-        Displays streamlines in the 3D view.
-        """
-        if self.streamline_item is not None:
-            for item in self.streamline_item:
-                self.removeItem(item)
-            self.streamline_item = None
-
+        """Display streamlines"""
+        for item in self.streamline_items:
+            self.removeItem(item)
+        self.streamline_items = []
+        
         if not streamlines:
             return
-
-        line_items = []
-        for streamline in streamlines[:50]:
+        
+        for streamline in streamlines[:self.streamline_count]:
             if len(streamline) > 1:
-                item = gl.GLLinePlotItem(
-                    pos=streamline, 
-                    color=(0, 1, 0, 0.8), 
-                    width=2, 
-                    antialias=True
-                )
-                line_items.append(item)
+                t = np.linspace(0, 1, len(streamline))
+                colors = np.zeros((len(streamline), 4))
+                colors[:,0] = t
+                colors[:,1] = 1-t
+                colors[:,2] = 0.2
+                colors[:,3] = 0.9
+                
+                item = gl.GLLinePlotItem(pos=streamline, color=colors, 
+                                        width=2.5, antialias=True)
+                self.streamline_items.append(item)
                 self.addItem(item)
 
-        self.streamline_item = line_items
-
     def clear_all(self):
-        """Clears all displayed items except grid."""
-        if self.mesh_item is not None:
+        """Clear all items"""
+        if self.mesh_item:
             self.removeItem(self.mesh_item)
             self.mesh_item = None
-        if self.volume_item is not None:
+        if self.volume_item:
             self.removeItem(self.volume_item)
             self.volume_item = None
-        if self.streamline_item is not None:
-            for item in self.streamline_item:
-                self.removeItem(item)
-            self.streamline_item = None
+        for item in self.streamline_items:
+            self.removeItem(item)
+        self.streamline_items = []
 
 
 class CFD_GUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CFD Solver GUI")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setWindowTitle("CFD Solver GUI - GPU Accelerated")
+        self.setGeometry(100, 100, 1600, 1000)
 
+        # Main widget
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
+        self.main_layout.setSpacing(10)
+        self.main_layout.setContentsMargins(5, 5, 5, 5)
 
         self.setup_control_panel()
         self.setup_visualization_panel()
@@ -319,11 +392,23 @@ class CFD_GUI(QMainWindow):
         self.stl_mesh = None
 
     def setup_control_panel(self):
-        self.control_panel = QVBoxLayout()
-        self.main_layout.addLayout(self.control_panel, 1)
+        """Setup scrollable control panel"""
+        # Create scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(400)
+        scroll.setMaximumWidth(450)
+        
+        # Control widget
+        control_widget = QWidget()
+        self.control_panel = QVBoxLayout(control_widget)
+        self.control_panel.setSpacing(5)
+        scroll.setWidget(control_widget)
+        
+        self.main_layout.addWidget(scroll)
 
-        # --- STL Input ---
-        stl_group = QGroupBox("STL Input")
+        # === STL Input ===
+        stl_group = QGroupBox("STL Input & Geometry")
         stl_layout = QVBoxLayout()
         stl_group.setLayout(stl_layout)
         self.control_panel.addWidget(stl_group)
@@ -333,216 +418,317 @@ class CFD_GUI(QMainWindow):
         stl_layout.addWidget(self.load_stl_button)
 
         self.stl_path_label = QLabel("No STL loaded.")
+        self.stl_path_label.setWordWrap(True)
         stl_layout.addWidget(self.stl_path_label)
+        
+        # Physical size
+        form = QFormLayout()
+        self.physical_size_input = QDoubleSpinBox()
+        self.physical_size_input.setRange(0.001, 1000.0)
+        self.physical_size_input.setValue(1.0)
+        self.physical_size_input.setDecimals(3)
+        self.physical_size_input.setSuffix(" m")
+        self.physical_size_input.valueChanged.connect(self.update_mesh_display)
+        form.addRow("Physical Length:", self.physical_size_input)
+        stl_layout.addLayout(form)
+        
+        # Padding
+        pad_group = QGroupBox("CFD Domain Padding")
+        pad_layout = QFormLayout()
+        pad_group.setLayout(pad_layout)
+        stl_layout.addWidget(pad_group)
+        
+        self.padding_front_input = QDoubleSpinBox()
+        self.padding_front_input.setRange(0.1, 10.0)
+        self.padding_front_input.setValue(1.0)
+        self.padding_front_input.valueChanged.connect(self.update_cfd_padding)
+        pad_layout.addRow("Front (L):", self.padding_front_input)
+        
+        self.padding_back_input = QDoubleSpinBox()
+        self.padding_back_input.setRange(0.1, 10.0)
+        self.padding_back_input.setValue(2.0)
+        self.padding_back_input.valueChanged.connect(self.update_cfd_padding)
+        pad_layout.addRow("Back (L):", self.padding_back_input)
+        
+        self.padding_sides_input = QDoubleSpinBox()
+        self.padding_sides_input.setRange(0.1, 10.0)
+        self.padding_sides_input.setValue(1.0)
+        self.padding_sides_input.valueChanged.connect(self.update_cfd_padding)
+        pad_layout.addRow("Sides (L):", self.padding_sides_input)
+        
+        self.padding_vertical_input = QDoubleSpinBox()
+        self.padding_vertical_input.setRange(0.1, 10.0)
+        self.padding_vertical_input.setValue(1.0)
+        self.padding_vertical_input.valueChanged.connect(self.update_cfd_padding)
+        pad_layout.addRow("Vertical (L):", self.padding_vertical_input)
+        
+        # Rotation
+        rot_group = QGroupBox("Mesh Orientation")
+        rot_layout = QFormLayout()
+        rot_group.setLayout(rot_layout)
+        stl_layout.addWidget(rot_group)
+        
+        self.rotation_x_slider = QSlider(Qt.Horizontal)
+        self.rotation_x_slider.setRange(-180, 180)
+        self.rotation_x_slider.setValue(0)
+        self.rotation_x_slider.valueChanged.connect(self.update_mesh_rotation)
+        self.rotation_x_label = QLabel("0°")
+        rx_layout = QHBoxLayout()
+        rx_layout.addWidget(self.rotation_x_slider)
+        rx_layout.addWidget(self.rotation_x_label)
+        rot_layout.addRow("Rotate X:", rx_layout)
+        
+        self.rotation_y_slider = QSlider(Qt.Horizontal)
+        self.rotation_y_slider.setRange(-180, 180)
+        self.rotation_y_slider.setValue(0)
+        self.rotation_y_slider.valueChanged.connect(self.update_mesh_rotation)
+        self.rotation_y_label = QLabel("0°")
+        ry_layout = QHBoxLayout()
+        ry_layout.addWidget(self.rotation_y_slider)
+        ry_layout.addWidget(self.rotation_y_label)
+        rot_layout.addRow("Rotate Y:", ry_layout)
+        
+        self.rotation_z_slider = QSlider(Qt.Horizontal)
+        self.rotation_z_slider.setRange(-180, 180)
+        self.rotation_z_slider.setValue(0)
+        self.rotation_z_slider.valueChanged.connect(self.update_mesh_rotation)
+        self.rotation_z_label = QLabel("0°")
+        rz_layout = QHBoxLayout()
+        rz_layout.addWidget(self.rotation_z_slider)
+        rz_layout.addWidget(self.rotation_z_label)
+        rot_layout.addRow("Rotate Z:", rz_layout)
 
-        # --- CFD Parameters ---
-        cfd_params_group = QGroupBox("CFD Configuration")
-        cfd_params_layout = QVBoxLayout()
-        cfd_params_group.setLayout(cfd_params_layout)
-        self.control_panel.addWidget(cfd_params_group)
+        # === CFD Parameters ===
+        cfd_group = QGroupBox("CFD Configuration")
+        cfd_layout = QVBoxLayout()
+        cfd_group.setLayout(cfd_layout)
+        self.control_panel.addWidget(cfd_group)
 
         self.cfd_tabs = QTabWidget()
-        cfd_params_layout.addWidget(self.cfd_tabs)
+        cfd_layout.addWidget(self.cfd_tabs)
 
-        # --- Basic Parameters Tab ---
+        # Basic tab
         basic_tab = QWidget()
-        basic_layout = QFormLayout()
-        basic_tab.setLayout(basic_layout)
-        self.cfd_tabs.addTab(basic_tab, "Basic Parameters")
+        basic_form = QFormLayout()
+        basic_tab.setLayout(basic_form)
+        self.cfd_tabs.addTab(basic_tab, "Basic")
 
         self.reynolds_input = QDoubleSpinBox()
-        self.reynolds_input.setRange(100, 1000000)  # Removed upper bound
+        self.reynolds_input.setRange(100, 1000000)
         self.reynolds_input.setValue(10000)
         self.reynolds_input.setSingleStep(1000)
-        basic_layout.addRow("Reynolds Number:", self.reynolds_input)
+        basic_form.addRow("Reynolds:", self.reynolds_input)
 
         self.mach_input = QDoubleSpinBox()
         self.mach_input.setRange(0.01, 0.5)
         self.mach_input.setValue(0.05)
-        self.mach_input.setSingleStep(0.01)
         self.mach_input.setDecimals(3)
-        basic_layout.addRow("Mach Number:", self.mach_input)
+        basic_form.addRow("Mach:", self.mach_input)
 
         self.steps_input = QSpinBox()
-        self.steps_input.setRange(10, 100000)  # Increased range
+        self.steps_input.setRange(10, 100000)
         self.steps_input.setValue(100)
-        self.steps_input.setSingleStep(10)
-        basic_layout.addRow("Simulation Steps:", self.steps_input)
+        basic_form.addRow("Steps:", self.steps_input)
 
-        # --- Advanced Parameters Tab ---
-        advanced_tab = QWidget()
-        advanced_layout = QFormLayout()
-        advanced_tab.setLayout(advanced_layout)
-        self.cfd_tabs.addTab(advanced_tab, "Advanced Parameters")
+        # Advanced tab
+        adv_tab = QWidget()
+        adv_form = QFormLayout()
+        adv_tab.setLayout(adv_form)
+        self.cfd_tabs.addTab(adv_tab, "Advanced")
 
         self.grid_resolution_input = QSpinBox()
-        self.grid_resolution_input.setRange(16, 8192)  # Increased range
+        self.grid_resolution_input.setRange(8, 512)
         self.grid_resolution_input.setValue(32)
-        self.grid_resolution_input.setSingleStep(8)
-        advanced_layout.addRow("Grid Resolution:", self.grid_resolution_input)
-
-        self.adaptive_cells_input = QSpinBox()
-        self.adaptive_cells_input.setRange(1000, 1000000)  # Increased range
-        self.adaptive_cells_input.setValue(5000)
-        self.adaptive_cells_input.setSingleStep(1000)
-        advanced_layout.addRow("Adaptive Cells Target:", self.adaptive_cells_input)
-
-        self.refinement_levels_input = QSpinBox()
-        self.refinement_levels_input.setRange(1, 10)  # Increased range
-        self.refinement_levels_input.setValue(3)
-        advanced_layout.addRow("Refinement Levels:", self.refinement_levels_input)
-
-        self.output_interval_input = QSpinBox()
-        self.output_interval_input.setRange(1, 10000)  # Increased range
-        self.output_interval_input.setValue(50)
-        advanced_layout.addRow("Output Interval:", self.output_interval_input)
-
-        # Solver selection
-        solver_selection_group = QGroupBox("Solver Selection")
-        solver_selection_layout = QFormLayout()
-        solver_selection_group.setLayout(solver_selection_layout)
-        advanced_layout.addRow(solver_selection_group)
+        adv_form.addRow("Grid Resolution:", self.grid_resolution_input)
 
         self.solver_selector = QComboBox()
         self.solver_selector.addItems(["d3q19_mrt", "d3q27_cascaded"])
-        self.solver_selector.setCurrentText("d3q19_mrt")
-        solver_selection_layout.addRow("CFD Solver:", self.solver_selector)
-
-        # LBM Physics parameters
-        lbm_group = QGroupBox("LBM Physics Configuration")
-        lbm_layout = QFormLayout()
-        lbm_group.setLayout(lbm_layout)
-        advanced_layout.addRow(lbm_group)
-
-        self.turbulence_model_selector = QComboBox()
-        self.turbulence_model_selector.addItems(["none", "smagorinsky", "dynamic_smagorinsky", "wale"])
-        self.turbulence_model_selector.setCurrentText("dynamic_smagorinsky")
-        lbm_layout.addRow("Turbulence Model:", self.turbulence_model_selector)
-
-        self.smagorinsky_constant_input = QDoubleSpinBox()
-        self.smagorinsky_constant_input.setRange(0.01, 1.0)
-        self.smagorinsky_constant_input.setValue(0.17)
-        self.smagorinsky_constant_input.setDecimals(3)
-        self.smagorinsky_constant_input.setSingleStep(0.01)
-        lbm_layout.addRow("Smagorinsky Constant:", self.smagorinsky_constant_input)
-
-        self.use_vorticity_confinement = QCheckBox()
-        self.use_vorticity_confinement.setChecked(True)
-        lbm_layout.addRow("Vorticity Confinement:", self.use_vorticity_confinement)
-
-        self.use_q_criterion = QCheckBox()
-        self.use_q_criterion.setChecked(True)
-        lbm_layout.addRow("Compute Q-Criterion:", self.use_q_criterion)
-
-        # Relaxation times
-        relaxation_group = QGroupBox("Relaxation Parameters")
-        relaxation_layout = QFormLayout()
-        relaxation_group.setLayout(relaxation_layout)
-        advanced_layout.addRow(relaxation_group)
-
-        self.s_bulk_input = QDoubleSpinBox()
-        self.s_bulk_input.setRange(0.5, 5.0)  # Increased range
-        self.s_bulk_input.setValue(1.0)
-        self.s_bulk_input.setSingleStep(0.1)
-        self.s_bulk_input.setDecimals(1)
-        relaxation_layout.addRow("Bulk Viscosity (s_bulk):", self.s_bulk_input)
-
-        self.s_energy_input = QDoubleSpinBox()
-        self.s_energy_input.setRange(1.0, 5.0)  # Increased range
-        self.s_energy_input.setValue(1.2)
-        self.s_energy_input.setSingleStep(0.1)
-        self.s_energy_input.setDecimals(1)
-        relaxation_layout.addRow("Energy Mode (s_energy):", self.s_energy_input)
-
-        self.s_higher_input = QDoubleSpinBox()
-        self.s_higher_input.setRange(1.0, 5.0)  # Increased range
-        self.s_higher_input.setValue(1.4)
-        self.s_higher_input.setSingleStep(0.1)
-        self.s_higher_input.setDecimals(1)
-        relaxation_layout.addRow("Higher Modes (s_higher):", self.s_higher_input)
+        adv_form.addRow("Solver:", self.solver_selector)
 
         self.run_cfd_button = QPushButton("Run CFD Simulation")
         self.run_cfd_button.clicked.connect(self.run_cfd_simulation)
-        cfd_params_layout.addWidget(self.run_cfd_button)
+        cfd_layout.addWidget(self.run_cfd_button)
         
         self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        cfd_params_layout.addWidget(self.progress_bar)
+        cfd_layout.addWidget(self.progress_bar)
 
-        self.status_label = QLabel("Ready.")
-        cfd_params_layout.addWidget(self.status_label)
+        gpu_status = "GPU Available" if torch.cuda.is_available() else "CPU Only"
+        self.status_label = QLabel(f"Ready. {gpu_status}")
+        self.status_label.setWordWrap(True)
+        cfd_layout.addWidget(self.status_label)
 
-        # --- Visualization Controls ---
+        # === Visualization ===
         vis_group = QGroupBox("Visualization")
         vis_layout = QVBoxLayout()
         vis_group.setLayout(vis_layout)
         self.control_panel.addWidget(vis_group)
 
-        vis_layout.addWidget(QLabel("Display Field:"))
         self.field_selector = QComboBox()
-        self.field_selector.addItems(["None", "Pressure", "Velocity Magnitude", "Density", 
-                                     "Streamlines", "Vorticity Magnitude", "Q-Criterion"])
+        self.field_selector.addItems(["None", "Pressure", "Velocity Magnitude", 
+                                     "Density", "Streamlines", "Vorticity Magnitude", "Q-Criterion"])
         self.field_selector.currentIndexChanged.connect(self.update_visualization)
+        vis_layout.addWidget(QLabel("Field:"))
         vis_layout.addWidget(self.field_selector)
 
-        self.vis_slider_label = QLabel("Threshold (0-1):")
-        vis_layout.addWidget(self.vis_slider_label)
-        self.vis_slider = QSlider(Qt.Horizontal)
-        self.vis_slider.setRange(0, 100)
-        self.vis_slider.setValue(10)
-        self.vis_slider.valueChanged.connect(self.update_visualization)
-        vis_layout.addWidget(self.vis_slider)
+        self.threshold_label = QLabel("Threshold: 0.10")
+        vis_layout.addWidget(self.threshold_label)
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setRange(0, 100)
+        self.threshold_slider.setValue(10)
+        self.threshold_slider.valueChanged.connect(self.update_threshold)
+        vis_layout.addWidget(self.threshold_slider)
+        
+        self.brightness_label = QLabel("Brightness: 1.00")
+        vis_layout.addWidget(self.brightness_label)
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(0, 200)
+        self.brightness_slider.setValue(100)
+        self.brightness_slider.valueChanged.connect(self.update_brightness_contrast)
+        vis_layout.addWidget(self.brightness_slider)
+        
+        self.contrast_label = QLabel("Contrast: 1.00")
+        vis_layout.addWidget(self.contrast_label)
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(10, 300)
+        self.contrast_slider.setValue(100)
+        self.contrast_slider.valueChanged.connect(self.update_brightness_contrast)
+        vis_layout.addWidget(self.contrast_slider)
+        
+        # Streamlines
+        stream_group = QGroupBox("Streamlines")
+        stream_layout = QVBoxLayout()
+        stream_group.setLayout(stream_layout)
+        vis_layout.addWidget(stream_group)
+        
+        self.streamline_count_label = QLabel("Count: 50")
+        stream_layout.addWidget(self.streamline_count_label)
+        self.streamline_count_slider = QSlider(Qt.Horizontal)
+        self.streamline_count_slider.setRange(10, 200)
+        self.streamline_count_slider.setValue(50)
+        self.streamline_count_slider.valueChanged.connect(self.update_streamline_params)
+        stream_layout.addWidget(self.streamline_count_slider)
+        
+        self.streamline_length_label = QLabel("Length: 100")
+        stream_layout.addWidget(self.streamline_length_label)
+        self.streamline_length_slider = QSlider(Qt.Horizontal)
+        self.streamline_length_slider.setRange(20, 500)
+        self.streamline_length_slider.setValue(100)
+        self.streamline_length_slider.valueChanged.connect(self.update_streamline_params)
+        stream_layout.addWidget(self.streamline_length_slider)
 
-        self.control_panel.addStretch(1)
+        self.control_panel.addStretch()
 
     def setup_visualization_panel(self):
-        self.visualization_panel = QVBoxLayout()
-        self.main_layout.addLayout(self.visualization_panel, 3)
-
+        """Setup visualization panel"""
         self.viewer = CFDVisualizationWidget()
-        self.visualization_panel.addWidget(self.viewer)
+        self.main_layout.addWidget(self.viewer, stretch=1)
+    
+    def update_cfd_padding(self):
+        self.viewer.set_cfd_padding(
+            self.padding_front_input.value(),
+            self.padding_back_input.value(),
+            self.padding_sides_input.value(),
+            self.padding_vertical_input.value()
+        )
+        self.update_mesh_display()
+    
+    def update_mesh_rotation(self):
+        rx = self.rotation_x_slider.value()
+        ry = self.rotation_y_slider.value()
+        rz = self.rotation_z_slider.value()
+        
+        self.rotation_x_label.setText(f"{rx}°")
+        self.rotation_y_label.setText(f"{ry}°")
+        self.rotation_z_label.setText(f"{rz}°")
+        
+        self.viewer.set_mesh_rotation(rx, ry, rz)
+        self.update_mesh_display()
+    
+    def update_mesh_display(self):
+        if self.stl_mesh is not None:
+            self.viewer.display_stl(
+                self.stl_mesh.vertices, 
+                self.stl_mesh.faces, 
+                self.physical_size_input.value()
+            )
+    
+    def update_threshold(self):
+        val = self.threshold_slider.value() / 100.0
+        self.threshold_label.setText(f"Threshold: {val:.2f}")
+        self.viewer.threshold = val
+        self.update_visualization()
+    
+    def update_brightness_contrast(self):
+        brightness = self.brightness_slider.value() / 100.0
+        contrast = self.contrast_slider.value() / 100.0
+        
+        self.brightness_label.setText(f"Brightness: {brightness:.2f}")
+        self.contrast_label.setText(f"Contrast: {contrast:.2f}")
+        
+        self.viewer.set_brightness_contrast(brightness, contrast)
+        self.update_visualization()
+    
+    def update_streamline_params(self):
+        count = self.streamline_count_slider.value()
+        length = self.streamline_length_slider.value()
+        
+        self.streamline_count_label.setText(f"Count: {count}")
+        self.streamline_length_label.setText(f"Length: {length}")
+        
+        self.viewer.set_streamline_params(count, length)
+        
+        if hasattr(self, 'cfd_results') and self.field_selector.currentText() == "Streamlines":
+            self.regenerate_streamlines()
+
+    def regenerate_streamlines(self):
+        if all(k in self.cfd_results for k in ["Velocity_X", "Velocity_Y", "Velocity_Z"]):
+            sl = self.viewer.generate_streamlines(
+                self.cfd_results["Velocity_X"],
+                self.cfd_results["Velocity_Y"],
+                self.cfd_results["Velocity_Z"]
+            )
+            self.viewer.display_streamlines(sl)
 
     def load_stl_file(self):
-        file_dialog = QFileDialog()
-        filepath, _ = file_dialog.getOpenFileName(self, "Load STL File", "", "STL Files (*.stl)")
+        filepath, _ = QFileDialog.getOpenFileName(self, "Load STL", "", "STL Files (*.stl)")
         if filepath:
             self.current_stl_path = filepath
             self.stl_path_label.setText(f"Loaded: {os.path.basename(filepath)}")
-            self.status_label.setText("STL file loaded. Ready to simulate.")
             
             try:
                 mesh = trimesh.load_mesh(filepath)
-                if (not hasattr(mesh, 'vertices') or mesh.vertices.size == 0 or
-                    not hasattr(mesh, 'faces') or mesh.faces.size == 0):
-                    self.status_label.setText("STL file is empty or invalid.")
+                if not hasattr(mesh, 'vertices') or mesh.vertices.size == 0:
+                    self.status_label.setText("Invalid STL file")
                     return
                 self.stl_mesh = mesh
-                self.viewer.display_stl(mesh.vertices, mesh.faces)
+                self.viewer.display_stl(mesh.vertices, mesh.faces, self.physical_size_input.value())
+                self.status_label.setText("STL loaded. Ready to simulate.")
             except Exception as e:
-                self.status_label.setText(f"Error loading STL: {e}")
+                self.status_label.setText(f"Error: {e}")
                 traceback.print_exc()
 
     def run_cfd_simulation(self):
         if not self.current_stl_path:
-            self.status_label.setText("Please load an STL file first.")
+            self.status_label.setText("Load STL first!")
             return
 
-        if self.cfd_solver_thread and self.cfd_solver_thread.isRunning():
-            self.cfd_solver_thread.requestInterruption()
-            self.cfd_solver_thread.wait()
+        if hasattr(self, 'cfd_thread') and self.cfd_thread.isRunning():
+            self.cfd_thread.requestInterruption()
+            self.cfd_thread.wait()
 
-        reynolds = self.reynolds_input.value()
-        mach = self.mach_input.value()
-        steps = self.steps_input.value()
-        solver_type = self.solver_selector.currentText()
-
-        self.status_label.setText("Starting CFD simulation...")
+        self.status_label.setText("Starting simulation...")
         self.progress_bar.setValue(0)
         self.run_cfd_button.setEnabled(False)
         self.viewer.clear_all()
 
         self.cfd_thread = QThread()
-        self.cfd_solver_worker = CFDSolverWorker(self.current_stl_path, reynolds, mach, steps, solver_type)
+        self.cfd_solver_worker = CFDSolverWorker(
+            self.current_stl_path,
+            self.reynolds_input.value(),
+            self.mach_input.value(),
+            self.steps_input.value(),
+            self.solver_selector.currentText()
+        )
         self.cfd_solver_worker.moveToThread(self.cfd_thread)
 
         self.cfd_solver_worker.update_progress.connect(self.update_progress)
@@ -557,53 +743,55 @@ class CFD_GUI(QMainWindow):
         self.status_label.setText(message)
 
     def cfd_simulation_finished(self, results):
-        self.status_label.setText("CFD simulation complete.")
+        self.status_label.setText("Simulation complete!")
         self.run_cfd_button.setEnabled(True)
         self.cfd_results = results
         
-        if "Velocity_X" in results and "Velocity_Y" in results and "Velocity_Z" in results:
-            self.cfd_results["Streamlines"] = self.viewer.generate_streamlines(
-                results["Velocity_X"], results["Velocity_Y"], results["Velocity_Z"]
-            )
+        print("\n=== Results ===")
+        for key, val in results.items():
+            if isinstance(val, np.ndarray) and val.ndim == 3:
+                print(f"{key}: {val.shape}, [{np.min(val):.3e}, {np.max(val):.3e}]")
+        
         self.update_visualization()
         self.cfd_thread.quit()
         self.cfd_thread.wait()
 
     def cfd_simulation_error(self, message):
-        self.status_label.setText(f"CFD Error: {message}")
+        self.status_label.setText(f"Error: {message}")
         self.run_cfd_button.setEnabled(True)
 
     def update_visualization(self):
-        selected_field = self.field_selector.currentText()
+        field = self.field_selector.currentText()
         if not hasattr(self, 'cfd_results') or self.cfd_results is None:
             return
 
-        self.viewer.threshold = self.vis_slider.value() / 100.0
         self.viewer.clear_all()
 
         if self.stl_mesh:
-            self.viewer.display_stl(self.stl_mesh.vertices, self.stl_mesh.faces)
+            self.viewer.display_stl(
+                self.stl_mesh.vertices,
+                self.stl_mesh.faces,
+                self.physical_size_input.value()
+            )
 
-        if selected_field == "None":
+        if field == "None":
             return
 
-        data_to_display = self.cfd_results.get(selected_field)
+        data = self.cfd_results.get(field)
 
-        if data_to_display is None:
-            self.status_label.setText(f"No data available for '{selected_field}'.")
+        if field == "Streamlines" or data is None:
+            if field == "Streamlines" and "Velocity_X" in self.cfd_results:
+                self.regenerate_streamlines()
             return
 
-        if selected_field in ["Pressure", "Velocity Magnitude", "Density", "Vorticity Magnitude", "Q-Criterion"]:
-            self.viewer.display_volume_data(data_to_display)
-            self.status_label.setText(f"Displaying {selected_field}.")
-        elif selected_field == "Streamlines":
-            if data_to_display and len(data_to_display) > 0:
-                self.viewer.display_streamlines(data_to_display)
-                self.status_label.setText(f"Displaying {selected_field}.")
+        if field in ["Pressure", "Velocity Magnitude", "Density", "Vorticity Magnitude", "Q-Criterion"]:
+            self.viewer.display_volume_data(data, smooth=True)
+            self.status_label.setText(f"Displaying {field}")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyle('Fusion')  # Use Fusion style for consistent rendering
     window = CFD_GUI()
     window.show()
     sys.exit(app.exec_())
