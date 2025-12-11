@@ -140,6 +140,11 @@ class LBMPhysicsConfig:
     s_energy: float = 1.2  # Energy mode relaxation
     s_higher: float = 1.4  # Higher order moments relaxation
 
+    # D3Q27 Cascaded LBM relaxation parameters
+    s_nu_d3q27: float = 1.0 / 0.6    # Viscosity relaxation
+    s_e_d3q27: float = 1.2           # Energy relaxation
+    s_h_d3q27: float = 1.6           # Higher order relaxation
+
     # Boundary conditions
     inlet_velocity_relaxation: float = 0.5  # For Zou-He BC smoothing
     convergence_tolerance: float = 1e-5  # Velocity change threshold
@@ -159,14 +164,16 @@ class LBMPhysicsConfig:
 @dataclass
 class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
+    solver_type: str = "D3Q19"  # "D3Q19" or "D3Q27"
     base_grid_resolution: int = 32  # Consistent grid resolution - no resizing needed
     mach_number: float = 0.025
     reynolds_number: float = 1e6
     simulation_steps: int = 1000
     output_interval: int = 50
     device_id: int = 0
-    # Adaptive mesh refinement - for compatibility with older code, resolution maps to base_grid_resolution
-    adaptive_cells_target: int = int(1e5)  # Target ~5k cells (for simulations that use refinement)
+    # Adaptive mesh refinement
+    use_amr: bool = False
+    adaptive_cells_target: int = int(5e3)  # Target ~5k cells for AMR
     refinement_levels: int = 3
     # LBM configuration
     lbm_config: LBMPhysicsConfig = None   # LBM parameters
@@ -895,14 +902,21 @@ class AdvancedCFDSimulator:
         self.resolution = config.base_grid_resolution
 
         # Adaptive mesh refinement
-        self.mesh_refinement = AdaptiveMeshRefinement(
-            target_cells=config.adaptive_cells_target,
-            refinement_levels=config.refinement_levels
-        )
+        if config.use_amr:
+            self.mesh_refinement = AdaptiveMeshRefinement(
+                target_cells=config.adaptive_cells_target,
+                refinement_levels=config.refinement_levels
+            )
+        else:
+            self.mesh_refinement = None
 
-        # GPU LBM solver with SoA layout - use advanced solver with CFD config
-        # The AdvancedGPULBMSolver expects the same interface as the CFD config
-        self.lbm_solver = AdvancedGPULBMSolver(self.config, device, LBMPhysicsConfig)
+        # Select and initialize the LBM solver
+        if config.solver_type == "D3Q19":
+            self.lbm_solver = AdvancedGPULBMSolver(self.config, device, LBMPhysicsConfig)
+        elif config.solver_type == "D3Q27":
+            self.lbm_solver = D3Q27CascadedSolver(self.config, device, LBMPhysicsConfig)
+        else:
+            raise ValueError(f"Unknown solver type: {config.solver_type}")
 
         # Initialize flow field
         self.init_flow_field()
@@ -919,9 +933,12 @@ class AdvancedCFDSimulator:
         """
         device = geometry.device
 
-        # Step 1: Adaptive mesh refinement
-        print("Applying adaptive mesh refinement...")
-        refined_geometry = self.mesh_refinement.refine_mesh(geometry, geometry)
+        # Step 1: Adaptive mesh refinement (if enabled)
+        if self.mesh_refinement:
+            print("Applying adaptive mesh refinement...")
+            refined_geometry = self.mesh_refinement.refine_mesh(geometry, geometry)
+        else:
+            refined_geometry = geometry
 
         # Step 2: Resize to LBM resolution if needed
         if refined_geometry.shape != (self.resolution, self.resolution, self.resolution):
@@ -936,8 +953,7 @@ class AdvancedCFDSimulator:
         geometry_mask = (refined_geometry > 0.5).float()
 
         # Step 3: Run GPU LBM solver
-        print("Running GPU LBM solver...")
-        # Use LBM solver with SoA layout and 256-thread blocks
+        print(f"Running {self.config.solver_type} GPU LBM solver...")
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
 
         # Step 4: Compute aerodynamic coefficients
@@ -1103,7 +1119,7 @@ class AerodynamicLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec) -> torch.Tensor:
+    def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec, cfd_simulator: "AdvancedCFDSimulator") -> torch.Tensor:
         """
         Compute aerodynamic loss balancing drag, lift, and volume using advanced CFD.
         """
@@ -1112,13 +1128,14 @@ class AerodynamicLoss(nn.Module):
 
         for b in range(batch_size):
             # Get single voxel grid for CFD
-            single_voxel_grid = voxel_grid[b:b+1]
+            single_voxel_grid = voxel_grid[b]
+            geometry = (single_voxel_grid > 0.5).float()
 
-            # Run advanced CFD analysis with adaptive mesh refinement
-            cfd_results = run_advanced_cfd_fast(single_voxel_grid, design_spec)
+            # Run advanced CFD analysis with the provided simulator
+            cfd_results = cfd_simulator.simulate_aerodynamics(geometry, steps=100)
 
             # Volume penalty (space weight)
-            volume = voxel_grid[b].sum() / np.prod(voxel_grid.shape[1:])
+            volume = geometry.sum() / np.prod(geometry.shape)
             volume_loss = design_spec.space_weight * volume
 
             # Drag coefficient penalty (drag weight)
@@ -1132,67 +1149,6 @@ class AerodynamicLoss(nn.Module):
             loss += volume_loss + drag_loss + lift_loss
 
         return loss / batch_size
-
-# ============================================================================
-# FLUIDX3D INTEGRATION FUNCTIONS
-# ============================================================================
-
-def find_fluidx3d_executable() -> Optional[Path]:
-    """Locate FluidX3D executable on system"""
-    candidates = []
-
-    if os.name == 'nt':  # Windows
-        candidates.extend([
-            Path('D:\\CodeProjects\\FluidX3D\\bin\\FluidX3D.exe'),
-            Path(os.environ.get('PROGRAMFILES', 'C:\\Program Files')) / 'FluidX3D' / 'FluidX3D.exe',
-            Path(os.environ.get('PROGRAMFILES(X86)', 'C:\\Program Files (x86)')) / 'FluidX3D' / 'FluidX3D.exe',
-            Path.home() / 'FluidX3D' / 'FluidX3D.exe',
-            Path.cwd() / 'FluidX3D' / 'FluidX3D.exe',
-        ])
-
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            print(f"Found FluidX3D executable at: {candidate}")
-            return candidate
-
-    # Try to find in PATH
-    try:
-        result = subprocess.run(['where', 'FluidX3D.exe'] if os.name == 'nt' else ['which', 'FluidX3D'],
-                              capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            path_str = result.stdout.strip().split('\n')[0]
-            if path_str:
-                print(f"Found FluidX3D executable at: {path_str}")
-                return Path(path_str)
-    except Exception:
-        pass
-    print("FluidX3D executable not found.")
-    return None
-
-def run_advanced_cfd_fast(voxel_grid: torch.Tensor, design_spec: DesignSpec) -> Dict[str, Any]:
-    """
-    Fast advanced CFD simulation with adaptive mesh refinement.
-    Integrates FluidX3D with LBM solver for optimal performance.
-    """
-    fluidx3d_exe = find_fluidx3d_executable()
-    
-    # Use advanced CFD simulator
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    cfd_config = CFDConfig()
-    simulator = AdvancedCFDSimulator(cfd_config, device)
-    
-    # Convert voxel grid to geometry
-    geometry = voxel_grid.squeeze(0) if voxel_grid.dim() == 4 else voxel_grid
-    geometry = (geometry > 0.5).float()
-    
-    # Run CFD simulation with adaptive mesh refinement
-    results = simulator.simulate_aerodynamics(geometry, steps=100)
-    
-    return {
-        'drag_coefficient': results['drag_coefficient'],
-        'lift_coefficient': results['lift_coefficient'],
-        'source': 'advanced_cfd'
-    }
 
 # ============================================================================
 # TRAINING PIPELINE WITH ALL OPTIMIZATIONS
@@ -1257,9 +1213,16 @@ class OptimizedDiffusionTrainer:
         self.connectivity_loss = ConnectivityLoss(penalty=training_config.disconnection_penalty)
         self.aero_loss = AerodynamicLoss()
         
-        # Advanced CFD simulator
+        # Advanced CFD simulator for training (fast, coarse)
         self.cfd_simulator = AdvancedCFDSimulator(cfd_config, self.device)
         
+        # High-fidelity CFD simulator for validation (accurate, refined)
+        import copy
+        val_cfd_config = copy.deepcopy(cfd_config)
+        val_cfd_config.solver_type = "D3Q27"
+        val_cfd_config.use_amr = True  # Enable AMR for validation
+        self.val_cfd_simulator = AdvancedCFDSimulator(val_cfd_config, self.device)
+
         # Pipeline parallelism
         self.pipeline = PipelineParallelism(training_config)
         
@@ -1277,7 +1240,39 @@ class OptimizedDiffusionTrainer:
         decay = self.training_config.ema_decay
         for ema_param, param in zip(self.ema_model.parameters(), self.diffusion_model.parameters()):
             ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
-    
+
+    def validate_epoch(self, val_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
+        """Validate for one epoch with the high-fidelity D3Q27 solver"""
+        self.diffusion_model.eval()
+        self.converter.eval()
+
+        total_aero_loss = 0.0
+
+        pbar = tqdm(val_loader, desc=f"Validating with D3Q27 solver (grid={grid_size}x{grid_size}x{grid_size})")
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(pbar):
+                latent = batch['latent'].to(self.device, dtype=self.dtype)
+
+                # Generate a design using the consistency model
+                generated_latent = self.consistency_model.fast_inference(latent.shape, num_steps=4)
+                voxel_grid = self.converter(generated_latent).nan_to_num(0.0)
+                voxel_grid = torch.sigmoid(voxel_grid).nan_to_num(0.0)
+
+                # CFD-based aerodynamic loss with the D3Q27 solver
+                design_spec = DesignSpec(target_speed=50.0)
+                aero_loss_val = self.aero_loss(voxel_grid, design_spec, self.val_cfd_simulator).nan_to_num(0.0)
+
+                total_aero_loss += aero_loss_val.item()
+
+        avg_aero_loss = total_aero_loss / len(val_loader)
+
+        self.writer.add_scalar('Loss/val_aerodynamic', avg_aero_loss, self.global_step)
+
+        print(f"Validation Aerodynamic Loss (D3Q27): {avg_aero_loss}")
+
+        return {'val_aerodynamic_loss': avg_aero_loss}
+
     def train_epoch(self, train_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Train for one epoch with all optimizations"""
         self.diffusion_model.train()
@@ -1333,7 +1328,7 @@ class OptimizedDiffusionTrainer:
             aero_loss_val = torch.tensor(0.0, device=self.device)
             if batch_idx % 10 == 0:
                 design_spec = DesignSpec(target_speed=50.0)
-                aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec).nan_to_num(0.0)
+                aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
 
             # Combined loss
             total_loss_val = mse_loss_val + consistency_loss + connectivity_loss_val + aero_loss_val
@@ -1430,6 +1425,9 @@ class OptimizedDiffusionTrainer:
                 metrics = self.train_epoch(train_loader, grid_size=grid_size)
 
                 print(f"Epoch {epoch + 1} Metrics: {metrics}")
+
+                if val_loader and (epoch + 1) % self.training_config.val_interval == 0:
+                    self.validate_epoch(val_loader, grid_size=grid_size)
 
                 if (epoch + 1) % self.training_config.save_interval == 0:
                     self.save_checkpoint(f'checkpoint_optimized_grid{grid_size}_ep{epoch+1}.pt')
@@ -1646,9 +1644,10 @@ def cli():
 @click.option('--enable-pipeline', is_flag=True, default=True, help='Enable pipeline parallelism')
 @click.option('--enable-checkpointing', is_flag=True, default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
+@click.option('--solver', default='D3Q19', help='CFD solver type: D3Q19 or D3Q27')
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
           num_samples, resume_from, save_dir, enable_consistency, enable_pipeline, 
-          enable_checkpointing, enable_compile):
+          enable_checkpointing, enable_compile, solver):
     """Train the optimized diffusion model with all TRM/HRM features"""
     import os
     import logging
@@ -1714,7 +1713,8 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
     
     cfd_config = CFDConfig(
         resolution=16,  # Will be adaptively refined to ~5k cells
-        adaptive_cells_target=5000
+        adaptive_cells_target=5000,
+        solver_type=solver
     )
 
     # Dataset
@@ -1756,7 +1756,8 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 @click.option('--target-speed', default=7.0, help='Target aircraft speed (m/s)')
 @click.option('--num-steps', default=4, help='Number of diffusion steps for generation (4 for consistency)')
 @click.option('--use-marching-cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
-def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes):
+@click.option('--solver', default='D3Q19', help='CFD solver type: D3Q19 or D3Q27')
+def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver):
     """Generate aircraft design using optimized 4-step consistency model"""
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1789,6 +1790,15 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes):
     # Export to optimized STL
     print(f"Converting to optimized STL mesh with adaptive refinement...")
     generator.voxels_to_stl(voxel_grid, output, use_marching_cubes=use_marching_cubes)
+
+    # Add final CFD analysis
+    print(f"🚀 Running final CFD analysis with {solver} solver...")
+    cfd_config = CFDConfig(solver_type=solver)
+    simulator = AdvancedCFDSimulator(cfd_config, device)
+    results = simulator.simulate_aerodynamics(voxel_grid, steps=1000)
+    print("CFD Analysis Results:")
+    print(f"  Drag Coefficient: {results['drag_coefficient']}")
+    print(f"  Lift Coefficient: {results['lift_coefficient']}")
 
 @cli.command()
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')

@@ -477,7 +477,7 @@ class D3Q27CascadedSolver:
         q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
 
-        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) * h**2
+        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
 
         drag_force = torch.tensor(1e-13, device=self.device)
         lift_force = torch.tensor(1e-13, device=self.device)
@@ -974,7 +974,7 @@ class GPULBMSolver:
         q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
 
-        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()) * h**2
+        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
 
         if not self.phys_config.momentum_exchange_correction:
             drag_force = torch.sum(self.velocity_x[geometry_mask > 0.5])
