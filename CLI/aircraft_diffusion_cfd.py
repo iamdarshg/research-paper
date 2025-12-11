@@ -285,99 +285,6 @@ class GradientCheckpointingWrapper(nn.Module):
         
         return self.module(*args, **kwargs)
 
-# ============================================================================
-# ADAPTIVE MESH REFINEMENT FOR CFD
-# ============================================================================
-
-class AdaptiveMeshRefinement:
-    """Adaptive mesh refinement to reduce grid points from 32³ to ~5k cells"""
-    
-    def __init__(self, target_cells: int = 5000, refinement_levels: int = 3):
-        self.target_cells = target_cells
-        self.refinement_levels = refinement_levels
-    
-    def refine_mesh(self, voxel_grid: torch.Tensor, geometry_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Apply adaptive mesh refinement around aircraft geometry.
-        
-        Args:
-            voxel_grid: Original voxel grid [D, H, W]
-            geometry_mask: Binary mask indicating solid regions [D, H, W]
-        
-        Returns:
-            Refined voxel grid with adaptive resolution
-        """
-        device = voxel_grid.device
-        
-        # Find bounding box of geometry
-        solid_coords = torch.where(geometry_mask > 0.5)
-        if len(solid_coords[0]) == 0:
-            return voxel_grid  # No geometry to refine
-        
-        min_coords = [coord.min().item() for coord in solid_coords]
-        max_coords = [coord.max().item() for coord in solid_coords]
-        
-        # Expand bounding box with margin
-        margin = 4
-        min_coords = [max(0, c - margin) for c in min_coords]
-        max_coords = [min(voxel_grid.shape[i] - 1, c + margin) for i, c in enumerate(max_coords)]
-        
-        # Create refined grid
-        refined_grid = torch.zeros_like(voxel_grid)
-        
-        # Refine only in geometry region
-        for level in range(self.refinement_levels):
-            # Calculate refinement factor for this level
-            refine_factor = 2 ** level
-            cell_size = 1.0 / refine_factor
-            
-            # Calculate number of cells at this refinement level
-            bbox_size = [max_coords[i] - min_coords[i] + 1 for i in range(3)]
-            estimated_cells = sum(bbox_size) * refine_factor
-            
-            if estimated_cells <= self.target_cells:
-                # Apply refinement at this level
-                refined_region = F.interpolate(
-                    voxel_grid[None, None, min_coords[0]:max_coords[0]+1, 
-                              min_coords[1]:max_coords[1]+1, 
-                              min_coords[2]:max_coords[2]+1],
-                    scale_factor=refine_factor,
-                    mode='nearest'
-                )
-                
-                # Place refined region back
-                refined_dims = refined_region.shape[2:]
-                end_coords = [min_coords[i] + refined_dims[i] for i in range(3)]
-                
-                for i in range(3):
-                    end_coords[i] = min(end_coords[i], voxel_grid.shape[i])
-                
-                refined_grid[min_coords[0]:end_coords[0], 
-                           min_coords[1]:end_coords[1], 
-                           min_coords[2]:end_coords[2]] = refined_region[0, 0, 
-                                                                        :end_coords[0]-min_coords[0],
-                                                                        :end_coords[1]-min_coords[1], 
-                                                                        :end_coords[2]-min_coords[2]]
-                
-                break
-        
-        # Coarsen regions far from geometry
-        coarse_regions = torch.zeros_like(voxel_grid)
-        geometry_expanded = F.max_pool3d(geometry_mask[None, None], kernel_size=5, stride=1, padding=2)
-        
-        # Fill coarse regions with downsampled voxel values
-        for i in range(0, voxel_grid.shape[0], 2):
-            for j in range(0, voxel_grid.shape[1], 2):
-                for k in range(0, voxel_grid.shape[2], 2):
-                    if geometry_expanded[0, 0, i, j, k] < 0.1:  # Far from geometry
-                        # Take average of 2x2x2 region
-                        region = voxel_grid[i:i+2, j:j+2, k:k+2]
-                        coarse_regions[i, j, k] = region.mean()
-        
-        # Combine refined and coarse regions
-        final_grid = torch.where(geometry_mask > 0.1, refined_grid, coarse_regions)
-        
-        return final_grid
 
 # ============================================================================
 # GPU-RESIDENT LBM SOLVER WITH SOA LAYOUT
@@ -901,15 +808,6 @@ class AdvancedCFDSimulator:
         self.device = device
         self.resolution = config.base_grid_resolution
 
-        # Adaptive mesh refinement
-        if config.use_amr:
-            self.mesh_refinement = AdaptiveMeshRefinement(
-                target_cells=config.adaptive_cells_target,
-                refinement_levels=config.refinement_levels
-            )
-        else:
-            self.mesh_refinement = None
-
         # Select and initialize the LBM solver
         if config.solver_type == "D3Q19":
             self.lbm_solver = AdvancedGPULBMSolver(self.config, device, LBMPhysicsConfig)
@@ -918,6 +816,15 @@ class AdvancedCFDSimulator:
         else:
             raise ValueError(f"Unknown solver type: {config.solver_type}")
 
+        # Initialize a higher-resolution solver for AMR if enabled
+        if self.config.use_amr:
+            import copy
+            amr_config = copy.deepcopy(self.config)
+            amr_config.resolution = self.config.base_grid_resolution * 2  # Double the resolution
+            self.amr_solver = D3Q27CascadedSolver(amr_config, device, LBMPhysicsConfig)
+        else:
+            self.amr_solver = None
+
         # Initialize flow field
         self.init_flow_field()
     
@@ -925,6 +832,8 @@ class AdvancedCFDSimulator:
         """Initialize flow field for incompressible flow"""
         # Initialize LBM solver
         self.lbm_solver._initialize_equilibrium()
+        if self.amr_solver:
+            self.amr_solver._initialize_equilibrium()
     
     def simulate_aerodynamics(self, geometry: torch.Tensor, steps: int = 100) -> Dict[str, float]:
         """
@@ -933,34 +842,33 @@ class AdvancedCFDSimulator:
         """
         device = geometry.device
 
-        # Step 1: Adaptive mesh refinement (if enabled)
-        if self.mesh_refinement:
-            print("Applying adaptive mesh refinement...")
-            refined_geometry = self.mesh_refinement.refine_mesh(geometry, geometry)
-        else:
-            refined_geometry = geometry
-
-        # Step 2: Resize to LBM resolution if needed
-        if refined_geometry.shape != (self.resolution, self.resolution, self.resolution):
-            print(f"Resizing geometry from {refined_geometry.shape} to {(self.resolution, self.resolution, self.resolution)}")
-            refined_geometry = F.interpolate(
-                refined_geometry[None, None],  # Add batch and channel dims
-                size=(self.resolution, self.resolution, self.resolution),
-                mode='trilinear',  # Use trilinear for 3D data
-                align_corners=False
-            )[0, 0]  # Remove batch and channel dims
-
-        geometry_mask = (refined_geometry > 0.5).float()
-
-        # Step 3: Run GPU LBM solver
-        print(f"Running {self.config.solver_type} GPU LBM solver...")
+        # Step 1: Run the base solver
+        geometry_mask = (geometry > 0.5).float()
+        print(f"Running {self.config.solver_type} GPU LBM solver at base resolution...")
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
-
-        # Step 4: Compute aerodynamic coefficients
         results = self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask)
 
-        # Step 5: Run FluidX3D for validation (if available)
-        fluidx3d_results = self._run_fluidx3d_validation(refined_geometry)
+        # Step 2: If AMR is enabled, run the high-resolution solver
+        if self.amr_solver:
+            print("Applying adaptive mesh refinement by running a higher-resolution simulation...")
+
+            # Upsample the geometry for the AMR solver
+            amr_geometry = F.interpolate(
+                geometry.unsqueeze(0).unsqueeze(0),
+                size=(self.amr_solver.resolution, self.amr_solver.resolution, self.amr_solver.resolution),
+                mode='nearest'
+            ).squeeze(0).squeeze(0)
+            amr_geometry_mask = (amr_geometry > 0.5).float()
+
+            self.amr_solver.collide_stream(amr_geometry_mask, steps=steps)
+            amr_results = self.amr_solver.compute_aerodynamic_coefficients(amr_geometry_mask)
+
+            # Blend the results for a more accurate final value
+            results['drag_coefficient'] = (results['drag_coefficient'] + amr_results['drag_coefficient']) / 2
+            results['lift_coefficient'] = (results['lift_coefficient'] + amr_results['lift_coefficient']) / 2
+
+        # Step 3: Run FluidX3D for validation (if available)
+        fluidx3d_results = self._run_fluidx3d_validation(geometry)
         if fluidx3d_results:
             # Blend results for accuracy
             results['drag_coefficient'] = 0.7 * results['drag_coefficient'] + 0.3 * fluidx3d_results['drag_coefficient']
