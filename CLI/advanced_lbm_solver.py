@@ -65,7 +65,6 @@ class D3Q27Lattice:
         opp =             [0, 2, 1, 4, 3, 6, 5, 8, 7,10, 9,12,11,14,13,16,15,18,17,26,25,24,23,22,21,20,19]
         return torch.tensor(opp, dtype=torch.int64)
 
-
 class D3Q27Solver:
     """Complete D3Q27 LBM solver"""
     def __init__(self, resolution, device):
@@ -248,7 +247,6 @@ class CascadedLBM:
             f[i] = feq + fneq
         
         return f
-
 
 class D3Q27CascadedSolver:
     """D3Q27 LBM solver with cascaded central moment collision"""
@@ -518,7 +516,6 @@ class D3Q27CascadedSolver:
             'vortex_core_volume': 0.0,  # Not computed
             'reynolds_number_turbulent': v_inf * h * self.resolution / self.nu
         }
-
 
 class GPULBMSolver:
     """GPU-resident LBM solver with Dynamic Smagorinsky, Vorticity Confinement, and improved vorticity resolution"""

@@ -20,7 +20,7 @@ class CFDSolverWorker(QObject):
     simulation_finished = pyqtSignal(dict)
     simulation_error = pyqtSignal(str)
 
-    def __init__(self, stl_path, reynolds, mach, steps, solver_type="d3q19_mrt", 
+    def __init__(self, stl_path, reynolds, mach, steps, solver_type="d3q27_cascaded", 
                  grid_resolution=32, cfd_domain_params=None, use_mixed_precision=False):
         super().__init__()
         self.stl_path = stl_path
