@@ -81,8 +81,9 @@ class ModelConfig:
     attention_groups: int = 8  # 4 groups instead of 8 heads (50% KV-cache reduction)
     attention_kv_groups: int = 8  # Groups for key/value
     num_attention_layers: int = 4
-    # Grid resolution - single resolution for all components
+    # Grid resolution - configurable for different lattice sizes
     base_grid_resolution: int = 32  # Consistent grid resolution for voxel, CFD, etc.
+    grid_resolution: int = None  # Working grid resolution (defaults to base_grid_resolution if not set)
     # Memory optimization
     enable_gradient_checkpointing: bool = True  # 60% VRAM savings
     use_torch_compile: bool = False  # Kernel fusion
@@ -92,6 +93,9 @@ class ModelConfig:
             self.encoder_channels = [24, 32, 48]
         if self.decoder_channels is None:
             self.decoder_channels = [48, 32, 24]
+        # Set working grid resolution if not specified
+        if self.grid_resolution is None:
+            self.grid_resolution = self.base_grid_resolution
 
 @dataclass
 class TrainingConfig:
@@ -691,13 +695,14 @@ class LatentDiffusionUNet(nn.Module):
 
 class LatentTo3DConverter(nn.Module):
     """Convert n-dimensional latent codes to 3D spatial representation"""
-    
-    def __init__(self, latent_dim: int, output_shape: Tuple[int, int, int] = (32, 32, 32)):
+
+    def __init__(self, latent_dim: int, grid_resolution: int = 32):
         super().__init__()
         self.latent_dim = latent_dim
-        self.output_shape = output_shape
-        total_voxels = np.prod(output_shape)
-        
+        self.grid_resolution = grid_resolution
+        self.output_shape = (grid_resolution, grid_resolution, grid_resolution)
+        total_voxels = grid_resolution ** 3
+
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, 1024),
             nn.ReLU(),
@@ -1098,7 +1103,7 @@ class OptimizedDiffusionTrainer:
 
         # Models with optimizations
         self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
-        self.converter = LatentTo3DConverter(model_config.latent_dim, (32, 32, 32)).to(self.device).to(self.dtype)
+        self.converter = LatentTo3DConverter(model_config.latent_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
         
         # 4-step consistency model
         self.consistency_model = ConsistencyModel(model_config, diffusion_config, self.dtype).to(self.device)
@@ -1396,7 +1401,7 @@ class OptimizedAircraftGenerator:
         self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
         
         self.diffusion_model = LatentDiffusionUNet(self.model_config, self.diffusion_config).to(self.device)
-        self.converter = LatentTo3DConverter(self.model_config.latent_dim, (32, 32, 32)).to(self.device)
+        self.converter = LatentTo3DConverter(self.model_config.latent_dim, self.model_config.grid_resolution).to(self.device)
         
         # Load consistency model
         self.consistency_model = ConsistencyModel(self.model_config, self.diffusion_config).to(self.device)
@@ -1619,8 +1624,14 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         enable_pipeline_parallelism=enable_pipeline
     )
     
+    # Determine correct grid resolution based on solver type
+    if solver == "D3Q27":
+        base_resolution = 16  # Use smaller grid for D3Q27 due to memory
+    else:
+        base_resolution = 32  # Standard resolution
+
     cfd_config = CFDConfig(
-        resolution=16,  # Will be adaptively refined to ~5k cells
+        base_grid_resolution=base_resolution,  # Match the grid resolution used
         adaptive_cells_target=5000,
         solver_type=solver
     )
