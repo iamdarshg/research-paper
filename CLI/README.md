@@ -255,6 +255,9 @@ labeled, num_components = label(voxel_grid > 0.5)
 print(f"Connected components: {num_components}")
 ```
 
+### OpenFOAM Force Coefficients Fail
+If `forceCoeffs` is unreliable on your OpenFOAM install, use the exported `system/forces` dictionary and normalize the reported force vector into coefficients manually. The repository now prefers this lower-level fallback because it is more tolerant of stripped-down OpenFOAM builds.
+
 ### Checkpoint Not Found
 Ensure path is correct:
 ```bash

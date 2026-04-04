@@ -1,0 +1,6 @@
+\section{Conclusion}
+\label{sec:conclusion}
+The present implementation demonstrates a working generative-design pipeline and a reduced freeform-object experiment that can be executed in the installed environment. The observed step sweep suggests that longer consistency sampling can improve the reported $L/D$ in this specific sanity setting, with the best sample reaching 1.53 after downsampling and CPU CFD evaluation.
+
+The OpenFOAM cross-check is now real but still rough: the reduced cube benchmark completed, and the manual pressure-force estimate is clearly different from the internal solver's near-zero coefficients. That gap is useful because it tells us the internal CFD path still needs calibration, not because it proves the cube benchmark is a good aerodynamic standard. The next revision should therefore prioritize solver stabilization, a reproducible force-extraction pipeline, and a larger ablation study before presenting stronger conclusions.
+

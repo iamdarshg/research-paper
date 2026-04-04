@@ -51,7 +51,7 @@ warnings.filterwarnings('ignore')
 
 OPENFOAM_ROOT = Path(os.environ.get("OPENFOAM_ROOT", "/home/darsh/.openclaw/openfoam/usr/share/openfoam"))
 OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
-OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam", "foamEtcFile"))
+OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam"))
 
 # ============================================================================
 # CONFIG & DATACLASSES
@@ -1792,7 +1792,7 @@ mixture
 { version 2.0; format ascii; class dictionary; object turbulenceProperties; }
 simulationType laminar;
 """)
-        (system / "forceCoeffs").write_text("""FoamFile\n{ version 2.0; format ascii; class dictionary; object forceCoeffs; }\npatches (design);\nrhoInf 1.225;\nrho rho;\np p;\nU U;\nCofR (0 0 0);\nAref 1;\nlRef 1;\nmagUInf 80;\nliftDir (0 0 1);\ndragDir (1 0 0);\n""")
+        (system / "forces").write_text("""FoamFile\n{ version 2.0; format ascii; class dictionary; object forces; }\npatches (design);\nrho rho;\nrhoInf 1.225;\np p;\nU U;\nCofR (0 0 0);\n""")
         (case_path / "0" / "U").write_text("""FoamFile\n{ version 2.0; format ascii; class volVectorField; object U; }\ndimensions [0 1 -1 0 0 0 0];\ninternalField uniform (80 0 0);\nboundaryField { inlet { type fixedValue; value uniform (80 0 0); } outlet { type pressureInletOutletVelocity; value uniform (80 0 0); } top { type slip; } bottom { type slip; } front { type symmetryPlane; } back { type symmetryPlane; } design { type noSlip; } }\n""")
         (case_path / "0" / "p").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object p; }\ndimensions [1 -1 -2 0 0 0 0];\ninternalField uniform 101325;\nboundaryField { inlet { type totalPressure; p0 uniform 101325; value uniform 101325; } outlet { type fixedValue; value uniform 101325; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
         (case_path / "0" / "T").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object T; }\ndimensions [0 0 0 1 0 0 0];\ninternalField uniform 300;\nboundaryField { inlet { type fixedValue; value uniform 300; } outlet { type zeroGradient; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")

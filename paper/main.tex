@@ -38,154 +38,19 @@ This paper presents a generative design pipeline for aircraft structures that co
 Generative Design, Diffusion Models, Computational Fluid Dynamics, Aerospace Engineering, Structural Optimization.
 \end{IEEEkeywords}
 
-\section{Introduction}
-\label{sec:introduction}
-\IEEEPARstart{G}{enerative} design has emerged as a transformative paradigm in engineering, promising to automate and optimize the design process of complex systems. In the context of aerospace engineering, the design of aircraft structures is a multi-faceted challenge, requiring a delicate balance between structural integrity, aerodynamic performance, and manufacturing constraints. Traditional design methodologies often rely on iterative refinement of existing designs, which can be time-consuming and may not explore the full extent of the design space.
 
-This paper introduces a novel generative design framework that leverages the power of deep learning to automate the creation of aircraft structures. Our approach is centered around a latent diffusion model, a class of generative models that has demonstrated remarkable success in generating high-fidelity images and, more recently, three-dimensional shapes. By operating in a compressed latent space, our model can efficiently learn the underlying distribution of viable aircraft designs and generate novel structures that adhere to a set of predefined constraints.
+% Section inputs
+\input{sections/introduction}
 
-The key contributions of this work are threefold:
-\begin{enumerate}
-    \item A latent diffusion model for generating 3D aircraft structures, which is both memory-efficient and capable of producing a wide diversity of designs.
-    \item The integration of a GPU-accelerated CFD solver directly into the training loop, enabling the optimization of aerodynamic performance as a core component of the generative process.
-    \item A hierarchical representation mapping and a connectivity-based loss function to ensure the structural viability of the generated designs.
-\end{enumerate}
+\input{sections/related-work}
 
-This paper is structured as follows: Section \ref{sec:related_work} provides a review of the relevant literature. Section \ref{sec:methodology} details the architecture of our proposed framework. Section \ref{sec:results} presents the forward-looking results and discussion. Section \ref{sec:validation} outlines our comprehensive validation and verification plan. Finally, Section \ref{sec:conclusion} concludes the paper and suggests directions for future research.
+\input{sections/methodology}
 
-\section{Related Work}
-\label{sec:related_work}
-The confluence of generative models and engineering design has been a burgeoning area of research. In particular, the use of deep learning for the generation of 3D shapes has seen significant advancements. Early approaches, such as Generative Adversarial Networks (GANs) and Variational Autoencoders (VAEs), have been applied to 3D object generation, but often struggle with producing high-resolution and structurally complex shapes.
+\input{sections/results-and-discussion}
 
-More recently, diffusion models \cite{ho2020denoising, nichol2021improved} have emerged as a powerful class of generative models, capable of producing high-fidelity images and 3D shapes. The application of diffusion models to 3D shape generation is a rapidly evolving field.
+\input{sections/validation-and-testing-standards}
 
-The concept of hierarchical representation has also been explored in the context of 3D shape generation. By representing shapes in a hierarchical manner, it is possible to capture both coarse and fine-grained details, leading to more realistic and detailed geometries. Our work builds upon these ideas, using a hierarchical representation to decode the latent vectors from our diffusion model.
-
-Furthermore, the integration of physics-based simulations into the generative process is a key area of research. By incorporating feedback from simulations, it is possible to generate designs that are not only aesthetically pleasing but also physically plausible and optimized for specific performance criteria. In the context of aerospace engineering, the use of CFD simulations to guide the design of aerodynamic shapes is a well-established practice. However, the integration of CFD solvers directly into the training loop of a generative model is a challenging endeavor, due to the computational cost of the simulations. Our work addresses this challenge by leveraging a GPU-accelerated CFD solver, which enables us to efficiently evaluate the aerodynamic performance of the generated designs during training.
-
-The Transformer architecture, first introduced in \cite{vaswani2017attention}, has revolutionized the field of natural language processing and is now being applied to a wide range of computer vision and generative modeling tasks. The attention mechanism at the core of the Transformer allows the model to capture long-range dependencies and complex relationships in the data. In our work, we draw inspiration from the Transformer architecture in the design of our latent diffusion model.
-
-Furthermore, this work is conceptually guided by two key principles: "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) and "Hierarchical Representation Mapping" (HRM). The LiDAR principle suggests a process where a vast design space is explored in parallel through a diffusion process, followed by a more structured, sequential evaluation. This mirrors the creative process of rapid ideation followed by critical analysis. The HRM principle, inspired by recursive models that demonstrate strong general reasoning on grid-based benchmarks, advocates for hierarchical and voxelized representations to effectively capture complex spatial relationships, which is particularly well-suited for structural design tasks.
-
-\section{Methodology}
-\label{sec:methodology}
-Our proposed framework embodies the LiDAR and HRM principles through a multi-stage generative process. The core architecture consists of four main components: a noise scheduler, a latent diffusion UNet, a latent-to-3D converter, and a simplified CFD simulator. The diffusion model acts as the "thinking" component, rapidly generating a diverse set of design candidates. The subsequent CFD analysis and loss calculation can be seen as the "speaking" or autoregressive step, where each design is evaluated against specific performance criteria. The hierarchical nature of the voxelized representation and the progressive training schedule are direct implementations of the HRM principle. The overall architecture is depicted in Figure \ref{fig:architecture}.
-
-\begin{figure*}[!t]
-\centering
-\includegraphics[width=7in]{placeholder.png}
-\caption{The architecture of our proposed generative design framework. A latent vector is first sampled from a standard normal distribution. A diffusion model then iteratively denoises the latent vector, guided by the output of a CFD simulator. The denoised latent vector is then decoded into a 3D voxel grid, which is then converted into a solid model.}
-\label{fig:architecture}
-\end{figure*}
-
-\subsection{Noise Scheduling}
-The forward diffusion process gradually adds Gaussian noise to the input data over a series of T timesteps. The noise schedule is defined by a variance schedule $\beta_t$, which is typically a linear or cosine schedule. In our work, we use a linear schedule, where $\beta_t$ increases linearly from $\beta_{start}$ to $\beta_{end}$.
-
-The forward process is defined as:
-\begin{equation}
-q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} x_{t-1}, \beta_t I)
-\end{equation}
-
-The reverse diffusion process is where the generative model learns to denoise the data. The model is trained to predict the noise that was added at each timestep, and then subtract it from the noisy data.
-
-\subsection{Latent Diffusion UNet}
-The core of our generative model is a UNet-based architecture that operates in the latent space. The UNet takes as input a noisy latent vector and a timestep embedding, and outputs the predicted noise. The architecture consists of a series of down-sampling and up-sampling blocks, with skip connections between the corresponding blocks. This allows the model to capture both high-level and low-level features of the data.
-
-\subsection{Latent-to-3D Converter}
-The latent-to-3D converter is a multi-layer perceptron (MLP) that maps the denoised latent vector to a 3D voxel grid. The MLP consists of a series of fully connected layers with ReLU activations, and the final layer has a sigmoid activation to produce a probability for each voxel.
-
-\subsection{CFD Simulator}
-The CFD simulator is a simplified, GPU-accelerated solver that is used to evaluate the aerodynamic performance of the generated designs. The simulator takes as input a voxel grid and a set of flow conditions (e.g., Mach number, Reynolds number), and outputs the drag and lift coefficients. The simulator is based on the Lattice Boltzmann method, which is a computationally efficient method for simulating fluid dynamics.
-
-\subsection{Loss Function}
-The total loss function is a weighted sum of three components: the diffusion loss, the connectivity loss, and the aerodynamic loss.
-
-\begin{equation}
-\mathcal{L} = \lambda_{diff} \mathcal{L}_{diff} + \lambda_{conn} \mathcal{L}_{conn} + \lambda_{aero} \mathcal{L}_{aero}
-\end{equation}
-
-The diffusion loss is the mean squared error between the predicted noise and the actual noise. The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis. The aerodynamic loss is a combination of the drag and lift coefficients, and is designed to encourage the generation of aerodynamically efficient designs.
-
-\section{Results and Discussion}
-\label{sec:results}
-We performed a CPU-only sanity run on the single freeform-object path using the installed virtual environment and the repository checkpoint emitted by training. The experiment was intentionally narrow: one epoch at each progressive grid stage (16\textsuperscript{3}, 24\textsuperscript{3}, and 32\textsuperscript{3}) with batch size 1 and two synthetic samples. Because the full CFD loop is numerically fragile on CPU in this environment, we treat the run as a code-path validation and reduced aerodynamic probe rather than a definitive performance benchmark.
-
-\subsection{Training Convergence}
-Figure \ref{fig:loss_curves} summarizes the observed losses across the three progressive stages. Total loss stayed in the 2.31--2.71 range, while the MSE term rose with resolution and the connectivity term stayed roughly constant. The aerodynamic loss was near zero in this short run, indicating that the CFD term was present in the pipeline but did not dominate optimization under this reduced setting.
-
-\begin{figure}[!t]
-\centering
-\includegraphics[width=3.5in]{figures/sanity_training_losses.png}
-\caption{Observed sanity-run losses across progressive grid stages. This is a reduced CPU-only training trace, not a full convergence study.}
-\label{fig:loss_curves}
-\end{figure}
-
-\subsection{Freeform-object Sweep: Steps vs. Shape Prior}
-We ran a compact sweep over generation step count and the new shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, downsampled the binary grid to 16\textsuperscript{3} for the CPU CFD pass, and computed occupancy, surface area, $C_L$, $C_D$, and $L/D$. The key observation is that the post-processing threshold materially changes the aerodynamic score: at 1 step the best setting reached $L/D=2.22$, while at 8 steps the best score was $L/D=0.59$ in this reduced CPU setup.
-
-\begin{figure}[!t]
-\centering
-\includegraphics[width=3.5in]{figures/freeform_realism_ld_by_steps.png}
-\caption{Mean $L/D$ from the reduced sweep over consistency steps, aggregated across three post-processing thresholds. Error bars show sample standard deviation.}
-\label{fig:ld_sweep}
-\end{figure}
-
-\begin{figure}[!t]
-\centering
-\includegraphics[width=3.5in]{figures/freeform_realism_occ_vs_ld.png}
-\caption{Occupancy versus $L/D$ for the same sweep. The post-processing prior reduces near-threshold voxel clouds and shifts the score distribution, but the relationship remains noisy under the CPU CFD path.}
-\label{fig:cfd_analysis}
-\end{figure}
-
-\subsection{Freeform-object Geometry Summary}
-The generated freeform objects are still dense and near-threshold before cleanup, but the new plausibility prior reduces isolated components and slightly lowers the occupancy fraction. In this environment, that matters more than small changes in the raw voxel logits: the cleaned binary shapes are less fragmented and more suitable for downstream meshing/export.
-
-\subsection{Hyperparameter and Tuning Notes}
-The sweep was intentionally small but meaningful for the current codebase: it varied the inference path length and the new connected-component cleanup threshold, which are the two knobs that currently have the most direct effect on shape plausibility. The training-side improvement was also incremental: a voxel-shape prior was added to the loss to discourage midpoint noise, excess surface roughness, and disconnected fragments.
-
-This is still a pilot study. The numbers above should be interpreted as a validation of the code path and a first-pass tuning signal, not as evidence of a stable optimum. A larger study should sweep:
-\begin{itemize}
-    \item latent dimension (8, 16, 32),
-    \item the shape-prior weights and occupancy target,
-    \item consistency steps (1, 2, 4, 8, 16), and
-    \item CFD solver resolution and reference-area normalization.
-\end{itemize}
-
-At minimum, a publication-quality sweep should report both realism metrics (occupancy, connectedness, surface smoothness) and aerodynamic metrics ($C_L$, $C_D$, $L/D$) instead of optimizing only one side of the tradeoff.
-
-\subsection{Discussion}
-The main takeaway is now a little sharper: the repository's end-to-end path executes, the shape prior is wired into training, and the export path now emits a concrete OpenFOAM validation case with the generated STL in `constant/triSurface/design.stl`. On the same reduced cube benchmark, the internal D3Q27 solver produced nearly zero aerodynamic load ($C_D = 0.0$, $C_L \approx 9.01\times10^{-9}$), while a manually integrated OpenFOAM sonicFoam run on the corresponding case produced a much larger pressure-only estimate ($C_D \approx -2.85$, $C_L \approx 6.35\times10^{-4}$ at the final sampled time). The sign mismatch indicates a convention difference in the reduced force estimate, but the magnitude gap is still large enough to show that the current solver is only a rough proxy and not yet a calibrated aerodynamic model.
-
-The experiment also exposed an important limitation: the local OpenFOAM tree under `/home/darsh/.openclaw/openfoam` is incomplete for direct function-object force extraction in this environment because the packaged `foamEtcFile` helper is missing and the `forceCoeffs`/`forces` utilities are unreliable on this build. The case could be exported, meshed, and solved, but force output had to be reconstructed manually from the pressure field. A higher-confidence CFD comparison will still need a complete OpenFOAM installation or a fully repaired local tree, careful normalization of reference area and flow conditions, and a more systematic hyperparameter sweep.
-
-\section{Validation and Testing Standards}
-\label{sec:validation}
-To make the validation story honest, we separate three levels of evidence:
-\begin{itemize}
-    \item \textbf{Code-path validation:} the training, generation, cleanup, export, and CFD scoring routines run end-to-end in this environment.
-    \item \textbf{Solver validation:} the built-in CFD path can be compared against a higher-fidelity external solver when one is available.
-    \item \textbf{Physical validation:} the generated shape should eventually be compared against analytic or experimental benchmarks, which is still future work.
-\end{itemize}
-
-\subsection{Verification}
-Verification checks that the implemented steps are executed correctly. In this revision we verified that:
-\begin{itemize}
-    \item the shape-plausibility loss contributes to training,
-    \item the connected-component cleanup hook reduces fragmented voxel outputs,
-    \item STL export succeeds from the cleaned voxel grid, and
-    \item the OpenFOAM export hook writes a runnable case directory skeleton, including `blockMeshDict`, `snappyHexMeshDict`, and surface STL output.
-\end{itemize}
-
-\subsection{Validation}
-Validation is partial but no longer purely blocked. The built-in CFD path was exercised on the reduced CPU pipeline, and a reduced OpenFOAM sonicFoam benchmark was run on the corresponding geometry. Because the OpenFOAM build in this environment does not reliably expose force function objects, the comparison used a manually integrated pressure force from the final OpenFOAM pressure field rather than `forceCoeffs`. That makes the comparison approximate, but it is still useful as a solver-to-solver sanity check.
-
-The paper therefore claims the following and nothing more: the export path is concrete, the benchmark comparison is measurable, and the current internal solver diverges substantially from the OpenFOAM pressure estimate on the reduced cube test. By being explicit about the manual extraction method and the remaining convention differences, the revision avoids overstating the credibility of the aerodynamic numbers.
-
-\section{Conclusion}
-\label{sec:conclusion}
-The present implementation demonstrates a working generative-design pipeline and a reduced freeform-object experiment that can be executed in the installed environment. The observed step sweep suggests that longer consistency sampling can improve the reported $L/D$ in this specific sanity setting, with the best sample reaching 1.53 after downsampling and CPU CFD evaluation.
-
-The OpenFOAM cross-check is now real but still rough: the reduced cube benchmark completed, and the manual pressure-force estimate is clearly different from the internal solver's near-zero coefficients. That gap is useful because it tells us the internal CFD path still needs calibration, not because it proves the cube benchmark is a good aerodynamic standard. The next revision should therefore prioritize solver stabilization, a reproducible force-extraction pipeline, and a larger ablation study before presenting stronger conclusions.
+\input{sections/conclusion}
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
