@@ -536,12 +536,13 @@ class D3Q27CascadedSolver:
 
         # The solver evolves in lattice units, while the benchmark normalizes
         # against an OpenFOAM-style dynamic pressure in physical units.
-        # Keep the coefficient normalization on the benchmark's geometric
-        # reference area so the comparison does not drift with voxelization.
+        # For the momentum-exchange force, the physically meaningful quantity
+        # is the dimensionless coefficient, which can be formed directly from
+        # the lattice force once it is normalized by the lattice reference area.
         u_lattice = max(self.config.mach_number * 0.10, 1e-12)
-        force_scale = 1.0 / (u_lattice ** 2)
 
         ref_area = 1.0
+        ref_area_cells = max(ref_area / (h * h), 1.0)
 
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples
@@ -552,14 +553,12 @@ class D3Q27CascadedSolver:
             lift_force = self.force_z_last
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        drag_force_phys = drag_force * force_scale
-        lift_force_phys = lift_force * force_scale
-
-        # Use the OpenFOAM sign convention: positive Cd corresponds to drag
-        # opposing the freestream, and the extracted momentum-exchange force is
-        # already oriented in the body-force direction.
-        cd = drag_force_phys.item() / (q_inf * ref_area + 1e-10)
-        cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
+        # Cd = F / (0.5 * rho * U^2 * A).  With the solver already in lattice
+        # units, the same nondimensional coefficient is recovered by dividing
+        # the lattice force by the lattice dynamic pressure scale and the
+        # lattice reference area.
+        cd = (2.0 * drag_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
+        cl = (2.0 * lift_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
 
         # Basic diagnostics
         rho = torch.sum(self.f, dim=0)
@@ -1045,26 +1044,27 @@ class GPULBMSolver:
         h = self.config.lbm_config.grid_spacing
 
         # The solver evolves in lattice units, while the benchmark normalizes
-        # against an OpenFOAM-style dynamic pressure in physical units. The raw
-        # momentum-exchange force needs to be lifted out of lattice velocity
-        # units, which scales like 1/u_lattice^2 for this setup.
+        # against an OpenFOAM-style dynamic pressure in physical units. For the
+        # momentum-exchange force, the cleaner comparison is to normalize the
+        # lattice force by the lattice dynamic-pressure scale and the lattice
+        # reference area, rather than applying an extra ad hoc force multiplier.
         u_lattice = max(self.config.mach_number * 0.10, 1e-12)
-        force_scale = 1.0 / (u_lattice ** 2)
 
         solid = geometry_mask > 0.5
         ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
+        ref_area_cells = max(ref_area / (h * h), 1.0)
 
-        # Use the latest force snapshot instead of averaging the full transient,
-        # which better matches the steady force sample OpenFOAM reports here.
-        drag_force = self.force_x_last
-        lift_force = self.force_z_last
-        force_definition = 'bounce-back momentum exchange from last streaming step'
+        if self.force_samples > 0:
+            drag_force = self.force_x_accum / self.force_samples
+            lift_force = self.force_z_accum / self.force_samples
+            force_definition = 'bounce-back momentum exchange accumulated during streaming'
+        else:
+            drag_force = self.force_x_last
+            lift_force = self.force_z_last
+            force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        drag_force_phys = drag_force * force_scale
-        lift_force_phys = lift_force * force_scale
-
-        cd = drag_force_phys.item() / (q_inf * ref_area + 1e-10)
-        cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
+        cd = (2.0 * drag_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
+        cl = (2.0 * lift_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
 
         vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0))
         vortex_cells = torch.sum((self.q_criterion > self.phys_config.q_threshold).float()).item()
