@@ -155,7 +155,7 @@ class GPULBMSolver:
         """Initialize with corrected D3Q19 equilibrium"""
         rho = 1.0
         ux = self.config.mach_number * 343.0
-        uy, uz = 10.0, 10.0
+        uy, uz = 0.0, 0.0
 
         for i in range(19):
             eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
@@ -167,10 +167,10 @@ class GPULBMSolver:
             self.f[i] = feq.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
     def _compute_strain_rate_tensor(self, ux, uy, uz):
-        return compute_strain_rate_tensor(ux, uy, uz)
+        return compute_strain_rate_tensor(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
 
     def _compute_vorticity(self, ux, uy, uz):
-        return compute_vorticity(ux, uy, uz)
+        return compute_vorticity(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
 
     def _compute_q_criterion(self, ux, uy, uz):
         """Compute Q-criterion for vortex identification [web:44][web:47]
@@ -359,13 +359,13 @@ class GPULBMSolver:
         Adds anti-dissipation force F = epsilon * (eta x omega)
         """
         if not self.phys_config.use_vorticity_confinement:
-            return torch.zeros_like(ux).nan_to_num(1e-12, posinf=1e18, neginf=-1e18), torch.zeros_like(uy).nan_to_num(1e-12, posinf=1e18, neginf=-1e18), torch.zeros_like(uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            return torch.zeros_like(ux), torch.zeros_like(uy), torch.zeros_like(uz)
 
         # Compute vorticity
         omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
-        self.vorticity[0] = omega_x.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        self.vorticity[1] = omega_y.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        self.vorticity[2] = omega_z.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        self.vorticity[0] = omega_x
+        self.vorticity[1] = omega_y
+        self.vorticity[2] = omega_z
 
         # Vorticity magnitude
         omega_mag = torch.sqrt(omega_x**2 + omega_y**2 + omega_z**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
@@ -374,17 +374,17 @@ class GPULBMSolver:
         grad_omega_x, grad_omega_y, grad_omega_z = torch.gradient(omega_mag, dim=(0, 1, 2))
         grad_omega_mag = torch.sqrt(grad_omega_x**2 + grad_omega_y**2 + grad_omega_z**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
-        eta_x = torch.clamp(grad_omega_x / grad_omega_mag, 1e-12, 1e12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        eta_y = torch.clamp(grad_omega_y / grad_omega_mag, 1e-12, 1e12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        eta_z = torch.clamp(grad_omega_z / grad_omega_mag, 1e-12, 1e12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        eta_x = torch.clamp(grad_omega_x / grad_omega_mag, -1e12, 1e12).nan_to_num(0.0, posinf=1e18, neginf=-1e18)
+        eta_y = torch.clamp(grad_omega_y / grad_omega_mag, -1e12, 1e12).nan_to_num(0.0, posinf=1e18, neginf=-1e18)
+        eta_z = torch.clamp(grad_omega_z / grad_omega_mag, -1e12, 1e12).nan_to_num(0.0, posinf=1e18, neginf=-1e18)
 
         # Adaptive epsilon based on local vorticity (preserve strong vortices more)
         if self.phys_config.vc_adaptive:
             # Scale epsilon by vorticity magnitude
-            omega_mean = torch.mean(omega_mag).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            omega_mean = torch.mean(omega_mag)
             epsilon_local = self.phys_config.vorticity_confinement_epsilon * (omega_mag / (omega_mean + 1e-12))
         else:
-            epsilon_local = self.phys_config.vorticity_confinement_epsilon.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            epsilon_local = self.phys_config.vorticity_confinement_epsilon
 
         # Confinement force: F = epsilon * (eta x omega)
         Fx = epsilon_local * (eta_y * omega_z - eta_z * omega_y).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
@@ -401,9 +401,9 @@ class GPULBMSolver:
         for step in range(steps):
             # === 1. Compute macroscopic variables ===
             rho = torch.sum(self.f, dim=0)
-            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) / (rho + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
 
             # === 2. Turbulence modeling (Dynamic Smagorinsky / WALE) ===
             self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
@@ -418,19 +418,19 @@ class GPULBMSolver:
 
             # === 5. MRT Collision with corrected equilibrium ===
             for i in range(19):
-                eu = (self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-                u_sq = (ux**2 + uy**2 + uz**2).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
+                u_sq = ux**2 + uy**2 + uz**2
 
                 # Correct Guo forcing scheme (exact)
-                eF = (self.ex[i]*Fx + self.ey[i]*Fy + self.ez[i]*Fz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-                uF = (ux*Fx + uy*Fy + uz*Fz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                eF = self.ex[i]*Fx + self.ey[i]*Fy + self.ez[i]*Fz
+                uF = ux*Fx + uy*Fy + uz*Fz
 
                 # Standard D3Q19 equilibrium (ALL directions use same formula)
-                feq = (self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-                force_term = (self.w[i] * (1.0 - 0.5*omega_eff) * (3.0*eF + 9.0*eu*eF - 3.0*uF)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                feq = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
+                force_term = self.w[i] * (1.0 - 0.5*omega_eff) * (3.0*eF + 9.0*eu*eF - 3.0*uF)
 
                 # Collision with force
-                self.f[i] += omega_eff.nan_to_num(1e-12, posinf=1e18, neginf=-1e18) * (feq - self.f[i]).nan_to_num(1e-12, posinf=1e18, neginf=-1e18) + force_term
+                self.f[i] += omega_eff * (feq - self.f[i]) + force_term
 
             # === 6. Store pre-stream populations for bounce-back ===
             self.f_pre_stream.copy_(self.f)
@@ -438,25 +438,25 @@ class GPULBMSolver:
             # === 7. Streaming ===
             for i in range(19):
                 shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
-                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2))
 
             # === 8. Boundary conditions - bounce-back using pre-stream values ===
             mask = geometry_mask > 0.5
             for i in range(19):
                 opp_i = int(self.opposite[i].item())
-                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i]).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
 
             self.f.copy_(self.f_temp)
 
             # === 8. Update fields ===
-            self.velocity_x = ux.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            self.velocity_y = uy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            self.velocity_z = uz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            self.velocity_x = ux
+            self.velocity_y = uy
+            self.velocity_z = uz
             self.pressure = rho * self.cs2
 
             # === 9. Compute Q-criterion for vortex detection ===
             if self.phys_config.compute_q_criterion:
-                self.q_criterion = self._compute_q_criterion(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                self.q_criterion = self._compute_q_criterion(ux, uy, uz)
 
             # === 10. Convergence check ===
             if step % self.phys_config.check_convergence_every == 0 and step > 0:
