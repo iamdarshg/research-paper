@@ -12,11 +12,11 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path('CLI').resolve()))
+REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str((REPO / 'CLI').resolve()))
 from aircraft_diffusion_cfd import CFDConfig, LBMPhysicsConfig
 from advanced_lbm_solver import D3Q27CascadedSolver
 
-REPO = Path(__file__).resolve().parent
 OF_ROOT = Path(os.environ.get('OPENFOAM_ROOT', '/home/darsh/.openclaw/openfoam/usr/share/openfoam'))
 OF_CMD = f'source "{OF_ROOT / "etc" / "bashrc"}" >/dev/null 2>&1 && '
 
@@ -32,12 +32,16 @@ def write(case: Path, rel: str, content: str) -> None:
     path.write_text(content)
 
 
+VALIDATION_OBJECT_NAME = 'centered cube STL'
+VALIDATION_OBJECT_DESCRIPTION = 'A unit cube centered at the origin, used as the shared validation object for both solvers.'
+
+
 def make_case() -> Path:
     case = Path(tempfile.mkdtemp(prefix='openfoam_sonic_cube_'))
     for p in [case / '0', case / 'constant' / 'triSurface', case / 'system']:
         p.mkdir(parents=True, exist_ok=True)
 
-    # Simple cube STL centered at the origin
+    # Validation object: simple cube STL centered at the origin
     write(case, 'constant/triSurface/cube.stl', """solid cube
 facet normal 0 0 -1
  outer loop
@@ -404,6 +408,13 @@ boundaryField
 }
 """)
 
+    write(case, 'VALIDATION_OBJECT.md', f"""# Validation object
+
+- **Name:** {VALIDATION_OBJECT_NAME}
+- **Description:** {VALIDATION_OBJECT_DESCRIPTION}
+- **Geometry:** 1.0 unit cube centered at the origin
+- **Use:** Internal D3Q27 benchmark vs. OpenFOAM sonicFoam comparison
+""")
     return case
 
 
@@ -547,7 +558,14 @@ def main():
     internal = solver.compute_aerodynamic_coefficients(mask)
 
     case = make_case()
-    results = {'case_dir': str(case), 'internal': internal}
+    results = {
+        'case_dir': str(case),
+        'validation_object': {
+            'name': VALIDATION_OBJECT_NAME,
+            'description': VALIDATION_OBJECT_DESCRIPTION,
+        },
+        'internal': internal,
+    }
     commands = [
         'blockMesh',
         'surfaceFeatureExtract',
