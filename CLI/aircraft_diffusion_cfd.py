@@ -49,6 +49,10 @@ from advanced_lbm_solver import GPULBMSolver as AdvancedGPULBMSolver, D3Q27Casca
 
 warnings.filterwarnings('ignore')
 
+OPENFOAM_ROOT = Path(os.environ.get("OPENFOAM_ROOT", "/home/darsh/.openclaw/openfoam/usr/share/openfoam"))
+OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
+OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam", "foamEtcFile"))
+
 # ============================================================================
 # CONFIG & DATACLASSES
 # ============================================================================
@@ -1433,6 +1437,25 @@ class OptimizedAircraftGenerator:
         print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
     
+    def _postprocess_voxels(self, voxel_grid: torch.Tensor, min_component_size: int = 32) -> torch.Tensor:
+        """Light cleanup for exported voxel geometries."""
+        if voxel_grid.ndim == 4:
+            voxel_grid = voxel_grid.squeeze(0)
+        binary = (voxel_grid > 0.5).detach().cpu().numpy().astype(np.uint8)
+        try:
+            from scipy import ndimage
+            labels, n = ndimage.label(binary)
+            if n <= 1:
+                return torch.as_tensor(binary, dtype=voxel_grid.dtype, device=voxel_grid.device)
+            sizes = ndimage.sum(binary, labels, index=range(1, n + 1))
+            keep = {i + 1 for i, size in enumerate(sizes) if size >= min_component_size}
+            cleaned = np.isin(labels, list(keep)).astype(np.uint8)
+            if cleaned.sum() == 0:
+                cleaned = binary
+        except Exception:
+            cleaned = binary
+        return torch.as_tensor(cleaned, dtype=voxel_grid.dtype, device=voxel_grid.device)
+
     def voxels_to_stl(self, voxel_grid: torch.Tensor, output_path: str, use_marching_cubes: bool = True):
         """Convert voxel grid to STL file using marching cubes with optimizations"""
         
@@ -1526,6 +1549,260 @@ class OptimizedAircraftGenerator:
             vertices = triangles.reshape(-1, 3)
             faces = np.arange(len(vertices)).reshape(-1, 3)
             self._write_stl(path, vertices, faces)
+
+    def export_openfoam_case(self, voxel_grid: torch.Tensor, case_dir: str) -> Dict[str, Any]:
+        """Create a minimal OpenFOAM validation case around the exported geometry."""
+        case_path = Path(case_dir)
+        tri_surface = case_path / "constant" / "triSurface"
+        system = case_path / "system"
+        constant = case_path / "constant"
+        for p in (tri_surface, system, constant / "polyMesh", case_path / "0"):
+            p.mkdir(parents=True, exist_ok=True)
+
+        processed = self._postprocess_voxels(voxel_grid.unsqueeze(0)).squeeze(0) if voxel_grid.ndim == 3 else self._postprocess_voxels(voxel_grid)
+        stl_path = tri_surface / "design.stl"
+        self.voxels_to_stl(processed, str(stl_path), use_marching_cubes=True)
+
+        (system / "blockMeshDict").write_text("""FoamFile\n{\n    version 2.0;\n    format ascii;\n    class dictionary;\n    object blockMeshDict;\n}\nconvertToMeters 1;\nvertices\n(\n    (-5 -2 -2)\n    ( 5 -2 -2)\n    ( 5  2 -2)\n    (-5  2 -2)\n    (-5 -2  2)\n    ( 5 -2  2)\n    ( 5  2  2)\n    (-5  2  2)\n);\nblocks\n(\n    hex (0 1 2 3 4 5 6 7) (60 24 24) simpleGrading (1 1 1)\n);\nedges ( );\nboundary\n(\n    inlet { type patch; faces ((0 4 7 3)); }\n    outlet { type patch; faces ((1 2 6 5)); }\n    top { type patch; faces ((3 7 6 2)); }\n    bottom { type patch; faces ((0 1 5 4)); }\n    front { type symmetryPlane; faces ((0 3 2 1)); }\n    back { type symmetryPlane; faces ((4 5 6 7)); }\n);\nmergePatchPairs ( );\n""")
+        (system / "snappyHexMeshDict").write_text("""FoamFile
+{ version 2.0; format ascii; class dictionary; object snappyHexMeshDict; }
+castellatedMesh true;
+snap true;
+addLayers false;
+mergeTolerance 1e-6;
+geometry
+{ design.stl { type triSurfaceMesh; name design; } }
+castellatedMeshControls
+{
+    maxLocalCells 50000; maxGlobalCells 200000; minRefinementCells 0; nCellsBetweenLevels 2;
+    features ( ); refinementSurfaces { design { level (1 2); } }; refinementRegions { };
+    allowFreeStandingZoneFaces true; resolveFeatureAngle 30; locationInMesh (0 0 0);
+}
+snapControls { nSmoothPatch 3; tolerance 2.0; nSolveIter 30; nRelaxIter 5; }
+addLayersControls
+{
+    relativeSizes true;
+    layers { }
+    expansionRatio 1.0;
+    finalLayerThickness 0.3;
+    minThickness 0.1;
+    nGrow 0;
+    featureAngle 30;
+    nRelaxIter 3;
+    nSmoothSurfaceNormals 1;
+    nSmoothNormals 3;
+    nSmoothThickness 10;
+    maxFaceThicknessRatio 0.5;
+    maxThicknessToMedialRatio 0.3;
+    minMedialAxisAngle 90;
+    nBufferCellsNoExtrude 0;
+    nLayerIter 0;
+}
+meshQualityControls
+{
+    maxNonOrtho 65;
+    maxBoundarySkewness 20;
+    maxInternalSkewness 4;
+    maxConcave 80;
+    minVol 1e-13;
+    minTetQuality 1e-30;
+    minArea -1;
+    minTwist 0.02;
+    minDeterminant 0.001;
+    minFaceWeight 0.02;
+    minVolRatio 0.01;
+    minTriangleTwist -1;
+    nSmoothScale 4;
+    errorReduction 0.75;
+}
+""")
+        (system / "controlDict").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"system\";
+    object      controlDict;
+}
+application     sonicFoam;
+startFrom       latestTime;
+startTime       0;
+stopAt          endTime;
+endTime         0.0027;
+deltaT          4e-08;
+writeControl    runTime;
+writeInterval   2e-04;
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  6;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+runTimeModifiable true;
+""")
+        (system / "fvSchemes").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O operation     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"system\";
+    object      fvSchemes;
+}
+ddtSchemes
+{
+    default         Euler;
+}
+gradSchemes
+{
+    default         Gauss linear;
+    grad(U)         cellLimited Gauss linear 1;
+}
+divSchemes
+{
+    default         none;
+    div(phi,U)      Gauss limitedLinearV 1;
+    div(phi,e)      Gauss limitedLinear 1;
+    div(phid,p)     Gauss limitedLinear 1;
+    div(phiv,p)     Gauss limitedLinear 1;
+    div(phi,K)      Gauss limitedLinear 1;
+    div(phi,k)      Gauss upwind;
+    div(phi,epsilon) Gauss upwind;
+    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
+}
+laplacianSchemes
+{
+    default         Gauss linear limited corrected 0.5;
+}
+interpolationSchemes
+{
+    default         linear;
+}
+snGradSchemes
+{
+    default         corrected;
+}
+""")
+        (system / "fvSolution").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"system\";
+    object      fvSolution;
+}
+solvers
+{
+    \"rho.*\"
+    {
+        solver          diagonal;
+    }
+
+    \"p.*\"
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-12;
+        relTol          0;
+    }
+
+    \"(U|e).*\"
+    {
+        $p;
+        tolerance       1e-9;
+    }
+
+    \"(k|epsilon).*\"
+    {
+        $p;
+        tolerance       1e-10;
+    }
+}
+PIMPLE
+{
+    nOuterCorrectors 1;
+    nCorrectors      2;
+    nNonOrthogonalCorrectors 0;
+}
+""")
+        (constant / "thermophysicalProperties").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O operation     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"constant\";
+    object      thermophysicalProperties;
+}
+thermoType
+{
+    type            hePsiThermo;
+    mixture         pureMixture;
+    transport       const;
+    thermo          hConst;
+    equationOfState perfectGas;
+    specie          specie;
+    energy          sensibleInternalEnergy;
+}
+mixture
+{
+    specie
+    {
+        molWeight       28.9;
+    }
+    thermodynamics
+    {
+        Cp              1005;
+        Hf              0;
+    }
+    transport
+    {
+        mu              0;
+        Pr              0.7;
+    }
+}
+""")
+        (constant / "turbulenceProperties").write_text("""FoamFile
+{ version 2.0; format ascii; class dictionary; object turbulenceProperties; }
+simulationType laminar;
+""")
+        (system / "forceCoeffs").write_text("""FoamFile\n{ version 2.0; format ascii; class dictionary; object forceCoeffs; }\npatches (design);\nrhoInf 1.225;\nrho rho;\np p;\nU U;\nCofR (0 0 0);\nAref 1;\nlRef 1;\nmagUInf 80;\nliftDir (0 0 1);\ndragDir (1 0 0);\n""")
+        (case_path / "0" / "U").write_text("""FoamFile\n{ version 2.0; format ascii; class volVectorField; object U; }\ndimensions [0 1 -1 0 0 0 0];\ninternalField uniform (80 0 0);\nboundaryField { inlet { type fixedValue; value uniform (80 0 0); } outlet { type pressureInletOutletVelocity; value uniform (80 0 0); } top { type slip; } bottom { type slip; } front { type symmetryPlane; } back { type symmetryPlane; } design { type noSlip; } }\n""")
+        (case_path / "0" / "p").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object p; }\ndimensions [1 -1 -2 0 0 0 0];\ninternalField uniform 101325;\nboundaryField { inlet { type totalPressure; p0 uniform 101325; value uniform 101325; } outlet { type fixedValue; value uniform 101325; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
+        (case_path / "0" / "T").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object T; }\ndimensions [0 0 0 1 0 0 0];\ninternalField uniform 300;\nboundaryField { inlet { type fixedValue; value uniform 300; } outlet { type zeroGradient; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
+        (case_path / "0" / "rho").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object rho; }\ndimensions [1 -3 0 0 0 0 0];\ninternalField uniform 1.225;\nboundaryField { inlet { type fixedValue; value uniform 1.225; } outlet { type zeroGradient; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
+        (case_path / "OPENFOAM_EXPORT.md").write_text(
+            "OpenFOAM validation case generated from repo geometry export.\n"
+            f"OpenFOAM root: {OPENFOAM_ROOT}\n"
+            "Run blockMesh -> surfaceFeatureExtract -> snappyHexMesh -> sonicFoam with forces.\n"
+        )
+        return {"case_dir": str(case_path), "stl_path": str(stl_path), "openfoam_available": OPENFOAM_AVAILABLE}
 
 # ============================================================================
 # CLI INTERFACE
