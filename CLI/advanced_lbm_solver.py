@@ -5,6 +5,31 @@ from typing import Dict
 from scipy.ndimage import binary_dilation
 from typing import TYPE_CHECKING
 
+def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref=1.225):
+    """Shared force normalization for drag/lift coefficients.
+
+    The solvers accumulate lattice-unit momentum-exchange forces. Convert them
+    with the same lattice-to-physical scaling and dynamic-pressure convention
+    so D3Q27 and D3Q19 report coefficients on the same basis.
+    """
+    v_inf = mach_number * 343.0
+    q_inf = 0.5 * rho_ref * v_inf**2
+    u_lattice = max(mach_number * 0.10, 1e-12)
+    force_scale = 1.0 / (u_lattice ** 2)
+
+    force_x_phys = force_x * force_scale
+    force_z_phys = force_z * force_scale
+    denom = q_inf * ref_area + 1e-10
+
+    return {
+        "drag_coefficient": force_x_phys.item() / denom,
+        "lift_coefficient": force_z_phys.item() / denom,
+        "freestream_speed": v_inf,
+        "density": rho_ref,
+        "force_scale": force_scale,
+    }
+
+
 class D3Q27Lattice:
     """D3Q27 velocity vectors and weights"""
 
@@ -532,19 +557,7 @@ class D3Q27CascadedSolver:
 
     def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
         """Compute forces using momentum-exchange method with enhanced diagnostics"""
-        rho_ref = 1.225
-        v_inf = self.config.mach_number * 343.0
-        q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
-
-        # The solver evolves in lattice units, while the benchmark normalizes
-        # against an OpenFOAM-style dynamic pressure in physical units.
-        # The momentum-exchange force still needs the lattice-to-physical
-        # velocity scale applied before comparing against q_inf.
-        u_lattice = max(self.config.mach_number * 0.10, 1e-12)
-        force_scale = 1.0 / (u_lattice ** 2)
-
-        ref_area = 1.0
 
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples
@@ -555,28 +568,30 @@ class D3Q27CascadedSolver:
             lift_force = self.force_z_last
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        drag_force_phys = drag_force * force_scale
-        lift_force_phys = lift_force * force_scale
-
-        # Keep the sign aligned with the OpenFOAM drag convention.
-        cd = drag_force_phys.item() / (q_inf * ref_area + 1e-10)
-        cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
+        coeffs = _compute_force_coefficients(
+            drag_force,
+            lift_force,
+            self.config.mach_number,
+            ref_area=1.0,
+            rho_ref=1.225,
+        )
 
         # Basic diagnostics
         rho = torch.sum(self.f, dim=0)
         vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0)) if hasattr(self.vorticity, 'shape') else torch.zeros_like(rho)
+        v_inf = coeffs['freestream_speed']
 
         return {
             'force_x': drag_force.item(),
             'force_z': lift_force.item(),
-            'drag_coefficient': cd,
-            'lift_coefficient': cl,
+            'drag_coefficient': coeffs['drag_coefficient'],
+            'lift_coefficient': coeffs['lift_coefficient'],
             'force_definition': force_definition,
-            'reference_area': ref_area,
+            'reference_area': 1.0,
             'reference_area_voxelized': torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2,
             'reference_length': h * self.resolution,
             'freestream_speed': v_inf,
-            'density': rho_ref,
+            'density': coeffs['density'],
             'pressure_sum': rho.sum().item(),
             'max_turbulent_viscosity': self.nu,
             'mean_smagorinsky_constant': 0.17,  # Default value
@@ -1040,21 +1055,10 @@ class GPULBMSolver:
         fluid cell adjacent to the solid, the reflected population transfers 2*f_i*e_i
         to the wall. The result is a total force (pressure + viscous) on the body.
         """
-        rho_ref = 1.0
-        v_inf = self.config.mach_number * 343.0
-        q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
-
-        # The solver evolves in lattice units, while the benchmark normalizes
-        # against an OpenFOAM-style dynamic pressure in physical units. For the
-        # momentum-exchange force, the cleaner comparison is to normalize the
-        # lattice force by the lattice dynamic-pressure scale and the lattice
-        # reference area, rather than applying an extra ad hoc force multiplier.
-        u_lattice = max(self.config.mach_number * 0.10, 1e-12)
 
         solid = geometry_mask > 0.5
         ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
-        ref_area_cells = max(ref_area / (h * h), 1.0)
 
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples
@@ -1065,17 +1069,23 @@ class GPULBMSolver:
             lift_force = self.force_z_last
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        cd = (2.0 * drag_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
-        cl = (2.0 * lift_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
+        coeffs = _compute_force_coefficients(
+            drag_force,
+            lift_force,
+            self.config.mach_number,
+            ref_area=max(ref_area, 1e-12),
+            rho_ref=1.225,
+        )
 
         vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0))
         vortex_cells = torch.sum((self.q_criterion > self.phys_config.q_threshold).float()).item()
+        v_inf = coeffs['freestream_speed']
 
         return {
             'force_x': drag_force.item(),
             'force_z': lift_force.item(),
-            'drag_coefficient': cd,
-            'lift_coefficient': cl,
+            'drag_coefficient': coeffs['drag_coefficient'],
+            'lift_coefficient': coeffs['lift_coefficient'],
             'force_definition': force_definition,
             'pressure_sum': self.pressure.sum().item(),
             'max_turbulent_viscosity': self.nu_turb.max().item(),
@@ -1085,6 +1095,6 @@ class GPULBMSolver:
             'reference_area': ref_area,
             'reference_length': h * self.resolution,
             'freestream_speed': v_inf,
-            'density': rho_ref,
+            'density': coeffs['density'],
             'reynolds_number_turbulent': v_inf * h * self.resolution / (self.nu + self.nu_turb.mean().item())
         }
