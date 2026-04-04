@@ -535,13 +535,13 @@ class D3Q27CascadedSolver:
         h = self.config.lbm_config.grid_spacing
 
         # The solver evolves in lattice units, while the benchmark normalizes
-        # against an OpenFOAM-style dynamic pressure in physical units. The raw
-        # momentum-exchange force needs to be lifted out of lattice velocity
-        # units, which scales like 1/u_lattice^2 for this setup.
+        # against an OpenFOAM-style dynamic pressure in physical units.
+        # Keep the coefficient normalization on the benchmark's geometric
+        # reference area so the comparison does not drift with voxelization.
         u_lattice = max(self.config.mach_number * 0.10, 1e-12)
         force_scale = 1.0 / (u_lattice ** 2)
 
-        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
+        ref_area = 1.0
 
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples
@@ -572,6 +572,7 @@ class D3Q27CascadedSolver:
             'lift_coefficient': cl,
             'force_definition': force_definition,
             'reference_area': ref_area,
+            'reference_area_voxelized': torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2,
             'reference_length': h * self.resolution,
             'freestream_speed': v_inf,
             'density': rho_ref,

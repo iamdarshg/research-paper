@@ -556,7 +556,7 @@ def _parse_forces_dat(path: Path) -> Dict[str, float]:
     rho = 1.225
     u_inf = 80.0
     q = 0.5 * rho * u_inf * u_inf
-    area_ref = 1.0
+    area_ref = VALIDATION_OBJECT_DETAILS['reference_area']
     return {
         'time': time,
         'force_x': float(force[0]),
@@ -567,6 +567,7 @@ def _parse_forces_dat(path: Path) -> Dict[str, float]:
         'moment_z': float(moment[2]),
         'cd_total': float(-force[0] / (q * area_ref)),
         'cl_total': float(force[2] / (q * area_ref)),
+        'reference_area': area_ref,
     }
 
 
@@ -625,6 +626,8 @@ def main():
     solver = D3Q27CascadedSolver(cfg, torch.device('cpu'), LBMPhysicsConfig)
     solver.collide_stream(mask, steps=200)
     internal = solver.compute_aerodynamic_coefficients(mask)
+    internal['reference_area_validation'] = VALIDATION_OBJECT_DETAILS['reference_area']
+    internal['reference_area_voxelized'] = internal.get('reference_area')
 
     case = make_case()
     results = {
