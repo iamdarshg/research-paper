@@ -149,9 +149,10 @@ class D3Q27CascadedSolver:
         """Compute STABLE physics constants"""
         # Lattice units - everything is O(1)
         self.cs2 = 1.0 / 3.0
-        
-        # Force lattice velocity to be small
-        u_lattice = 0.05  # Fixed, safe value
+
+        # Use the lattice-consistent freestream speed for the Mach number.
+        # For D3Q27, c_s = 1/sqrt(3), so u = Ma * c_s.
+        u_lattice = self.config.mach_number / (3.0 ** 0.5)
         L_lattice = self.resolution
         
         # Force reasonable Reynolds number for this grid
@@ -183,8 +184,8 @@ class D3Q27CascadedSolver:
     def _initialize_equilibrium(self):
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
-        u_lattice = self.config.mach_number * 0.10  # ~0.025 for Mach 0.025
-        ux = u_lattice  # Lattice units, not physical!
+        u_lattice = self.config.mach_number / (3.0 ** 0.5)
+        ux = u_lattice  # Lattice-consistent freestream speed.
         uy, uz = 0.0, 0.0
 
         for i in range(27):
