@@ -9,6 +9,7 @@ This repository includes a GitHub Actions workflow that can spin up a local Open
   - `pull_request_review_comment` events
 - It checks out the PR branch
 - It calls the local OpenClaw CLI with the PR comment and PR context
+- It posts the agent's reply back to the PR as a comment
 - If the agent changes files, the hook commits and pushes those changes back to the branch
 
 ## Requirements

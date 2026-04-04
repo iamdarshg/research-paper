@@ -88,12 +88,14 @@ def agent_prompt(pr_number: int, pr: dict, comment_author: str, comment_body: st
         - If code or docs need updating, make the minimum safe changes.
         - Run the most relevant validation you can.
         - Leave the repo in a commit-ready state.
+        - Also draft a concise PR reply that can be posted back automatically.
         - If the comment is purely informational, explain the needed response clearly.
 
         Important:
         - Keep changes focused.
         - Avoid broad refactors unless the comment clearly requires them.
         - Prefer minimal, reviewable edits.
+        - Write the reply as normal GitHub comment markdown, without surrounding fences.
         """
     ).strip()
 
@@ -106,6 +108,15 @@ def git_status() -> str:
 def current_branch() -> str:
     result = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=REPO_ROOT)
     return result.stdout.strip()
+
+
+def post_pr_comment(pr_number: int, body: str) -> None:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as tmp:
+        tmp.write(body)
+        tmp_path = tmp.name
+    run(["gh", "pr", "comment", str(pr_number), "--repo", os.environ["GITHUB_REPOSITORY"], "--body-file", tmp_path], cwd=REPO_ROOT)
 
 
 def maybe_commit_and_push(pr_number: int) -> str | None:
@@ -160,6 +171,23 @@ def main() -> int:
     print(agent_run.stdout)
     if agent_run.stderr:
         print(agent_run.stderr, file=sys.stderr)
+
+    reply = None
+    try:
+        parsed = json.loads(agent_run.stdout)
+        payloads = parsed.get("payloads", [])
+        texts = [p.get("text", "").strip() for p in payloads if p.get("text")]
+        reply = "\n\n".join(texts).strip() if texts else None
+    except json.JSONDecodeError:
+        reply = None
+
+    if not reply:
+        reply = (
+            f"OpenClaw checked this PR comment from @{author} and ran the agent, but it did not return a comment-ready reply. "
+            f"The repo state will be committed separately if files changed."
+        )
+
+    post_pr_comment(pr_number, reply)
 
     commit_sha = maybe_commit_and_push(pr_number)
     if commit_sha:
