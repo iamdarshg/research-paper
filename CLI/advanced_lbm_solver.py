@@ -401,9 +401,12 @@ class GPULBMSolver:
         for step in range(steps):
             # === 1. Compute macroscopic variables ===
             rho = torch.sum(self.f, dim=0)
-            ux = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
-            uy = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
-            uz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
+            momentum_x = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0)
+            momentum_y = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0)
+            momentum_z = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0)
+            ux = (momentum_x + 0.5 * Fx) / (rho + 1e-12)
+            uy = (momentum_y + 0.5 * Fy) / (rho + 1e-12)
+            uz = (momentum_z + 0.5 * Fz) / (rho + 1e-12)
 
             # === 2. Turbulence modeling (Dynamic Smagorinsky / WALE) ===
             self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
