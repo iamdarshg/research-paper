@@ -901,25 +901,22 @@ class AdvancedCFDSimulator:
     def _voxel_to_stl_path(self, voxel_grid: torch.Tensor) -> Optional[str]:
         """Convert voxel grid to STL file path"""
         try:
-            # Convert to numpy
             voxel_np = voxel_grid.cpu().numpy()
             binary_grid = (voxel_np > 0.5).astype(np.float32)
-            
-            # Use marching cubes for smooth mesh
             vertices, faces, _, _ = measure.marching_cubes(
                 binary_grid,
                 level=0.5,
                 spacing=(1.0, 1.0, 1.0)
             )
-            
-            # Create mesh
+            # Match the same centered physical frame used by the internal solver
+            # and the OpenFOAM validation case: unit cube centered at the origin.
+            scale = float(self.config.lbm_config.physical_length_scale)
+            h = scale / float(self.config.base_grid_resolution)
+            vertices = vertices * h - (scale * 0.5) + (0.5 * h)
             mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-            
-            # Export to temporary STL
             with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
                 mesh.export(tmp.name)
                 return tmp.name
-                
         except Exception as e:
             print(f"STL conversion failed: {e}")
             return None
@@ -1476,6 +1473,9 @@ class OptimizedAircraftGenerator:
                     level=level,
                     spacing=(1.0, 1.0, 1.0)
                 )
+                scale = float(self.config.lbm_config.physical_length_scale)
+                h = scale / float(self.config.base_grid_resolution)
+                vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                 
                 print(f"Generated optimized mesh: {len(vertices)} vertices, {len(faces)} faces")
                 
@@ -1533,6 +1533,9 @@ class OptimizedAircraftGenerator:
                             [x, y, z], [x+1, y, z], [x+1, y+1, z], [x, y+1, z],
                             [x, y, z+1], [x+1, y, z+1], [x+1, y+1, z+1], [x, y+1, z+1]
                         ], dtype=np.float32)
+                        scale = float(self.config.lbm_config.physical_length_scale)
+                        h = scale / float(self.config.base_grid_resolution)
+                        vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                         
                         # Cube face indices
                         faces = [
@@ -1576,7 +1579,7 @@ castellatedMeshControls
 {
     maxLocalCells 50000; maxGlobalCells 200000; minRefinementCells 0; nCellsBetweenLevels 2;
     features ( ); refinementSurfaces { design { level (1 2); } }; refinementRegions { };
-    allowFreeStandingZoneFaces true; resolveFeatureAngle 30; locationInMesh (0 0 0);
+    allowFreeStandingZoneFaces true; resolveFeatureAngle 30; locationInMesh (4 0 0);
 }
 snapControls { nSmoothPatch 3; tolerance 2.0; nSolveIter 30; nRelaxIter 5; }
 addLayersControls
@@ -1792,7 +1795,7 @@ mixture
 { version 2.0; format ascii; class dictionary; object turbulenceProperties; }
 simulationType laminar;
 """)
-        (system / "forces").write_text("""FoamFile\n{ version 2.0; format ascii; class dictionary; object forces; }\npatches (design);\nrho rho;\nrhoInf 1.225;\np p;\nU U;\nCofR (0 0 0);\n""")
+        (system / "forces").write_text("""FoamFile\n{ version 2.0; format ascii; class dictionary; object forces; }\ntype forces;\nfunctionObjectLibs (\"libforces.so\");\npatches (design);\nrho rho;\nrhoInf 1.225;\np p;\nU U;\nCofR (0 0 0);\n""")
         (case_path / "0" / "U").write_text("""FoamFile\n{ version 2.0; format ascii; class volVectorField; object U; }\ndimensions [0 1 -1 0 0 0 0];\ninternalField uniform (80 0 0);\nboundaryField { inlet { type fixedValue; value uniform (80 0 0); } outlet { type pressureInletOutletVelocity; value uniform (80 0 0); } top { type slip; } bottom { type slip; } front { type symmetryPlane; } back { type symmetryPlane; } design { type noSlip; } }\n""")
         (case_path / "0" / "p").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object p; }\ndimensions [1 -1 -2 0 0 0 0];\ninternalField uniform 101325;\nboundaryField { inlet { type totalPressure; p0 uniform 101325; value uniform 101325; } outlet { type fixedValue; value uniform 101325; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
         (case_path / "0" / "T").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object T; }\ndimensions [0 0 0 1 0 0 0];\ninternalField uniform 300;\nboundaryField { inlet { type fixedValue; value uniform 300; } outlet { type zeroGradient; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")

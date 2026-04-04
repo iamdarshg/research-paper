@@ -285,6 +285,13 @@ class D3Q27CascadedSolver:
         # Convergence tracking
         self.velocity_prev = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
 
+        # Force accounting from bounce-back / momentum exchange
+        self.force_x_accum = torch.tensor(0.0, device=device)
+        self.force_z_accum = torch.tensor(0.0, device=device)
+        self.force_samples = 0
+        self.force_x_last = torch.tensor(0.0, device=device)
+        self.force_z_last = torch.tensor(0.0, device=device)
+
         # Cascaded relaxation parameters (these could be made configurable)
         self.s_nu = 1.0 / 0.6    # Viscosity relaxation
         self.s_e = 1.2           # Energy relaxation
@@ -423,11 +430,36 @@ class D3Q27CascadedSolver:
                 self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
             # === 5. Boundary conditions - bounce-back using pre-stream values ===
+            mask = geometry_mask > 0.5
+            step_force_x = torch.tensor(0.0, device=self.device)
+            step_force_z = torch.tensor(0.0, device=self.device)
+            solid_np = mask.cpu().numpy().astype(bool)
             for i in range(27):
-                opp_i = int(self.opposite[i].item())  # Convert to Python int
-                mask = geometry_mask > 0.5
-                opp_i = int(self.opposite[i].item())  # Convert to Python int
+                opp_i = int(self.opposite[i].item())
                 self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+
+                if i == 0 or i > opp_i:
+                    continue
+
+                dx = int(self.ex[i].item())
+                dy = int(self.ey[i].item())
+                dz = int(self.ez[i].item())
+                neighbor_is_solid = torch.tensor(
+                    np.roll(solid_np, shift=(-dx, -dy, -dz), axis=(0, 1, 2)),
+                    device=self.device,
+                    dtype=torch.bool,
+                )
+                boundary_link = (~mask) & neighbor_is_solid
+                if not torch.any(boundary_link):
+                    continue
+                step_force_x += torch.sum(2.0 * self.ex[i] * self.f_pre_stream[i][boundary_link])
+                step_force_z += torch.sum(2.0 * self.ez[i] * self.f_pre_stream[i][boundary_link])
+
+            self.force_x_last = step_force_x
+            self.force_z_last = step_force_z
+            self.force_x_accum += step_force_x
+            self.force_z_accum += step_force_z
+            self.force_samples += 1
             self.f = self.f_temp.clone()
 
             # === 6. Update macroscopic fields for GUI interface ===
@@ -470,45 +502,52 @@ class D3Q27CascadedSolver:
 
     def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
         """Compute forces using momentum-exchange method with enhanced diagnostics"""
-        rho_ref = 1.0
+        rho_ref = 1.225
         v_inf = self.config.mach_number * 343.0
         q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
 
+        # The solver evolves in lattice units, but the benchmark compares against
+        # a physical-unit OpenFOAM force coefficient. Convert the raw lattice
+        # momentum-exchange force using the same lattice velocity scale used when
+        # the case is initialized, otherwise the coefficient is underreported by
+        # roughly (u_phys / u_lattice)^2.
+        u_lattice = max(self.config.mach_number * 0.10, 1e-12)
+        force_scale = (v_inf / u_lattice) ** 2
+
         ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
 
-        drag_force = torch.tensor(1e-13, device=self.device)
-        lift_force = torch.tensor(1e-13, device=self.device)
+        if self.force_samples > 0:
+            drag_force = self.force_x_accum / self.force_samples
+            lift_force = self.force_z_accum / self.force_samples
+            force_definition = 'bounce-back momentum exchange accumulated during streaming'
+        else:
+            drag_force = self.force_x_last
+            lift_force = self.force_z_last
+            force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        geom_np = geometry_mask.cpu().numpy().astype(bool)
-        dilated = binary_dilation(geom_np, iterations=1)
-        boundary_fluid = torch.tensor(dilated & ~geom_np, device=self.device, dtype=torch.bool).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        drag_force_phys = drag_force * force_scale
+        lift_force_phys = lift_force * force_scale
 
-        for i in range(27):  # D3Q27 has 27 directions
-            shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
-            geom_shifted = torch.roll(geometry_mask, shifts=shifts, dims=(0,1,2))
-
-            # Fix bitwise AND to logical operations for numpy arrays
-            boundary_link_np = np.logical_and(dilated, np.logical_not(geom_np))
-            boundary_link = torch.tensor(boundary_link_np, device=self.device, dtype=torch.bool)
-
-            opp_i = int(self.opposite[i].item())
-            momentum_x = self.ex[i] * (self.f[i] + self.f[opp_i])
-            momentum_z = self.ez[i] * (self.f[i] + self.f[opp_i])
-
-            drag_force += torch.sum(momentum_x[boundary_link])
-            lift_force += torch.sum(momentum_z[boundary_link])
-
-        cd = abs(drag_force.item()) / (q_inf * ref_area + 1e-10)
-        cl = abs(lift_force.item()) / (q_inf * ref_area + 1e-10)
+        # Keep the raw force components in the global axes, but normalize the
+        # coefficient using the physical-unit scale.
+        cd = -drag_force_phys.item() / (q_inf * ref_area + 1e-10)
+        cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
 
         # Basic diagnostics
         rho = torch.sum(self.f, dim=0)
         vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0)) if hasattr(self.vorticity, 'shape') else torch.zeros_like(rho)
 
         return {
+            'force_x': drag_force.item(),
+            'force_z': lift_force.item(),
             'drag_coefficient': cd,
             'lift_coefficient': cl,
+            'force_definition': force_definition,
+            'reference_area': ref_area,
+            'reference_length': h * self.resolution,
+            'freestream_speed': v_inf,
+            'density': rho_ref,
             'pressure_sum': rho.sum().item(),
             'max_turbulent_viscosity': self.nu,
             'mean_smagorinsky_constant': 0.17,  # Default value
@@ -965,55 +1004,60 @@ class GPULBMSolver:
                       f"vortex cells: {vortex_volume:.0f}, mean Cs: {self.cs_dynamic.mean():.4f}")
 
     def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
-        """Compute forces using momentum-exchange method with enhanced diagnostics"""
+        """Compute total hydrodynamic force from fluid-solid links.
+
+        This uses the standard momentum-exchange interpretation of bounce-back: for each
+        fluid cell adjacent to the solid, the reflected population transfers 2*f_i*e_i
+        to the wall. The result is a total force (pressure + viscous) on the body.
+        """
         rho_ref = 1.0
         v_inf = self.config.mach_number * 343.0
         q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
 
-        ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
+        # The solver evolves in lattice units, but the benchmark compares against
+        # a physical-unit OpenFOAM force coefficient. Convert the raw lattice
+        # momentum-exchange force using the same lattice velocity scale used when
+        # the case is initialized, otherwise the coefficient is underreported by
+        # roughly (u_phys / u_lattice)^2.
+        u_lattice = max(self.config.mach_number * 0.10, 1e-12)
+        force_scale = (v_inf / u_lattice) ** 2
 
-        if not self.phys_config.momentum_exchange_correction:
-            drag_force = torch.sum(self.velocity_x[geometry_mask > 0.5])
-            lift_force = torch.sum(self.velocity_z[geometry_mask > 0.5])
+        solid = geometry_mask > 0.5
+        ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
+
+        if self.force_samples > 0:
+            drag_force = self.force_x_accum / self.force_samples
+            lift_force = self.force_z_accum / self.force_samples
+            force_definition = 'bounce-back momentum exchange accumulated during streaming'
         else:
-            # Momentum-Exchange Method
-            drag_force = torch.tensor(0.0, device=self.device)
-            lift_force = torch.tensor(0.0, device=self.device)
+            drag_force = self.force_x_last
+            lift_force = self.force_z_last
+            force_definition = 'bounce-back momentum exchange from last streaming step'
 
-            geom_np = geometry_mask.cpu().numpy().astype(bool)
-            dilated = binary_dilation(geom_np, iterations=1)
-            boundary_fluid = torch.tensor(dilated & ~geom_np, device=self.device, dtype=torch.bool)
+        drag_force_phys = drag_force * force_scale
+        lift_force_phys = lift_force * force_scale
 
-            for i in range(19):
-                shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
-                geom_shifted = torch.roll(geometry_mask, shifts=shifts, dims=(0,1,2))
+        cd = -drag_force_phys.item() / (q_inf * ref_area + 1e-10)
+        cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
 
-                # Fix bitwise AND to logical operations for numpy arrays
-                boundary_link_np = np.logical_and(dilated, np.logical_not(geom_np))
-                boundary_link = torch.tensor(boundary_link_np, device=self.device, dtype=torch.bool)
-
-                opp_i = self.opposite[i]
-                momentum_x = self.ex[i] * (self.f[i] + self.f[opp_i])
-                momentum_z = self.ez[i] * (self.f[i] + self.f[opp_i])
-
-                drag_force += torch.sum(momentum_x[boundary_link])
-                lift_force += torch.sum(momentum_z[boundary_link])
-
-        cd = abs(drag_force.item()) / (q_inf * ref_area + 1e-10)
-        cl = abs(lift_force.item()) / (q_inf * ref_area + 1e-10)
-
-        # Vorticity-based diagnostics
         vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0))
         vortex_cells = torch.sum((self.q_criterion > self.phys_config.q_threshold).float()).item()
 
         return {
+            'force_x': drag_force.item(),
+            'force_z': lift_force.item(),
             'drag_coefficient': cd,
             'lift_coefficient': cl,
+            'force_definition': force_definition,
             'pressure_sum': self.pressure.sum().item(),
             'max_turbulent_viscosity': self.nu_turb.max().item(),
             'mean_smagorinsky_constant': self.cs_dynamic.mean().item(),
             'max_vorticity': vorticity_mag.max().item(),
             'vortex_core_volume': vortex_cells * h**3,
+            'reference_area': ref_area,
+            'reference_length': h * self.resolution,
+            'freestream_speed': v_inf,
+            'density': rho_ref,
             'reynolds_number_turbulent': v_inf * h * self.resolution / (self.nu + self.nu_turb.mean().item())
         }
