@@ -507,13 +507,12 @@ class D3Q27CascadedSolver:
         q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
 
-        # The solver evolves in lattice units, but the benchmark compares against
-        # a physical-unit OpenFOAM force coefficient. Convert the raw lattice
-        # momentum-exchange force using the same lattice velocity scale used when
-        # the case is initialized, otherwise the coefficient is underreported by
-        # roughly (u_phys / u_lattice)^2.
+        # The solver evolves in lattice units, while the benchmark normalizes
+        # against an OpenFOAM-style dynamic pressure in physical units. The raw
+        # momentum-exchange force needs to be lifted out of lattice velocity
+        # units, which scales like 1/u_lattice^2 for this setup.
         u_lattice = max(self.config.mach_number * 0.10, 1e-12)
-        force_scale = (v_inf / u_lattice) ** 2
+        force_scale = 1.0 / (u_lattice ** 2)
 
         ref_area = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
 
@@ -529,9 +528,10 @@ class D3Q27CascadedSolver:
         drag_force_phys = drag_force * force_scale
         lift_force_phys = lift_force * force_scale
 
-        # Keep the raw force components in the global axes, but normalize the
-        # coefficient using the physical-unit scale.
-        cd = -drag_force_phys.item() / (q_inf * ref_area + 1e-10)
+        # Use the OpenFOAM sign convention: positive Cd corresponds to drag
+        # opposing the freestream, and the extracted momentum-exchange force is
+        # already oriented in the body-force direction.
+        cd = drag_force_phys.item() / (q_inf * ref_area + 1e-10)
         cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
 
         # Basic diagnostics
@@ -1015,13 +1015,12 @@ class GPULBMSolver:
         q_inf = 0.5 * rho_ref * v_inf**2
         h = self.config.lbm_config.grid_spacing
 
-        # The solver evolves in lattice units, but the benchmark compares against
-        # a physical-unit OpenFOAM force coefficient. Convert the raw lattice
-        # momentum-exchange force using the same lattice velocity scale used when
-        # the case is initialized, otherwise the coefficient is underreported by
-        # roughly (u_phys / u_lattice)^2.
+        # The solver evolves in lattice units, while the benchmark normalizes
+        # against an OpenFOAM-style dynamic pressure in physical units. The raw
+        # momentum-exchange force needs to be lifted out of lattice velocity
+        # units, which scales like 1/u_lattice^2 for this setup.
         u_lattice = max(self.config.mach_number * 0.10, 1e-12)
-        force_scale = (v_inf / u_lattice) ** 2
+        force_scale = 1.0 / (u_lattice ** 2)
 
         solid = geometry_mask > 0.5
         ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
@@ -1038,7 +1037,7 @@ class GPULBMSolver:
         drag_force_phys = drag_force * force_scale
         lift_force_phys = lift_force * force_scale
 
-        cd = -drag_force_phys.item() / (q_inf * ref_area + 1e-10)
+        cd = drag_force_phys.item() / (q_inf * ref_area + 1e-10)
         cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
 
         vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0))
