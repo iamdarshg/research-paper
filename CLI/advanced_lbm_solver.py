@@ -6,6 +6,7 @@ from scipy.ndimage import binary_dilation
 from typing import TYPE_CHECKING
 
 from lbm_utils import D3Q27Lattice, _compute_force_coefficients
+from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity
 
 class D3Q27Solver:
     """Complete D3Q27 LBM solver"""
@@ -166,40 +167,10 @@ class GPULBMSolver:
             self.f[i] = feq.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
     def _compute_strain_rate_tensor(self, ux, uy, uz):
-        """Compute strain rate tensor S_ij = 0.5*(du_i/dx_j + du_j/dx_i)"""
-        # Velocity gradients
-        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2))
-        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2))
-        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2))
-
-        # Strain rate tensor (symmetric)
-        S11 = dux_dx.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S22 = duy_dy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S33 = duz_dz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S12 = 0.5 * (dux_dy + duy_dx)
-        S13 = 0.5 * (dux_dz + duz_dx)
-        S23 = 0.5 * (duy_dz + duz_dy)
-
-        return S11, S22, S33, S12, S13, S23
+        return compute_strain_rate_tensor(ux, uy, uz)
 
     def _compute_vorticity(self, ux, uy, uz):
-        """Compute vorticity omega = curl(u) [web:44]"""
-        # Compute all gradients properly
-        grad_ux = torch.gradient(ux, dim=(0, 1, 2))  # Returns (dux/dx, dux/dy, dux/dz)
-        grad_uy = torch.gradient(uy, dim=(0, 1, 2))
-        grad_uz = torch.gradient(uz, dim=(0, 1, 2))
-
-        # Extract individual components
-        dux_dx, dux_dy, dux_dz = grad_ux
-        duy_dx, duy_dy, duy_dz = grad_uy
-        duz_dx, duz_dy, duz_dz = grad_uz
-
-        # Vorticity: curl(u)
-        omega_x = duz_dy - duy_dz  # ∂w/∂y - ∂v/∂z
-        omega_y = dux_dz - duz_dx  # ∂u/∂z - ∂w/∂x
-        omega_z = duy_dx - dux_dy  # ∂v/∂x - ∂u/∂y
-
-        return omega_x.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_y.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_z.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        return compute_vorticity(ux, uy, uz)
 
     def _compute_q_criterion(self, ux, uy, uz):
         """Compute Q-criterion for vortex identification [web:44][web:47]
