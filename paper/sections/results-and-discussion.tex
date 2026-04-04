@@ -7,7 +7,11 @@ Figure \ref{fig:loss_curves} summarizes the observed losses across the three pro
 
 \begin{figure}[!t]
 \centering
-\includegraphics[width=3.5in]{figures/sanity_training_losses.png}
+\IfFileExists{figures/sanity_training_losses.png}{%
+\includegraphics[width=3.5in]{figures/sanity_training_losses.png}%
+}{%
+\includegraphics[width=3.5in]{placeholder.png}%
+}
 \caption{Observed sanity-run losses across progressive grid stages. This is a reduced CPU-only training trace, not a full convergence study.}
 \label{fig:loss_curves}
 \end{figure}
@@ -17,14 +21,22 @@ We ran a compact sweep over generation step count and the new shape-prior cleanu
 
 \begin{figure}[!t]
 \centering
-\includegraphics[width=3.5in]{figures/freeform_realism_ld_by_steps.png}
+\IfFileExists{figures/freeform_realism_ld_by_steps.png}{%
+\includegraphics[width=3.5in]{figures/freeform_realism_ld_by_steps.png}%
+}{%
+\includegraphics[width=3.5in]{placeholder.png}%
+}
 \caption{Mean $L/D$ from the reduced sweep over consistency steps, aggregated across three post-processing thresholds. Error bars show sample standard deviation.}
 \label{fig:ld_sweep}
 \end{figure}
 
 \begin{figure}[!t]
 \centering
-\includegraphics[width=3.5in]{figures/freeform_realism_occ_vs_ld.png}
+\IfFileExists{figures/freeform_realism_occ_vs_ld.png}{%
+\includegraphics[width=3.5in]{figures/freeform_realism_occ_vs_ld.png}%
+}{%
+\includegraphics[width=3.5in]{placeholder.png}%
+}
 \caption{Occupancy versus $L/D$ for the same sweep. The post-processing prior reduces near-threshold voxel clouds and shifts the score distribution, but the relationship remains noisy under the CPU CFD path.}
 \label{fig:cfd_analysis}
 \end{figure}
