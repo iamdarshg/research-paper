@@ -1,0 +1,49 @@
+name: Build paper PDF
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'paper/**'
+      - '.github/workflows/build-paper-pdf.yml'
+  pull_request:
+    paths:
+      - 'paper/**'
+      - '.github/workflows/build-paper-pdf.yml'
+  workflow_dispatch:
+
+jobs:
+  build-paper:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: paper
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up TeX Live
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: paper/main.tex
+          working_directory: paper
+          args: >-
+            -pdf
+            -interaction=nonstopmode
+            -halt-on-error
+            -file-line-error
+            -shell-escape
+
+      - name: Rename PDF artifact
+        run: |
+          cp main.pdf research-paper.pdf
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-paper-pdf
+          path: paper/research-paper.pdf
+          if-no-files-found: error

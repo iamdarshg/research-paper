@@ -50,3 +50,5 @@ The main takeaway is now a little sharper: the repository's end-to-end path exec
 
 The OpenFOAM export path now writes a plain `forces` function-object dictionary, and the resulting force vector is normalized manually to recover coefficients when coefficient output is not available. The current benchmark still shows a substantial Cd gap, which we are now treating as a solver- and sampling-consistency issue rather than a paper-level normalization issue. A higher-confidence CFD comparison will still need a more systematic hyperparameter sweep and consistent normalization of reference area and flow conditions.
 
+The next recorded physics correction was applied in `CLI/cascaded_lbm.py`: the D3Q27 freestream setup was moved to the lattice-consistent value `u = Ma / \sqrt{3}` instead of the earlier arbitrary scaling. That change is now part of the benchmark history and is being checked against the Cd mismatch before any deeper transform rewrite.
+
