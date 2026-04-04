@@ -11,19 +11,27 @@ class CascadedLBM:
     MOMENT_NAMES = [f"{a}{b}{c}" for a, b, c in MOMENT_KEYS]
 
     @staticmethod
-    def compute_central_moments(f, ux, uy, uz, ex, ey, ez):
-        """Transform populations to tensor-product raw moments."""
-        del ux, uy, uz
-        K = {}
-        ex = ex.to(device=f.device, dtype=f.dtype).view(-1, 1, 1, 1)
-        ey = ey.to(device=f.device, dtype=f.dtype).view(-1, 1, 1, 1)
-        ez = ez.to(device=f.device, dtype=f.dtype).view(-1, 1, 1, 1)
-
+    def build_moment_basis(ex, ey, ez):
+        """Build the 27-row tensor-product raw-moment basis once per lattice."""
+        ex = ex.to(dtype=torch.float32)
+        ey = ey.to(dtype=torch.float32)
+        ez = ez.to(dtype=torch.float32)
+        basis_rows = []
         for a, b, c in CascadedLBM.MOMENT_KEYS:
-            key = f"{a}{b}{c}"
-            K[key] = torch.sum(f * (ex ** a) * (ey ** b) * (ez ** c), dim=0)
+            basis_rows.append((ex ** a) * (ey ** b) * (ez ** c))
+        return torch.stack(basis_rows, dim=0)
 
-        return K
+    @staticmethod
+    def compute_central_moments(f, ux, uy, uz, ex, ey, ez):
+        """Transform populations to tensor-product raw moments.
+
+        Note: this is a raw-moment basis, not a true velocity-shifted central
+        moment transform. The name is kept for compatibility with the existing
+        solver pipeline.
+        """
+        del ux, uy, uz
+        basis = CascadedLBM.build_moment_basis(ex, ey, ez).to(device=f.device, dtype=f.dtype)
+        return torch.tensordot(basis, f, dims=([1], [0]))
 
     @staticmethod
     def equilibrium_central_moments(rho, ux, uy, uz, cs2=1/3):
@@ -72,13 +80,7 @@ class CascadedLBM:
 
     @staticmethod
     def build_moment_matrix(ex, ey, ez):
-        ex = ex.to(dtype=torch.float32)
-        ey = ey.to(dtype=torch.float32)
-        ez = ez.to(dtype=torch.float32)
-        rows = []
-        for a, b, c in CascadedLBM.MOMENT_KEYS:
-            rows.append((ex ** a) * (ey ** b) * (ez ** c))
-        return torch.stack(rows, dim=0)
+        return CascadedLBM.build_moment_basis(ex, ey, ez)
 
     @staticmethod
     def moments_to_populations(K, moment_matrix_inv):
@@ -107,7 +109,8 @@ class D3Q27CascadedSolver:
         self.ez = self.ez.to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         self.w = D3Q27Lattice.get_weights().to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         self.opposite = D3Q27Lattice.get_opposite().to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        self.moment_matrix_inv = torch.inverse(CascadedLBM.build_moment_matrix(self.ex, self.ey, self.ez).to(device=device, dtype=torch.float32))
+        self.moment_basis = CascadedLBM.build_moment_basis(self.ex, self.ey, self.ez).to(device=device, dtype=torch.float32)
+        self.moment_matrix_inv = torch.inverse(self.moment_basis)
 
         # Populations (27 for D3Q27)
         self.f = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=device)+1e-12
