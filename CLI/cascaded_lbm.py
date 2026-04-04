@@ -285,7 +285,21 @@ class D3Q27CascadedSolver:
                 dx = int(self.ex[i].item())
                 dy = int(self.ey[i].item())
                 dz = int(self.ez[i].item())
-                self.f_temp[i] = torch.roll(self.f[i], shifts=(dx, dy, dz), dims=(0, 1, 2)).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+                self.f_temp[i] = torch.roll(self.f[i], shifts=(dx, dy, dz), dims=(0, 1, 2))
+
+                # Prevent periodic wraparound at the outer domain boundary.
+                if dx > 0:
+                    self.f_temp[i][0, :, :] = self.f_pre_stream[i][0, :, :]
+                elif dx < 0:
+                    self.f_temp[i][-1, :, :] = self.f_pre_stream[i][-1, :, :]
+                if dy > 0:
+                    self.f_temp[i][:, 0, :] = self.f_pre_stream[i][:, 0, :]
+                elif dy < 0:
+                    self.f_temp[i][:, -1, :] = self.f_pre_stream[i][:, -1, :]
+                if dz > 0:
+                    self.f_temp[i][:, :, 0] = self.f_pre_stream[i][:, :, 0]
+                elif dz < 0:
+                    self.f_temp[i][:, :, -1] = self.f_pre_stream[i][:, :, -1]
 
                 # Open far-field treatment: refill wrapped populations with the
                 # same uniform freestream equilibrium used at initialization.

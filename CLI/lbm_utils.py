@@ -12,7 +12,8 @@ def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref
     """
     v_inf = mach_number * 343.0
     q_inf = 0.5 * rho_ref * v_inf**2
-    u_lattice = max(mach_number * 0.10, 1e-12)
+    # Use a lattice-scale Mach normalization tied to the lattice sound speed.
+    u_lattice = max(mach_number / (3.0 ** 0.5), 1e-12)
     force_scale = 1.0 / (u_lattice ** 2)
 
     force_x_phys = force_x * force_scale

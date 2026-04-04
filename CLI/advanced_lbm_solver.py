@@ -101,6 +101,12 @@ class GPULBMSolver:
         self._setup_mrt_matrices()
         self._initialize_equilibrium()
 
+        self.force_x_accum = torch.tensor(0.0, device=device)
+        self.force_z_accum = torch.tensor(0.0, device=device)
+        self.force_samples = 0
+        self.force_x_last = torch.tensor(0.0, device=device)
+        self.force_z_last = torch.tensor(0.0, device=device)
+
     def _setup_physics_constants(self):
         """Compute physics constants from config"""
         h = self.config.lbm_config.grid_spacing
@@ -297,9 +303,10 @@ class GPULBMSolver:
         Cw = self.phys_config.wale_constant
 
         # Velocity gradient tensor
-        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2))
-        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2))
-        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2))
+        grad_spacing = (self.config.lbm_config.grid_spacing,) * 3
+        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=grad_spacing)
+        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=grad_spacing)
+        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=grad_spacing)
 
         # Traceless symmetric part of velocity gradient squared
         # S_d = 0.5*(grad_u + grad_u^T) - (1/3)*tr(grad_u)*I
@@ -371,7 +378,8 @@ class GPULBMSolver:
         omega_mag = torch.sqrt(omega_x**2 + omega_y**2 + omega_z**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Confinement direction: eta = grad(|omega|) / |grad(|omega|)|
-        grad_omega_x, grad_omega_y, grad_omega_z = torch.gradient(omega_mag, dim=(0, 1, 2))
+        grad_spacing = (self.config.lbm_config.grid_spacing,) * 3
+        grad_omega_x, grad_omega_y, grad_omega_z = torch.gradient(omega_mag, dim=(0, 1, 2), spacing=grad_spacing)
         grad_omega_mag = torch.sqrt(grad_omega_x**2 + grad_omega_y**2 + grad_omega_z**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         eta_x = torch.clamp(grad_omega_x / grad_omega_mag, -1e12, 1e12).nan_to_num(0.0, posinf=1e18, neginf=-1e18)
@@ -442,6 +450,20 @@ class GPULBMSolver:
             for i in range(19):
                 shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
                 self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2))
+
+                # Prevent periodic wraparound at the outer domain boundary.
+                if shifts[0] > 0:
+                    self.f_temp[i][0, :, :] = self.f_pre_stream[i][0, :, :]
+                elif shifts[0] < 0:
+                    self.f_temp[i][-1, :, :] = self.f_pre_stream[i][-1, :, :]
+                if shifts[1] > 0:
+                    self.f_temp[i][:, 0, :] = self.f_pre_stream[i][:, 0, :]
+                elif shifts[1] < 0:
+                    self.f_temp[i][:, -1, :] = self.f_pre_stream[i][:, -1, :]
+                if shifts[2] > 0:
+                    self.f_temp[i][:, :, 0] = self.f_pre_stream[i][:, :, 0]
+                elif shifts[2] < 0:
+                    self.f_temp[i][:, :, -1] = self.f_pre_stream[i][:, :, -1]
 
             # === 8. Boundary conditions - bounce-back using pre-stream values ===
             mask = geometry_mask > 0.5
