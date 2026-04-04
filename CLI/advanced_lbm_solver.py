@@ -539,29 +539,28 @@ class D3Q27CascadedSolver:
 
         # The solver evolves in lattice units, while the benchmark normalizes
         # against an OpenFOAM-style dynamic pressure in physical units.
-        # For the momentum-exchange force, the physically meaningful quantity
-        # is the dimensionless coefficient, which can be formed directly from
-        # the lattice force once it is normalized by the lattice reference area.
+        # The momentum-exchange force still needs the lattice-to-physical
+        # velocity scale applied before comparing against q_inf.
         u_lattice = max(self.config.mach_number * 0.10, 1e-12)
+        force_scale = 1.0 / (u_lattice ** 2)
 
         ref_area = 1.0
-        ref_area_cells = max(ref_area / (h * h), 1.0)
 
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples
             lift_force = self.force_z_accum / self.force_samples
-            force_definition = 'bounce-back momentum exchange accumulated during streaming'
+            force_definition = 'bounce-back momentum exchange averaged over the last-quarter window'
         else:
             drag_force = self.force_x_last
             lift_force = self.force_z_last
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        # Cd = F / (0.5 * rho * U^2 * A).  With the solver already in lattice
-        # units, the same nondimensional coefficient is recovered by dividing
-        # the lattice force by the lattice dynamic pressure scale and the
-        # lattice reference area.
-        cd = (2.0 * drag_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
-        cl = (2.0 * lift_force.item()) / (u_lattice * u_lattice * ref_area_cells + 1e-10)
+        drag_force_phys = drag_force * force_scale
+        lift_force_phys = lift_force * force_scale
+
+        # Keep the sign aligned with the OpenFOAM drag convention.
+        cd = drag_force_phys.item() / (q_inf * ref_area + 1e-10)
+        cl = lift_force_phys.item() / (q_inf * ref_area + 1e-10)
 
         # Basic diagnostics
         rho = torch.sum(self.f, dim=0)
