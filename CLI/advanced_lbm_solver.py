@@ -405,11 +405,14 @@ class D3Q27CascadedSolver:
         h = self.config.lbm_config.grid_spacing
         dt = self.config.lbm_config.time_step
         # Reset force accounting for each run and only average over the
-        # late-time window to suppress startup transients.
+        # quasi-steady tail of the run to suppress startup transients.
+        # A last-quarter window is a better tradeoff than whole-run averaging
+        # for the benchmark cube, while keeping the cost identical.
         self.force_x_accum = torch.tensor(0.0, device=self.device)
         self.force_z_accum = torch.tensor(0.0, device=self.device)
         self.force_samples = 0
-        sample_start = max(0, steps // 2)
+        sample_window = max(10, steps // 4)
+        sample_start = max(0, steps - sample_window)
 
         for step in range(steps):
             # === 1. Compute macroscopic variables ===
@@ -1057,7 +1060,7 @@ class GPULBMSolver:
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples
             lift_force = self.force_z_accum / self.force_samples
-            force_definition = 'bounce-back momentum exchange accumulated during streaming'
+            force_definition = 'bounce-back momentum exchange averaged over the last-quarter window'
         else:
             drag_force = self.force_x_last
             lift_force = self.force_z_last
