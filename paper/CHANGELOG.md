@@ -2,6 +2,7 @@
 
 ## Unreleased
 
-- Added the centered cube validation object to the benchmark script and documented a one-command local verification path.
-- Switched the OpenFOAM export fallback from `forceCoeffs` to a lower-level `forces` function object, then normalized the result manually for coefficient comparison.
-- Kept the paper text focused on the validation result itself; the implementation detail above lives here instead of in the main narrative.
+- Added the centered-cube validation object to the benchmark script and documented the exact geometry in `paper/sections/validation-and-testing-standards.tex`.
+- Consolidated local verification into `run_internal_benchmark.py`, which now runs the internal D3Q27 solver and the OpenFOAM sonicFoam case on the same geometry.
+- Switched the OpenFOAM extraction path from `forceCoeffs` to a lower-level `forces` function object, with a manual pressure-integration fallback if the function-object output is unavailable.
+- Moved the remaining extraction/workaround details out of the main paper and into this changelog so the paper stays focused on the validation result itself.

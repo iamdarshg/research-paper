@@ -33,7 +33,13 @@ def write(case: Path, rel: str, content: str) -> None:
 
 
 VALIDATION_OBJECT_NAME = 'centered cube STL'
-VALIDATION_OBJECT_DESCRIPTION = 'A unit cube centered at the origin, used as the shared validation object for both solvers.'
+VALIDATION_OBJECT_DESCRIPTION = 'A 1.0-unit cube centered at the origin, used as the shared validation object for both solvers.'
+VALIDATION_OBJECT_DETAILS = {
+    'name': VALIDATION_OBJECT_NAME,
+    'description': VALIDATION_OBJECT_DESCRIPTION,
+    'geometry': 'solid cube STL spanning [-0.5, 0.5]^3',
+    'purpose': 'Shared verification geometry for the internal D3Q27 solver and OpenFOAM sonicFoam.',
+}
 
 
 def make_case() -> Path:
@@ -513,7 +519,40 @@ def face_area_vector(face_pts: np.ndarray) -> np.ndarray:
     return 0.5 * area
 
 
-def pressure_force_from_case(case: Path, patch_name: str = 'cube', p_ref: float = 101325.0) -> Dict[str, float]:
+def _parse_forces_dat(path: Path) -> Dict[str, float]:
+    lines = [line for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#')]
+    if not lines:
+        raise ValueError(f'No force data found in {path}')
+    last = lines[-1].split()
+    if len(last) < 7:
+        raise ValueError(f'Unexpected forces data format in {path}: {lines[-1]!r}')
+    time = float(last[0])
+    force = np.array([float(last[1]), float(last[2]), float(last[3])], dtype=float)
+    moment = np.array([float(last[4]), float(last[5]), float(last[6])], dtype=float)
+    rho = 1.225
+    u_inf = 80.0
+    q = 0.5 * rho * u_inf * u_inf
+    area_ref = 1.0
+    return {
+        'time': time,
+        'force_x': float(force[0]),
+        'force_y': float(force[1]),
+        'force_z': float(force[2]),
+        'moment_x': float(moment[0]),
+        'moment_y': float(moment[1]),
+        'moment_z': float(moment[2]),
+        'cd_pressure': float(force[0] / (q * area_ref)),
+        'cl_pressure': float(force[2] / (q * area_ref)),
+    }
+
+
+def pressure_force_from_case(case: Path, patch_name: str = 'cube') -> Dict[str, float]:
+    forces_file = case / 'postProcessing' / 'forcesOnCube' / '0' / 'forces.dat'
+    if forces_file.exists():
+        out = _parse_forces_dat(forces_file)
+        out['source'] = 'postProcessing/forces'
+        return out
+
     points = parse_points(case / 'constant' / 'polyMesh' / 'points')
     faces = parse_faces(case / 'constant' / 'polyMesh' / 'faces')
     owner = parse_owner(case / 'constant' / 'polyMesh' / 'owner')
@@ -532,14 +571,14 @@ def pressure_force_from_case(case: Path, patch_name: str = 'cube', p_ref: float 
         sf = face_area_vector(face_pts)
         cell = owner[face_idx]
         p_cell = p[cell] if cell < len(p) else p[-1]
-        p_gauge = p_cell - p_ref
-        force += -p_gauge * sf
+        force += -(p_cell - 101325.0) * sf
 
     rho = 1.225
     u_inf = 80.0
     q = 0.5 * rho * u_inf * u_inf
     area_ref = 1.0
     return {
+        'source': 'manual_pressure_integration',
         'pressure_force_x': float(force[0]),
         'pressure_force_y': float(force[1]),
         'pressure_force_z': float(force[2]),
@@ -560,10 +599,7 @@ def main():
     case = make_case()
     results = {
         'case_dir': str(case),
-        'validation_object': {
-            'name': VALIDATION_OBJECT_NAME,
-            'description': VALIDATION_OBJECT_DESCRIPTION,
-        },
+        'validation_object': VALIDATION_OBJECT_DETAILS,
         'internal': internal,
     }
     commands = [

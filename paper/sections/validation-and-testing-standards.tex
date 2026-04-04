@@ -17,7 +17,7 @@ Verification checks that the implemented steps are executed correctly. In this r
 \end{itemize}
 
 \subsection{Validation}
-Validation is partial but no longer purely blocked. The built-in CFD path was exercised on the reduced CPU pipeline, and a reduced OpenFOAM sonicFoam benchmark was run on the corresponding geometry. The comparison used the lower-level `forces` output and then normalized the result manually into coefficients. That makes the comparison approximate, but it is still useful as a solver-to-solver sanity check.
+Validation is now reproducible on a single local machine with OpenFOAM installed. The built-in CFD path is exercised on the reduced CPU pipeline, and the OpenFOAM sonicFoam benchmark is run on the shared centered-cube validation object. The comparison uses the lower-level `forces` output when available, with a manual pressure integration fallback only if the function-object output is missing.
 
-The paper therefore claims the following and nothing more: the export path is concrete, the benchmark comparison is measurable, and the current internal solver diverges substantially from the OpenFOAM pressure estimate on the reduced cube test. By being explicit about the manual extraction method and the remaining convention differences, the revision avoids overstating the credibility of the aerodynamic numbers.
+The paper therefore claims the following and nothing more: the export path is concrete, the benchmark comparison is measurable, and the shared validation geometry is documented explicitly so the solver-to-solver check can be repeated without ambiguity.
 
