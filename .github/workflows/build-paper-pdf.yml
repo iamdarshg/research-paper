@@ -9,14 +9,10 @@ name: Build paper PDF
     paths:
       - 'paper/**'
       - '.github/workflows/build-paper-pdf.yml'
-    paths-ignore:
-      - 'paper/research-paper.pdf'
   pull_request:
     paths:
       - 'paper/**'
       - '.github/workflows/build-paper-pdf.yml'
-    paths-ignore:
-      - 'paper/research-paper.pdf'
   workflow_dispatch:
 
 permissions:
