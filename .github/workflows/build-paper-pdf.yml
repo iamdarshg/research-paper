@@ -5,6 +5,7 @@ name: Build paper PDF
     branches:
       - main
       - master
+      - openfoam-benchmark-compare
     paths:
       - 'paper/**'
       - '.github/workflows/build-paper-pdf.yml'
