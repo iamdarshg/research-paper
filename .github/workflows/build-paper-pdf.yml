@@ -24,7 +24,8 @@ jobs:
       - name: Set up TeX Live
         uses: xu-cheng/latex-action@v3
         with:
-          root_file: paper/main.tex
+          working_directory: paper
+          root_file: main.tex
           args: >-
             -pdf
             -interaction=nonstopmode
