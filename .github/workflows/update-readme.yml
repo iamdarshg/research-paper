@@ -1,6 +1,7 @@
 name: Update Benchmark Summary
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - openfoam-benchmark-compare
