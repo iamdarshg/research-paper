@@ -28,8 +28,7 @@ jobs:
       - name: Set up TeX Live
         uses: xu-cheng/latex-action@v3
         with:
-          root_file: main.tex
-          working_directory: paper
+          root_file: paper/main.tex
           args: >-
             -pdf
             -interaction=nonstopmode
@@ -38,6 +37,7 @@ jobs:
             -shell-escape
 
       - name: Rename PDF artifact
+        working-directory: paper
         run: |
           cp main.pdf research-paper.pdf
 
