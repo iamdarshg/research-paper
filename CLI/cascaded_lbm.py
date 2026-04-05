@@ -196,10 +196,11 @@ class D3Q27CascadedSolver:
 
     def _compute_vorticity(self, ux, uy, uz):
         """Compute vorticity omega = curl(u) [web:44]"""
-        # Compute all gradients properly
-        grad_ux = torch.gradient(ux, dim=(0, 1, 2))  # Returns (dux/dx, dux/dy, dux/dz)
-        grad_uy = torch.gradient(uy, dim=(0, 1, 2))
-        grad_uz = torch.gradient(uz, dim=(0, 1, 2))
+        h = self.config.lbm_config.grid_spacing
+        # Compute all gradients in physical space.
+        grad_ux = torch.gradient(ux, spacing=(h, h, h), dim=(0, 1, 2))  # Returns (dux/dx, dux/dy, dux/dz)
+        grad_uy = torch.gradient(uy, spacing=(h, h, h), dim=(0, 1, 2))
+        grad_uz = torch.gradient(uz, spacing=(h, h, h), dim=(0, 1, 2))
 
         # Extract individual components
         dux_dx, dux_dy, dux_dz = grad_ux
@@ -230,10 +231,11 @@ class D3Q27CascadedSolver:
 
     def _compute_strain_rate_tensor(self, ux, uy, uz):
         """Compute strain rate tensor S_ij = 0.5*(du_i/dx_j + du_j/dx_i)"""
-        # Velocity gradients
-        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2))
-        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2))
-        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2))
+        h = self.config.lbm_config.grid_spacing
+        # Velocity gradients in physical space.
+        dux_dx, dux_dy, dux_dz = torch.gradient(ux, spacing=(h, h, h), dim=(0, 1, 2))
+        duy_dx, duy_dy, duy_dz = torch.gradient(uy, spacing=(h, h, h), dim=(0, 1, 2))
+        duz_dx, duz_dy, duz_dz = torch.gradient(uz, spacing=(h, h, h), dim=(0, 1, 2))
 
         # Strain rate tensor (symmetric)
         S11 = dux_dx.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
@@ -402,11 +404,13 @@ class D3Q27CascadedSolver:
             lift_force = self.force_z_last
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
+        reference_area_voxelized = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
+
         coeffs = _compute_force_coefficients(
             drag_force,
             lift_force,
             self.config.mach_number,
-            ref_area=1.0,
+            ref_area=reference_area_voxelized,
             rho_ref=1.225,
         )
 
@@ -421,8 +425,8 @@ class D3Q27CascadedSolver:
             'drag_coefficient': coeffs['drag_coefficient'],
             'lift_coefficient': coeffs['lift_coefficient'],
             'force_definition': force_definition,
-            'reference_area': 1.0,
-            'reference_area_voxelized': torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2,
+            'reference_area': reference_area_voxelized,
+            'reference_area_voxelized': reference_area_voxelized,
             'reference_length': h * self.resolution,
             'freestream_speed': v_inf,
             'density': coeffs['density'],
