@@ -1,0 +1,44 @@
+name: Update Benchmark Summary
+
+on:
+  push:
+    branches:
+      - openfoam-benchmark-compare
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Run Benchmarks
+        run: |
+          python3 research-paper/run_internal_benchmark.py > benchmark.log
+          CURRENT_ERROR=$(grep -i error benchmark.log | tail -1 | awk '{print $NF}')
+          SPEED=$(grep -i speed benchmark.log | tail -1 | awk '{print $NF}')
+          echo "::set-output name=error::$CURRENT_ERROR"
+          echo "::set-output name=speed::$SPEED"
+        id: benchmark
+
+      - name: Update README.md
+        run: |
+          ERROR_VALUE=${{ steps.benchmark.outputs.error }}
+          SPEED_VALUE=${{ steps.benchmark.outputs.speed }}
+
+          sed -i "/Error Percentage:/c\### Error Percentage: ${ERROR_VALUE}" research-paper/README.md
+          sed -i "/Execution Speed:/c\### Execution Speed: ${SPEED_VALUE}" research-paper/README.md
+
+      - name: Commit Results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add research-paper/README.md
+          git commit -m "Update README with benchmark results" || echo "No changes to commit"
+          git push

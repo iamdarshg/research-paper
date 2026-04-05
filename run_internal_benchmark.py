@@ -626,10 +626,26 @@ def main():
     solver = D3Q27CascadedSolver(cfg, torch.device('cpu'), LBMPhysicsConfig)
     solver.collide_stream(mask, steps=200)
     internal = solver.compute_aerodynamic_coefficients(mask)
+
+    # New validation scenario
+    validation_mask = torch.ones((n, n, n), dtype=torch.float32)
+    validation_mask[10:20, 10:20, 10:20] = 0.0  # Hollow center
+    new_case_result = solver.compute_aerodynamic_coefficients(validation_mask)
+    internal['hollow_validation'] = new_case_result
     internal['reference_area_validation'] = VALIDATION_OBJECT_DETAILS['reference_area']
     internal['reference_area_voxelized'] = internal.get('reference_area')
 
     case = make_case()
+
+    # Additional Test Case: Modify input for a smaller cube
+    smaller_case = make_case()
+    smaller_case_path = smaller_case / 'constant' / 'triSurface' / 'cube.stl'
+    smaller_cube_stl = smaller_case_path.read_text().replace('-0.5', '-0.25').replace('0.5', '0.25')
+    smaller_case_path.write_text(smaller_cube_stl)
+    results['smaller_cube_case'] = {
+        'case_dir': str(smaller_case),
+        'validation_object': VALIDATION_OBJECT_DETAILS,
+    }
     results = {
         'case_dir': str(case),
         'validation_object': VALIDATION_OBJECT_DETAILS,
