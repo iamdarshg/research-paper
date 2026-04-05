@@ -637,6 +637,65 @@ def main():
 
     case = make_case()
 
+    # Additional complex shapes
+    complex_shapes = {
+        'cone.stl': """solid cone
+facet normal 0 0 -1
+ outer loop
+  vertex 0.0 -0.5 -0.5
+  vertex 0.5 0.5 -0.5
+  vertex -0.5 0.5 -0.5
+ endloop
+endfacet
+facet normal 0 0 1
+ outer loop
+  vertex 0.0 -0.5 0.5
+  vertex 0.5 0.5 0.5
+  vertex -0.5 0.5 0.5
+ endloop
+endfacet
+endsolid cone""",
+
+        'sphere.stl': """solid sphere
+facet normal 0 0 -1
+ outer loop
+  vertex -0.5 -0.5 -0.5
+  vertex 0.5 -0.5 -0.5
+  vertex 0.5 0.5 -0.5
+ endloop
+endfacet
+facet normal 0 0 1
+ outer loop
+  vertex -0.5 -0.5 0.5
+  vertex -0.5 0.5 0.5
+  vertex 0.5 0.5 0.5
+ endloop
+endfacet
+endsolid sphere""",
+
+        'cylinder.stl': """solid cylinder
+facet normal 0 0 -1
+ outer loop
+  vertex -0.5 -0.5 -0.5
+  vertex 0.5 -0.5 -0.5
+  vertex 0.5 0.5 -0.5
+ endloop
+endfacet
+facet normal 0 0 1
+ outer loop
+  vertex -0.5 -0.5 0.5
+  vertex 0.5 -0.5 0.5
+  vertex 0.5 0.5 0.5
+ endloop
+endfacet
+endsolid cylinder""",
+    }
+    for name, content in complex_shapes.items():
+        shape_case = make_case()
+        shape_path = shape_case / 'constant' / 'triSurface' / name
+        shape_path.write_text(content)
+        results[f'{name}_case'] = {'status': 'added'}
+
     # Additional Test Case: Modify input for a smaller cube
     smaller_case = make_case()
     smaller_case_path = smaller_case / 'constant' / 'triSurface' / 'cube.stl'
