@@ -6,7 +6,7 @@ from scipy.ndimage import binary_dilation
 from typing import TYPE_CHECKING
 
 from lbm_utils import D3Q27Lattice, _compute_force_coefficients
-from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity
+from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity, compute_velocity_gradients
 
 class D3Q27Solver:
     """Complete D3Q27 LBM solver"""
@@ -172,11 +172,11 @@ class GPULBMSolver:
 
             self.f[i] = feq.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
-    def _compute_strain_rate_tensor(self, ux, uy, uz):
-        return compute_strain_rate_tensor(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
+    def _compute_strain_rate_tensor(self, ux, uy, uz, gradients=None):
+        return compute_strain_rate_tensor(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing, gradients=gradients)
 
-    def _compute_vorticity(self, ux, uy, uz):
-        return compute_vorticity(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
+    def _compute_vorticity(self, ux, uy, uz, gradients=None):
+        return compute_vorticity(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing, gradients=gradients)
 
     def _compute_q_criterion(self, ux, uy, uz):
         """Compute Q-criterion for vortex identification [web:44][web:47]
@@ -303,10 +303,10 @@ class GPULBMSolver:
         Cw = self.phys_config.wale_constant
 
         # Velocity gradient tensor
-        grad_spacing = (self.config.lbm_config.grid_spacing,) * 3
-        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=grad_spacing)
-        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=grad_spacing)
-        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=grad_spacing)
+        gradients = compute_velocity_gradients(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
+        dux_dx, dux_dy, dux_dz = gradients[0]
+        duy_dx, duy_dy, duy_dz = gradients[1]
+        duz_dx, duz_dy, duz_dz = gradients[2]
 
         # Traceless symmetric part of velocity gradient squared
         # S_d = 0.5*(grad_u + grad_u^T) - (1/3)*tr(grad_u)*I
@@ -323,7 +323,6 @@ class GPULBMSolver:
         Sd_mag = torch.sqrt(Sd_11**2 + Sd_22**2 + Sd_33**2 + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Strain rate magnitude
-        _, _, _, _, _, _ = self._compute_strain_rate_tensor(ux, uy, uz)
         S_mag = torch.sqrt(2.0*(dux_dx**2 + duy_dy**2 + duz_dz**2) + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # WALE turbulent viscosity
@@ -369,7 +368,8 @@ class GPULBMSolver:
             return torch.zeros_like(ux), torch.zeros_like(uy), torch.zeros_like(uz)
 
         # Compute vorticity
-        omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
+        gradients = compute_velocity_gradients(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
+        omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz, gradients=gradients)
         self.vorticity[0] = omega_x
         self.vorticity[1] = omega_y
         self.vorticity[2] = omega_z
@@ -515,6 +515,7 @@ class GPULBMSolver:
 
         solid = geometry_mask > 0.5
         ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
+        ref_area = max(ref_area, h**2)
 
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples

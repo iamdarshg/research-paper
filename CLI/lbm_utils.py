@@ -6,26 +6,24 @@ import torch
 def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref=1.225):
     """Shared force normalization for drag/lift coefficients.
 
-    The solvers accumulate lattice-unit momentum-exchange forces. Convert them
-    with the same lattice-to-physical scaling and dynamic-pressure convention
-    so the D3Q27 and D3Q19 paths report coefficients on the same basis.
+    The solvers accumulate momentum-exchange forces in lattice units. We keep
+    the coefficient definition explicit and dimensionally conventional:
+    C = F / (0.5 * rho_inf * U_inf^2 * A_ref).
+
+    The caller is responsible for supplying a consistent reference area,
+    ideally the voxelized projected area of the solid body.
     """
     v_inf = mach_number * 343.0
     q_inf = 0.5 * rho_ref * v_inf**2
-    # Use a lattice-scale Mach normalization tied to the lattice sound speed.
-    u_lattice = max(mach_number / (3.0 ** 0.5), 1e-12)
-    force_scale = 1.0 / (u_lattice ** 2)
-
-    force_x_phys = force_x * force_scale
-    force_z_phys = force_z * force_scale
-    denom = q_inf * ref_area + 1e-10
+    ref_area = max(float(ref_area), 1e-12)
+    denom = q_inf * ref_area + 1e-12
 
     return {
-        "drag_coefficient": force_x_phys.item() / denom,
-        "lift_coefficient": force_z_phys.item() / denom,
+        "drag_coefficient": force_x.item() / denom,
+        "lift_coefficient": force_z.item() / denom,
         "freestream_speed": v_inf,
         "density": rho_ref,
-        "force_scale": force_scale,
+        "force_scale": 1.0,
     }
 
 

@@ -491,6 +491,7 @@ class GPULBMSolver:
 
         solid = geometry_mask > 0.5
         ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
+        ref_area = max(ref_area, h**2)
 
         if self.force_samples > 0:
             drag_force = self.force_x_accum / self.force_samples

@@ -5,7 +5,7 @@ from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 
 
 class CascadedLBM:
-    """Tensor-product moment collision for D3Q27."""
+    """Tensor-product raw-moment collision for D3Q27."""
 
     MOMENT_KEYS = [(a, b, c) for a in range(3) for b in range(3) for c in range(3)]
     MOMENT_NAMES = [f"{a}{b}{c}" for a, b, c in MOMENT_KEYS]
@@ -22,7 +22,7 @@ class CascadedLBM:
         return torch.stack(basis_rows, dim=0)
 
     @staticmethod
-    def compute_central_moments(f, ux, uy, uz, ex, ey, ez):
+    def compute_central_moments(f, ux, uy, uz, ex, ey, ez, basis=None):
         """Transform populations to tensor-product raw moments.
 
         Note: this is a raw-moment basis, not a true velocity-shifted central
@@ -30,7 +30,9 @@ class CascadedLBM:
         solver pipeline.
         """
         del ux, uy, uz
-        basis = CascadedLBM.build_moment_basis(ex, ey, ez).to(device=f.device, dtype=f.dtype)
+        if basis is None:
+            basis = CascadedLBM.build_moment_basis(ex, ey, ez)
+        basis = basis.to(device=f.device, dtype=f.dtype)
         return torch.tensordot(basis, f, dims=([1], [0]))
 
     @staticmethod
@@ -92,7 +94,7 @@ class CascadedLBM:
 
 
 class D3Q27CascadedSolver:
-    """D3Q27 LBM solver with cascaded central moment collision"""
+    """D3Q27 LBM solver with cascaded raw-moment collision."""
 
     def __init__(self, config, device: torch.device, phys_config):
         self.config = config
@@ -111,6 +113,8 @@ class D3Q27CascadedSolver:
         self.opposite = D3Q27Lattice.get_opposite().to(device).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         self.moment_basis = CascadedLBM.build_moment_basis(self.ex, self.ey, self.ez).to(device=device, dtype=torch.float32)
         self.moment_matrix_inv = torch.inverse(self.moment_basis)
+        self._moment_names = CascadedLBM.MOMENT_NAMES
+        self._moment_basis_cached = self.moment_basis
 
         # Populations (27 for D3Q27)
         self.f = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=device)+1e-12
@@ -271,8 +275,8 @@ class D3Q27CascadedSolver:
             # === 2. Store pre-stream populations for bounce-back ===
             self.f_pre_stream.copy_(self.f)
 
-            # === 3. Cascaded collision using central moments ===
-            K = CascadedLBM.compute_central_moments(self.f, ux, uy, uz, self.ex, self.ey, self.ez)
+            # === 3. Cascaded collision using raw tensor-product moments ===
+            K = CascadedLBM.compute_central_moments(self.f, ux, uy, uz, self.ex, self.ey, self.ez, basis=self._moment_basis_cached)
             K_eq = CascadedLBM.equilibrium_central_moments(rho, ux, uy, uz)
 
             # Update relaxation parameter
@@ -369,9 +373,8 @@ class D3Q27CascadedSolver:
 
             # === 8. Diagnostic output ===
             if step % 100 == 0:
-                # Always compute vorticity for diagnostics even if flag is off
+                # Reuse the already computed vorticity field when diagnostics are enabled.
                 if not hasattr(self.phys_config, 'compute_q_criterion') or self.phys_config.compute_q_criterion:
-                    omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
                     self.vorticity[0] = omega_x
                     self.vorticity[1] = omega_y
                     self.vorticity[2] = omega_z
@@ -405,6 +408,7 @@ class D3Q27CascadedSolver:
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
         reference_area_voxelized = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
+        reference_area_voxelized = max(reference_area_voxelized, h**2)
 
         coeffs = _compute_force_coefficients(
             drag_force,

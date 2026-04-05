@@ -7,12 +7,24 @@ def _spacing_3d(spacing):
     return (spacing, spacing, spacing)
 
 
-def compute_strain_rate_tensor(ux, uy, uz, spacing=None):
-    """Compute strain rate tensor S_ij = 0.5*(du_i/dx_j + du_j/dx_i)."""
+def compute_velocity_gradients(ux, uy, uz, spacing=None):
+    """Compute the full velocity-gradient tensor once."""
     grad_spacing = _spacing_3d(spacing)
-    dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=grad_spacing)
-    duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=grad_spacing)
-    duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=grad_spacing)
+    return (
+        torch.gradient(ux, dim=(0, 1, 2), spacing=grad_spacing),
+        torch.gradient(uy, dim=(0, 1, 2), spacing=grad_spacing),
+        torch.gradient(uz, dim=(0, 1, 2), spacing=grad_spacing),
+    )
+
+
+def compute_strain_rate_tensor(ux, uy, uz, spacing=None, gradients=None):
+    """Compute strain rate tensor S_ij = 0.5*(du_i/dx_j + du_j/dx_i)."""
+    if gradients is None:
+        gradients = compute_velocity_gradients(ux, uy, uz, spacing=spacing)
+    grad_ux, grad_uy, grad_uz = gradients
+    dux_dx, dux_dy, dux_dz = grad_ux
+    duy_dx, duy_dy, duy_dz = grad_uy
+    duz_dx, duz_dy, duz_dz = grad_uz
 
     S11 = dux_dx.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
     S22 = duy_dy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
@@ -24,13 +36,11 @@ def compute_strain_rate_tensor(ux, uy, uz, spacing=None):
     return S11, S22, S33, S12, S13, S23
 
 
-def compute_vorticity(ux, uy, uz, spacing=None):
+def compute_vorticity(ux, uy, uz, spacing=None, gradients=None):
     """Compute vorticity omega = curl(u)."""
-    grad_spacing = _spacing_3d(spacing)
-    grad_ux = torch.gradient(ux, dim=(0, 1, 2), spacing=grad_spacing)
-    grad_uy = torch.gradient(uy, dim=(0, 1, 2), spacing=grad_spacing)
-    grad_uz = torch.gradient(uz, dim=(0, 1, 2), spacing=grad_spacing)
-
+    if gradients is None:
+        gradients = compute_velocity_gradients(ux, uy, uz, spacing=spacing)
+    grad_ux, grad_uy, grad_uz = gradients
     dux_dx, dux_dy, dux_dz = grad_ux
     duy_dx, duy_dy, duy_dz = grad_uy
     duz_dx, duz_dy, duz_dz = grad_uz
