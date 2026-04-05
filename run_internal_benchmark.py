@@ -553,8 +553,8 @@ def _parse_forces_dat(path: Path) -> Dict[str, float]:
     time = float(last[0])
     force = np.array([float(last[1]), float(last[2]), float(last[3])], dtype=float)
     moment = np.array([float(last[4]), float(last[5]), float(last[6])], dtype=float)
-    rho = 1.225
-    u_inf = 80.0
+    rho = VALIDATION_OBJECT_DETAILS['density']
+    u_inf = VALIDATION_OBJECT_DETAILS['freestream_speed']
     q = 0.5 * rho * u_inf * u_inf
     area_ref = VALIDATION_OBJECT_DETAILS['reference_area']
     return {
@@ -601,8 +601,8 @@ def pressure_force_from_case(case: Path, patch_name: str = 'cube') -> Dict[str, 
         # Use the same absolute pressure baseline as the OpenFOAM case setup.
         force += -(p_cell - pressure_ref) * sf
 
-    rho = 1.225
-    u_inf = 80.0
+    rho = VALIDATION_OBJECT_DETAILS['density']
+    u_inf = VALIDATION_OBJECT_DETAILS['freestream_speed']
     q = 0.5 * rho * u_inf * u_inf
     area_ref = VALIDATION_OBJECT_DETAILS['reference_area']
     return {

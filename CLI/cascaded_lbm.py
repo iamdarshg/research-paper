@@ -22,21 +22,15 @@ class CascadedLBM:
         return torch.stack(basis_rows, dim=0)
 
     @staticmethod
-    def compute_central_moments(f, ux, uy, uz, ex, ey, ez, basis=None):
-        """Transform populations to tensor-product raw moments.
-
-        Note: this is a raw-moment basis, not a true velocity-shifted central
-        moment transform. The name is kept for compatibility with the existing
-        solver pipeline.
-        """
-        del ux, uy, uz
+    def compute_raw_moments(f, ex, ey, ez, basis=None):
+        """Transform populations to tensor-product raw moments."""
         if basis is None:
             basis = CascadedLBM.build_moment_basis(ex, ey, ez)
         basis = basis.to(device=f.device, dtype=f.dtype)
         return torch.tensordot(basis, f, dims=([1], [0]))
 
     @staticmethod
-    def equilibrium_central_moments(rho, ux, uy, uz, cs2=1/3):
+    def equilibrium_raw_moments(rho, ux, uy, uz, cs2=1/3):
         """Equilibrium tensor-product moments for D3Q27."""
         K_eq = {}
 
@@ -155,8 +149,8 @@ class D3Q27CascadedSolver:
         self.cs2 = 1.0 / 3.0
 
         # Use the lattice-consistent freestream speed for the Mach number.
-        # For D3Q27, c_s = 1/sqrt(3), so u = Ma * c_s.
-        u_lattice = self.config.mach_number / (3.0 ** 0.5)
+        # For D3Q27, c_s = 1/3, so u = Ma * c_s.
+        u_lattice = self.config.mach_number / 3.0
         L_lattice = self.resolution
         
         # Force reasonable Reynolds number for this grid
@@ -188,7 +182,7 @@ class D3Q27CascadedSolver:
     def _initialize_equilibrium(self):
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
-        u_lattice = self.config.mach_number / (3.0 ** 0.5)
+        u_lattice = self.config.mach_number / 3.0
         ux = u_lattice  # Lattice-consistent freestream speed.
         uy, uz = 0.0, 0.0
 
@@ -276,8 +270,8 @@ class D3Q27CascadedSolver:
             self.f_pre_stream.copy_(self.f)
 
             # === 3. Cascaded collision using raw tensor-product moments ===
-            K = CascadedLBM.compute_central_moments(self.f, ux, uy, uz, self.ex, self.ey, self.ez, basis=self._moment_basis_cached)
-            K_eq = CascadedLBM.equilibrium_central_moments(rho, ux, uy, uz)
+            K = CascadedLBM.compute_raw_moments(self.f, self.ex, self.ey, self.ez, basis=self._moment_basis_cached)
+            K_eq = CascadedLBM.equilibrium_raw_moments(rho, ux, uy, uz)
 
             # Update relaxation parameter
             self.s_nu = 1.0 / (3.0 * self.nu + 0.5)
@@ -319,11 +313,11 @@ class D3Q27CascadedSolver:
                     self.f_temp[i][:dx, :, :] = feq_inf
                 elif dx < 0:
                     self.f_temp[i][dx:, :, :] = feq_inf
-                if dy > 0:
+                elif dy > 0:
                     self.f_temp[i][:, :dy, :] = feq_inf
                 elif dy < 0:
                     self.f_temp[i][:, dy:, :] = feq_inf
-                if dz > 0:
+                elif dz > 0:
                     self.f_temp[i][:, :, :dz] = feq_inf
                 elif dz < 0:
                     self.f_temp[i][:, :, dz:] = feq_inf
@@ -373,12 +367,6 @@ class D3Q27CascadedSolver:
 
             # === 8. Diagnostic output ===
             if step % 100 == 0:
-                # Reuse the already computed vorticity field when diagnostics are enabled.
-                if not hasattr(self.phys_config, 'compute_q_criterion') or self.phys_config.compute_q_criterion:
-                    self.vorticity[0] = omega_x
-                    self.vorticity[1] = omega_y
-                    self.vorticity[2] = omega_z
-
                 if hasattr(self.vorticity, 'shape') and torch.sum(torch.isfinite(self.vorticity)) > 0:
                     vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0))
                     max_vort = torch.max(vorticity_mag.nan_to_num(0.0))

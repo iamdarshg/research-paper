@@ -183,12 +183,11 @@ class GPULBMSolver:
         Q = 0.5*(||Omega||^2 - ||S||^2) where Omega is rotation rate tensor
         Positive Q indicates vortex regions (rotation > strain)
         """
-        # Strain rate tensor magnitude
-        S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)
+        gradients = compute_velocity_gradients(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
+        S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz, gradients=gradients)
         S_mag_sq = S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)
 
-        # Vorticity (rotation rate) magnitude
-        omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
+        omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz, gradients=gradients)
         omega_mag_sq = omega_x**2 + omega_y**2 + omega_z**2
 
         # Q-criterion: Q > 0 indicates vortex regions
@@ -367,7 +366,6 @@ class GPULBMSolver:
         if not self.phys_config.use_vorticity_confinement:
             return torch.zeros_like(ux), torch.zeros_like(uy), torch.zeros_like(uz)
 
-        # Compute vorticity
         gradients = compute_velocity_gradients(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing)
         omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz, gradients=gradients)
         self.vorticity[0] = omega_x
@@ -406,6 +404,9 @@ class GPULBMSolver:
         h = self.config.lbm_config.grid_spacing
         dt = self.config.lbm_config.time_step
 
+        Fx = torch.zeros_like(self.velocity_x)
+        Fy = torch.zeros_like(self.velocity_y)
+        Fz = torch.zeros_like(self.velocity_z)
         for step in range(steps):
             # === 1. Compute macroscopic variables ===
             rho = torch.sum(self.f, dim=0)

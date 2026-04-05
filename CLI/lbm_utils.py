@@ -6,8 +6,8 @@ import torch
 def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref=1.225):
     """Shared force normalization for drag/lift coefficients.
 
-    The solvers accumulate momentum-exchange forces in lattice units. We keep
-    the coefficient definition explicit and dimensionally conventional:
+    The solvers are expected to supply forces in a consistent physical force
+    scale. This helper only applies the aerodynamic coefficient denominator:
     C = F / (0.5 * rho_inf * U_inf^2 * A_ref).
 
     The caller is responsible for supplying a consistent reference area,
@@ -23,7 +23,6 @@ def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref
         "lift_coefficient": force_z.item() / denom,
         "freestream_speed": v_inf,
         "density": rho_ref,
-        "force_scale": 1.0,
     }
 
 
