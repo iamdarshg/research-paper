@@ -616,6 +616,31 @@ def pressure_force_from_case(case: Path, patch_name: str = 'cube') -> Dict[str, 
     }
 
 
+def multi_object_validation(shapes: dict, solver, mask_config):
+    """
+    Validates multiple complex shapes by:
+    - Calculating aerodynamic coefficients for each shape.
+    - Reporting individual and average errors.
+    """
+    total_error = 0
+    results = {}
+
+    for shape, content in shapes.items():
+        # Dynamically create test case for each shape
+        case = make_case()
+        shape_path = case / 'constant' / 'triSurface' / shape
+        shape_path.write_text(content)
+
+        # Run the solver
+        solver.collide_stream(mask_config, steps=200)
+        error = solver.compute_aerodynamic_coefficients(mask_config)['total_error']  # Hypothetical key
+        results[shape] = {'error': error}
+        total_error += error
+
+    # Compute the average error across all shapes
+    results['average_error'] = total_error / len(shapes)
+    return results
+
 def main():
     n = 32
     mask = torch.zeros((n, n, n), dtype=torch.float32)
