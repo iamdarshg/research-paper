@@ -1,6 +1,6 @@
 name: Build paper PDF
 
-on:
+"on":
   push:
     branches:
       - main
