@@ -6,6 +6,9 @@ checkpoint*
 test_checkpoints
 GUI/__pycache__
 */__pycache__
+<<<<<<< HEAD
 CLI/checkpoints_sanity/final_optimized_model.pt
 *.pt
 !paper/sections/*.tex
+=======
+>>>>>>> tmp_main
