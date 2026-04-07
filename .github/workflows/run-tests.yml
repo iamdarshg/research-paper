@@ -1,0 +1,31 @@
+name: Run Unit Tests
+
+on:
+  push:
+    branches: [ main, integrate-gui-solver-paper-update ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libegl1 libgles2 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xinput0 libxcb-xfixes0 xvfb
+        python -m pip install --upgrade pip
+        pip install torch numpy scipy scikit-image click pyyaml tqdm tensorboard pydantic PyQt5 pyqtgraph matplotlib trimesh
+
+    - name: Run tests
+      run: |
+        export PYTHONPATH=$PYTHONPATH:$(pwd)/CLI:$(pwd)/GUI
+        xvfb-run python -m unittest discover tests

@@ -1,76 +1,52 @@
 \section{Methodology}
 \label{sec:methodology}
-Our framework integrates several advanced computational techniques to achieve efficient and high-fidelity generative design of aircraft structures. The core architecture leverages a Hybrid Diffusion Network (HDN) optimized with Consistency Distillation, a Grouped-Query Attention (GQA) mechanism for reduced memory footprint, and a high-accuracy D3Q27 Cascaded Lattice Boltzmann Method (LBM) solver.
+Our proposed framework embodies the LiDAR and HRM principles through a multi-stage generative process. The core architecture consists of four main components: a noise scheduler, a latent diffusion UNet, a latent-to-3D converter, and a simplified CFD simulator. The diffusion model acts as the "thinking" component, rapidly generating a diverse set of design candidates. The subsequent CFD analysis and loss calculation can be seen as the "speaking" or autoregressive step, where each design is evaluated against specific performance criteria. The hierarchical nature of the voxelized representation and the progressive training schedule are direct implementations of the HRM principle. The overall architecture is depicted in Figure \ref{fig:architecture}.
 
-\subsection{Hybrid Diffusion Networks with Consistency Distillation}
-Traditional diffusion models \cite{ho2020denoising, nichol2021improved} require hundreds of sampling steps, making them computationally prohibitive for design loops involving physics-based optimization. We implement Consistency Models \cite{song2023consistency}, which map points on any trajectory of the probability flow ordinary differential equation (ODE) to the trajectory's origin. This allows for high-quality sample generation in as few as 4 steps, providing a 250$\times$ speedup over standard diffusion processes.
-
-The consistency mapping $f(x_t, t)$ is trained such that:
-\begin{equation}
-f(x_t, t) = f(x_{t'}, t') \quad \forall t, t' \in [\epsilon, T]
-\end{equation}
-where $\epsilon$ is a small positive constant. By enforcing this property, the model learns to "jump" directly to the clean design $x_0$ from any noise level $t$.
-
-\subsection{Memory-Optimized Architecture with GQA}
-To handle the high-dimensional requirements of 3D voxel generation while remaining within the 8-13GB VRAM constraints of consumer GPUs, we employ Grouped-Query Attention (GQA) \cite{chen2023gqa}. GQA generalizes multi-head attention (MHA) and multi-query attention (MQA) by using a single key and value head for each group of query heads.
-
-In our implementation, we use $G=4$ groups, which yields a 50\% reduction in KV-cache memory requirements compared to standard MHA. This optimization, combined with gradient checkpointing, results in a total VRAM saving of approximately 60\%, enabling the training of deeper architectures on higher-resolution grids.
-
-\subsection{D3Q27 Cascaded LBM Solver}
-The aerodynamic evaluation is performed using a GPU-accelerated Cascaded Lattice Boltzmann Method (CLBM) on a D3Q27 lattice. Unlike standard BGK or MRT operators, the cascaded operator performs relaxation in the space of raw moments, significantly improving numerical stability at high Reynolds numbers and reducing spurious oscillations \cite{geier2015cascaded, premnath2009cascaded}.
-
-The collision step in the cascaded LBM is performed by relaxing moments $K_{abc}$ towards their equilibrium $K_{abc}^{eq}$ in a hierarchical fashion:
-\begin{equation}
-K_{abc}^{post} = K_{abc} + s_{abc} (K_{abc}^{eq} - K_{abc})
-\end{equation}
-where the relaxation rates $s_{abc}$ are tuned for viscosity and stability. The D3Q27 lattice provides superior angular resolution compared to the more common D3Q19, which is critical for capturing complex flow features around arbitrary aircraft geometries.
-
-\subsection{Optimization Performance Analysis}
-To quantify the improvements made in this system, we analyze the convergence stability and memory efficiency. Figure \ref{fig:optimization_graphs} illustrates the comparative performance of our cascaded D3Q27 solver versus a standard D3Q19 MRT implementation.
-
-\begin{figure}[h]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}
-\begin{axis}[
-    width=0.45\textwidth,
-    title={Solver Stability Comparison},
-    xlabel={Reynolds Number},
-    ylabel={Relative Error (\%)},
-    xmin=1000, xmax=100000,
-    ymin=0, ymax=15,
-    xtick={1000, 10000, 50000, 100000},
-    ytick={0, 5, 10, 15},
-    legend pos=north west,
-    ymajorgrids=true,
-    grid style=dashed,
-]
-\addplot[
-    color=blue,
-    mark=square,
-    ]
-    coordinates {
-    (1000, 2.1)(5000, 2.5)(10000, 3.2)(50000, 4.8)(100000, 5.4)
-    };
-    \addlegendentry{D3Q27 Cascaded}
-\addplot[
-    color=red,
-    mark=triangle,
-    ]
-    coordinates {
-    (1000, 2.8)(5000, 4.2)(10000, 6.5)(20000, 12.1)(30000, 25.0)
-    };
-    \addlegendentry{D3Q19 MRT}
-\end{axis}
-\end{tikzpicture}
-\caption{Comparison of numerical stability and error between the D3Q27 Cascaded solver and D3Q19 MRT. The cascaded solver maintains sub-5.5\% error at high Reynolds numbers where the MRT solver becomes unstable.}
-\label{fig:optimization_graphs}
-\end{figure}
+\includegraphics[width=7in]{placeholder.png}
+\caption{The architecture of our proposed generative design framework. A latent vector is first sampled from a standard normal distribution. A diffusion model then iteratively denoises the latent vector, guided by the output of a CFD simulator. The denoised latent vector is then decoded into a 3D voxel grid, which is then converted into a solid model.}
+\label{fig:architecture}
+\end{figure*}
 
-The graph in Figure \ref{fig:optimization_graphs} highlights the robustness of the cascaded approach. While the MRT solver's error increases exponentially and eventually diverges beyond $Re > 30,000$, the cascaded solver remains stable and accurate, which is essential for the high-speed regimes encountered in aircraft design.
+\subsection{Noise Scheduling}
+The forward diffusion process gradually adds Gaussian noise to the input data over a series of T timesteps. The noise schedule is defined by a variance schedule $\beta_t$, which is typically a linear or cosine schedule. In our work, we use a linear schedule, where $\beta_t$ increases linearly from $\beta_{start}$ to $\beta_{end}$.
 
-\subsection{Loss Function and Connectivity}
-The optimization objective $\mathcal{L}$ balances aerodynamic performance with structural integrity:
+The forward process is defined as:
 \begin{equation}
-\mathcal{L} = w_{diff} \mathcal{L}_{mse} + w_{aero} (C_D / C_L) + w_{conn} \mathcal{L}_{connectivity}
+q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} x_{t-1}, \beta_t I)
 \end{equation}
-The connectivity loss $\mathcal{L}_{connectivity}$ uses a 3D connected components analysis to ensure that the generated structure is a single contiguous volume, preventing the "floating island" artifacts common in voxel-based generative models.
+
+The reverse diffusion process is where the generative model learns to denoise the data. The model is trained to predict the noise that was added at each timestep, and then subtract it from the noisy data.
+
+\subsection{Latent Diffusion UNet}
+The core of our generative model is a UNet-based architecture that operates in the latent space. The UNet takes as input a noisy latent vector and a timestep embedding, and outputs the predicted noise. The architecture consists of a series of down-sampling and up-sampling blocks, with skip connections between the corresponding blocks. This allows the model to capture both high-level and low-level features of the data.
+
+\subsection{Latent-to-3D Converter}
+The latent-to-3D converter is a multi-layer perceptron (MLP) that maps the denoised latent vector to a 3D voxel grid. The MLP consists of a series of fully connected layers with ReLU activations, and the final layer has a sigmoid activation to produce a probability for each voxel.
+
+\subsection{CFD Simulator}
+The CFD simulator is a simplified, GPU-accelerated solver that is used to evaluate the aerodynamic performance of the generated designs. The simulator takes as input a voxel grid and a set of flow conditions (e.g., Mach number, Reynolds number), and outputs the drag and lift coefficients. The simulator is based on the Lattice Boltzmann method, which is a computationally efficient method for simulating fluid dynamics.
+
+\subsection{Loss Function}
+The total loss function is a weighted sum of three components: the diffusion loss, the connectivity loss, and the aerodynamic loss.
+
+\begin{equation}
+\mathcal{L} = \lambda_{diff} \mathcal{L}_{diff} + \lambda_{conn} \mathcal{L}_{conn} + \lambda_{aero} \mathcal{L}_{aero}
+\end{equation}
+
+The diffusion loss is the mean squared error between the predicted noise and the actual noise. The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis. The aerodynamic loss is a combination of the drag and lift coefficients, and is designed to encourage the generation of aerodynamically efficient designs.
+
+\subsection{Rigorous Integration of CFD in Diffusion Training}
+To ensure the generated geometries are physically viable, we integrate the CFD solver directly into the gradient-based optimization loop. This is achieved by differentiating through the LBM solver or by using the solver as a score-guidance function during the reverse diffusion process.
+
+\begin{itemize}
+    \item \textbf{Step 1:} Sample noisy latent $z_t$.
+    \item \textbf{Step 2:} Predict $z_0$ using the UNet.
+    \item \textbf{Step 3:} Decode $z_0$ to voxel grid $V$.
+    \item \textbf{Step 4:} Run GPU-accelerated LBM solver on $V$.
+    \item \textbf{Step 5:} Compute aerodynamic coefficients $C_L, C_D$.
+    \item \textbf{Step 6:} Update UNet weights to maximize $C_L/C_D$.
+\end{itemize}
+
+\textbf{TODO:} Implement DeepSeek-style visual performance graphs comparing solver stability and convergence rates across different Reynolds numbers (e.g., TikZ/PGFPlots comparing D3Q27 Cascaded vs. D3Q19 MRT).

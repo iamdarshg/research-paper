@@ -6,10 +6,9 @@ This paper introduces a novel generative design framework that leverages the pow
 
 The key contributions of this work are threefold:
 \begin{enumerate}
-    \item A Hybrid Diffusion Network for generating 3D aircraft structures, optimized via Consistency Distillation for 4-step rapid sampling.
-    \item A high-accuracy D3Q27 Cascaded Lattice Boltzmann Method (LBM) solver integrated into the design loop for stable aerodynamic evaluation at high Reynolds numbers.
-    \item Memory-efficient architectural optimizations including Grouped-Query Attention (GQA) and gradient checkpointing, enabling high-fidelity generation within consumer GPU memory constraints.
+    \item A latent diffusion model for generating 3D aircraft structures, which is both memory-efficient and capable of producing a wide diversity of designs.
+    \item The integration of a GPU-accelerated CFD solver directly into the training loop, enabling the optimization of aerodynamic performance as a core component of the generative process.
+    \item A hierarchical representation mapping and a connectivity-based loss function to ensure the structural viability of the generated designs.
 \end{enumerate}
 
 This paper is structured as follows: Section \ref{sec:related_work} provides a review of the relevant literature. Section \ref{sec:methodology} details the architecture of our proposed framework. Section \ref{sec:results} presents the forward-looking results and discussion. Section \ref{sec:validation} outlines our comprehensive validation and verification plan. Finally, Section \ref{sec:conclusion} concludes the paper and suggests directions for future research.
-
