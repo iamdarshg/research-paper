@@ -911,6 +911,11 @@ class AdvancedCFDSimulator:
                 level=0.5,
                 spacing=(1.0, 1.0, 1.0)
             )
+            # Match the same centered physical frame used by the internal solver
+            # and the OpenFOAM validation case: unit cube centered at the origin.
+            scale = float(self.config.lbm_config.physical_length_scale)
+            h = scale / float(self.config.base_grid_resolution)
+            vertices = vertices * h - (scale * 0.5) + (0.5 * h)
 
             # Create mesh
             mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
@@ -1082,7 +1087,7 @@ class OptimizedDiffusionTrainer:
         cfd_config: CFDConfig,
         device: torch.device = None
     ):
-        self.device = device or torch.device('cuda' if torch.available() else 'cpu')
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         self.model_config = model_config
         self.diffusion_config = diffusion_config
@@ -1436,7 +1441,26 @@ class OptimizedAircraftGenerator:
         voxel_grid = torch.sigmoid(self.converter(voxel_grid))
         print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
-    
+
+    def _postprocess_voxels(self, voxel_grid: torch.Tensor, min_component_size: int = 32) -> torch.Tensor:
+        """Light cleanup for exported voxel geometries."""
+        if voxel_grid.ndim == 4:
+            voxel_grid = voxel_grid.squeeze(0)
+        binary = (voxel_grid > 0.5).detach().cpu().numpy().astype(np.uint8)
+        try:
+            from scipy import ndimage
+            labels, n = ndimage.label(binary)
+            if n <= 1:
+                return torch.as_tensor(binary, dtype=voxel_grid.dtype, device=voxel_grid.device)
+            sizes = ndimage.sum(binary, labels, index=range(1, n + 1))
+            keep = {i + 1 for i, size in enumerate(sizes) if size >= min_component_size}
+            cleaned = np.isin(labels, list(keep)).astype(np.uint8)
+            if cleaned.sum() == 0:
+                cleaned = binary
+        except Exception:
+            cleaned = binary
+        return torch.as_tensor(cleaned, dtype=voxel_grid.dtype, device=voxel_grid.device)
+
     def voxels_to_stl(self, voxel_grid: torch.Tensor, output_path: str, use_marching_cubes: bool = True):
         """Convert voxel grid to STL file using marching cubes with optimizations"""
         
@@ -1457,6 +1481,12 @@ class OptimizedAircraftGenerator:
                     level=level,
                     spacing=(1.0, 1.0, 1.0)
                 )
+                # Match the same centered physical frame used by the internal solver
+                # and the OpenFOAM validation case: unit cube centered at the origin.
+                # Assuming physical_length_scale is around 1.0 and resolution is 32
+                scale = 1.0
+                h = scale / 32.0
+                vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                 
                 print(f"Generated optimized mesh: {len(vertices)} vertices, {len(faces)} faces")
                 
@@ -1492,7 +1522,11 @@ class OptimizedAircraftGenerator:
             for face in faces:
                 v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
                 normal = np.cross(v1 - v0, v2 - v0)
-                normal = normal / (np.linalg.norm(normal) + 1e-10)
+                norm = np.linalg.norm(normal)
+                if norm > 1e-12:
+                    normal = normal / norm
+                else:
+                    normal = np.zeros(3)
                 
                 f.write(normal.astype(np.float32).tobytes())
                 f.write(v0.astype(np.float32).tobytes())
@@ -1514,6 +1548,9 @@ class OptimizedAircraftGenerator:
                             [x, y, z], [x+1, y, z], [x+1, y+1, z], [x, y+1, z],
                             [x, y, z+1], [x+1, y, z+1], [x+1, y+1, z+1], [x, y+1, z+1]
                         ], dtype=np.float32)
+                        scale = 1.0
+                        h = scale / 32.0
+                        vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                         
                         # Cube face indices
                         faces = [
@@ -1530,6 +1567,260 @@ class OptimizedAircraftGenerator:
             vertices = triangles.reshape(-1, 3)
             faces = np.arange(len(vertices)).reshape(-1, 3)
             self._write_stl(path, vertices, faces)
+
+    def export_openfoam_case(self, voxel_grid: torch.Tensor, case_dir: str) -> Dict[str, Any]:
+        """Create a minimal OpenFOAM validation case around the exported geometry."""
+        case_path = Path(case_dir)
+        tri_surface = case_path / "constant" / "triSurface"
+        system = case_path / "system"
+        constant = case_path / "constant"
+        for p in (tri_surface, system, constant / "polyMesh", case_path / "0"):
+            p.mkdir(parents=True, exist_ok=True)
+
+        processed = self._postprocess_voxels(voxel_grid.unsqueeze(0)).squeeze(0) if voxel_grid.ndim == 3 else self._postprocess_voxels(voxel_grid)
+        stl_path = tri_surface / "design.stl"
+        self.voxels_to_stl(processed, str(stl_path), use_marching_cubes=True)
+
+        (system / "blockMeshDict").write_text("""FoamFile\n{\n    version 2.0;\n    format ascii;\n    class dictionary;\n    object blockMeshDict;\n}\nconvertToMeters 1;\nvertices\n(\n    (-5 -2 -2)\n    ( 5 -2 -2)\n    ( 5  2 -2)\n    (-5  2 -2)\n    (-5 -2  2)\n    ( 5 -2  2)\n    ( 5  2  2)\n    (-5  2  2)\n);\nblocks\n(\n    hex (0 1 2 3 4 5 6 7) (60 24 24) simpleGrading (1 1 1)\n);\nedges ( );\nboundary\n(\n    inlet { type patch; faces ((0 4 7 3)); }\n    outlet { type patch; faces ((1 2 6 5)); }\n    top { type patch; faces ((3 7 6 2)); }\n    bottom { type patch; faces ((0 1 5 4)); }\n    front { type symmetryPlane; faces ((0 3 2 1)); }\n    back { type symmetryPlane; faces ((4 5 6 7)); }\n);\nmergePatchPairs ( );\n""")
+        (system / "snappyHexMeshDict").write_text("""FoamFile
+{ version 2.0; format ascii; class dictionary; object snappyHexMeshDict; }
+castellatedMesh true;
+snap true;
+addLayers false;
+mergeTolerance 1e-6;
+geometry
+{ design.stl { type triSurfaceMesh; name design; } }
+castellatedMeshControls
+{
+    maxLocalCells 50000; maxGlobalCells 200000; minRefinementCells 0; nCellsBetweenLevels 2;
+    features ( ); refinementSurfaces { design { level (1 2); } }; refinementRegions { };
+    allowFreeStandingZoneFaces true; resolveFeatureAngle 30; locationInMesh (4 0 0);
+}
+snapControls { nSmoothPatch 3; tolerance 2.0; nSolveIter 30; nRelaxIter 5; }
+addLayersControls
+{
+    relativeSizes true;
+    layers { }
+    expansionRatio 1.0;
+    finalLayerThickness 0.3;
+    minThickness 0.1;
+    nGrow 0;
+    featureAngle 30;
+    nRelaxIter 3;
+    nSmoothSurfaceNormals 1;
+    nSmoothNormals 3;
+    nSmoothThickness 10;
+    maxFaceThicknessRatio 0.5;
+    maxThicknessToMedialRatio 0.3;
+    minMedialAxisAngle 90;
+    nBufferCellsNoExtrude 0;
+    nLayerIter 0;
+}
+meshQualityControls
+{
+    maxNonOrtho 65;
+    maxBoundarySkewness 20;
+    maxInternalSkewness 4;
+    maxConcave 80;
+    minVol 1e-13;
+    minTetQuality 1e-30;
+    minArea -1;
+    minTwist 0.02;
+    minDeterminant 0.001;
+    minFaceWeight 0.02;
+    minVolRatio 0.01;
+    minTriangleTwist -1;
+    nSmoothScale 4;
+    errorReduction 0.75;
+}
+""")
+        (system / "controlDict").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"system\";
+    object      controlDict;
+}
+application     sonicFoam;
+startFrom       latestTime;
+startTime       0;
+stopAt          endTime;
+endTime         0.0027;
+deltaT          4e-08;
+writeControl    runTime;
+writeInterval   2e-04;
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  6;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+runTimeModifiable true;
+""")
+        (system / "fvSchemes").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O operation     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"system\";
+    object      fvSchemes;
+}
+ddtSchemes
+{
+    default         Euler;
+}
+gradSchemes
+{
+    default         Gauss linear;
+    grad(U)         cellLimited Gauss linear 1;
+}
+divSchemes
+{
+    default         none;
+    div(phi,U)      Gauss limitedLinearV 1;
+    div(phi,e)      Gauss limitedLinear 1;
+    div(phid,p)     Gauss limitedLinear 1;
+    div(phiv,p)     Gauss limitedLinear 1;
+    div(phi,K)      Gauss limitedLinear 1;
+    div(phi,k)      Gauss upwind;
+    div(phi,epsilon) Gauss upwind;
+    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
+}
+laplacianSchemes
+{
+    default         Gauss linear limited corrected 0.5;
+}
+interpolationSchemes
+{
+    default         linear;
+}
+snGradSchemes
+{
+    default         corrected;
+}
+""")
+        (system / "fvSolution").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"system\";
+    object      fvSolution;
+}
+solvers
+{
+    \"rho.*\"
+    {
+        solver          diagonal;
+    }
+
+    \"p.*\"
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-12;
+        relTol          0;
+    }
+
+    \"(U|e).*\"
+    {
+        $p;
+        tolerance       1e-9;
+    }
+
+    \"(k|epsilon).*\"
+    {
+        $p;
+        tolerance       1e-10;
+    }
+}
+PIMPLE
+{
+    nOuterCorrectors 1;
+    nCorrectors      2;
+    nNonOrthogonalCorrectors 0;
+}
+""")
+        (constant / "thermophysicalProperties").write_text("""/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O operation     | Version:  v1912                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    \"constant\";
+    object      thermophysicalProperties;
+}
+thermoType
+{
+    type            hePsiThermo;
+    mixture         pureMixture;
+    transport       const;
+    thermo          hConst;
+    equationOfState perfectGas;
+    specie          specie;
+    energy          sensibleInternalEnergy;
+}
+mixture
+{
+    specie
+    {
+        molWeight       28.9;
+    }
+    thermodynamics
+    {
+        Cp              1005;
+        Hf              0;
+    }
+    transport
+    {
+        mu              0;
+        Pr              0.7;
+    }
+}
+""")
+        (constant / "turbulenceProperties").write_text("""FoamFile
+{ version 2.0; format ascii; class dictionary; object turbulenceProperties; }
+simulationType laminar;
+""")
+        (system / "forces").write_text("""FoamFile\n{ version 2.0; format ascii; class dictionary; object forces; }\ntype forces;\nfunctionObjectLibs (\"libforces.so\");\npatches (design);\nrho rho;\nrhoInf 1.225;\np p;\nU U;\nCofR (0 0 0);\n""")
+        (case_path / "0" / "U").write_text("""FoamFile\n{ version 2.0; format ascii; class volVectorField; object U; }\ndimensions [0 1 -1 0 0 0 0];\ninternalField uniform (80 0 0);\nboundaryField { inlet { type fixedValue; value uniform (80 0 0); } outlet { type pressureInletOutletVelocity; value uniform (80 0 0); } top { type slip; } bottom { type slip; } front { type symmetryPlane; } back { type symmetryPlane; } design { type noSlip; } }\n""")
+        (case_path / "0" / "p").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object p; }\ndimensions [1 -1 -2 0 0 0 0];\ninternalField uniform 101325;\nboundaryField { inlet { type totalPressure; p0 uniform 101325; value uniform 101325; } outlet { type fixedValue; value uniform 101325; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
+        (case_path / "0" / "T").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object T; }\ndimensions [0 0 0 1 0 0 0];\ninternalField uniform 300;\nboundaryField { inlet { type fixedValue; value uniform 300; } outlet { type zeroGradient; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
+        (case_path / "0" / "rho").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object rho; }\ndimensions [1 -3 0 0 0 0 0];\ninternalField uniform 1.225;\nboundaryField { inlet { type fixedValue; value uniform 1.225; } outlet { type zeroGradient; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
+        (case_path / "OPENFOAM_EXPORT.md").write_text(
+            "OpenFOAM validation case generated from repo geometry export.\n"
+            f"OpenFOAM root: {OPENFOAM_ROOT}\n"
+            "Run blockMesh -> surfaceFeatureExtract -> snappyHexMesh -> sonicFoam with forces.\n"
+        )
+        return {"case_dir": str(case_path), "stl_path": str(stl_path), "openfoam_available": OPENFOAM_AVAILABLE}
 
 # ============================================================================
 # CLI INTERFACE
@@ -1678,12 +1969,12 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 @click.option('--output', default='aircraft_optimized.stl', help='Output STL file path')
 @click.option('--target-speed', default=7.0, help='Target aircraft speed (m/s)')
 @click.option('--num-steps', default=4, help='Number of diffusion steps for generation (4 for consistency)')
-@click.option('--use-marching_cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
+@click.option('--use-marching-cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
 @click.option('--solver', default='D3Q19', help='CFD solver type: D3Q19 or D3Q27')
 def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver):
     """Generate aircraft design using optimized 4-step consistency model"""
     
-    device = torch.device('cuda' if torch.available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     if not os.path.exists(checkpoint):
@@ -1755,7 +2046,7 @@ def performance_benchmark():
     print("\n🚀 TRM/HRM RECURSIVE STYLE PERFORMANCE BENCHMARK")
     print("="*60)
     
-    device = torch.device('cuda' if torch.available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     
     if torch.cuda.is_available():

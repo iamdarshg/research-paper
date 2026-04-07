@@ -23,28 +23,32 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install torch numpy scipy scikit-image trimesh pyyaml tqdm click
+          pip install torch numpy scipy scikit-image trimesh pyyaml tqdm click tensorboard
 
       - name: Run Benchmarks
         id: benchmark
         run: |
-          # Run benchmark and capture JSON output
-          # We might need to mock OpenFOAM if it's not available
-          export OPENFOAM_ROOT="/tmp/openfoam"
-          mkdir -p $OPENFOAM_ROOT
+          # We'll run the benchmark script.
+          # It will try to run OpenFOAM but will fail gracefully if not found.
+          # We export GITHUB_ACTIONS=true so it outputs single-line JSON.
+          export GITHUB_ACTIONS=true
           python3 run_internal_benchmark.py > benchmark_results.json || echo "{}" > benchmark_results.json
 
           # Extract values from JSON (using python for simplicity)
-          ERROR=$(python3 -c "import json, sys; data=json.load(open('benchmark_results.json')); print(data.get('error_percentage', '0.0'))")
-          SPEED=$(python3 -c "import json, sys; data=json.load(open('benchmark_results.json')); print(data.get('execution_speed', '0.0'))")
+          ERROR=$(python3 -c "import json, sys; data=json.load(open('benchmark_results.json')); print(data.get('error_percentage', 'N/A'))")
+          SPEED=$(python3 -c "import json, sys; data=json.load(open('benchmark_results.json')); print(data.get('execution_speed', 'N/A'))")
 
           echo "error=$ERROR" >> $GITHUB_OUTPUT
           echo "speed=$SPEED" >> $GITHUB_OUTPUT
 
       - name: Update README.md
         run: |
-          ERROR_VALUE="${{ steps.benchmark.outputs.error }}%"
-          SPEED_VALUE="${{ steps.benchmark.outputs.speed }} it/s"
+          ERROR_VALUE="${{ steps.benchmark.outputs.error }}"
+          if [ "$ERROR_VALUE" != "N/A" ]; then ERROR_VALUE="${ERROR_VALUE}%"; fi
+
+          SPEED_VALUE="${{ steps.benchmark.outputs.speed }}"
+          if [ "$SPEED_VALUE" != "N/A" ]; then SPEED_VALUE="${SPEED_VALUE} it/s"; fi
+
           DATE_VALUE=$(date +%Y-%m-%d)
 
           # Use sed to replace the benchmark block
