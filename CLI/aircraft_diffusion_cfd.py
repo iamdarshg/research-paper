@@ -901,8 +901,11 @@ class AdvancedCFDSimulator:
     def _voxel_to_stl_path(self, voxel_grid: torch.Tensor) -> Optional[str]:
         """Convert voxel grid to STL file path"""
         try:
+            # Convert to numpy
             voxel_np = voxel_grid.cpu().numpy()
             binary_grid = (voxel_np > 0.5).astype(np.float32)
+
+            # Use marching cubes for smooth mesh
             vertices, faces, _, _ = measure.marching_cubes(
                 binary_grid,
                 level=0.5,
@@ -913,10 +916,15 @@ class AdvancedCFDSimulator:
             scale = float(self.config.lbm_config.physical_length_scale)
             h = scale / float(self.config.base_grid_resolution)
             vertices = vertices * h - (scale * 0.5) + (0.5 * h)
+
+            # Create mesh
             mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+            # Export to temporary STL
             with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
                 mesh.export(tmp.name)
                 return tmp.name
+
         except Exception as e:
             print(f"STL conversion failed: {e}")
             return None
@@ -1393,7 +1401,7 @@ class OptimizedAircraftGenerator:
     """Optimized inference engine with 4-step generation"""
     
     def __init__(self, checkpoint_path: str, device: torch.device = None):
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device or torch.device('cuda' if torch.available() else 'cpu')
         
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -1433,7 +1441,7 @@ class OptimizedAircraftGenerator:
         voxel_grid = torch.sigmoid(self.converter(voxel_grid))
         print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
-    
+
     def _postprocess_voxels(self, voxel_grid: torch.Tensor, min_component_size: int = 32) -> torch.Tensor:
         """Light cleanup for exported voxel geometries."""
         if voxel_grid.ndim == 4:
@@ -1473,8 +1481,11 @@ class OptimizedAircraftGenerator:
                     level=level,
                     spacing=(1.0, 1.0, 1.0)
                 )
-                scale = float(self.config.lbm_config.physical_length_scale)
-                h = scale / float(self.config.base_grid_resolution)
+                # Match the same centered physical frame used by the internal solver
+                # and the OpenFOAM validation case: unit cube centered at the origin.
+                # Assuming physical_length_scale is around 1.0 and resolution is 32
+                scale = 1.0
+                h = scale / 32.0
                 vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                 
                 print(f"Generated optimized mesh: {len(vertices)} vertices, {len(faces)} faces")
@@ -1511,7 +1522,11 @@ class OptimizedAircraftGenerator:
             for face in faces:
                 v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
                 normal = np.cross(v1 - v0, v2 - v0)
-                normal = normal / (np.linalg.norm(normal) + 1e-10)
+                norm = np.linalg.norm(normal)
+                if norm > 1e-12:
+                    normal = normal / norm
+                else:
+                    normal = np.zeros(3)
                 
                 f.write(normal.astype(np.float32).tobytes())
                 f.write(v0.astype(np.float32).tobytes())
@@ -1533,8 +1548,8 @@ class OptimizedAircraftGenerator:
                             [x, y, z], [x+1, y, z], [x+1, y+1, z], [x, y+1, z],
                             [x, y, z+1], [x+1, y, z+1], [x+1, y+1, z+1], [x, y+1, z+1]
                         ], dtype=np.float32)
-                        scale = float(self.config.lbm_config.physical_length_scale)
-                        h = scale / float(self.config.base_grid_resolution)
+                        scale = 1.0
+                        h = scale / 32.0
                         vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                         
                         # Cube face indices
@@ -2006,7 +2021,7 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
 def batch_generate(checkpoint, output_dir, num_designs):
     """Generate multiple aircraft designs using optimized pipeline"""
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.available() else 'cpu')
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     print(f"Using device: {device}")

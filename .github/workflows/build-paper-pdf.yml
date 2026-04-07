@@ -6,6 +6,7 @@ name: Build paper PDF
       - main
       - master
       - openfoam-benchmark-compare
+      - jules-*
     paths:
       - 'paper/**'
       - '.github/workflows/build-paper-pdf.yml'
@@ -31,6 +32,7 @@ jobs:
         uses: xu-cheng/latex-action@v3
         with:
           root_file: paper/main.tex
+          work_in_root_file_dir: true
           args: >-
             -pdf
             -interaction=nonstopmode
@@ -53,7 +55,7 @@ jobs:
             exit 0
           fi
           git commit -m "docs: update paper pdf [skip ci]"
-          git push
+          git push origin ${{ github.ref_name }}
 
       - name: Upload PDF artifact
         uses: actions/upload-artifact@v4
