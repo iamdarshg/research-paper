@@ -5,7 +5,9 @@ from PyQt5.QtCore import QObject, pyqtSignal
 import sys
 import os
 import traceback
-sys.path.append(r"D:\research-paper\CLI")
+
+# Add the CLI directory to the path relative to this file
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
 try:
     from aircraft_diffusion_cfd import AdvancedCFDSimulator, CFDConfig, LBMPhysicsConfig
@@ -104,6 +106,8 @@ class CFDSolverWorker(QObject):
             
             if self.solver_type == "d3q27_cascaded":
                 lbm_solver = D3Q27CascadedSolver(cfd_config, device, LBMPhysicsConfig)
+            elif self.solver_type == "d3q19_mrt":
+                lbm_solver = GPULBMSolver(cfd_config, device, LBMPhysicsConfig)
             else:
                 simulator = AdvancedCFDSimulator(cfd_config, device)
                 lbm_solver = simulator.lbm_solver
