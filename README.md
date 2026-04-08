@@ -75,14 +75,6 @@ python3 run_internal_benchmark.py
 
 This runs the internal D3Q27 solver and a local OpenFOAM sonicFoam case on the same centered cube validation object, then prints a JSON summary with the force comparison.
 
-### Internal Benchmark Results
-
-<!-- BENCHMARK_START -->
-- **Error Percentage:** 0.0%
-- **Execution Speed:** 0.0 it/s
-- **Last Updated:** 2025-01-01
-<!-- BENCHMARK_END -->
-
 ## Commands Reference
 
 ### `train`

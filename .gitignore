@@ -5,10 +5,7 @@ checkpoints/
 checkpoint*
 test_checkpoints
 GUI/__pycache__
-*/__pycache__
-<<<<<<< HEAD
+*/__pycache__/*
 CLI/checkpoints_sanity/final_optimized_model.pt
 *.pt
-!paper/sections/*.tex
-=======
->>>>>>> tmp_main
+deprecated/
