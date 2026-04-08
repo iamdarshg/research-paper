@@ -1,5 +1,8 @@
 name: Internal Benchmark and README Update
 
+permissions:
+  contents: write   # grants push access to github-actions[bot]
+  
 on:
   workflow_dispatch:
   push:

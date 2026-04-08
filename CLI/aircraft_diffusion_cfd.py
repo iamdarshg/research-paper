@@ -913,11 +913,8 @@ class AdvancedCFDSimulator:
             scale = float(self.config.lbm_config.physical_length_scale)
             h = scale / float(self.config.base_grid_resolution)
             vertices = vertices * h - (scale * 0.5) + (0.5 * h)
-<<<<<<< HEAD
 
             # Create mesh
-=======
->>>>>>> parent of 87881ff (repair actions, merge main, and run benchmarks)
             mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
             with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
                 mesh.export(tmp.name)
@@ -1438,11 +1435,8 @@ class OptimizedAircraftGenerator:
         voxel_grid = torch.sigmoid(self.converter(voxel_grid))
         print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
-<<<<<<< HEAD
 
-=======
     
->>>>>>> parent of 87881ff (repair actions, merge main, and run benchmarks)
     def _postprocess_voxels(self, voxel_grid: torch.Tensor, min_component_size: int = 32) -> torch.Tensor:
         """Light cleanup for exported voxel geometries."""
         if voxel_grid.ndim == 4:
@@ -1482,16 +1476,9 @@ class OptimizedAircraftGenerator:
                     level=level,
                     spacing=(1.0, 1.0, 1.0)
                 )
-<<<<<<< HEAD
-                # Match the same centered physical frame used by the internal solver
-                # and the OpenFOAM validation case: unit cube centered at the origin.
-                # Assuming physical_length_scale is around 1.0 and resolution is 32
-                scale = 1.0
-                h = scale / 32.0
-=======
+
                 scale = float(self.config.lbm_config.physical_length_scale)
                 h = scale / float(self.config.base_grid_resolution)
->>>>>>> parent of 87881ff (repair actions, merge main, and run benchmarks)
                 vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                 
                 print(f"Generated optimized mesh: {len(vertices)} vertices, {len(faces)} faces")
@@ -1554,13 +1541,8 @@ class OptimizedAircraftGenerator:
                             [x, y, z], [x+1, y, z], [x+1, y+1, z], [x, y+1, z],
                             [x, y, z+1], [x+1, y, z+1], [x+1, y+1, z+1], [x, y+1, z+1]
                         ], dtype=np.float32)
-<<<<<<< HEAD
-                        scale = 1.0
-                        h = scale / 32.0
-=======
                         scale = float(self.config.lbm_config.physical_length_scale)
                         h = scale / float(self.config.base_grid_resolution)
->>>>>>> parent of 87881ff (repair actions, merge main, and run benchmarks)
                         vertices = vertices * h - (scale * 0.5) + (0.5 * h)
                         
                         # Cube face indices
