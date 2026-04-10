@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Made `run_internal_benchmark.py` cross-platform by sourcing OpenFOAM through either Linux `bash` or Windows WSL, added an optional `--install-openfoam` bootstrap path, and switched the benchmark sweep to `20mm_cube.stl` plus any other STL files in the repo root.
 - Added the centered-cube validation object to the benchmark script and documented the exact geometry in `paper/sections/validation-and-testing-standards.tex`.
 - Consolidated local verification into `run_internal_benchmark.py`, which now runs the internal D3Q27 solver and the OpenFOAM sonicFoam case on the same geometry.
 - Switched the OpenFOAM extraction path from `forceCoeffs` to a lower-level `forces` function object, with a manual pressure-integration fallback if the function-object output is unavailable.

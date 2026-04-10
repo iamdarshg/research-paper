@@ -4,6 +4,14 @@ from typing import Dict
 from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 
 
+def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
+    """Convert raw lattice momentum exchange into a physical force scale."""
+    freestream_speed = float(mach_number) * 343.0
+    # Use consistent analytic scaling with dynamic pressure factor 0.5
+    force_scale = 0.5 * float(density) * freestream_speed * freestream_speed * float(grid_spacing) * float(grid_spacing)
+    return force * force_scale
+
+
 class CascadedLBM:
     """Tensor-product raw-moment collision for D3Q27."""
 
@@ -159,7 +167,7 @@ class D3Q27CascadedSolver:
         Re_max_stable = L_lattice ** 1.5
         Re_target = min(self.config.reynolds_number, Re_max_stable * 0.25)
         
-        print(f"Reynolds number adjusted: {self.config.reynolds_number} → {Re_target:.0f}")
+        print(f"Reynolds number adjusted: {self.config.reynolds_number} -> {Re_target:.0f}")
         
         # Compute viscosity in lattice units
         self.nu = u_lattice * L_lattice / Re_target
@@ -174,9 +182,9 @@ class D3Q27CascadedSolver:
         
         # Validate stability
         if tau < 0.6:
-            print("⚠️  WARNING: tau < 0.6, expect instability!")
+            print("WARNING: tau < 0.6, expect instability!")
         if u_lattice > 0.15:
-            print("⚠️  WARNING: u > 0.15, expect instability!")
+            print("WARNING: u > 0.15, expect instability!")
 
 
     def _initialize_equilibrium(self):
@@ -270,7 +278,11 @@ class D3Q27CascadedSolver:
             self.f_pre_stream.copy_(self.f)
 
             # === 3. Cascaded collision using raw tensor-product moments ===
-            K = CascadedLBM.compute_raw_moments(self.f, self.ex, self.ey, self.ez, basis=self._moment_basis_cached)
+            K_raw = CascadedLBM.compute_raw_moments(self.f, self.ex, self.ey, self.ez, basis=self._moment_basis_cached)
+            K = {
+                name: K_raw[idx]
+                for idx, name in enumerate(CascadedLBM.MOMENT_NAMES)
+            }
             K_eq = CascadedLBM.equilibrium_raw_moments(rho, ux, uy, uz)
 
             # Update relaxation parameter
@@ -398,9 +410,11 @@ class D3Q27CascadedSolver:
         reference_area_voxelized = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
         reference_area_voxelized = max(reference_area_voxelized, h**2)
 
+        physical_drag_force = _scale_momentum_exchange_force(drag_force, h, self.config.mach_number)
+        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, self.config.mach_number)
         coeffs = _compute_force_coefficients(
-            drag_force,
-            lift_force,
+            physical_drag_force,
+            physical_lift_force,
             self.config.mach_number,
             ref_area=reference_area_voxelized,
             rho_ref=1.225,
@@ -412,8 +426,10 @@ class D3Q27CascadedSolver:
         v_inf = coeffs['freestream_speed']
 
         return {
-            'force_x': drag_force.item(),
-            'force_z': lift_force.item(),
+            'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
+            'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
+            'raw_force_x': float(drag_force.item() if isinstance(drag_force, torch.Tensor) else drag_force),
+            'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
             'drag_coefficient': coeffs['drag_coefficient'],
             'lift_coefficient': coeffs['lift_coefficient'],
             'force_definition': force_definition,

@@ -49,5 +49,26 @@ class TestLBMSolvers(unittest.TestCase):
         self.assertIn('lift_coefficient', coeffs)
         self.assertIsInstance(coeffs['drag_coefficient'], float)
 
+    def test_d3q27_benchmark_like_run_is_finite(self):
+        benchmark_config = CFDConfig(
+            base_grid_resolution=32,
+            mach_number=80 / 343.0,
+            reynolds_number=80 * 40.0 / 1.47e-5,
+        )
+        benchmark_config.lbm_config = LBMPhysicsConfig()
+        benchmark_config.lbm_config.grid_spacing = 40.0 / 32.0
+        benchmark_config.lbm_config.physical_length_scale = 40.0
+
+        solver = D3Q27CascadedSolver(benchmark_config, self.device, LBMPhysicsConfig)
+        geometry_mask = torch.zeros((32, 32, 32), device=self.device)
+        geometry_mask[14:18, 14:18, 14:18] = 1.0
+
+        solver.collide_stream(geometry_mask, steps=1)
+        coeffs = solver.compute_aerodynamic_coefficients(geometry_mask)
+
+        self.assertTrue(torch.isfinite(solver.f).all().item())
+        self.assertTrue(torch.isfinite(torch.tensor(coeffs['drag_coefficient'])).item())
+        self.assertTrue(torch.isfinite(torch.tensor(coeffs['lift_coefficient'])).item())
+
 if __name__ == '__main__':
     unittest.main()

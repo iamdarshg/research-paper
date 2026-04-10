@@ -1,0 +1,107 @@
+import tempfile
+import unittest
+import shutil
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO))
+
+import run_internal_benchmark as benchmark
+
+
+class TestBenchmarkDiscovery(unittest.TestCase):
+    def test_discover_root_stls_prioritizes_20mm_cube(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '20mm_cube.stl').write_text('solid cube\nendsolid cube\n')
+            (root / 'alpha.stl').write_text('solid alpha\nendsolid alpha\n')
+            nested = root / 'nested'
+            nested.mkdir()
+            (nested / 'ignored.stl').write_text('solid ignored\nendsolid ignored\n')
+
+            stls = benchmark.discover_root_stls(root)
+
+            self.assertEqual([p.name for p in stls], ['20mm_cube.stl', 'alpha.stl'])
+            self.assertTrue(all(p.parent == root.resolve() for p in stls))
+
+    def test_build_sweep_specs_cartesian_product(self):
+        args = SimpleNamespace(
+            grid_resolutions='24,32',
+            domain_scales='2.0',
+            freestream_speeds='60,80',
+            reynolds_numbers='5e4,1e5',
+            step_counts=None,
+            grid_resolution=32,
+            domain_scale=2.0,
+            freestream_speed=80.0,
+            reynolds_number=1e5,
+            steps=200,
+            max_combinations=None,
+        )
+
+        sweep = benchmark.build_sweep_specs(args)
+
+        self.assertEqual(len(sweep['combinations']), 8)
+        self.assertEqual(sweep['combinations'][0]['grid_resolution'], 24)
+        self.assertEqual(sweep['combinations'][0]['freestream_speed'], 60.0)
+        self.assertEqual(sweep['combinations'][0]['reynolds_number'], 50000.0)
+        self.assertEqual(sweep['axes']['grid_resolutions'], [24, 32])
+
+    def test_make_case_uses_grid_resolution_for_block_mesh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stl_path = root / 'geom.stl'
+            stl_path.write_text(
+                '\n'.join([
+                    'solid geom',
+                    'facet normal 0 0 1',
+                    '  outer loop',
+                    '    vertex 0 0 0',
+                    '    vertex 1 0 0',
+                    '    vertex 0 1 0',
+                    '  endloop',
+                    'endfacet',
+                    'endsolid geom',
+                ])
+            )
+            domain_min = benchmark.np.array([0.0, 0.0, 0.0], dtype=float)
+            domain_max = benchmark.np.array([2.0, 2.0, 2.0], dtype=float)
+
+            case = benchmark.make_case(
+                stl_path,
+                patch_name='geom',
+                grid_resolution=18,
+                domain_min=domain_min,
+                domain_max=domain_max,
+                freestream_speed=80.0,
+                reynolds_number=1e5,
+            )
+            try:
+                block_mesh = (case / 'system' / 'blockMeshDict').read_text()
+                self.assertIn('(18 18 18)', block_mesh)
+            finally:
+                shutil.rmtree(case, ignore_errors=True)
+
+    def test_cube_stl_text_is_watertight(self):
+        try:
+            import trimesh
+        except Exception:
+            self.skipTest('trimesh is not available')
+
+        stl_text = benchmark._cube_stl_text(center=(0.0, 0.0, 0.0), edge_length=1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            stl_path = Path(tmp) / 'cube.stl'
+            stl_path.write_text(stl_text)
+            mesh = trimesh.load_mesh(str(stl_path), force='mesh')
+            if isinstance(mesh, trimesh.Scene):
+                mesh = trimesh.util.concatenate(tuple(mesh.dump()))
+            self.assertTrue(mesh.is_watertight)
+            self.assertTrue(mesh.is_winding_consistent)
+            self.assertEqual(len(mesh.faces), 12)
+
+
+if __name__ == '__main__':
+    unittest.main()
