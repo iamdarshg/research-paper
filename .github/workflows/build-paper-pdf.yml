@@ -1,0 +1,65 @@
+name: Build paper PDF
+
+"on":
+  push:
+    branches:
+      - main
+      - master
+      - openfoam-benchmark-compare
+      - jules-*
+    paths:
+      - 'paper/**'
+      - '.github/workflows/build-paper-pdf.yml'
+  pull_request:
+    paths:
+      - 'paper/**'
+      - '.github/workflows/build-paper-pdf.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-paper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up TeX Live
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: paper/main.tex
+          work_in_root_file_dir: true
+          args: >-
+            -pdf
+            -interaction=nonstopmode
+            -halt-on-error
+            -file-line-error
+            -shell-escape
+
+      - name: Rename PDF artifact
+        run: |
+          cp paper/main.pdf paper/research-paper.pdf
+
+      - name: Commit PDF into branch
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add paper/research-paper.pdf
+          if git diff --cached --quiet; then
+            echo "No PDF changes to commit"
+            exit 0
+          fi
+          git commit -m "docs: update paper pdf [skip ci]"
+          git push origin ${{ github.ref_name }}
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-paper-pdf
+          path: paper/research-paper.pdf
+          if-no-files-found: error

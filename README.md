@@ -67,6 +67,14 @@ python aircraft_diffusion_cfd.py evaluate \
   --cfd-steps 1000
 ```
 
+### 6. Run the Validation Benchmark
+
+```bash
+python3 run_internal_benchmark.py
+```
+
+This runs the internal D3Q27 solver and, when OpenFOAM is available, a local sonicFoam case for `20mm_cube.stl` plus any other root-level `*.stl` files, then prints a JSON summary with the force comparison. On Linux or Windows/WSL, pass `--install-openfoam` to let the benchmark bootstrap OpenFOAM if it is missing.
+
 ## Commands Reference
 
 ### `train`

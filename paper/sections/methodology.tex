@@ -1,0 +1,52 @@
+\section{Methodology}
+\label{sec:methodology}
+Our proposed framework embodies the LiDAR and HRM principles through a multi-stage generative process. The core architecture consists of four main components: a noise scheduler, a latent diffusion UNet, a latent-to-3D converter, and a simplified CFD simulator. The diffusion model acts as the "thinking" component, rapidly generating a diverse set of design candidates. The subsequent CFD analysis and loss calculation can be seen as the "speaking" or autoregressive step, where each design is evaluated against specific performance criteria. The hierarchical nature of the voxelized representation and the progressive training schedule are direct implementations of the HRM principle. The overall architecture is depicted in Figure \ref{fig:architecture}.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=7in]{placeholder.png}
+\caption{The architecture of our proposed generative design framework. A latent vector is first sampled from a standard normal distribution. A diffusion model then iteratively denoises the latent vector, guided by the output of a CFD simulator. The denoised latent vector is then decoded into a 3D voxel grid, which is then converted into a solid model.}
+\label{fig:architecture}
+\end{figure*}
+
+\subsection{Noise Scheduling}
+The forward diffusion process gradually adds Gaussian noise to the input data over a series of T timesteps. The noise schedule is defined by a variance schedule $\beta_t$, which is typically a linear or cosine schedule. In our work, we use a linear schedule, where $\beta_t$ increases linearly from $\beta_{start}$ to $\beta_{end}$.
+
+The forward process is defined as:
+\begin{equation}
+q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} x_{t-1}, \beta_t I)
+\end{equation}
+
+The reverse diffusion process is where the generative model learns to denoise the data. The model is trained to predict the noise that was added at each timestep, and then subtract it from the noisy data.
+
+\subsection{Latent Diffusion UNet}
+The core of our generative model is a UNet-based architecture that operates in the latent space. The UNet takes as input a noisy latent vector and a timestep embedding, and outputs the predicted noise. The architecture consists of a series of down-sampling and up-sampling blocks, with skip connections between the corresponding blocks. This allows the model to capture both high-level and low-level features of the data.
+
+\subsection{Latent-to-3D Converter}
+The latent-to-3D converter is a multi-layer perceptron (MLP) that maps the denoised latent vector to a 3D voxel grid. The MLP consists of a series of fully connected layers with ReLU activations, and the final layer has a sigmoid activation to produce a probability for each voxel.
+
+\subsection{CFD Simulator}
+The CFD simulator is a simplified, GPU-accelerated solver that is used to evaluate the aerodynamic performance of the generated designs. The simulator takes as input a voxel grid and a set of flow conditions (e.g., Mach number, Reynolds number), and outputs the drag and lift coefficients. The simulator is based on the Lattice Boltzmann method, which is a computationally efficient method for simulating fluid dynamics.
+
+\subsection{Loss Function}
+The total loss function is a weighted sum of three components: the diffusion loss, the connectivity loss, and the aerodynamic loss.
+
+\begin{equation}
+\mathcal{L} = \lambda_{diff} \mathcal{L}_{diff} + \lambda_{conn} \mathcal{L}_{conn} + \lambda_{aero} \mathcal{L}_{aero}
+\end{equation}
+
+The diffusion loss is the mean squared error between the predicted noise and the actual noise. The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis. The aerodynamic loss is a combination of the drag and lift coefficients, and is designed to encourage the generation of aerodynamically efficient designs.
+
+\subsection{Rigorous Integration of CFD in Diffusion Training}
+To ensure the generated geometries are physically viable, we integrate the CFD solver directly into the gradient-based optimization loop. This is achieved by differentiating through the LBM solver or by using the solver as a score-guidance function during the reverse diffusion process.
+
+\begin{itemize}
+    \item \textbf{Step 1:} Sample noisy latent $z_t$.
+    \item \textbf{Step 2:} Predict $z_0$ using the UNet.
+    \item \textbf{Step 3:} Decode $z_0$ to voxel grid $V$.
+    \item \textbf{Step 4:} Run GPU-accelerated LBM solver on $V$.
+    \item \textbf{Step 5:} Compute aerodynamic coefficients $C_L, C_D$.
+    \item \textbf{Step 6:} Update UNet weights to maximize $C_L/C_D$.
+\end{itemize}
+
+\textbf{TODO:} Implement DeepSeek-style visual performance graphs comparing solver stability and convergence rates across different Reynolds numbers (e.g., TikZ/PGFPlots comparing D3Q27 Cascaded vs. D3Q19 MRT).

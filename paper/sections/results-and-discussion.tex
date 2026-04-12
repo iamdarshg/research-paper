@@ -1,0 +1,66 @@
+\section{Results and Discussion}
+\label{sec:results}
+We performed a CPU-only sanity run on the single freeform-object path using the installed virtual environment and the repository checkpoint emitted by training. The experiment was intentionally narrow: one epoch at each progressive grid stage (16\textsuperscript{3}, 24\textsuperscript{3}, and 32\textsuperscript{3}) with batch size 1 and two synthetic samples. We treat the run as a code-path validation and reduced aerodynamic probe rather than a definitive performance benchmark.
+
+\subsection{Training Convergence}
+Figure \ref{fig:loss_curves} summarizes the observed losses across the three progressive stages. Total loss stayed in the 2.31--2.71 range, while the MSE term rose with resolution and the connectivity term stayed roughly constant. The aerodynamic loss was near zero in this short run, indicating that the CFD term was present in the pipeline but did not dominate optimization under this reduced setting.
+
+\begin{figure}[!t]
+\centering
+\IfFileExists{figures/sanity_training_losses.png}{%
+\includegraphics[width=3.5in]{figures/sanity_training_losses.png}%
+}{%
+\includegraphics[width=3.5in]{placeholder.png}%
+}
+\caption{Observed sanity-run losses across progressive grid stages. This is a reduced CPU-only training trace, not a full convergence study.}
+\label{fig:loss_curves}
+\end{figure}
+
+\subsection{Freeform-object Sweep: Steps vs. Shape Prior}
+We ran a compact sweep over generation step count and the new shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, downsampled the binary grid to 16\textsuperscript{3} for the CPU CFD pass, and computed occupancy, surface area, $C_L$, $C_D$, and $L/D$. The key observation is that the post-processing threshold materially changes the aerodynamic score: at 1 step the best setting reached $L/D=2.22$, while at 8 steps the best score was $L/D=0.59$ in this reduced CPU setup.
+
+\begin{figure}[!t]
+\centering
+\IfFileExists{figures/freeform_realism_ld_by_steps.png}{%
+\includegraphics[width=3.5in]{figures/freeform_realism_ld_by_steps.png}%
+}{%
+\includegraphics[width=3.5in]{placeholder.png}%
+}
+\caption{Mean $L/D$ from the reduced sweep over consistency steps, aggregated across three post-processing thresholds. Error bars show sample standard deviation.}
+\label{fig:ld_sweep}
+\end{figure}
+
+\begin{figure}[!t]
+\centering
+\IfFileExists{figures/freeform_realism_occ_vs_ld.png}{%
+\includegraphics[width=3.5in]{figures/freeform_realism_occ_vs_ld.png}%
+}{%
+\includegraphics[width=3.5in]{placeholder.png}%
+}
+\caption{Occupancy versus $L/D$ for the same sweep. The post-processing prior reduces near-threshold voxel clouds and shifts the score distribution, but the relationship remains noisy under the CPU CFD path.}
+\label{fig:cfd_analysis}
+\end{figure}
+
+\subsection{Freeform-object Geometry Summary}
+The generated freeform objects are still dense and near-threshold before cleanup, but the new plausibility prior reduces isolated components and slightly lowers the occupancy fraction. In this environment, that matters more than small changes in the raw voxel logits: the cleaned binary shapes are less fragmented and more suitable for downstream meshing/export.
+
+\subsection{Hyperparameter and Tuning Notes}
+The sweep was intentionally small but meaningful for the current codebase: it varied the inference path length and the new connected-component cleanup threshold, which are the two knobs that currently have the most direct effect on shape plausibility. The training-side improvement was also incremental: a voxel-shape prior was added to the loss to discourage midpoint noise, excess surface roughness, and disconnected fragments.
+
+This is still a pilot study. The numbers above should be interpreted as a validation of the code path and a first-pass tuning signal, not as evidence of a stable optimum. A larger study should sweep:
+\begin{itemize}
+    \item latent dimension (8, 16, 32),
+    \item the shape-prior weights and occupancy target,
+    \item consistency steps (1, 2, 4, 8, 16), and
+    \item CFD solver resolution and reference-area normalization.
+\end{itemize}
+
+At minimum, a publication-quality sweep should report both realism metrics (occupancy, connectedness, surface smoothness) and aerodynamic metrics ($C_L$, $C_D$, $L/D$) instead of optimizing only one side of the tradeoff.
+
+\subsection{Discussion}
+The main takeaway is now a little sharper: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM validation case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline.
+
+The OpenFOAM export path now writes a plain \texttt{forces} function-object dictionary, and the resulting force vector is normalized manually to recover coefficients when coefficient output is not available. The current benchmark still shows a substantial Cd gap, which we are now treating as a solver- and sampling-consistency issue rather than a paper-level normalization issue. A higher-confidence CFD comparison will still need a more systematic hyperparameter sweep and consistent normalization of reference area and flow conditions.
+
+The next recorded physics correction was applied in \texttt{CLI/cascaded\_lbm.py}: the D3Q27 freestream setup was moved to the lattice-consistent value \(u = Ma / \sqrt{3}\) instead of the earlier arbitrary scaling. That change is now part of the benchmark history and is being checked against the Cd mismatch before any deeper transform rewrite.
+

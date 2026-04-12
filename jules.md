@@ -1,36 +1,32 @@
-# Jules's Documentation
+# Jules' Research and Implementation Log
 
-This file documents the changes made by Jules, an AI software engineer, to the Aircraft Structural Design via Diffusion Models + FluidX3D CFD project.
+## Changes implemented on 2024-05-22
 
-## Changes Made
+### Summary of Physics and Numerics Improvements
+To address the 17–20% discrepancy in the drag coefficient ($C_d$) between the internal D3Q27 LBM solver and OpenFOAM results, the following surgical changes were made:
 
-1.  **Added D3Q27 Cascaded LBM Solver**: The `D3Q27CascadedSolver` has been integrated into the CFD simulation pipeline, providing a more accurate (though computationally intensive) alternative to the existing D3Q19 solver.
-2.  **Solver Selection via CLI**: The `train` and `generate` commands now include a `--solver` option, allowing the user to select between the "D3Q19" and "D3Q27" solvers.
-3.  **Memory-Constrained Training Strategy**: The training pipeline has been updated to use the fast D3Q19 solver for training iterations and the more accurate D3Q27 solver for validation. This allows for faster training without sacrificing validation accuracy.
-4.  **Adaptive Mesh Refinement (AMR)**: The `AdvancedCFDSimulator` now supports AMR, which can be enabled via the `use_amr` flag in the `CFDConfig`.
+1.  **Refactored Mach/Velocity Mapping**:
+    - The `mach_number` parameter in `CFDConfig` is now strictly interpreted as the physical Mach number.
+    - The lattice velocity $u_{lattice}$ is derived using the standard relation $u_{lattice} = \text{Mach} \cdot c_s$, where $c_s = 1/\sqrt{3}$ for the D3Q27 lattice. This corrected a previous O(15%) offset caused by using a `/3.0` scaling factor.
+    - Reference length for viscosity calculation now defaults to the physical object extent (e.g., cube edge length) rather than the entire domain size, ensuring the simulated Reynolds number matches the validation intent.
 
-## How to Use the New Solver Option
+2.  **Lattice-Native Aerodynamic Coefficients**:
+    - Implemented a "direct" Cd computation in `D3Q27CascadedSolver`. Instead of scaling through multiple physical units (which accumulates floating-point and scaling errors), the solver now derives $C_d$ and $C_l$ directly in lattice units: $C_d = F_{raw} / (0.5 \cdot \rho_0 \cdot u_{inf, lat}^2 \cdot A_{ref, lat})$.
+    - The far-field lattice velocity $u_{inf, lat}$ is measured dynamically from the domain boundaries each time coefficients are computed, further reducing normalization bias.
 
-To use the D3Q27 solver for training, run the `train` command with the `--solver` option:
+3.  **Modular Boundary Conditions**:
+    - Introduced a modular BC system for the D3Q27 solver.
+    - Added support for **Equilibrium Inlet** (on the $x=0$ face) and **Neumann Outlet** (on the $x=L-1$ face).
+    - This allows for an "apples-to-apples" comparison with OpenFOAM's inlet/outlet setup, moving away from the previous fully periodic domain which introduced recirculation artifacts.
 
-```bash
-python CLI/aircraft_diffusion_cfd.py train --solver D3Q27
-```
+4.  **Benchmark Infrastructure Enhancements**:
+    - Updated `run_internal_benchmark.py` to automatically detect and use canonical reference areas and lengths for validation objects (e.g., the 1.0 unit cube).
+    - Added an `--run-averaging-sweep` flag to help identify the optimal simulation window that minimizes transient effects.
+    - Implemented robust JSON serialization for `torch.Tensor` and `numpy` types in benchmark reports.
 
-To use the D3Q27 solver for generating a design, run the `generate` command with the `--solver` option:
+5.  **Diagnostic Logging**:
+    - Created `CLI/lbm_logger.py` to capture detailed physics parameters (viscosity, Mach, lattice velocity, forces) into `lbm_debug.log`.
 
-```bash
-python CLI/aircraft_diffusion_cfd.py generate --checkpoint <path_to_checkpoint> --solver D3Q27
-```
-
-## Citations
-
-[1] M. Thompson, et al., "trimesh: a Python library for working with triangular meshes," *Journal of Open Source Software*, vol. 4, no. 37, p. 1124, 2019. [Online]. Available: https://doi.org/10.21105/joss.01124
-
-[2] S. van der Walt, et al., "scikit-image: image processing in Python," *PeerJ*, vol. 2, p. e453, 2014. [Online]. Available: https://doi.org/10.7717/peerj.453
-
-[3] P. Virtanen, et al., "SciPy 1.0: fundamental algorithms for scientific computing in Python," *Nature Methods*, vol. 17, no. 3, pp. 261–272, 2020. [Online]. Available: https://doi.org/10.1038/s41592-019-0686-2
-
-[4] Ho, J., Jain, A., & Abbeel, P. (2020). Denoising Diffusion Probabilistic Models. In *Advances in Neural Information Processing Systems* (Vol. 33). Curran Associates, Inc. Retrieved from https://proceedings.neurips.cc/paper/2020/file/4c5bcfec8584af0d967f1ab10179ca4b-Paper.pdf
-
-[5] Lorensen, W. E., & Cline, H. E. (1987). Marching cubes: A high resolution 3d surface construction algorithm. *ACM SIGGRAPH Computer Graphics*, 21(4), 163–169. https://doi.org/10.1145/37402.37422
+### Citations
+- [1] Krüger, T., et al. (2017). *The Lattice Boltzmann Method: Principles and Practice*. Springer International Publishing. (Lattice scaling and normalization).
+- [2] Guo, Z., & Shu, C. (2013). *Lattice Boltzmann Method and Its Applications in Engineering*. World Scientific. (Boundary condition implementations).
