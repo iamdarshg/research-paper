@@ -1313,11 +1313,28 @@ def run_benchmark_case(
             reynolds_number=sweep_case['reynolds_number'],
             simulation_steps=sweep_case['steps'],
         )
-        cfg.lbm_config.physical_length_scale = domain_size
+
+        # Use object size as reference length for Reynolds number if possible
+        ref_length = max_extent
+        if 'cube' in stl_path.name.lower() and math.isclose(max_extent, 1.0, rel_tol=1e-2):
+             ref_length = VALIDATION_OBJECT_DETAILS["reference_length"]
+
+        cfg.lbm_config.physical_length_scale = ref_length
         cfg.lbm_config.grid_spacing = domain_size / cfg.base_grid_resolution
+
         solver = D3Q27CascadedSolver(cfg, torch.device('cpu'), LBMPhysicsConfig)
-        solver.collide_stream(geometry_mask, steps=sweep_case['steps'])
-        internal = solver.compute_aerodynamic_coefficients(geometry_mask)
+
+        # Determine if we should use inlet/outlet BCs
+        use_inlet_outlet = sweep_case.get('use_inlet_outlet', True)
+
+        solver.collide_stream(geometry_mask, steps=sweep_case['steps'], use_inlet_outlet=use_inlet_outlet)
+
+        # Check for validation object overrides
+        ref_area_override = None
+        if 'cube' in stl_path.name.lower() and math.isclose(max_extent, 1.0, rel_tol=1e-3):
+             ref_area_override = VALIDATION_OBJECT_DETAILS["reference_area"]
+
+        internal = solver.compute_aerodynamic_coefficients(geometry_mask, ref_area_override=ref_area_override)
         internal['stl_name'] = stl_path.name
         internal['domain_size'] = domain_size
         internal['max_extent'] = max_extent
@@ -1522,7 +1539,37 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument('--install-openfoam', action='store_true', help='Attempt to install OpenFOAM automatically if it is missing.')
     parser.add_argument('--openfoam-package', default=OPENFOAM_PACKAGE, help='OpenFOAM package name to install on Ubuntu/WSL.')
     parser.add_argument('--openfoam-timeout', type=int, default=1200, help='Timeout for each OpenFOAM command in seconds.')
+    parser.add_argument('--run-averaging-sweep', action='store_true', help='Run a sweep of step counts to find the optimal window.')
     return parser.parse_args(argv)
+
+
+def run_averaging_sweep(stl_path: Path, mesh, base_sweep_case: Dict[str, Any], args) -> List[Dict[str, Any]]:
+    """Sweep step counts to find optimal averaging window."""
+    results = []
+    step_options = [100, 200, 300, 400, 500, 750, 1000]
+    for steps in step_options:
+        case = base_sweep_case.copy()
+        case['steps'] = steps
+        print(f"Running averaging sweep: {steps} steps...")
+        res = run_benchmark_case(stl_path, mesh, case, args)
+        results.append({
+            'steps': steps,
+            'cd': res['internal']['drag_coefficient'],
+            'u_inf_lat': res['internal'].get('u_inf_lat'),
+        })
+    return results
+
+
+def _json_serializable(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().numpy().tolist()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def main(argv: Optional[Sequence[str]] = None):
@@ -1544,11 +1591,24 @@ def main(argv: Optional[Sequence[str]] = None):
 
     if not stls:
         results['error'] = 'No root-level STL files were found.'
-        print(json.dumps(results, indent=None if os.environ.get('GITHUB_ACTIONS') == 'true' else 2))
+        print(json.dumps(results, indent=None if os.environ.get('GITHUB_ACTIONS') == 'true' else 2, default=_json_serializable))
         return 1
 
     error_values: List[float] = []
     for stl_path in stls:
+        if args.run_averaging_sweep:
+            mesh = _load_trimesh(stl_path)
+            base_case = {
+                'grid_resolution': args.grid_resolution,
+                'domain_scale': args.domain_scale,
+                'freestream_speed': args.freestream_speed,
+                'reynolds_number': args.reynolds_number,
+                'use_inlet_outlet': True
+            }
+            avg_results = run_averaging_sweep(stl_path, mesh, base_case, args)
+            results[f'averaging_sweep_{stl_path.name}'] = avg_results
+            print(f"Averaging sweep for {stl_path.name}: {json.dumps(avg_results, indent=2, default=_json_serializable)}")
+
         case_result = run_benchmark_for_stl(stl_path, args)
         results['cases'].append(case_result)
         for sweep_case in case_result.get('sweep_results', []):
@@ -1562,9 +1622,9 @@ def main(argv: Optional[Sequence[str]] = None):
         results['error_percentage'] = None
 
     if os.environ.get('GITHUB_ACTIONS') == 'true':
-        print(json.dumps(results))
+        print(json.dumps(results, default=_json_serializable))
     else:
-        print(json.dumps(results, indent=2))
+        print(json.dumps(results, indent=2, default=_json_serializable))
     return 0
 
 

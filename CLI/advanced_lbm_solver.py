@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity, compute_velocity_gradients
+from lbm_logger import lbm_debug_logger
 
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
@@ -39,10 +40,14 @@ class D3Q27Solver:
         self.reset_force_accounting()
 
     def compute_equilibrium(self, rho, ux, uy, uz):
-        feq = torch.zeros_like(self.f)
+        # Use spatial shape of input for feq
+        spatial_shape = rho.shape
+        feq = torch.zeros((27, *spatial_shape), device=self.device, dtype=self.f.dtype)
+
+        u_sq = ux**2 + uy**2 + uz**2
+
         for i in range(27):
             cu = self.ex[i]*ux + self.ey[i]*uy + self.ez[i]*uz
-            u_sq = ux**2 + uy**2 + uz**2
             feq[i] = self.w[i] * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
         return feq
 
@@ -75,10 +80,42 @@ class D3Q27Solver:
             if not torch.any(boundary_link):
                 continue
 
-            step_force_x += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i][boundary_link])
-            step_force_z += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i][boundary_link])
+            step_force_x += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i, boundary_link])
+            step_force_z += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i, boundary_link])
 
         return step_force_x, step_force_z
+
+    def apply_boundary_conditions(self, geometry_mask, u_inlet=None):
+        """Apply modular boundary conditions.
+        Currently supports:
+        - Bounce-back on geometry_mask (solid body)
+        - Periodic in Y and Z
+        - Inlet (Zou-He or Equilibrium) on X-min
+        - Outlet (Neumann or Equilibrium) on X-max
+        """
+        mask = geometry_mask > 0.5
+
+        # 1. Body Bounce-back (already handled in collide_and_stream by default)
+        # However, we can move it here for modularity.
+
+        # 2. X-Inlet (X=0)
+        if u_inlet is not None:
+            # Simple equilibrium inlet for now
+            rho_in = torch.sum(self.f[:, 0, :, :], dim=0)
+            ux_in = torch.full_like(rho_in, u_inlet)
+            uy_in = torch.zeros_like(rho_in)
+            uz_in = torch.zeros_like(rho_in)
+            feq_in = self.compute_equilibrium(rho_in, ux_in, uy_in, uz_in)
+            # Apply to populations that point into the domain from X=0
+            # Directions with ex[i] > 0: 1, 7, 9, 11, 13, 19, 21, 23, 25
+            for i in [1, 7, 9, 11, 13, 19, 21, 23, 25]:
+                self.f[i, 0, :, :] = feq_in[i]
+
+        # 3. X-Outlet (X=res-1)
+        # Simple Neumann (zero-gradient) for populations pointing out
+        # Directions with ex[i] < 0: 2, 8, 10, 12, 14, 20, 22, 24, 26
+        for i in [2, 8, 10, 12, 14, 20, 22, 24, 26]:
+            self.f[i, -1, :, :] = self.f[i, -2, :, :]
 
     def collide_and_stream(self, omega, geometry_mask):
         # Macroscopic variables
@@ -693,6 +730,7 @@ class D3Q27CascadedSolver:
         self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)
         self.q_criterion = torch.zeros_like(self.velocity_x)
         self.nu = self._estimate_kinematic_viscosity()
+        lbm_debug_logger.debug(f"Initialized D3Q27CascadedSolver: resolution={self.resolution}, nu={self.nu}")
 
         # Initialize populations to equilibrium immediately so tests see valid data
         # (non-NaN, correct shape) on solver construction.
@@ -703,22 +741,34 @@ class D3Q27CascadedSolver:
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         dt = getattr(self.config.lbm_config, 'time_step', 0.001)
         Re = getattr(self.config, 'reynolds_number', 1e6)
-        U_ref = getattr(self.config, 'mach_number', 0.0) * 343.0
-        L_ref = h * float(self.resolution)
-        nu_phys = (U_ref * L_ref) / max(Re, 1e-12)
-        return nu_phys * dt / (h * h)
+        # Use physical speed from Mach
+        U_phys = getattr(self.config, 'mach_number', 0.0) * 343.0
+        # Reference length should be the body size, but often defaults to domain size
+        # in the current config.
+        L_phys = getattr(self.config.lbm_config, 'physical_length_scale', h * self.resolution)
+        nu_phys = (U_phys * L_phys) / max(Re, 1e-12)
+        nu_lattice = nu_phys * dt / (h * h)
+        lbm_debug_logger.debug(f"Viscosity estimate: Mach={U_phys/343:.4f}, Re={Re}, L_phys={L_phys:.4f}, nu_phys={nu_phys:.6e}, nu_lattice={nu_lattice:.6e}")
+        return nu_lattice
 
     def _initialize_equilibrium(self):
         """Initialize solver populations to equilibrium with a small freestream."""
-        rho = torch.ones(self.resolution, self.resolution, self.resolution, device=self.device)
+        # Use dtype of solver's population for consistency
+        dtype = self._solver.f.dtype
+        rho = torch.ones(self.resolution, self.resolution, self.resolution, device=self.device, dtype=dtype)
         ux = torch.zeros_like(rho)
         uy = torch.zeros_like(rho)
         uz = torch.zeros_like(rho)
 
         # Seed the equilibrium in lattice units for stability.
-        mach = getattr(self.config, 'mach_number', getattr(self.config, 'lbm_config', None) and getattr(self.config.lbm_config, 'mach_number', 0.0))
-        if mach:
-            ux = torch.full_like(rho, mach / 3.0)
+        # u_lattice = Mach_phys * cs, where cs = 1/sqrt(3)
+        mach_phys = getattr(self.config, 'mach_number', 0.0)
+        cs_lattice = 1.0 / (3.0**0.5)
+        u_lattice = mach_phys * cs_lattice
+
+        if mach_phys > 0:
+            ux = torch.full_like(rho, u_lattice)
+            lbm_debug_logger.debug(f"Initializing equilibrium: mach_phys={mach_phys:.4f}, u_lattice={u_lattice:.6e}")
 
         # compute and set equilibrium populations
         feq = self._solver.compute_equilibrium(rho, ux, uy, uz)
@@ -733,7 +783,7 @@ class D3Q27CascadedSolver:
         self.pressure.copy_(rho * (1.0 / 3.0))
         self.rho.copy_(rho)
 
-    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
+    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100, use_inlet_outlet: bool = False):
         """Run collide/stream for a number of steps. This adapts the simpler
         D3Q27 solver's `collide_and_stream(omega, geometry_mask)` API.
         """
@@ -749,8 +799,14 @@ class D3Q27CascadedSolver:
         sample_start = max(0, steps - sample_window)
         self._solver.reset_force_accounting(sample_start=sample_start)
 
+        # Inlet velocity in lattice units
+        mach_phys = getattr(self.config, 'mach_number', 0.0)
+        u_inlet = mach_phys / (3.0**0.5) if use_inlet_outlet else None
+
         # run steps
         for _ in range(steps):
+            if use_inlet_outlet:
+                self._solver.apply_boundary_conditions(geometry_mask, u_inlet=u_inlet)
             ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask)
             # store fields for diagnostics
             self.velocity_x = ux
@@ -767,7 +823,11 @@ class D3Q27CascadedSolver:
     def _refresh_flow_diagnostics(self):
         """Update vorticity, Q-criterion, and turbulence proxy from the fields."""
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
-        gradients = compute_velocity_gradients(self.velocity_x, self.velocity_y, self.velocity_z, spacing=h)
+
+        # Ensure input fields have consistent dtype
+        vx, vy, vz = self.velocity_x, self.velocity_y, self.velocity_z
+
+        gradients = compute_velocity_gradients(vx, vy, vz, spacing=h)
         S11, S22, S33, S12, S13, S23 = compute_strain_rate_tensor(
             self.velocity_x, self.velocity_y, self.velocity_z, spacing=h, gradients=gradients
         )
@@ -791,59 +851,91 @@ class D3Q27CascadedSolver:
 
         return vorticity_mag
 
-    def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
+    def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor, ref_area_override: float = None) -> Dict[str, float]:
         """Compute approximate aerodynamic coefficients from the last simulated
-        macroscopic fields. This mirrors the interface used by `GPULBMSolver`.
+        macroscopic fields. Derives Cd directly in lattice units for accuracy.
         """
-        # conservative reference area and freestream speed
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
-        solid = geometry_mask > 0.5
-        ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
-        ref_area = max(ref_area, h**2)
+        dt = getattr(self.config.lbm_config, 'time_step', 0.001)
 
+        # 1. Determine reference area in lattice units (voxels)
+        solid = geometry_mask > 0.5
+        if ref_area_override is not None:
+            # ref_area_override is physical m^2, convert to lattice dx^2
+            ref_area_lat = ref_area_override / (h**2)
+        else:
+            ref_area_lat = torch.sum(torch.any(solid, dim=0).float()).item()
+        ref_area_lat = max(ref_area_lat, 1.0)
+
+        # 2. Get raw lattice forces
         if self._solver.force_samples > 0:
-            drag_force = self._solver.force_x_accum / self._solver.force_samples
-            lift_force = self._solver.force_z_accum / self._solver.force_samples
+            drag_force_lat = self._solver.force_x_accum / self._solver.force_samples
+            lift_force_lat = self._solver.force_z_accum / self._solver.force_samples
             force_definition = 'bounce-back momentum exchange averaged over the last-quarter window'
         else:
-            drag_force = self._solver.force_x_last
-            lift_force = self._solver.force_z_last
+            drag_force_lat = self._solver.force_x_last
+            lift_force_lat = self._solver.force_z_last
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        physical_drag_force = _scale_momentum_exchange_force(drag_force, h, getattr(self.config, 'mach_number', 0.0))
-        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, getattr(self.config, 'mach_number', 0.0))
-        coeffs = _compute_force_coefficients(
-            physical_drag_force,
-            physical_lift_force,
-            getattr(self.config, 'mach_number', 0.0),
-            ref_area=max(ref_area, 1e-12),
-            rho_ref=1.225
-        )
+        # 3. Measure far-field lattice velocity for dynamic pressure
+        # Use a shell of 2 layers at the domain boundaries (excluding inlet/outlet faces if any)
+        # For now, just average the whole domain's velocity_x as a proxy, or better,
+        # a specific region.
+        u_inf_lat = torch.mean(self.velocity_x).item() # Rough proxy
+        # More robust: average of the first 2 and last 2 layers in Y and Z
+        u_inf_lat = (torch.mean(self.velocity_x[:, :2, :]) +
+                     torch.mean(self.velocity_x[:, -2:, :]) +
+                     torch.mean(self.velocity_x[:, :, :2]) +
+                     torch.mean(self.velocity_x[:, :, -2:])) / 4.0
+        u_inf_lat = abs(u_inf_lat)
+        if u_inf_lat < 1e-9:
+            mach_phys = getattr(self.config, 'mach_number', 0.0)
+            u_inf_lat = mach_phys / (3.0**0.5)
+
+        # 4. Compute Cd, Cl directly in lattice units
+        # Cd = F / (0.5 * rho_lat * u_inf_lat^2 * A_ref_lat)
+        # In standard LBM, rho_lat approx 1.0
+        rho_lat = 1.0
+        q_inf_lat = 0.5 * rho_lat * (u_inf_lat**2)
+
+        cd = drag_force_lat.item() / (q_inf_lat * ref_area_lat + 1e-12)
+        cl = lift_force_lat.item() / (q_inf_lat * ref_area_lat + 1e-12)
+
+        # 5. Convert to physical units for compatibility
+        # F_phys = F_lat * (rho_phys * dx^4 / dt^2)
+        rho_phys = 1.225
+        force_scale = rho_phys * (h**4) / (dt**2)
+        physical_drag_force = drag_force_lat * force_scale
+        physical_lift_force = lift_force_lat * force_scale
+
+        v_inf_phys = u_inf_lat * (h / dt)
+
+        lbm_debug_logger.debug(f"Cd computation: drag_lat={drag_force_lat.item():.6e}, u_inf_lat={u_inf_lat:.6f}, q_inf_lat={q_inf_lat:.6e}, A_ref_lat={ref_area_lat:.2f}, Cd={cd:.6f}")
 
         vorticity_mag = self._refresh_flow_diagnostics()
         vortex_cells = torch.sum((self.q_criterion > getattr(self.phys_config, 'q_threshold', 0.0)).float()).item()
-        v_inf = coeffs.get('freestream_speed', 0.0)
         nu_turb_mean = float(self.nu_turb.mean().item())
-        reynolds_turbulent = float(v_inf * h * self.resolution / max(self.nu + nu_turb_mean, 1e-12))
+        reynolds_turbulent = float(v_inf_phys * h * self.resolution / max((self.nu + nu_turb_mean) * (h**2/dt), 1e-12))
 
         return {
-            'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
-            'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
-            'raw_force_x': float(drag_force.item() if isinstance(drag_force, torch.Tensor) else drag_force),
-            'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
-            'drag_coefficient': coeffs['drag_coefficient'],
-            'lift_coefficient': coeffs['lift_coefficient'],
+            'force_x': float(physical_drag_force.item()),
+            'force_z': float(physical_lift_force.item()),
+            'raw_force_x': float(drag_force_lat.item()),
+            'raw_force_z': float(lift_force_lat.item()),
+            'drag_coefficient': float(cd),
+            'lift_coefficient': float(cl),
             'force_definition': force_definition,
             'pressure_sum': float(self.pressure.sum().item()),
             'max_turbulent_viscosity': float(self.nu_turb.max().item()),
             'mean_smagorinsky_constant': float(getattr(self.phys_config, 'smagorinsky_constant', 0.17)),
             'max_vorticity': float(vorticity_mag.max().item()),
             'vortex_core_volume': float(vortex_cells * h**3),
-            'reference_area': ref_area,
+            'reference_area': ref_area_lat * (h**2),
             'reference_length': h * self.resolution,
-            'freestream_speed': v_inf,
-            'density': coeffs['density'],
-            'reynolds_number_turbulent': reynolds_turbulent
+            'freestream_speed': v_inf_phys,
+            'density': rho_phys,
+            'reynolds_number_turbulent': reynolds_turbulent,
+            'u_inf_lat': u_inf_lat
         }
 
 
