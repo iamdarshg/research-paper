@@ -1,6 +1,7 @@
 
 import torch
 import numpy as np
+import math
 from typing import Dict
 from typing import TYPE_CHECKING
 
@@ -154,53 +155,55 @@ class D3Q27Solver:
         uy = torch.sum(self.f * self.ey_f.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
         uz = torch.sum(self.f * self.ez_f.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
 
-        # Collision (Cascaded Central Moment MRT)
-        # 1. Transform to Central Moments
-        # K_ijk = sum_a f_a * (e_ax - ux)^i * (e_ay - uy)^j * (e_az - uz)^k
-        # We can do this by shifting populations to a co-moving frame
+        # 1. Transform to Central Moments K_prime
+        dx = self.ex_f.view(27, 1, 1, 1) - ux.unsqueeze(0)
+        dy = self.ey_f.view(27, 1, 1, 1) - uy.unsqueeze(0)
+        dz = self.ez_f.view(27, 1, 1, 1) - uz.unsqueeze(0)
 
-        # SRT Implementation (Commented out as requested)
-        # feq = self.compute_equilibrium(rho, ux, uy, uz)
-        # self.f += omega * (feq - self.f)
+        pow_x = [torch.ones_like(dx[0]), dx, dx**2]
+        pow_y = [torch.ones_like(dy[0]), dy, dy**2]
+        pow_z = [torch.ones_like(dz[0]), dz, dz**2]
 
-        # Cascaded MRT Implementation
-        f_flat = self.f.reshape(27, -1)
-        K = torch.matmul(self.M_matrix, f_flat)
+        K_prime = []
+        for (i, j, m) in self.moment_indices:
+            K_prime.append(torch.sum(self.f * pow_x[i] * pow_y[j] * pow_z[m], dim=0))
+        K_prime = torch.stack(K_prime, dim=0)
 
-        # To simplify, we'll implement relaxation in raw moment space with central moment equivalent equilibrium
-        # A full cascaded central moment implementation is more complex,
-        # but this MRT approach is significantly more stable than SRT.
-
+        # 2. Relax Central Moments
         cs2 = 1.0/3.0
-        # Relax moments K towards K_eq
-        for k, (a, b, c) in enumerate(self.moment_indices):
-            # Conserved moments: (0,0,0), (1,0,0), (0,1,0), (0,0,1)
-            if a + b + c <= 1:
-                continue
+        m_eq = [torch.ones_like(rho), torch.zeros_like(rho), torch.full_like(rho, cs2)]
 
-            # Equilibrium raw moments for D3Q27
-            # K_eq = rho * m1d(a, ux) * m1d(b, uy) * m1d(c, uz)
-            def m1d(order, u):
-                if order == 0: return 1.0
-                if order == 1: return u
-                if order == 2: return u*u + cs2
-                return 0.0
+        for k, (i, j, m) in enumerate(self.moment_indices):
+            if i + j + m <= 1: continue # Conserved moments
 
-            keq = rho.view(-1) * m1d(a, ux.view(-1)) * m1d(b, uy.view(-1)) * m1d(c, uz.view(-1))
+            keq = rho * m_eq[i] * m_eq[j] * m_eq[m]
 
-            # Select relaxation rate
             s = self.s_ghost
-            if a+b+c == 2:
-                # viscous moments
-                if (a==1 and b==1) or (a==1 and c==1) or (b==1 and c==1):
+            if i+j+m == 2:
+                if (i==1 and j==1) or (i==1 and m==1) or (j==1 and m==1):
                     s = omega
-                else: # 200, 020, 002 are related to energy/bulk
+                else:
                     s = self.s_e
 
-            K[k] = K[k] + s * (keq - K[k])
+            K_prime[k] += s * (keq - K_prime[k])
 
-        # Transform back to populations
-        self.f.copy_(torch.matmul(self.M_inv, K).reshape(self.f.shape))
+        # 3. Transform back to Populations via Raw Moments
+        ux_pow = [torch.ones_like(ux), ux, ux**2]
+        uy_pow = [torch.ones_like(uy), uy, uy**2]
+        uz_pow = [torch.ones_like(uz), uz, uz**2]
+
+        idx_map = {(i,j,m): k for k, (i,j,m) in enumerate(self.moment_indices)}
+        K_raw = torch.zeros_like(K_prime)
+        for (i, j, m), k in idx_map.items():
+            res_k = torch.zeros_like(rho)
+            for p in range(i + 1):
+                for q in range(j + 1):
+                    for r in range(m + 1):
+                        coeff = math.comb(i, p) * math.comb(j, q) * math.comb(m, r)
+                        res_k += coeff * (ux_pow[i-p] * uy_pow[j-q] * uz_pow[m-r]) * K_prime[idx_map[(p, q, r)]]
+            K_raw[k] = res_k
+
+        self.f.copy_(torch.matmul(self.M_inv, K_raw.reshape(27, -1)).reshape(self.f.shape))
 
         self.f_pre_stream.copy_(self.f)
         

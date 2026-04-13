@@ -1,9 +1,10 @@
 import torch
+import math
 from typing import Dict
 from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 
 class GPULBMSolver:
-    """GPU-resident LBM solver with D3Q27 MRT, Dynamic Smagorinsky, and Vorticity Confinement"""
+    """GPU-resident LBM solver with D3Q27 Central Moment MRT, Dynamic Smagorinsky, and Vorticity Confinement"""
 
     def __init__(self, config, device: torch.device, phys_config):
         self.config = config
@@ -84,6 +85,7 @@ class GPULBMSolver:
                 for c in range(3):
                     moments.append((a, b, c))
         self.moment_indices = moments
+        self.idx_map = {(a,b,c): k for k, (a,b,c) in enumerate(moments)}
 
         M = torch.zeros((27, 27), device=self.device)
         ex_f = self.ex.float()
@@ -110,7 +112,7 @@ class GPULBMSolver:
                     self.s_relax[k] = s_e
 
     def _initialize_equilibrium(self):
-        """Initialize with D3Q27 equilibrium"""
+        """Initialize with corrected D3Q27 equilibrium"""
         rho = 1.0
         ux = self.config.mach_number / 3.0
         uy, uz = 0.0, 0.0
@@ -239,37 +241,74 @@ class GPULBMSolver:
             self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz)
             Fx, Fy, Fz = self._apply_vorticity_confinement(ux, uy, uz)
             s_nu_eff = 1.0 / (3.0 * (self.nu + self.nu_turb) + 0.5)
-            f_flat = self.f.reshape(27, -1)
-            K = torch.matmul(self.M_matrix, f_flat)
+
+            # 1. Transform to Central Moments
+            ex_f = self.ex.float()
+            ey_f = self.ey.float()
+            ez_f = self.ez.float()
+            dx = ex_f.view(27, 1, 1, 1) - ux.unsqueeze(0)
+            dy = ey_f.view(27, 1, 1, 1) - uy.unsqueeze(0)
+            dz = ez_f.view(27, 1, 1, 1) - uz.unsqueeze(0)
+
+            pow_x = [torch.ones_like(dx[0]), dx, dx**2]
+            pow_y = [torch.ones_like(dy[0]), dy, dy**2]
+            pow_z = [torch.ones_like(dz[0]), dz, dz**2]
+
+            K_prime = []
+            for (i, j, m) in self.moment_indices:
+                K_prime.append(torch.sum(self.f * pow_x[i] * pow_y[j] * pow_z[m], dim=0))
+            K_prime = torch.stack(K_prime, dim=0)
+
+            # 2. Relax Central Moments with Guo Forcing
             cs2 = 1.0/3.0
-            for k, (a, b, c) in enumerate(self.moment_indices):
-                if a + b + c <= 1: continue
-                def m1d(order, u):
-                    if order == 0: return 1.0
-                    if order == 1: return u
-                    if order == 2: return u*u + cs2
-                    return 0.0
-                keq = rho.view(-1) * m1d(a, ux.view(-1)) * m1d(b, uy.view(-1)) * m1d(c, uz.view(-1))
+            m_eq = [torch.ones_like(rho), torch.zeros_like(rho), torch.full_like(rho, cs2)]
+
+            for k, (i, j, m) in enumerate(self.moment_indices):
+                if i + j + m <= 1: continue
+
+                keq = rho * m_eq[i] * m_eq[j] * m_eq[m]
                 s = self.s_relax[k]
-                if (a+b+c == 2) and ((a==1 and b==1) or (a==1 and c==1) or (b==1 and c==1)): s = s_nu_eff.view(-1)
-                eF, uF = self.ex[k]*Fx + self.ey[k]*Fy + self.ez[k]*Fz, ux*Fx + uy*Fy + uz*Fz
+                if (i+j+m == 2) and ((i==1 and j==1) or (i==1 and m==1) or (j==1 and m==1)):
+                    s = s_nu_eff
+
+                # Guo Forcing integration in central moment space (approximation)
+                eF = self.ex[k]*Fx + self.ey[k]*Fy + self.ez[k]*Fz
+                uF = ux*Fx + uy*Fy + uz*Fz
                 force_moment = self.w[k] * (1.0 - 0.5*s) * (3.0*eF + 9.0*(self.ex[k]*ux+self.ey[k]*uy+self.ez[k]*uz)*eF - 3.0*uF)
-                K[k] = K[k] + s * (keq - K[k]) + force_moment.view(-1)
-            self.f.copy_(torch.matmul(self.M_inv, K).reshape(self.f.shape))
+
+                K_prime[k] += s * (keq - K_prime[k]) + force_moment
+
+            # 3. Transform back via Raw Moments
+            ux_p = [torch.ones_like(ux), ux, ux**2]
+            uy_p = [torch.ones_like(uy), uy, uy**2]
+            uz_p = [torch.ones_like(uz), uz, uz**2]
+
+            K_raw = torch.zeros_like(K_prime)
+            for (i, j, m), k in self.idx_map.items():
+                res_k = torch.zeros_like(rho)
+                for p in range(i + 1):
+                    for q in range(j + 1):
+                        for r in range(m + 1):
+                            coeff = math.comb(i, p) * math.comb(j, q) * math.comb(m, r)
+                            res_k += coeff * (ux_p[i-p] * uy_p[j-q] * uz_p[m-r]) * K_prime[self.idx_map[(p, q, r)]]
+                K_raw[k] = res_k
+
+            self.f.copy_(torch.matmul(self.M_inv, K_raw.reshape(27, -1)).reshape(self.f.shape))
             self.f_pre_stream.copy_(self.f)
+
             for i in range(27):
-                dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
-                self.f_temp[i] = torch.roll(self.f[i], shifts=(dx, dy, dz), dims=(0, 1, 2))
-                if dx > 0: self.f_temp[i][0, :, :] = self.f_pre_stream[i][0, :, :]
-                elif dx < 0: self.f_temp[i][-1, :, :] = self.f_pre_stream[i][-1, :, :]
+                dx_s, dy_s, dz_s = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
+                self.f_temp[i] = torch.roll(self.f[i], shifts=(dx_s, dy_s, dz_s), dims=(0, 1, 2))
+                if dx_s > 0: self.f_temp[i][0, :, :] = self.f_pre_stream[i][0, :, :]
+                elif dx_s < 0: self.f_temp[i][-1, :, :] = self.f_pre_stream[i][-1, :, :]
             mask = geometry_mask > 0.5
             sfx, sfz = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
             for i in range(27):
                 opp_i = int(self.opposite[i].item())
                 self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
                 if i == 0 or i > opp_i: continue
-                dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
-                boundary_link = (~mask) & torch.roll(mask, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
+                dx_s, dy_s, dz_s = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
+                boundary_link = (~mask) & torch.roll(mask, shifts=(-dx_s, -dy_s, -dz_s), dims=(0, 1, 2))
                 if not torch.any(boundary_link): continue
                 sfx += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i][boundary_link])
                 sfz += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i][boundary_link])
