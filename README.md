@@ -1,6 +1,6 @@
 # Aircraft Diffusion CFD - CLI Project
 
-> A production-ready command-line tool for generating and optimizing aircraft structures using diffusion models and GPU-accelerated CFD simulation.
+> A production-ready command-line tool for generating and optimizing aircraft structures using diffusion models and GPU-accelerated CFD simulation. Developed by Darsh Gupta.
 
 ## Overview
 
@@ -21,8 +21,8 @@ This CLI project combines **generative diffusion models**, **hierarchical struct
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
-cd research-paper/CLI
+git clone https://github.com/darshgu77/aircraft-diffusion-cfd
+cd aircraft-diffusion-cfd/CLI
 
 # Create and activate virtual environment
 python -m venv venv
@@ -318,15 +318,15 @@ If you use this project in your research, please cite:
 ```bibtex
 @software{aircraft_diffusion_cfd,
   title={Aircraft Diffusion CFD: Generative Design via Diffusion Models},
-  author={Your Name},
+  author={Darsh Gupta},
   year={2025},
-  url={https://github.com/yourusername/research-paper}
+  url={https://github.com/darshgu77/aircraft-diffusion-cfd}
 }
 ```
 
 ## License
 
-[Your License Here]
+This project is licensed under the **GNU General Public License v2.0 (GPL-v2)**. See the [LICENSE](LICENSE) file for the full license text.
 
 ## Contributing
 
