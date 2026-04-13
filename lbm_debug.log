@@ -1,22 +1,15 @@
-2026-04-13 04:10:58,317 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=5.488000e-07
-2026-04-13 04:10:58,318 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=8, nu=5.488000000000001e-07
-2026-04-13 04:10:58,318 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.0250, u_lattice=1.443376e-02
-2026-04-13 04:10:58,322 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.0250, u_lattice=1.443376e-02
-2026-04-13 04:10:58,326 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=5.488000e-07
-2026-04-13 04:10:58,343 - lbm_debug - DEBUG - Cd computation: drag_lat=1.557784e+00, u_inf_lat=0.014434, q_inf_lat=1.041666e-04, A_ref_lat=4.00, Cd=3738.684570
-2026-04-13 04:10:58,355 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.1000, Re=100, L_phys=1.0000, nu_phys=3.430000e-01, nu_lattice=2.195200e-02
-2026-04-13 04:10:58,355 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=8, nu=0.021952000000000003
-2026-04-13 04:10:58,356 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.1000, u_lattice=5.773503e-02
-2026-04-13 04:10:58,359 - lbm_debug - DEBUG - Cd computation: drag_lat=0.000000e+00, u_inf_lat=0.057735, q_inf_lat=1.666665e-03, A_ref_lat=4.00, Cd=0.000000
-2026-04-13 04:10:58,378 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.2332, Re=217687074.82993197, L_phys=40.0000, nu_phys=1.470000e-05, nu_lattice=9.408000e-09
-2026-04-13 04:10:58,378 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=32, nu=9.408e-09
-2026-04-13 04:10:58,379 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.2332, u_lattice=1.346590e-01
-2026-04-13 04:10:58,397 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.2332, Re=217687074.82993197, L_phys=40.0000, nu_phys=1.470000e-05, nu_lattice=9.408000e-09
-2026-04-13 04:10:58,574 - lbm_debug - DEBUG - Cd computation: drag_lat=1.006005e+01, u_inf_lat=0.134659, q_inf_lat=9.066510e-03, A_ref_lat=16.00, Cd=69.348961
-2026-04-13 04:10:58,591 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.1000, Re=100, L_phys=1.0000, nu_phys=3.430000e-01, nu_lattice=2.195200e-02
-2026-04-13 04:10:58,591 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=8, nu=0.021952000000000003
-2026-04-13 04:10:58,591 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.1000, u_lattice=5.773503e-02
-2026-04-13 04:10:58,597 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.1000, Re=100, L_phys=1.0000, nu_phys=3.430000e-01, nu_lattice=2.195200e-02
-2026-04-13 04:10:58,597 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=8, nu=0.021952000000000003
-2026-04-13 04:10:58,597 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.1000, u_lattice=5.773503e-02
-2026-04-13 04:10:58,601 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.1000, Re=100, L_phys=1.0000, nu_phys=3.430000e-01, nu_lattice=2.195200e-02
+2026-04-13 08:23:59,731 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=8.575000e-05
+2026-04-13 08:23:59,732 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=16, nu=8.575000000000002e-05
+2026-04-13 08:23:59,732 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.0250, u_lattice=1.443376e-02
+2026-04-13 08:23:59,737 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=8.575000e-05
+2026-04-13 08:23:59,939 - lbm_debug - DEBUG - Cd computation: drag_lat=1.153271e+02, u_inf_lat=0.008050, q_inf_lat=3.240314e-05, A_ref_lat=64.00, Cd=55611.472656
+2026-04-13 08:23:59,943 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=8.575000e-05
+2026-04-13 08:23:59,943 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=16, nu=8.575000000000002e-05
+2026-04-13 08:23:59,943 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.0250, u_lattice=1.443376e-02
+2026-04-13 08:23:59,948 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=8.575000e-05
+2026-04-13 08:24:00,155 - lbm_debug - DEBUG - Cd computation: drag_lat=1.153271e+02, u_inf_lat=0.008050, q_inf_lat=3.240314e-05, A_ref_lat=64.00, Cd=55611.472656
+2026-04-13 08:24:00,159 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=8.575000e-05
+2026-04-13 08:24:00,159 - lbm_debug - DEBUG - Initialized D3Q27CascadedSolver: resolution=16, nu=8.575000000000002e-05
+2026-04-13 08:24:00,159 - lbm_debug - DEBUG - Initializing equilibrium: mach_phys=0.0250, u_lattice=1.443376e-02
+2026-04-13 08:24:00,163 - lbm_debug - DEBUG - Viscosity estimate: Mach=0.0250, Re=1000000.0, L_phys=1.0000, nu_phys=8.575000e-06, nu_lattice=8.575000e-05
+2026-04-13 08:24:00,262 - lbm_debug - DEBUG - Cd computation: drag_lat=2.815994e+01, u_inf_lat=0.014284, q_inf_lat=1.020125e-04, A_ref_lat=64.00, Cd=4313.186523

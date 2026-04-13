@@ -1,4 +1,20 @@
+# Copyright (C) 2025 Darsh Gupta
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, see <https://www.gnu.org/licenses/>.
 
+
+from sdf_utils import compute_sdf, compute_bfl_q, add_box_to_sdf, get_full_mask
 import torch
 import numpy as np
 import math
@@ -92,7 +108,7 @@ class D3Q27Solver:
         self._force_sample_start = max(0, int(sample_start))
         self._force_step = 0
 
-    def _accumulate_momentum_exchange_force(self, geometry_mask):
+    def _accumulate_momentum_exchange_force(self, geometry_mask, sdf=None):
         """Compute wall force from fluid-solid links using bounce-back exchange."""
         mask = geometry_mask > 0.5
         step_force_x = torch.tensor(0.0, device=self.device)
@@ -111,8 +127,32 @@ class D3Q27Solver:
             if not torch.any(boundary_link):
                 continue
 
-            step_force_x += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i, boundary_link])
-            step_force_z += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i, boundary_link])
+            if sdf is not None:
+                q = compute_bfl_q(sdf, (dx, dy, dz))
+                # Refined momentum exchange for BFL: accounted for sub-voxel distance
+                # Factor of 2.0 still applies for bounce-back, but we use the fluid-side distance q.
+                # Momentum exchange force F = sum [ (f_in + f_out) * e_i ]
+                # For BFL: f_out is the interpolated value.
+                # A simplified accurate approach: force is the net momentum change.
+                # We use the standard summation but with BFL populations if they were used.
+                # Actually, f_pre_stream[i] is f_in. f_temp[opp_i] (after BFL) is f_out.
+                # But here we are in a separate function.
+                # Let's keep it simple and correct: F = sum (f_in + f_out_interpolated) * e_i
+
+                f_in = self.f_pre_stream[i, boundary_link]
+                f_opp = self.f_pre_stream[opp_i, boundary_link]
+                # Need f_in_prev for BFL-style f_out
+                f_in_prev = torch.roll(self.f_pre_stream[i], shifts=(dx, dy, dz), dims=(0, 1, 2))[boundary_link]
+
+                res_low = 2.0 * q[boundary_link] * f_in + (1.0 - 2.0 * q[boundary_link]) * f_in_prev
+                res_high = (1.0 / (2.0 * q[boundary_link])) * f_in + (1.0 - 1.0 / (2.0 * q[boundary_link])) * f_opp
+                f_out_bfl = torch.where(q[boundary_link] < 0.5, res_low, res_high)
+
+                step_force_x += torch.sum((f_in + f_out_bfl) * float(self.ex[i].item()))
+                step_force_z += torch.sum((f_in + f_out_bfl) * float(self.ez[i].item()))
+            else:
+                step_force_x += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i, boundary_link])
+                step_force_z += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i, boundary_link])
 
         return step_force_x, step_force_z
 
@@ -148,7 +188,7 @@ class D3Q27Solver:
         for i in [2, 8, 10, 12, 14, 20, 22, 24, 26]:
             self.f[i, -1, :, :] = self.f[i, -2, :, :]
 
-    def collide_and_stream(self, omega, geometry_mask):
+    def collide_and_stream(self, omega, geometry_mask, sdf=None):
         # Macroscopic variables
         rho = torch.sum(self.f, dim=0)
         ux = torch.sum(self.f * self.ex_f.view(-1, 1, 1, 1), dim=0) / (rho + 1e-12)
@@ -212,13 +252,48 @@ class D3Q27Solver:
             shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
             self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0,1,2))
         
-        # Bounce-back using PRE-STREAM populations
+        # Boundary Conditions (Bounce-back or BFL)
         mask = geometry_mask > 0.5
-        for i in range(27):
-            opp_i = int(self.opposite[i].item())
-            self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+        if sdf is not None:
+            # Bouzidi-Firdaouss-Lallemand (BFL) Boundary Conditions
+            for i in range(27):
+                opp_i = int(self.opposite[i].item())
+                dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
 
-        step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask)
+                # Fluid nodes with a solid neighbor in direction i
+                neighbor_is_solid = torch.roll(mask, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
+                boundary_link = (~mask) & neighbor_is_solid
+
+                if not torch.any(boundary_link):
+                    # For non-boundary links, if it's solid, use standard bounce-back
+                    self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+                    continue
+
+                # q = distance from fluid node to wall along direction i
+                q = compute_bfl_q(sdf, (dx, dy, dz))
+
+                # BFL Interpolation (Linear)
+                f_in = self.f_pre_stream[i]
+                f_opp = self.f_pre_stream[opp_i]
+                f_in_prev = torch.roll(f_in, shifts=(dx, dy, dz), dims=(0, 1, 2))
+
+                res_low = 2.0 * q * f_in + (1.0 - 2.0 * q) * f_in_prev
+                res_high = (1.0 / (2.0 * q)) * f_in + (1.0 - 1.0 / (2.0 * q)) * f_opp
+
+                bfl_res = torch.where(q < 0.5, res_low, res_high)
+
+                # Overwrite the rolled population at the fluid node
+                self.f_temp[opp_i] = torch.where(boundary_link, bfl_res, self.f_temp[opp_i])
+
+                # Also handle solid nodes normally
+                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+        else:
+            # Standard Bounce-back using PRE-STREAM populations
+            for i in range(27):
+                opp_i = int(self.opposite[i].item())
+                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+
+        step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask, sdf=sdf)
 
         self.f.copy_(self.f_temp)
         self.force_x_last = step_force_x
@@ -325,7 +400,7 @@ class D3Q27CascadedSolver:
         self.pressure.copy_(rho * (1.0 / 3.0))
         self.rho.copy_(rho)
 
-    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100, use_inlet_outlet: bool = False):
+    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100, use_inlet_outlet: bool = False, sdf: torch.Tensor = None):
         """Run collide/stream for a number of steps. This adapts the simpler
         D3Q27 solver's `collide_and_stream(omega, geometry_mask)` API.
         """
@@ -340,6 +415,11 @@ class D3Q27CascadedSolver:
         sample_window = max(10, steps // 4)
         sample_start = max(0, steps - sample_window)
         self._solver.reset_force_accounting(sample_start=sample_start)
+        # If Bouzidi is enabled in config and sdf is not provided, compute it
+        if sdf is None and getattr(self.phys_config, 'use_bouzidi_bfl', False):
+            sdf = compute_sdf(geometry_mask)
+            sdf = add_box_to_sdf(sdf)
+            geometry_mask = get_full_mask(geometry_mask)
 
         # Inlet velocity in lattice units
         mach_phys = getattr(self.config, 'mach_number', 0.0)
@@ -349,7 +429,7 @@ class D3Q27CascadedSolver:
         for _ in range(steps):
             if use_inlet_outlet:
                 self._solver.apply_boundary_conditions(geometry_mask, u_inlet=u_inlet)
-            ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask)
+            ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask, sdf=sdf)
             # store fields for diagnostics
             self.velocity_x = ux
             self.velocity_y = uy
@@ -406,7 +486,13 @@ class D3Q27CascadedSolver:
             # ref_area_override is physical m^2, convert to lattice dx^2
             ref_area_lat = ref_area_override / (h**2)
         else:
-            ref_area_lat = torch.sum(torch.any(solid, dim=0).float()).item()
+            # Subtract domain walls from ref area if they were added
+            inner_solid = solid.clone()
+            res = inner_solid.shape[0]
+            inner_solid[0,:,:] = 0; inner_solid[-1,:,:] = 0
+            inner_solid[:,0,:] = 0; inner_solid[:,-1,:] = 0
+            inner_solid[:,:,0] = 0; inner_solid[:,:,-1] = 0
+            ref_area_lat = torch.sum(torch.any(inner_solid, dim=0).float()).item()
         ref_area_lat = max(ref_area_lat, 1.0)
 
         # 2. Get raw lattice forces
