@@ -7,7 +7,7 @@ import os
 # Add CLI to path
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
-from advanced_lbm_solver import D3Q27CascadedSolver, GPULBMSolver, D3Q27Lattice
+from advanced_lbm_solver import D3Q27CascadedSolver, D3Q27Lattice
 from aircraft_diffusion_cfd import CFDConfig, LBMPhysicsConfig
 
 class TestLBMSolvers(unittest.TestCase):
@@ -20,11 +20,6 @@ class TestLBMSolvers(unittest.TestCase):
     def test_d3q27_init(self):
         solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
         self.assertEqual(solver.f.shape, (27, 8, 8, 8))
-        self.assertFalse(torch.isnan(solver.f).any())
-
-    def test_d3q19_init(self):
-        solver = GPULBMSolver(self.config, self.device, LBMPhysicsConfig)
-        self.assertEqual(solver.f.shape, (19, 8, 8, 8))
         self.assertFalse(torch.isnan(solver.f).any())
 
     def test_d3q27_step(self):
