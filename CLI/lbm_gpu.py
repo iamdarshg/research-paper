@@ -4,7 +4,7 @@ from typing import Dict
 from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 
 class GPULBMSolver:
-    """GPU-resident LBM solver with D3Q27 Central Moment MRT, Dynamic Smagorinsky, and Vorticity Confinement"""
+    """GPU-resident LBM solver with D3Q27 Central Moment MRT, Mixed Precision (DDF-Shift), and LES."""
 
     def __init__(self, config, device: torch.device, phys_config):
         self.config = config
@@ -18,24 +18,27 @@ class GPULBMSolver:
         self._setup_physics_constants()
 
         # Structure of Arrays (SoA) layout
-        self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
+        self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.pressure = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
 
-        # LBM populations (D3Q27)
-        self.f = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.f_temp = torch.zeros_like(self.f)+1e-12
+        # --- Mixed Precision & DDF Shift Setup ---
+        # Store populations in float16 to save bandwidth
+        self.f = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=device, dtype=torch.float16)
+        self.f_temp = torch.zeros_like(self.f)
         self.f_pre_stream = torch.empty_like(self.f)
 
+        # Precompute f_eq_ref for DDF shift (centered at freestream)
+        self.f_eq_ref = self._compute_f_eq_ref()
+
         # Turbulence and vorticity fields
-        self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution),
+        self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)
+        self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)
+        self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution), 
                                      self.phys_config.smagorinsky_constant, device=device)
 
-        # Convergence tracking
         self.velocity_prev = torch.zeros_like(self.velocity_x)
 
         self._setup_d3q27_lattice()
@@ -48,28 +51,36 @@ class GPULBMSolver:
         self.force_x_last = torch.tensor(0.0, device=device)
         self.force_z_last = torch.tensor(0.0, device=device)
 
+    def _compute_f_eq_ref(self):
+        """Compute the reference equilibrium for the DDF shift."""
+        rho_ref = 1.0
+        ux_ref = self.config.mach_number / 3.0
+        uy_ref, uz_ref = 0.0, 0.0
+        
+        ex, ey, ez = D3Q27Lattice.get_vectors()
+        w = D3Q27Lattice.get_weights()
+        
+        f_eq = torch.zeros(27, device=self.device, dtype=torch.float32)
+        u_sq = ux_ref**2 + uy_ref**2 + uz_ref**2
+        for i in range(27):
+            cu = ex[i]*ux_ref + ey[i]*uy_ref + ez[i]*uz_ref
+            f_eq[i] = w[i] * rho_ref * (1.0 + 3.0*cu + 4.5*cu**2 - 1.5*u_sq)
+        
+        return f_eq.view(27, 1, 1, 1).expand(27, self.resolution, self.resolution, self.resolution).half()
+
     def _setup_physics_constants(self):
-        """Compute physics constants from config"""
         h = self.config.lbm_config.grid_spacing
         dt = self.config.lbm_config.time_step
-
         self.cs2 = 1.0 / 3.0
-
         U_ref = self.config.mach_number * 343.0
         L_ref = h * self.resolution
         Re = getattr(self.config, 'reynolds_number', 1000)
         nu_phys = U_ref * L_ref / Re
-
         self.nu = nu_phys * dt / (h * h)
         tau = 3.0 * self.nu + 0.5
         self.phys_config.s_nu = 1.0 / tau
 
-        max_velocity_lattice = self.config.mach_number * 343.0 * dt / h
-        if max_velocity_lattice > self.phys_config.max_mach:
-            print(f"WARNING: Lattice velocity {max_velocity_lattice:.3f} exceeds stability limit")
-
     def _setup_d3q27_lattice(self):
-        """Setup D3Q27 lattice"""
         ex, ey, ez = D3Q27Lattice.get_vectors()
         self.ex = ex.to(self.device, dtype=torch.int32)
         self.ey = ey.to(self.device, dtype=torch.int32)
@@ -78,19 +89,12 @@ class GPULBMSolver:
         self.opposite = D3Q27Lattice.get_opposite().to(self.device)
 
     def _setup_mrt_matrices(self):
-        """Setup MRT transformation matrices for D3Q27"""
-        moments = []
-        for a in range(3):
-            for b in range(3):
-                for c in range(3):
-                    moments.append((a, b, c))
+        moments = [(a, b, c) for a in range(3) for b in range(3) for c in range(3)]
         self.moment_indices = moments
-        self.idx_map = {(a,b,c): k for k, (a,b,c) in enumerate(moments)}
+        self.idx_map = {m: k for k, m in enumerate(moments)}
 
         M = torch.zeros((27, 27), device=self.device)
-        ex_f = self.ex.float()
-        ey_f = self.ey.float()
-        ez_f = self.ez.float()
+        ex_f, ey_f, ez_f = self.ex.float(), self.ey.float(), self.ez.float()
         for k, (a, b, c) in enumerate(moments):
             M[k] = (ex_f**a) * (ey_f**b) * (ez_f**c)
 
@@ -103,109 +107,103 @@ class GPULBMSolver:
 
         self.s_relax = torch.ones(27, device=self.device) * s_h
         for k, (a, b, c) in enumerate(moments):
-            if a + b + c <= 1:
-                self.s_relax[k] = 0.0 # Conserved
+            if a + b + c <= 1: self.s_relax[k] = 0.0
             elif a + b + c == 2:
-                if (a==1 and b==1) or (a==1 and c==1) or (b==1 and c==1):
-                    self.s_relax[k] = s_nu
-                else:
-                    self.s_relax[k] = s_e
+                self.s_relax[k] = s_nu if (a+b==2 or a+c==2 or b+c==2) else s_e
 
     def _initialize_equilibrium(self):
-        """Initialize with corrected D3Q27 equilibrium"""
         rho = 1.0
         ux = self.config.mach_number / 3.0
         uy, uz = 0.0, 0.0
-
+        f_eq = torch.zeros(27, self.resolution, self.resolution, self.resolution, device=self.device)
         for i in range(27):
             eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
             u_sq = ux*ux + uy*uy + uz*uz
-            feq = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
-            self.f[i] = feq.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            f_eq[i] = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
+        self.f.copy_((f_eq - self.f_eq_ref.float()).half())
 
     def _compute_strain_rate_tensor(self, ux, uy, uz):
-        grad_spacing = (self.config.lbm_config.grid_spacing,) * 3
-        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=grad_spacing)
-        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=grad_spacing)
-        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=grad_spacing)
-        S11 = dux_dx.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S22 = duy_dy.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S33 = duz_dz.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S12 = 0.5 * (dux_dy + duy_dx)
-        S13 = 0.5 * (dux_dz + duz_dx)
-        S23 = 0.5 * (duy_dz + duz_dy)
-        return S11, S22, S33, S12, S13, S23
+        h = self.config.lbm_config.grid_spacing
+        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=(h, h, h))
+        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=(h, h, h))
+        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=(h, h, h))
+        return dux_dx, dux_dy, dux_dz, duy_dx, duy_dy, duy_dz, duz_dx, duz_dy, duz_dz
 
     def _compute_vorticity(self, ux, uy, uz):
-        grad_spacing = (self.config.lbm_config.grid_spacing,) * 3
-        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=grad_spacing)
-        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=grad_spacing)
-        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=grad_spacing)
-        omega_x = duz_dy - duy_dz
-        omega_y = dux_dz - duz_dx
-        omega_z = duy_dx - dux_dy
-        return omega_x.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_y.nan_to_num(1e-12, posinf=1e18, neginf=-1e18), omega_z.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        h = self.config.lbm_config.grid_spacing
+        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=(h, h, h))
+        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=(h, h, h))
+        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=(h, h, h))
+        return duz_dy - duy_dz, dux_dz - duz_dx, duy_dx - dux_dy
 
-    def _compute_q_criterion(self, ux, uy, uz):
-        S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)
-        S_mag_sq = S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)
-        omega_x, omega_y, omega_z = self._compute_vorticity(ux, uy, uz)
-        omega_mag_sq = omega_x**2 + omega_y**2 + omega_z**2
-        return 0.5 * (omega_mag_sq - S_mag_sq).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
+        Fx, Fy, Fz = torch.zeros_like(self.velocity_x), torch.zeros_like(self.velocity_y), torch.zeros_like(self.velocity_z)
+        self.force_x_accum, self.force_z_accum, self.force_samples = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device), 0
+        sample_start = max(0, steps - max(10, steps // 4))
 
-    def _compute_dynamic_smagorinsky(self, ux, uy, uz):
-        Delta = self.config.lbm_config.grid_spacing
-        Delta_test = self.phys_config.test_filter_ratio * Delta
-        S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)
-        S_mag = torch.sqrt(2.0 * (S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)) + 1e-12)
-        kernel_size = int(self.phys_config.test_filter_ratio)
-        if kernel_size % 2 == 0: kernel_size += 1
-        padding = kernel_size // 2
-        ux_test = torch.nn.functional.avg_pool3d(ux.unsqueeze(0).unsqueeze(0), kernel_size=kernel_size, stride=1, padding=padding).squeeze()
-        uy_test = torch.nn.functional.avg_pool3d(uy.unsqueeze(0).unsqueeze(0), kernel_size=kernel_size, stride=1, padding=padding).squeeze()
-        uz_test = torch.nn.functional.avg_pool3d(uz.unsqueeze(0).unsqueeze(0), kernel_size=kernel_size, stride=1, padding=padding).squeeze()
-        S11_t, S22_t, S33_t, S12_t, S13_t, S23_t = self._compute_strain_rate_tensor(ux_test, uy_test, uz_test)
-        S_mag_t = torch.sqrt(2.0 * (S11_t**2 + S22_t**2 + S33_t**2 + 2.0*(S12_t**2 + S13_t**2 + S23_t**2)) + 1e-12)
-        L11 = torch.nn.functional.avg_pool3d((ux*ux).unsqueeze(0).unsqueeze(0), kernel_size, 1, padding).squeeze() - ux_test*ux_test
-        L22 = torch.nn.functional.avg_pool3d((uy*uy).unsqueeze(0).unsqueeze(0), kernel_size, 1, padding).squeeze() - uy_test*uy_test
-        L33 = torch.nn.functional.avg_pool3d((uz*uz).unsqueeze(0).unsqueeze(0), kernel_size, 1, padding).squeeze() - uz_test*uz_test
-        L12 = torch.nn.functional.avg_pool3d((ux*uy).unsqueeze(0).unsqueeze(0), kernel_size, 1, padding).squeeze() - ux_test*uy_test
-        L13 = torch.nn.functional.avg_pool3d((ux*uz).unsqueeze(0).unsqueeze(0), kernel_size, 1, padding).squeeze() - ux_test*uz_test
-        L23 = torch.nn.functional.avg_pool3d((uy*uz).unsqueeze(0).unsqueeze(0), kernel_size, 1, padding).squeeze() - uy_test*uz_test
-        M11 = -2.0*Delta**2*S_mag*S11 + 2.0*Delta_test**2*S_mag_t*S11_t
-        M22 = -2.0*Delta**2*S_mag*S22 + 2.0*Delta_test**2*S_mag_t*S22_t
-        M33 = -2.0*Delta**2*S_mag*S33 + 2.0*Delta_test**2*S_mag_t*S33_t
-        M12 = -2.0*Delta**2*S_mag*S12 + 2.0*Delta_test**2*S_mag_t*S12_t
-        M13 = -2.0*Delta**2*S_mag*S13 + 2.0*Delta_test**2*S_mag_t*S13_t
-        M23 = -2.0*Delta**2*S_mag*S23 + 2.0*Delta_test**2*S_mag_t*S23_t
-        LM = L11*M11 + L22*M22 + L33*M33 + 2.0*(L12*M12 + L13*M13 + L23*M23)
-        MM = M11**2 + M22**2 + M33**2 + 2.0*(M12**2 + M13**2 + M23**2)
-        Cs_sq = torch.clamp(LM / (MM + 1e-12), min=1e-12)
-        Cs = torch.sqrt(Cs_sq).clamp(min=self.phys_config.dynamic_cs_clip_min, max=self.phys_config.dynamic_cs_clip_max)
-        return Cs, S_mag
+        for step in range(steps):
+            f = self.f.float() + self.f_eq_ref.float()
+            rho = torch.sum(f, dim=0)
+            mx = torch.sum(f * self.ex.view(-1, 1, 1, 1).float(), dim=0)
+            my = torch.sum(f * self.ey.view(-1, 1, 1, 1).float(), dim=0)
+            mz = torch.sum(f * self.ez.view(-1, 1, 1, 1).float(), dim=0)
+            ux, uy, uz = (mx + 0.5*Fx)/(rho+1e-12), (my + 0.5*Fy)/(rho+1e-12), (mz + 0.5*Fz)/(rho+1e-12)
 
-    def _compute_wale_model(self, ux, uy, uz):
-        Delta = self.config.lbm_config.grid_spacing
-        Cw = self.phys_config.wale_constant
-        grad_spacing = (Delta,) * 3
-        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0,1,2), spacing=grad_spacing)
-        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0,1,2), spacing=grad_spacing)
-        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0,1,2), spacing=grad_spacing)
-        gij_gji_11 = dux_dx**2 + dux_dy*duy_dx + dux_dz*duz_dx
-        gij_gji_22 = duy_dx*dux_dy + duy_dy**2 + duy_dz*duz_dy
-        gij_gji_33 = duz_dx*dux_dz + duz_dy*duy_dz + duz_dz**2
-        trace_third = (dux_dx + duy_dy + duz_dz) / 3.0
-        Sd_11 = 0.5*(gij_gji_11 + gij_gji_11) - 2.0*trace_third*dux_dx
-        Sd_22 = 0.5*(gij_gji_22 + gij_gji_22) - 2.0*trace_third*duy_dy
-        Sd_33 = 0.5*(gij_gji_33 + gij_gji_33) - 2.0*trace_third*duz_dz
-        Sd_mag = torch.sqrt(Sd_11**2 + Sd_22**2 + Sd_33**2 + 1e-12)
-        S_mag = torch.sqrt(2.0*(dux_dx**2 + duy_dy**2 + duz_dz**2) + 1e-12)
-        return (Cw * Delta)**2 * (Sd_mag**1.5) / (S_mag**2.5 + Sd_mag**1.25 + 1e-12)
+            self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz)
+            Fx, Fy, Fz = self._apply_vorticity_confinement(ux, uy, uz)
+            s_nu_eff = 1.0 / (3.0 * (self.nu + self.nu_turb) + 0.5)
+
+            f_flat = f.reshape(27, -1)
+            K = torch.matmul(self.M_matrix, f_flat)
+            
+            cs2 = 1.0/3.0
+            K_eq = torch.zeros_like(K)
+            K_eq[0] = rho.flatten()
+            for k, (a,b,c) in enumerate(self.moment_indices):
+                if a+b+c == 2: K_eq[k] = rho.flatten() * cs2
+
+            s_relax = self.s_relax.view(27, 1)
+            for k, (a,b,c) in enumerate(self.moment_indices):
+                if (a+b+c == 2) and ((a==1 and b==1) or (a==1 and c==1) or (b==1 and c==1)):
+                    s_relax[k] = s_nu_eff
+
+            K += s_relax * (K_eq - K)
+            f_flat = torch.matmul(self.M_inv, K)
+            f = f_flat.reshape(27, self.resolution, self.resolution, self.resolution)
+
+            f_pre = f.clone()
+            for i in range(27):
+                sh = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
+                f[i] = torch.roll(f[i], shifts=sh, dims=(0, 1, 2))
+                if sh[0] > 0: f[i][0, :, :] = f_pre[i][0, :, :]
+                elif sh[0] < 0: f[i][-1, :, :] = f_pre[i][-1, :, :]
+
+            mask = geometry_mask > 0.5
+            sfx, sfz = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+            for i in range(27):
+                opp_i = int(self.opposite[i].item())
+                f[i] = torch.where(mask, f_pre[opp_i], f[i])
+                if i == 0 or i > opp_i: continue
+                sh = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
+                boundary_link = (~mask) & torch.roll(mask, shifts=(-sh[0], -sh[1], -sh[2]), dims=(0, 1, 2))
+                if torch.any(boundary_link):
+                    sfx += torch.sum(2.0 * float(self.ex[i].item()) * f_pre[i][boundary_link])
+                    sfz += torch.sum(2.0 * float(self.ez[i].item()) * f_pre[i][boundary_link])
+
+            self.force_x_last, self.force_z_last = sfx, sfz
+            if step >= sample_start:
+                self.force_x_accum += sfx
+                self.force_z_accum += sfz
+                self.force_samples += 1
+
+            self.f.copy_((f - self.f_eq_ref.float()).half())
+            self.velocity_x, self.velocity_y, self.velocity_z, self.pressure = ux, uy, uz, rho * self.cs2
+            if self.phys_config.compute_q_criterion: self.q_criterion = self._compute_q_criterion(ux, uy, uz)
 
     def _compute_turbulent_viscosity(self, ux, uy, uz):
         if not self.phys_config.use_les_turbulence: return torch.zeros_like(ux)
         if self.phys_config.turbulence_model == "smagorinsky":
-            S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)
+            S11, S22, S33, S12, S13, S23 = self._compute_strain_rate_tensor(ux, uy, uz)[:6]
             S_mag = torch.sqrt(2.0 * (S11**2 + S22**2 + S33**2 + 2.0*(S12**2 + S13**2 + S23**2)) + 1e-12)
             return (self.phys_config.smagorinsky_constant * self.config.lbm_config.grid_spacing)**2 * S_mag
         elif self.phys_config.turbulence_model == "dynamic_smagorinsky":
@@ -216,107 +214,38 @@ class GPULBMSolver:
             return self._compute_wale_model(ux, uy, uz)
         return torch.zeros_like(ux)
 
+    def _compute_strain_rate_tensor(self, ux, uy, uz):
+        h = self.config.lbm_config.grid_spacing
+        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=(h, h, h))
+        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=(h, h, h))
+        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=(h, h, h))
+        return dux_dx, dux_dy, dux_dz, duy_dx, duy_dy, duy_dz, duz_dx, duy_dy, duz_dz
+
+    def _compute_vorticity(self, ux, uy, uz):
+        h = self.config.lbm_config.grid_spacing
+        dux_dx, dux_dy, dux_dz = torch.gradient(ux, dim=(0, 1, 2), spacing=(h, h, h))
+        duy_dx, duy_dy, duy_dz = torch.gradient(uy, dim=(0, 1, 2), spacing=(h, h, h))
+        duz_dx, duz_dy, duz_dz = torch.gradient(uz, dim=(0, 1, 2), spacing=(h, h, h))
+        return duz_dy - duy_dz, dux_dz - duz_dx, duy_dx - dux_dy
+
+    def _compute_q_criterion(self, ux, uy, uz):
+        S = self._compute_strain_rate_tensor(ux, uy, uz)
+        S_mag_sq = S[0]**2 + S[4]**2 + S[8]**2 + 2.0*(S[1]**2 + S[2]**2 + S[5]**2)
+        omega = self._compute_vorticity(ux, uy, uz)
+        omega_mag_sq = omega[0]**2 + omega[1]**2 + omega[2]**2
+        return 0.5 * (omega_mag_sq - S_mag_sq).nan_to_num(1e-12)
+
     def _apply_vorticity_confinement(self, ux, uy, uz):
         if not self.phys_config.use_vorticity_confinement: return torch.zeros_like(ux), torch.zeros_like(uy), torch.zeros_like(uz)
         ox, oy, oz = self._compute_vorticity(ux, uy, uz)
         self.vorticity[0], self.vorticity[1], self.vorticity[2] = ox, oy, oz
         omega_mag = torch.sqrt(ox**2 + oy**2 + oz**2 + 1e-12)
-        grad_spacing = (self.config.lbm_config.grid_spacing,) * 3
-        gox, goy, goz = torch.gradient(omega_mag, dim=(0, 1, 2), spacing=grad_spacing)
+        h = self.config.lbm_config.grid_spacing
+        gox, goy, goz = torch.gradient(omega_mag, dim=(0, 1, 2), spacing=(h, h, h))
         gom = torch.sqrt(gox**2 + goy**2 + goz**2 + 1e-12)
         ex, ey, ez = gox/gom, goy/gom, goz/gom
         eps = self.phys_config.vorticity_confinement_epsilon * (omega_mag / (torch.mean(omega_mag) + 1e-12)) if self.phys_config.vc_adaptive else self.phys_config.vorticity_confinement_epsilon
         return eps*(ey*oz - ez*oy), eps*(ez*ox - ex*oz), eps*(ex*oy - ey*ox)
-
-    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
-        Fx, Fy, Fz = torch.zeros_like(self.velocity_x), torch.zeros_like(self.velocity_y), torch.zeros_like(self.velocity_z)
-        self.force_x_accum, self.force_z_accum, self.force_samples = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device), 0
-        sample_start = max(0, steps - max(10, steps // 4))
-        for step in range(steps):
-            rho = torch.sum(self.f, dim=0)
-            mx = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0)
-            my = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0)
-            mz = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0)
-            ux, uy, uz = (mx + 0.5*Fx)/(rho+1e-12), (my + 0.5*Fy)/(rho+1e-12), (mz + 0.5*Fz)/(rho+1e-12)
-            self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz)
-            Fx, Fy, Fz = self._apply_vorticity_confinement(ux, uy, uz)
-            s_nu_eff = 1.0 / (3.0 * (self.nu + self.nu_turb) + 0.5)
-
-            # 1. Transform to Central Moments
-            ex_f = self.ex.float()
-            ey_f = self.ey.float()
-            ez_f = self.ez.float()
-            dx = ex_f.view(27, 1, 1, 1) - ux.unsqueeze(0)
-            dy = ey_f.view(27, 1, 1, 1) - uy.unsqueeze(0)
-            dz = ez_f.view(27, 1, 1, 1) - uz.unsqueeze(0)
-
-            pow_x = [torch.ones_like(dx[0]), dx, dx**2]
-            pow_y = [torch.ones_like(dy[0]), dy, dy**2]
-            pow_z = [torch.ones_like(dz[0]), dz, dz**2]
-
-            K_prime = []
-            for (i, j, m) in self.moment_indices:
-                K_prime.append(torch.sum(self.f * pow_x[i] * pow_y[j] * pow_z[m], dim=0))
-            K_prime = torch.stack(K_prime, dim=0)
-
-            # 2. Relax Central Moments with Guo Forcing
-            cs2 = 1.0/3.0
-            m_eq = [torch.ones_like(rho), torch.zeros_like(rho), torch.full_like(rho, cs2)]
-
-            for k, (i, j, m) in enumerate(self.moment_indices):
-                if i + j + m <= 1: continue
-
-                keq = rho * m_eq[i] * m_eq[j] * m_eq[m]
-                s = self.s_relax[k]
-                if (i+j+m == 2) and ((i==1 and j==1) or (i==1 and m==1) or (j==1 and m==1)):
-                    s = s_nu_eff
-
-                # Guo Forcing integration in central moment space (approximation)
-                eF = self.ex[k]*Fx + self.ey[k]*Fy + self.ez[k]*Fz
-                uF = ux*Fx + uy*Fy + uz*Fz
-                force_moment = self.w[k] * (1.0 - 0.5*s) * (3.0*eF + 9.0*(self.ex[k]*ux+self.ey[k]*uy+self.ez[k]*uz)*eF - 3.0*uF)
-
-                K_prime[k] += s * (keq - K_prime[k]) + force_moment
-
-            # 3. Transform back via Raw Moments
-            ux_p = [torch.ones_like(ux), ux, ux**2]
-            uy_p = [torch.ones_like(uy), uy, uy**2]
-            uz_p = [torch.ones_like(uz), uz, uz**2]
-
-            K_raw = torch.zeros_like(K_prime)
-            for (i, j, m), k in self.idx_map.items():
-                res_k = torch.zeros_like(rho)
-                for p in range(i + 1):
-                    for q in range(j + 1):
-                        for r in range(m + 1):
-                            coeff = math.comb(i, p) * math.comb(j, q) * math.comb(m, r)
-                            res_k += coeff * (ux_p[i-p] * uy_p[j-q] * uz_p[m-r]) * K_prime[self.idx_map[(p, q, r)]]
-                K_raw[k] = res_k
-
-            self.f.copy_(torch.matmul(self.M_inv, K_raw.reshape(27, -1)).reshape(self.f.shape))
-            self.f_pre_stream.copy_(self.f)
-
-            for i in range(27):
-                dx_s, dy_s, dz_s = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
-                self.f_temp[i] = torch.roll(self.f[i], shifts=(dx_s, dy_s, dz_s), dims=(0, 1, 2))
-                if dx_s > 0: self.f_temp[i][0, :, :] = self.f_pre_stream[i][0, :, :]
-                elif dx_s < 0: self.f_temp[i][-1, :, :] = self.f_pre_stream[i][-1, :, :]
-            mask = geometry_mask > 0.5
-            sfx, sfz = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
-            for i in range(27):
-                opp_i = int(self.opposite[i].item())
-                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
-                if i == 0 or i > opp_i: continue
-                dx_s, dy_s, dz_s = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
-                boundary_link = (~mask) & torch.roll(mask, shifts=(-dx_s, -dy_s, -dz_s), dims=(0, 1, 2))
-                if not torch.any(boundary_link): continue
-                sfx += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i][boundary_link])
-                sfz += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i][boundary_link])
-            self.force_x_last, self.force_z_last = sfx, sfz
-            if step >= sample_start: self.force_x_accum += sfx; self.force_z_accum += sfz; self.force_samples += 1
-            self.f.copy_(self.f_temp)
-            self.velocity_x, self.velocity_y, self.velocity_z, self.pressure = ux, uy, uz, rho * self.cs2
-            if self.phys_config.compute_q_criterion: self.q_criterion = self._compute_q_criterion(ux, uy, uz)
 
     def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
         h = self.config.lbm_config.grid_spacing

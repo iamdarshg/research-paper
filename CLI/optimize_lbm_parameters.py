@@ -13,7 +13,7 @@ sys.path.insert(0, str(REPO_ROOT / 'CLI'))
 sys.path.insert(0, str(REPO_ROOT))
 
 from aircraft_diffusion_cfd import CFDConfig, LBMPhysicsConfig
-from advanced_lbm_solver import D3Q27CascadedSolver
+from lbm_gpu import GPULBMSolver
 import run_internal_benchmark as benchmark
 
 def calculate_error(internal_results, openfoam_results):
@@ -65,7 +65,7 @@ def run_optimization_sweep(args):
 
                 # Setup internal solver with candidate parameters
                 domain_min, domain_max, domain_size, max_extent = benchmark.compute_geometry_frame(mesh, sweep_case['domain_scale'])
-                geometry_mask = benchmark.mesh_to_geometry_mask(mesh, res, domain_min, domain_size)
+                geometry_mask = benchmark.mesh_to_geometry_mask(mesh, res, domain_min, domain_size).to(torch.device('cuda'))
 
                 cfg = CFDConfig(
                     base_grid_resolution=res,
@@ -78,12 +78,14 @@ def run_optimization_sweep(args):
                 cfg.lbm_config.physical_length_scale = ref_length
                 cfg.lbm_config.grid_spacing = domain_size / res
 
-                solver = D3Q27CascadedSolver(cfg, torch.device('cpu'), LBMPhysicsConfig)
-                # Apply parameters to the underlying D3Q27Solver
-                solver._solver.s_e = se
-                solver._solver.s_ghost = sh
+                # Setup physics config with candidate parameters
+                phys_cfg = LBMPhysicsConfig()
+                phys_cfg.s_energy = se
+                phys_cfg.s_higher = sh
 
-                solver.collide_stream(geometry_mask, steps=200, use_inlet_outlet=True)
+                solver = GPULBMSolver(cfg, torch.device('cuda'), phys_cfg)
+
+                solver.collide_stream(geometry_mask, steps=200)
                 internal_res = solver.compute_aerodynamic_coefficients(geometry_mask)
 
                 # Run or get OpenFOAM results (using benchmark utility)
