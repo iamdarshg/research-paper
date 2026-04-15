@@ -22,9 +22,9 @@ class TestLBMSolvers(unittest.TestCase):
         self.assertEqual(solver.f.shape, (27, 8, 8, 8))
         self.assertFalse(torch.isnan(solver.f).any())
 
-    def test_d3q19_init(self):
+    def test_d3q27_gpu_init(self):
         solver = GPULBMSolver(self.config, self.device, LBMPhysicsConfig)
-        self.assertEqual(solver.f.shape, (19, 8, 8, 8))
+        self.assertEqual(solver.f.shape, (27, 8, 8, 8))
         self.assertFalse(torch.isnan(solver.f).any())
 
     def test_d3q27_step(self):

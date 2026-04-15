@@ -1,14 +1,15 @@
 import torch
+import numpy as np
 from typing import Dict
 
 from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 
 
-def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
-    """Convert raw lattice momentum exchange into a physical force scale."""
-    freestream_speed = float(mach_number) * 343.0
-    # Use consistent analytic scaling with dynamic pressure factor 0.5
-    force_scale = 0.5 * float(density) * freestream_speed * freestream_speed * float(grid_spacing) * float(grid_spacing)
+def _scale_momentum_exchange_force(force, grid_spacing: float, time_step: float, density: float = 1.225):
+    """Convert raw lattice momentum exchange into a physical force scale.
+    The correct LBM physical conversion factor for force is rho_phys * (dx^4 / dt^2).
+    """
+    force_scale = float(density) * (float(grid_spacing)**4) / (float(time_step)**2)
     return force * force_scale
 
 
@@ -157,8 +158,8 @@ class D3Q27CascadedSolver:
         self.cs2 = 1.0 / 3.0
 
         # Use the lattice-consistent freestream speed for the Mach number.
-        # For D3Q27, c_s = 1/3, so u = Ma * c_s.
-        u_lattice = self.config.mach_number / 3.0
+        # For D3Q27, c_s = 1/sqrt(3), so u = Ma * c_s.
+        u_lattice = self.config.mach_number / np.sqrt(3.0)
         L_lattice = self.resolution
         
         # Force reasonable Reynolds number for this grid
@@ -190,7 +191,7 @@ class D3Q27CascadedSolver:
     def _initialize_equilibrium(self):
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
-        u_lattice = self.config.mach_number / 3.0
+        u_lattice = self.config.mach_number / np.sqrt(3.0)
         ux = u_lattice  # Lattice-consistent freestream speed.
         uy, uz = 0.0, 0.0
 
@@ -410,8 +411,9 @@ class D3Q27CascadedSolver:
         reference_area_voxelized = torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item() * h**2
         reference_area_voxelized = max(reference_area_voxelized, h**2)
 
-        physical_drag_force = _scale_momentum_exchange_force(drag_force, h, self.config.mach_number)
-        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, self.config.mach_number)
+        dt = self.config.lbm_config.time_step
+        physical_drag_force = _scale_momentum_exchange_force(drag_force, h, dt)
+        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, dt)
         coeffs = _compute_force_coefficients(
             physical_drag_force,
             physical_lift_force,
