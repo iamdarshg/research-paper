@@ -32,10 +32,12 @@ The current voxel-based approach, while robust for CFD, lacks the topological "c
 - **Goal**: Move beyond voxels to a Boundary Representation (B-Rep) or structured mesh generation.
 - **Approach**: Investigate the use of **structured latent spaces** that encode topological relationships (vertices, edges, faces) rather than just spatial occupancy. This mirrors Autodesk's research into B-Rep generative diffusion.
 - **Project Bernini Influence**: Look into multi-modal 3D generation where the model is trained on a mixture of CAD objects and organic shapes to ensure functional plausibility.
+- **Implementation Detail**: Hybridize the latent diffusion model to predict B-Rep chain complexes (inspired by ComplexGen) while maintaining CFD-validity.
 
 ### 2. Procedural Design Intent (Inspired by Solidworks AI)
 - **Goal**: Integrate AI into the modeling *workflow* rather than just the final result.
 - **Approach**: Implement a "Sketch + Extrude" latent generator. Instead of generating a 3D blob, the AI should predict a sequence of 2D profiles and operations that can be imported directly into CAD software as editable history.
+- **Assembly Awareness**: Incorporate Auto-Fastener and Command Prediction logic (as seen in Solidworks AI) to facilitate the assembly of generated structural components.
 
 ### 3. Hyper-Optimized Training Loop
 - **Latent Dim**: Sweep 128-512 for higher-dimensional B-Rep encodings.
@@ -53,3 +55,4 @@ The current voxel-based approach, while robust for CFD, lacks the topological "c
 - [2] Autodesk AI Lab. (2024). *Project Bernini*.
 - [3] Solidworks. (2024). *AI-Powered Workflow Optimization*.
 - [4] Krüger, T., et al. (2017). *The Lattice Boltzmann Method: Principles and Practice*. (D3Q27 Cascaded implementation).
+- [5] Pan, H., et al. (2022). *ComplexGen: CAD Reconstruction by B-Rep Chain Complex Generation*.

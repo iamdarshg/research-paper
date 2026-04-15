@@ -11,7 +11,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
 try:
     from aircraft_diffusion_cfd import AdvancedCFDSimulator, CFDConfig, LBMPhysicsConfig
-    from advanced_lbm_solver import D3Q27CascadedSolver
+    from advanced_lbm_solver import GPULBMSolver, D3Q27CascadedSolver
     IMPORTS_SUCCESSFUL = True
 except Exception as e:
     print(f"Import error: {e}")
@@ -106,9 +106,20 @@ class CFDSolverWorker(QObject):
             
             if self.solver_type == "d3q27_cascaded":
                 lbm_solver = D3Q27CascadedSolver(cfd_config, device, LBMPhysicsConfig)
+            elif self.solver_type == "d3q19_mrt":
+                lbm_solver = GPULBMSolver(cfd_config, device, LBMPhysicsConfig)
             else:
-                lbm_solver = D3Q27CascadedSolver(cfd_config, device, LBMPhysicsConfig)
-            
+                simulator = AdvancedCFDSimulator(cfd_config, device)
+                lbm_solver = simulator.lbm_solver
+
+            # Apply mixed precision if enabled
+            if self.use_mixed_precision and torch.cuda.is_available():
+                try:
+                    from mixed_precision_solver import wrap_solver_mixed_precision
+                    lbm_solver = wrap_solver_mixed_precision(lbm_solver, enable_fp16=True)
+                    print("Mixed precision enabled")
+                except ImportError:
+                    print("Mixed precision module not found, using FP32")
             
             self.update_progress.emit(10, "Running CFD...")
             geometry_mask = (voxel_tensor > 0.5).float()
