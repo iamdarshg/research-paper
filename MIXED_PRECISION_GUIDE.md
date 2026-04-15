@@ -42,7 +42,7 @@ In `cfd_solver_integration.py`, add parameter:
 class CFDSolverWorker:
     def __init__(self, ..., use_mixed_precision=False):
         self.use_mixed_precision = use_mixed_precision
-    
+
     def run_simulation(self):
         # After creating solver
         if self.use_mixed_precision and torch.cuda.is_available():
@@ -80,7 +80,7 @@ Compute (FP32):    f[i] = 0.12500000 (4 bytes)
 Compute (FP32):    f[i] = 0.13750000
                       ↓
                    .half()
-                      ↓  
+                      ↓
 Memory (FP16):     f[i] = 0.1375   (2 bytes)
 ```
 
@@ -167,7 +167,7 @@ mesh.vertices *= scale
 
 **Solution**:
 1. Reduce Reynolds number
-2. Increase grid resolution  
+2. Increase grid resolution
 3. Use smaller time steps
 4. Disable FP16 for this case
 
@@ -198,23 +198,23 @@ class GPULBMSolver:
     def __init__(self, ..., use_fp16=False):
         self.use_fp16 = use_fp16
         dtype = torch.float16 if use_fp16 else torch.float32
-        
+
         # Store in FP16
         self.f = torch.zeros(..., dtype=dtype)
-        
+
         # Reference for DDF
         if use_fp16:
             self.f_eq_ref = self._compute_equilibrium(1.0, 0).half()
-    
+
     def collide_stream(self, ...):
         # Convert to FP32 for compute
         f_fp32 = self.f.float()
-        
+
         if self.use_fp16:
             f_fp32 += self.f_eq_ref.float()
-        
+
         # ... standard collision in FP32 ...
-        
+
         # Convert back to FP16 for storage
         if self.use_fp16:
             self.f = (f_post_collision - self.f_eq_ref.float()).half()

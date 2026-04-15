@@ -92,12 +92,12 @@ class D3Q27Solver:
         self.f += omega * (feq - self.f)
 
         self.f_pre_stream.copy_(self.f)
-        
+
         # Streaming
         for i in range(27):
             shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
             self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0,1,2))
-        
+
         # Bounce-back using PRE-STREAM populations
         mask = geometry_mask > 0.5
         for i in range(27):
@@ -146,7 +146,7 @@ class GPULBMSolver:
         self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
         self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)+1e-12
         self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution), 
+        self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution),
                                      self.phys_config.smagorinsky_constant, device=device)
 
         # Convergence tracking
@@ -192,11 +192,11 @@ class GPULBMSolver:
         self.ey = torch.tensor(ey, dtype=torch.int32, device=self.device)
         self.ez = torch.tensor(ez, dtype=torch.int32, device=self.device)
 
-        w = [1/3, 1/18, 1/18, 1/18, 1/18, 1/18, 1/18, 
+        w = [1/3, 1/18, 1/18, 1/18, 1/18, 1/18, 1/18,
              1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36, 1/36]
         self.w = torch.tensor(w, dtype=torch.float32, device=self.device)
 
-        self.opposite = torch.tensor([0, 2, 1, 4, 3, 6, 5, 9, 10, 7, 8, 13, 14, 11, 12, 17, 18, 15, 16], 
+        self.opposite = torch.tensor([0, 2, 1, 4, 3, 6, 5, 9, 10, 7, 8, 13, 14, 11, 12, 17, 18, 15, 16],
                                      dtype=torch.int64, device=self.device)
 
     def _setup_mrt_matrices(self):
@@ -275,7 +275,7 @@ class GPULBMSolver:
 
         # Apply test filter to velocities (approximation)
         ux_test = torch.nn.functional.avg_pool3d(
-            ux.unsqueeze(0).unsqueeze(0), 
+            ux.unsqueeze(0).unsqueeze(0),
             kernel_size=kernel_size, stride=1, padding=padding
         ).squeeze().nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         uy_test = torch.nn.functional.avg_pool3d(
@@ -297,12 +297,12 @@ class GPULBMSolver:
         S12_test = S12_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         S13_test = S13_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         S23_test = S23_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S_mag_test = torch.sqrt(2.0 * (S11_test**2 + S22_test**2 + S33_test**2 + 
+        S_mag_test = torch.sqrt(2.0 * (S11_test**2 + S22_test**2 + S33_test**2 +
                                        2.0*(S12_test**2 + S13_test**2 + S23_test**2)) + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Leonard stress (Germano identity)
         # L_ij = test_filter(u_i * u_j) - test_filter(u_i) * test_filter(u_j)
-        L11 = torch.nn.functional.avg_pool3d((ux*ux).unsqueeze(0).unsqueeze(0), 
+        L11 = torch.nn.functional.avg_pool3d((ux*ux).unsqueeze(0).unsqueeze(0),
                                             kernel_size, 1, padding).squeeze() - ux_test*ux_test
         L22 = torch.nn.functional.avg_pool3d((uy*uy).unsqueeze(0).unsqueeze(0),
                                             kernel_size, 1, padding).squeeze() - uy_test*uy_test
@@ -345,7 +345,7 @@ class GPULBMSolver:
         Cs = torch.sqrt(Cs_squared+1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Clip to reasonable bounds
-        Cs = torch.clamp(Cs, 
+        Cs = torch.clamp(Cs,
                         min=self.phys_config.dynamic_cs_clip_min,
                         max=self.phys_config.dynamic_cs_clip_max)
 
@@ -406,7 +406,7 @@ class GPULBMSolver:
             self.cs_dynamic = Cs  # Store for diagnostics
             Delta = self.config.lbm_config.grid_spacing
             nu_turb = ((Cs * Delta)**2 * S_mag).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            
+
         elif self.phys_config.turbulence_model == "wale":
             # WALE model
             nu_turb = self._compute_wale_model(ux, uy, uz)
