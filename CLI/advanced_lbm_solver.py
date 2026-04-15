@@ -1,6 +1,7 @@
 
 import torch
 import numpy as np
+import math
 from typing import Dict
 from typing import TYPE_CHECKING
 
@@ -89,12 +90,12 @@ class D3Q27Solver:
         self.f += omega * (feq - self.f)
 
         self.f_pre_stream.copy_(self.f)
-        
+
         # Streaming
         for i in range(27):
             shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
             self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0,1,2))
-        
+
         # Bounce-back using PRE-STREAM populations
         mask = geometry_mask > 0.5
         for i in range(27):
@@ -143,7 +144,7 @@ class GPULBMSolver:
         self.nu_turb = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
         self.vorticity = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)+1e-12
         self.q_criterion = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
-        self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution), 
+        self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution),
                                      self.phys_config.smagorinsky_constant, device=device)
 
         # Convergence tracking (storing full velocity vector)
@@ -203,19 +204,16 @@ class GPULBMSolver:
 
     def _initialize_equilibrium(self):
         """Initialize with corrected D3Q27 equilibrium"""
-        rho = 1.0
         # Correct lattice velocity for c_s = 1/sqrt(3)
-        ux = self.config.mach_number / np.sqrt(3.0)
-        uy, uz = 0.0, 0.0
+        u_lat = self.config.mach_number / math.sqrt(3.0)
+        ux, uy, uz = u_lat, 0.0, 0.0
+        rho = 1.0
 
         for i in range(27):
-            eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
+            eu = self.ex[i].item() * ux + self.ey[i].item() * uy + self.ez[i].item() * uz
             u_sq = ux*ux + uy*uy + uz*uz
-
-            # Standard LBM equilibrium
-            feq = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
-
-            self.f[i] = feq.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+            feq_val = self.w[i].item() * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
+            self.f[i].fill_(feq_val)
 
     def _compute_strain_rate_tensor(self, ux, uy, uz, gradients=None):
         return compute_strain_rate_tensor(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing, gradients=gradients)
@@ -263,7 +261,7 @@ class GPULBMSolver:
 
         # Apply test filter to velocities (approximation)
         ux_test = torch.nn.functional.avg_pool3d(
-            ux.unsqueeze(0).unsqueeze(0), 
+            ux.unsqueeze(0).unsqueeze(0),
             kernel_size=kernel_size, stride=1, padding=padding
         ).squeeze().nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         uy_test = torch.nn.functional.avg_pool3d(
@@ -285,12 +283,12 @@ class GPULBMSolver:
         S12_test = S12_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         S13_test = S13_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
         S23_test = S23_test.nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        S_mag_test = torch.sqrt(2.0 * (S11_test**2 + S22_test**2 + S33_test**2 + 
+        S_mag_test = torch.sqrt(2.0 * (S11_test**2 + S22_test**2 + S33_test**2 +
                                        2.0*(S12_test**2 + S13_test**2 + S23_test**2)) + 1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Leonard stress (Germano identity)
         # L_ij = test_filter(u_i * u_j) - test_filter(u_i) * test_filter(u_j)
-        L11 = torch.nn.functional.avg_pool3d((ux*ux).unsqueeze(0).unsqueeze(0), 
+        L11 = torch.nn.functional.avg_pool3d((ux*ux).unsqueeze(0).unsqueeze(0),
                                             kernel_size, 1, padding).squeeze() - ux_test*ux_test
         L22 = torch.nn.functional.avg_pool3d((uy*uy).unsqueeze(0).unsqueeze(0),
                                             kernel_size, 1, padding).squeeze() - uy_test*uy_test
@@ -333,7 +331,7 @@ class GPULBMSolver:
         Cs = torch.sqrt(Cs_squared+1e-12).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         # Clip to reasonable bounds
-        Cs = torch.clamp(Cs, 
+        Cs = torch.clamp(Cs,
                         min=self.phys_config.dynamic_cs_clip_min,
                         max=self.phys_config.dynamic_cs_clip_max)
 
@@ -394,7 +392,7 @@ class GPULBMSolver:
             self.cs_dynamic = Cs  # Store for diagnostics
             Delta = self.config.lbm_config.grid_spacing
             nu_turb = ((Cs * Delta)**2 * S_mag).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            
+
         elif self.phys_config.turbulence_model == "wale":
             # WALE model
             nu_turb = self._compute_wale_model(ux, uy, uz)
@@ -525,7 +523,7 @@ class GPULBMSolver:
 
                 # Implement Velocity Equilibrium Inlet at min X
                 if shifts[0] > 0: # populations moving into domain from min X
-                    u_inf = self.config.mach_number / np.sqrt(3.0)
+                    u_inf = self.config.mach_number / math.sqrt(3.0)
                     eu_inf = self.ex[i] * u_inf
                     feq_inf = self.w[i] * 1.0 * (1.0 + 3.0*eu_inf + 4.5*eu_inf**2 - 1.5*u_inf**2)
                     self.f_temp[i][0, :, :] = feq_inf
@@ -733,7 +731,7 @@ class D3Q27CascadedSolver:
         # Seed the equilibrium in lattice units for stability.
         mach = getattr(self.config, 'mach_number', getattr(self.config, 'lbm_config', None) and getattr(self.config.lbm_config, 'mach_number', 0.0))
         if mach:
-            ux = torch.full_like(rho, mach / np.sqrt(3.0))
+            ux = torch.full_like(rho, mach / math.sqrt(3.0))
 
         # compute and set equilibrium populations
         feq = self._solver.compute_equilibrium(rho, ux, uy, uz)

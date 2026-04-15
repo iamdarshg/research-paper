@@ -111,7 +111,7 @@ class CFDSolverWorker(QObject):
             else:
                 simulator = AdvancedCFDSimulator(cfd_config, device)
                 lbm_solver = simulator.lbm_solver
-            
+
             # Apply mixed precision if enabled
             if self.use_mixed_precision and torch.cuda.is_available():
                 try:

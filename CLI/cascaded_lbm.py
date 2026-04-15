@@ -159,28 +159,28 @@ class D3Q27CascadedSolver:
 
         # Use the lattice-consistent freestream speed for the Mach number.
         # For D3Q27, c_s = 1/sqrt(3), so u = Ma * c_s.
-        u_lattice = self.config.mach_number / np.sqrt(3.0)
+        u_lattice = self.config.mach_number / math.sqrt(3.0)
         L_lattice = self.resolution
-        
+
         # Force reasonable Reynolds number for this grid
         # Keep tau safely above 0.6 to avoid the near-singular regime that
         # produced unstable forces in the benchmark case.
         Re_max_stable = L_lattice ** 1.5
         Re_target = min(self.config.reynolds_number, Re_max_stable * 0.25)
-        
+
         print(f"Reynolds number adjusted: {self.config.reynolds_number} -> {Re_target:.0f}")
-        
+
         # Compute viscosity in lattice units
         self.nu = u_lattice * L_lattice / Re_target
-        
+
         # Relaxation time (must be > 0.5 for stability)
         tau = 3.0 * self.nu + 0.5
         self.phys_config.s_nu = 1.0 / tau
-        
+
         print(f"Lattice viscosity: {self.nu:.6f}")
         print(f"Relaxation time: {tau:.4f}")
         print(f"Relaxation parameter: {self.phys_config.s_nu:.4f}")
-        
+
         # Validate stability
         if tau < 0.6:
             print("WARNING: tau < 0.6, expect instability!")
@@ -191,7 +191,7 @@ class D3Q27CascadedSolver:
     def _initialize_equilibrium(self):
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
-        u_lattice = self.config.mach_number / np.sqrt(3.0)
+        u_lattice = self.config.mach_number / math.sqrt(3.0)
         ux = u_lattice  # Lattice-consistent freestream speed.
         uy, uz = 0.0, 0.0
 
@@ -447,4 +447,3 @@ class D3Q27CascadedSolver:
             'vortex_core_volume': 0.0,  # Not computed
             'reynolds_number_turbulent': v_inf * h * self.resolution / self.nu
         }
-
