@@ -61,8 +61,7 @@ class D3Q27Solver:
         step_force_z = torch.tensor(0.0, device=self.device)
 
         for i in range(27):
-            opp_i = int(self.opposite[i].item())
-            if i == 0 or i > opp_i:
+            if i == 0:
                 continue
 
             dx = int(self.ex[i].item())
@@ -96,11 +95,17 @@ class D3Q27Solver:
             shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
             self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0,1,2))
 
-        # Bounce-back using PRE-STREAM populations
+        # Standard half-way bounce-back at fluid nodes adjacent to solid
         mask = geometry_mask > 0.5
         for i in range(27):
             opp_i = int(self.opposite[i].item())
-            self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
+            dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
+            neighbor_is_solid = torch.roll(mask, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
+            boundary_link = (~mask) & neighbor_is_solid
+
+            # Perform half-way bounce-back: overwrite streamed populations moving from solid into fluid
+            # with reflected fluid populations
+            self.f_temp[opp_i] = torch.where(boundary_link, self.f_pre_stream[i], self.f_temp[opp_i])
 
         step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask)
 
@@ -539,27 +544,26 @@ class GPULBMSolver:
                     self.f_temp[i][:, :, 0] = self.f_pre_stream[i][:, :, 0]
                     self.f_temp[i][:, :, -1] = self.f_pre_stream[i][:, :, -1]
 
-            # === 8. Solid Boundary conditions - bounce-back using pre-stream values ===
+            # === 8. Solid Boundary conditions - proper half-way bounce-back ===
             mask = geometry_mask > 0.5
             step_force_x = torch.tensor(0.0, device=self.device)
             step_force_z = torch.tensor(0.0, device=self.device)
 
+            # Momentum Exchange Force Calculation and Bounce-back
             for i in range(27):
                 opp_i = int(self.opposite[i].item())
-                self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
-
-                # Momentum Exchange Force Calculation
-                # Correct indexing and link identification
-                if i == 0: continue
-
                 dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
-                # Neighbor in direction i
+
+                # Identify fluid cells with a solid neighbor in direction i
                 neighbor_is_solid = torch.roll(mask, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
                 boundary_link = (~mask) & neighbor_is_solid
 
-                # Each link should only be counted once.
-                # In BB, force on wall is \sum 2 * f_i * e_i for all i pointing into wall.
-                if torch.any(boundary_link):
+                # Perform half-way bounce-back: overwrite outgoing population with reflected one
+                if i != 0:
+                    self.f_temp[opp_i] = torch.where(boundary_link, self.f_pre_stream[i], self.f_temp[opp_i])
+
+                # Accumulate force on wall: 2 * f_i * e_i
+                if i != 0 and torch.any(boundary_link):
                     step_force_x += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i][boundary_link])
                     step_force_z += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i][boundary_link])
 

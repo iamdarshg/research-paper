@@ -343,7 +343,7 @@ class D3Q27CascadedSolver:
                 opp_i = int(self.opposite[i].item())
                 self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
 
-                if i == 0 or i > opp_i:
+                if i == 0:
                     continue
 
                 dx = int(self.ex[i].item())
