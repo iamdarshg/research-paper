@@ -1,0 +1,70 @@
+path = 'CLI/advanced_lbm_solver.py'
+with open(path, 'r') as f:
+    lines = f.readlines()
+
+new_lines = []
+skip = False
+for line in lines:
+    if 'def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):' in line:
+        new_lines.append(line)
+        new_lines.append('        """Standard LBGK collision with LES, vorticity confinement, and improved turbulence"""\n')
+        new_lines.append('        h = self.config.lbm_config.grid_spacing\n')
+        new_lines.append('        Fx = torch.zeros_like(self.velocity_x)\n')
+        new_lines.append('        Fy = torch.zeros_like(self.velocity_y)\n')
+        new_lines.append('        Fz = torch.zeros_like(self.velocity_z)\n')
+        new_lines.append('        self.force_x_accum = torch.tensor(0.0, device=self.device)\n')
+        new_lines.append('        self.force_z_accum = torch.tensor(0.0, device=self.device)\n')
+        new_lines.append('        self.force_samples = 0\n')
+        new_lines.append('        sample_window = max(10, steps // 4)\n')
+        new_lines.append('        sample_start = max(0, steps - sample_window)\n')
+        new_lines.append('        for step in range(steps):\n')
+        new_lines.append('            rho = torch.sum(self.f, dim=0)\n')
+        new_lines.append('            mx = torch.sum(self.f * self.ex.view(-1,1,1,1), dim=0)\n')
+        new_lines.append('            my = torch.sum(self.f * self.ey.view(-1,1,1,1), dim=0)\n')
+        new_lines.append('            mz = torch.sum(self.f * self.ez.view(-1,1,1,1), dim=0)\n')
+        new_lines.append('            ux, uy, uz = (mx + 0.5*Fx)/(rho+1e-12), (my + 0.5*Fy)/(rho+1e-12), (mz + 0.5*Fz)/(rho+1e-12)\n')
+        new_lines.append('            self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz).nan_to_num(0.0)\n')
+        new_lines.append('            Fx, Fy, Fz = self._apply_vorticity_confinement(ux, uy, uz)\n')
+        new_lines.append('            omega_eff = 1.0 / torch.clamp(3.0 * (self.nu + self.nu_turb) + 0.5, min=0.501)\n')
+        new_lines.append('            u_sq = ux**2 + uy**2 + uz**2\n')
+        new_lines.append('            for i in range(27):\n')
+        new_lines.append('                eu = self.ex[i]*ux + self.ey[i]*uy + self.ez[i]*uz\n')
+        new_lines.append('                feq = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)\n')
+        new_lines.append('                eF, uF = self.ex[i]*Fx + self.ey[i]*Fy + self.ez[i]*Fz, ux*Fx + uy*Fy + uz*Fz\n')
+        new_lines.append('                force_term = self.w[i] * (1.0 - 0.5*omega_eff) * (3.0*eF + 9.0*eu*eF - 3.0*uF)\n')
+        new_lines.append('                self.f[i] += omega_eff * (feq - self.f[i]) + force_term\n')
+        new_lines.append('            self.f_pre_stream.copy_(self.f)\n')
+        new_lines.append('            for i in range(27):\n')
+        new_lines.append('                dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())\n')
+        new_lines.append('                self.f_temp[i] = torch.roll(self.f[i], shifts=(dx,dy,dz), dims=(0,1,2))\n')
+        new_lines.append('                if dx > 0: self.f_temp[i][0,:,:] = self.w[i]*(1.0+3.0*self.ex[i]*self.u_lat+4.5*(self.ex[i]*self.u_lat)**2-1.5*self.u_lat**2)\n')
+        new_lines.append('                if dx < 0: self.f_temp[i][-1,:,:] = self.f_pre_stream[i][-1,:,:]\n')
+        new_lines.append('                if dy != 0: self.f_temp[i][:,0,:], self.f_temp[i][:,-1,:] = self.f_pre_stream[i][:,0,:], self.f_pre_stream[i][:,-1,:]\n')
+        new_lines.append('                if dz != 0: self.f_temp[i][:,:,0], self.f_temp[i][:,:,-1] = self.f_pre_stream[i][:,:,0], self.f_pre_stream[i][:,:,-1]\n')
+        new_lines.append('            mask = geometry_mask > 0.5\n')
+        new_lines.append('            sfx, sfz = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)\n')
+        new_lines.append('            for i in range(27):\n')
+        new_lines.append('                opp_i = int(self.opposite[i].item())\n')
+        new_lines.append('                dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())\n')
+        new_lines.append('                boundary_link = (~mask) & torch.roll(mask, shifts=(-dx,-dy,-dz), dims=(0,1,2))\n')
+        new_lines.append('                if i != 0: self.f_temp[opp_i] = torch.where(boundary_link, self.f_pre_stream[i], self.f_temp[opp_i])\n')
+        new_lines.append('                if i != 0 and torch.any(boundary_link):\n')
+        new_lines.append('                    sfx += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i][boundary_link])\n')
+        new_lines.append('                    sfz += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i][boundary_link])\n')
+        new_lines.append('            self.force_x_last, self.force_z_last = sfx, sfz\n')
+        new_lines.append('            if step >= sample_start: self.force_x_accum += sfx; self.force_z_accum += sfz; self.force_samples += 1\n')
+        new_lines.append('            self.f.copy_(self.f_temp); self.velocity_x, self.velocity_y, self.velocity_z, self.pressure = ux, uy, uz, rho*self.cs2\n')
+        new_lines.append('            if step % self.phys_config.check_convergence_every == 0 and step > 0:\n')
+        new_lines.append('                u_curr = torch.stack([ux, uy, uz], dim=0)\n')
+        new_lines.append('                if torch.norm(u_curr - self.velocity_prev)/(torch.norm(u_curr)+1e-12) < self.phys_config.convergence_tolerance: break\n')
+        new_lines.append('                self.velocity_prev = u_curr.clone()\n')
+        new_lines.append('        return\n')
+        skip = True
+    elif skip and 'def compute_aerodynamic_coefficients' in line:
+        skip = False
+        new_lines.append(line)
+    elif not skip:
+        new_lines.append(line)
+
+with open(path, 'w') as f:
+    f.writelines(new_lines)

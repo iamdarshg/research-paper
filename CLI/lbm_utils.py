@@ -74,8 +74,12 @@ class D3Q27Lattice:
         Opposite directions for D3Q27:
         0 (rest) → 0
         1-6 (faces): ±x, ±y, ±z → swap pairs
-        7-18 (edges): diagonal pairs
-        19-26 (corners): 3D diagonal pairs
+        7-18 (edges): diagonal pairs (e.g., opposite of (1,1,0) is (-1,-1,0))
+        19-26 (corners): 3D diagonal pairs (e.g., opposite of (1,1,1) is (-1,-1,-1))
         """
-        opp = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17, 26, 25, 24, 23, 22, 21, 20, 19]
+        opp = [0, 2, 1, 4, 3, 6, 5,
+               10, 9, 8, 7,  # (1,1,0), (-1,1,0), (1,-1,0), (-1,-1,0) -> opposites: (-1,-1,0), (1,-1,0), (-1,1,0), (1,1,0)
+               14, 13, 12, 11, # (1,0,1), (-1,0,1), (1,0,-1), (-1,0,-1) -> opposites: (-1,0,-1), (1,0,-1), (-1,0,1), (1,0,1)
+               18, 17, 16, 15, # (0,1,1), (0,-1,1), (0,1,-1), (0,-1,-1) -> opposites: (0,-1,-1), (0,1,-1), (0,-1,1), (0,1,1)
+               26, 25, 24, 23, 22, 21, 20, 19] # corners
         return torch.tensor(opp, dtype=torch.int64)

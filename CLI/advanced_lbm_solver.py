@@ -1,7 +1,7 @@
+import math
 
 import torch
 import numpy as np
-import math
 from typing import Dict
 from typing import TYPE_CHECKING
 
@@ -9,11 +9,14 @@ from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity, compute_velocity_gradients
 
 
-def _scale_momentum_exchange_force(force, grid_spacing: float, time_step: float, density: float = 1.225):
-    """Convert raw lattice momentum exchange into a physical force scale.
-    The correct LBM physical conversion factor for force is rho_phys * (dx^4 / dt^2).
-    """
-    force_scale = float(density) * (float(grid_spacing)**4) / (float(time_step)**2)
+def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
+    """Convert raw lattice momentum exchange into a physical force scale."""
+    freestream_speed = float(mach_number) * 343.0
+    # Use analytic momentum-exchange → physical scaling:
+    # physical_force = raw_lattice_sum * (0.5 * rho * U_inf^2 * dx^2)
+    # The 0.5 factor aligns the momentum-exchange definition with the
+    # aerodynamic dynamic pressure used in the coefficient denominator.
+    force_scale = 0.5 * float(density) * freestream_speed * freestream_speed * float(grid_spacing) * float(grid_spacing)
     return force * force_scale
 
 
@@ -61,7 +64,8 @@ class D3Q27Solver:
         step_force_z = torch.tensor(0.0, device=self.device)
 
         for i in range(27):
-            if i == 0:
+            opp_i = int(self.opposite[i].item())
+            if i == 0 or i > opp_i:
                 continue
 
             dx = int(self.ex[i].item())
@@ -95,17 +99,11 @@ class D3Q27Solver:
             shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
             self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0,1,2))
 
-        # Standard half-way bounce-back at fluid nodes adjacent to solid
+        # Bounce-back using PRE-STREAM populations
         mask = geometry_mask > 0.5
         for i in range(27):
             opp_i = int(self.opposite[i].item())
-            dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
-            neighbor_is_solid = torch.roll(mask, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
-            boundary_link = (~mask) & neighbor_is_solid
-
-            # Perform half-way bounce-back: overwrite streamed populations moving from solid into fluid
-            # with reflected fluid populations
-            self.f_temp[opp_i] = torch.where(boundary_link, self.f_pre_stream[i], self.f_temp[opp_i])
+            self.f_temp[i] = torch.where(mask, self.f_pre_stream[opp_i], self.f_temp[i])
 
         step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask)
 
@@ -152,7 +150,7 @@ class GPULBMSolver:
         self.cs_dynamic = torch.full((self.resolution, self.resolution, self.resolution),
                                      self.phys_config.smagorinsky_constant, device=device)
 
-        # Convergence tracking (storing full velocity vector)
+        # Convergence tracking
         self.velocity_prev = torch.zeros(3, self.resolution, self.resolution, self.resolution, device=device)
 
         self._setup_d3q27_lattice()
@@ -166,60 +164,34 @@ class GPULBMSolver:
         self.force_z_last = torch.tensor(0.0, device=device)
 
     def _setup_physics_constants(self):
-        """Compute physics constants from config"""
+        """Compute physics constants from config with improved stability mapping."""
         h = self.config.lbm_config.grid_spacing
-        dt = self.config.lbm_config.time_step
-
         self.cs2 = 1.0 / 3.0
-
-        U_ref = self.config.mach_number * 343.0
-        L_ref = h * self.resolution
+        U_phys = self.config.mach_number * 343.0
         Re = getattr(self.config, 'reynolds_number', 1000)
-        nu_phys = U_ref * L_ref / Re
-
-        self.nu = nu_phys * dt / (h * h)
-        tau = 3.0 * self.nu + 0.5
-        self.phys_config.s_nu = 1.0 / tau  # Ensure this gets set properly
-
-        max_velocity_lattice = self.config.mach_number * 343.0 * dt / h
-        if max_velocity_lattice > self.phys_config.max_mach:
-            print(f"WARNING: Lattice velocity {max_velocity_lattice:.3f} exceeds stability limit")
-
+        self.u_lat = self.config.mach_number / math.sqrt(3.0)
+        if self.u_lat > 0.1: self.u_lat = 0.1
+        self.nu = self.u_lat * self.resolution / max(float(Re), 1e-12)
+        self.tau = max(3.0 * self.nu + 0.5, 0.501)
+        self.phys_config.s_nu = 1.0 / self.tau
     def _setup_d3q27_lattice(self):
         """Setup D3Q27 lattice"""
         ex, ey, ez = D3Q27Lattice.get_vectors()
-        self.ex = ex.to(self.device, dtype=torch.int32)
-        self.ey = ey.to(self.device, dtype=torch.int32)
-        self.ez = ez.to(self.device, dtype=torch.int32)
+        self.ex, self.ey, self.ez = ex.to(self.device, dtype=torch.int32), ey.to(self.device, dtype=torch.int32), ez.to(self.device, dtype=torch.int32)
         self.w = D3Q27Lattice.get_weights().to(self.device, dtype=torch.float32)
         self.opposite = D3Q27Lattice.get_opposite().to(self.device, dtype=torch.int64)
 
     def _setup_mrt_matrices(self):
-        """Setup MRT transformation matrices for D3Q27"""
-        s_nu = self.phys_config.s_nu
-        s_bulk = self.phys_config.s_bulk
-        s_energy = self.phys_config.s_energy
-        s_higher = self.phys_config.s_higher
-
-        # Simplified D3Q27 MRT relaxation rates
-        # Mapping: 0: rho (1), 1-3: momentum (1,1,1), 4-9: stress (s_nu), 10-26: higher order (s_higher)
-        self.s_relax = torch.ones(27, device=self.device)
-        self.s_relax[4:10] = s_nu
-        self.s_relax[10:] = s_higher
+        self.s_relax = torch.full((27,), 1.0 / self.tau, device=self.device)
 
     def _initialize_equilibrium(self):
-        """Initialize with corrected D3Q27 equilibrium"""
-        # Correct lattice velocity for c_s = 1/sqrt(3)
-        u_lat = self.config.mach_number / math.sqrt(3.0)
-        ux, uy, uz = u_lat, 0.0, 0.0
+        ux, uy, uz = self.u_lat, 0.0, 0.0
         rho = 1.0
-
         for i in range(27):
             eu = self.ex[i].item() * ux + self.ey[i].item() * uy + self.ez[i].item() * uz
             u_sq = ux*ux + uy*uy + uz*uz
             feq_val = self.w[i].item() * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
             self.f[i].fill_(feq_val)
-
     def _compute_strain_rate_tensor(self, ux, uy, uz, gradients=None):
         return compute_strain_rate_tensor(ux, uy, uz, spacing=self.config.lbm_config.grid_spacing, gradients=gradients)
 
@@ -441,233 +413,71 @@ class GPULBMSolver:
             epsilon_local = self.phys_config.vorticity_confinement_epsilon
 
         # Confinement force: F = epsilon * (eta x omega)
-        # Scale by grid spacing and time step for grid independence
-        h = self.config.lbm_config.grid_spacing
-        dt = self.config.lbm_config.time_step
-        scaling = (dt / h)
-
-        Fx = epsilon_local * scaling * (eta_y * omega_z - eta_z * omega_y).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        Fy = epsilon_local * scaling * (eta_z * omega_x - eta_x * omega_z).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-        Fz = epsilon_local * scaling * (eta_x * omega_y - eta_y * omega_x).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        Fx = epsilon_local * (eta_y * omega_z - eta_z * omega_y).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        Fy = epsilon_local * (eta_z * omega_x - eta_x * omega_z).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
+        Fz = epsilon_local * (eta_x * omega_y - eta_y * omega_x).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
 
         return Fx, Fy, Fz
 
     def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
-        """MRT collision with LES, vorticity confinement, and improved turbulence"""
         h = self.config.lbm_config.grid_spacing
-        dt = self.config.lbm_config.time_step
-        Fx = torch.zeros_like(self.velocity_x)
-        Fy = torch.zeros_like(self.velocity_y)
-        Fz = torch.zeros_like(self.velocity_z)
-
-        # Precompute MRT transformation matrix if possible or just use weights for pseudo-MRT
-        # For simplicity and correctness in this refactor, we'll use weighted MRT-like collision
-        # or properly transform to moment space if we had the full M matrix.
-        # Given the previous D3Q19 MRT was fake, let's implement a more robust one.
-
-        # Reset force accounting and determine sampling window (average last-quarter)
-        self.force_x_accum = torch.tensor(0.0, device=self.device)
-        self.force_z_accum = torch.tensor(0.0, device=self.device)
-        self.force_samples = 0
+        Fx, Fy, Fz = torch.zeros_like(self.velocity_x), torch.zeros_like(self.velocity_x), torch.zeros_like(self.velocity_x)
+        self.force_x_accum, self.force_z_accum, self.force_samples = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device), 0
         sample_window = max(10, steps // 4)
-        sample_start = max(0, steps - sample_window)
+        sample_start = steps - sample_window
         for step in range(steps):
-            # === 1. Compute macroscopic variables ===
             rho = torch.sum(self.f, dim=0)
-            momentum_x = torch.sum(self.f * self.ex.view(-1, 1, 1, 1), dim=0)
-            momentum_y = torch.sum(self.f * self.ey.view(-1, 1, 1, 1), dim=0)
-            momentum_z = torch.sum(self.f * self.ez.view(-1, 1, 1, 1), dim=0)
-
-            # Macroscopic velocity with forcing offset for second-order accuracy (Guo's method)
-            ux = (momentum_x + 0.5 * Fx) / (rho + 1e-12)
-            uy = (momentum_y + 0.5 * Fy) / (rho + 1e-12)
-            uz = (momentum_z + 0.5 * Fz) / (rho + 1e-12)
-
-            # === 2. Turbulence modeling (Dynamic Smagorinsky / WALE) ===
-            self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz).nan_to_num(1e-12, posinf=1e18, neginf=-1e18)
-            nu_eff = self.nu + self.nu_turb
-
-            # === 3. Vorticity confinement force ===
+            mx = torch.sum(self.f * self.ex.view(-1,1,1,1), dim=0)
+            my = torch.sum(self.f * self.ey.view(-1,1,1,1), dim=0)
+            mz = torch.sum(self.f * self.ez.view(-1,1,1,1), dim=0)
+            ux, uy, uz = (mx + 0.5*Fx)/(rho+1e-12), (my + 0.5*Fy)/(rho+1e-12), (mz + 0.5*Fz)/(rho+1e-12)
+            self.nu_turb = self._compute_turbulent_viscosity(ux, uy, uz).nan_to_num(0.0)
             Fx, Fy, Fz = self._apply_vorticity_confinement(ux, uy, uz)
-
-            # === 4. Update relaxation parameters ===
-            tau_eff = 3.0 * nu_eff + 0.5
-            s_nu_eff = 1.0 / tau_eff
-            # Update s_relax with the new effective viscosity relaxation
-            self.s_relax[4:10] = s_nu_eff.mean() # Simplified: use mean for MRT matrix components
-
-            # === 5. MRT Collision with Guo forcing ===
-            # We'll use a simplified MRT-like approach since full D3Q27 MRT matrix is large.
-            # However, we MUST use s_relax correctly.
+            omega = 1.0 / torch.clamp(3.0 * (self.nu + self.nu_turb) + 0.5, min=0.501)
             u_sq = ux**2 + uy**2 + uz**2
             for i in range(27):
-                eu = self.ex[i] * ux + self.ey[i] * uy + self.ez[i] * uz
+                eu, eF, uF = self.ex[i]*ux + self.ey[i]*uy + self.ez[i]*uz, self.ex[i]*Fx + self.ey[i]*Fy + self.ez[i]*Fz, ux*Fx + uy*Fy + uz*Fz
                 feq = self.w[i] * rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
-
-                # Guo's forcing term
-                eF = self.ex[i]*Fx + self.ey[i]*Fy + self.ez[i]*Fz
-                uF = ux*Fx + uy*Fy + uz*Fz
-                force_term = self.w[i] * (1.0 - 0.5 * s_nu_eff) * (3.0*eF + 9.0*eu*eF - 3.0*uF)
-
-                # Use per-population relaxation rate from s_relax if possible,
-                # but s_nu_eff varies spatially due to turbulence.
-                # For stress-related populations, use s_nu_eff.
-                omega_i = self.s_relax[i]
-                if 4 <= i < 10:
-                    omega_i = s_nu_eff
-
-                self.f[i] += omega_i * (feq - self.f[i]) + force_term
-
-            # === 6. Store pre-stream populations for bounce-back and force ===
+                force_term = self.w[i] * (1.0 - 0.5*omega) * (3.0*eF + 9.0*eu*eF - 3.0*uF)
+                self.f[i] += omega * (feq - self.f[i]) + force_term
             self.f_pre_stream.copy_(self.f)
-
-            # === 7. Streaming and Boundary Conditions ===
             for i in range(27):
-                shifts = (int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item()))
-                self.f_temp[i] = torch.roll(self.f[i], shifts=shifts, dims=(0, 1, 2))
-
-                # Implement Velocity Equilibrium Inlet at min X
-                if shifts[0] > 0: # populations moving into domain from min X
-                    u_inf = self.config.mach_number / math.sqrt(3.0)
-                    eu_inf = self.ex[i] * u_inf
-                    feq_inf = self.w[i] * 1.0 * (1.0 + 3.0*eu_inf + 4.5*eu_inf**2 - 1.5*u_inf**2)
-                    self.f_temp[i][0, :, :] = feq_inf
-
-                # Implement Neumann (Zero-Gradient) Outlet at max X, and similar for Y/Z boundaries
-                # to prevent periodic wraparound artifacts in open-domain simulations.
-                if shifts[0] < 0:
-                    self.f_temp[i][-1, :, :] = self.f_pre_stream[i][-1, :, :]
-                if shifts[1] != 0:
-                    self.f_temp[i][:, 0, :] = self.f_pre_stream[i][:, 0, :]
-                    self.f_temp[i][:, -1, :] = self.f_pre_stream[i][:, -1, :]
-                if shifts[2] != 0:
-                    self.f_temp[i][:, :, 0] = self.f_pre_stream[i][:, :, 0]
-                    self.f_temp[i][:, :, -1] = self.f_pre_stream[i][:, :, -1]
-
-            # === 8. Solid Boundary conditions - proper half-way bounce-back ===
+                dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
+                self.f_temp[i] = torch.roll(self.f[i], shifts=(dx,dy,dz), dims=(0,1,2))
+                if dx > 0: self.f_temp[i][0,:,:] = self.w[i]*(1.0+3.0*self.ex[i]*self.u_lat+4.5*(self.ex[i]*self.u_lat)**2-1.5*self.u_lat**2)
+                if dx < 0: self.f_temp[i][-1,:,:] = self.f_pre_stream[i][-1,:,:]
+                if dy != 0: self.f_temp[i][:,0,:], self.f_temp[i][:,-1,:] = self.f_pre_stream[i][:,0,:], self.f_pre_stream[i][:,-1,:]
+                if dz != 0: self.f_temp[i][:,:,0], self.f_temp[i][:,:,-1] = self.f_pre_stream[i][:,:,0], self.f_pre_stream[i][:,:,-1]
             mask = geometry_mask > 0.5
-            step_force_x = torch.tensor(0.0, device=self.device)
-            step_force_z = torch.tensor(0.0, device=self.device)
-
-            # Momentum Exchange Force Calculation and Bounce-back
+            sfx, sfz = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
             for i in range(27):
                 opp_i = int(self.opposite[i].item())
                 dx, dy, dz = int(self.ex[i].item()), int(self.ey[i].item()), int(self.ez[i].item())
-
-                # Identify fluid cells with a solid neighbor in direction i
-                neighbor_is_solid = torch.roll(mask, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
+                neighbor_is_solid = torch.roll(mask, shifts=(-dx,-dy,-dz), dims=(0,1,2))
                 boundary_link = (~mask) & neighbor_is_solid
-
-                # Perform half-way bounce-back: overwrite outgoing population with reflected one
                 if i != 0:
                     self.f_temp[opp_i] = torch.where(boundary_link, self.f_pre_stream[i], self.f_temp[opp_i])
-
-                # Accumulate force on wall: 2 * f_i * e_i
-                if i != 0 and torch.any(boundary_link):
-                    step_force_x += torch.sum(2.0 * float(self.ex[i].item()) * self.f_pre_stream[i][boundary_link])
-                    step_force_z += torch.sum(2.0 * float(self.ez[i].item()) * self.f_pre_stream[i][boundary_link])
-
-            self.force_x_last = step_force_x
-            self.force_z_last = step_force_z
-            if step >= sample_start:
-                self.force_x_accum += step_force_x
-                self.force_z_accum += step_force_z
-                self.force_samples += 1
-
-            self.f.copy_(self.f_temp)
-
-            # === 8. Update fields ===
-            self.velocity_x = ux
-            self.velocity_y = uy
-            self.velocity_z = uz
-            self.pressure = rho * self.cs2
-
-            # === 9. Compute Q-criterion for vortex detection ===
-            if self.phys_config.compute_q_criterion:
-                self.q_criterion = self._compute_q_criterion(ux, uy, uz)
-
-            # === 10. Convergence check ===
+                    if torch.any(boundary_link):
+                        sfx += torch.sum(1.0 * float(self.ex[i].item()) * self.f_pre_stream[i][boundary_link])
+                        sfz += torch.sum(1.0 * float(self.ez[i].item()) * self.f_pre_stream[i][boundary_link])
+            self.force_x_last, self.force_z_last = sfx, sfz
+            if step >= sample_start: self.force_x_accum += sfx; self.force_z_accum += sfz; self.force_samples += 1
+            self.f.copy_(self.f_temp); self.velocity_x, self.velocity_y, self.velocity_z, self.pressure = ux, uy, uz, rho*self.cs2
             if step % self.phys_config.check_convergence_every == 0 and step > 0:
-                # Use L2 norm of full velocity vector change
                 u_curr = torch.stack([ux, uy, uz], dim=0)
-                vel_change = torch.norm(u_curr - self.velocity_prev) / (torch.norm(u_curr) + 1e-12)
-
-                if vel_change < self.phys_config.convergence_tolerance:
-                    print(f"Converged at step {step}, relative velocity change (L2): {vel_change:.2e}")
-                    break
+                if torch.norm(u_curr - self.velocity_prev)/(torch.norm(u_curr)+1e-12) < self.phys_config.convergence_tolerance: break
                 self.velocity_prev = u_curr.clone()
-
-            # === 11. Quick diagnostic (suggested by user) ===
-            if step % 100 == 0:
-                print(f"Step {step}:")
-                print(f"  max vorticity: {torch.max(torch.sqrt(torch.sum(self.vorticity**2, dim=0))):.4f}")
-                print(f"  s_nu: {self.phys_config.s_nu}")
-                print(f"  nu_turb mean: {self.nu_turb.mean():.6f}")
-                print(f"  any NaN: {torch.any(torch.isnan(self.f))}")
-
-            if step % 500 == 0:
-                vortex_volume = torch.sum((self.q_criterion > self.phys_config.q_threshold).float()).item()
-                print(f"Step {step}/{steps}, max vel: {torch.max(torch.sqrt(ux**2 + uy**2 + uz**2)):.4f}, "
-                      f"vortex cells: {vortex_volume:.0f}, mean Cs: {self.cs_dynamic.mean():.4f}")
-
+        return
     def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
-        """Compute total hydrodynamic force from fluid-solid links.
-
-        This uses the standard momentum-exchange interpretation of bounce-back: for each
-        fluid cell adjacent to the solid, the reflected population transfers 2*f_i*e_i
-        to the wall. The result is a total force (pressure + viscous) on the body.
-        """
         h = self.config.lbm_config.grid_spacing
-
         solid = geometry_mask > 0.5
-        ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
-        ref_area = max(ref_area, h**2)
-
-        if self.force_samples > 0:
-            drag_force = self.force_x_accum / self.force_samples
-            lift_force = self.force_z_accum / self.force_samples
-            force_definition = 'bounce-back momentum exchange averaged over the last-quarter window'
-        else:
-            drag_force = self.force_x_last
-            lift_force = self.force_z_last
-            force_definition = 'bounce-back momentum exchange from last streaming step'
-
-        dt = self.config.lbm_config.time_step
-        physical_drag_force = _scale_momentum_exchange_force(drag_force, h, dt)
-        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, dt)
-        coeffs = _compute_force_coefficients(
-            physical_drag_force,
-            physical_lift_force,
-            self.config.mach_number,
-            ref_area=max(ref_area, 1e-12),
-            rho_ref=1.225,
-        )
-
-        vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0))
-        vortex_cells = torch.sum((self.q_criterion > self.phys_config.q_threshold).float()).item()
-        v_inf = coeffs['freestream_speed']
-
-        return {
-            'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
-            'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
-            'raw_force_x': float(drag_force.item() if isinstance(drag_force, torch.Tensor) else drag_force),
-            'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
-            'drag_coefficient': coeffs['drag_coefficient'],
-            'lift_coefficient': coeffs['lift_coefficient'],
-            'force_definition': force_definition,
-            'pressure_sum': self.pressure.sum().item(),
-            'max_turbulent_viscosity': self.nu_turb.max().item(),
-            'mean_smagorinsky_constant': self.cs_dynamic.mean().item(),
-            'max_vorticity': vorticity_mag.max().item(),
-            'vortex_core_volume': vortex_cells * h**3,
-            'reference_area': ref_area,
-            'reference_length': h * self.resolution,
-            'freestream_speed': v_inf,
-            'density': coeffs['density'],
-            'reynolds_number_turbulent': v_inf * h * self.resolution / (self.nu + self.nu_turb.mean().item())
-        }
-
-
+        ref_area_lat = max(torch.sum(torch.any(solid, dim=0).float()).item(), 1.0)
+        df_lat, lf_lat = (self.force_x_accum / self.force_samples, self.force_z_accum / self.force_samples) if self.force_samples > 0 else (self.force_x_last, self.force_z_last)
+        q_lat = 0.5 * 1.0 * (self.u_lat**2) * ref_area_lat
+        cd, cl = df_lat.item()/q_lat, lf_lat.item()/q_lat
+        up = self.config.mach_number * 343.0
+        qp = 0.5 * 1.225 * (up**2) * (ref_area_lat * h**2)
+        return {"drag_coefficient": cd, "lift_coefficient": cl, "force_x": cd*qp, "force_z": cl*qp, "freestream_speed": up, "density": 1.225, "reference_area": ref_area_lat*h**2, "force_definition": "lattice-native"}
 class D3Q27CascadedSolver:
     """Adapter to provide a D3Q27 cascaded solver API compatible with the CFD
     simulator. Wraps the simpler `D3Q27Solver` defined above and exposes the
@@ -735,7 +545,7 @@ class D3Q27CascadedSolver:
         # Seed the equilibrium in lattice units for stability.
         mach = getattr(self.config, 'mach_number', getattr(self.config, 'lbm_config', None) and getattr(self.config.lbm_config, 'mach_number', 0.0))
         if mach:
-            ux = torch.full_like(rho, mach / math.sqrt(3.0))
+            ux = torch.full_like(rho, mach / 3.0)
 
         # compute and set equilibrium populations
         feq = self._solver.compute_equilibrium(rho, ux, uy, uz)
@@ -827,9 +637,8 @@ class D3Q27CascadedSolver:
             lift_force = self._solver.force_z_last
             force_definition = 'bounce-back momentum exchange from last streaming step'
 
-        dt = getattr(self.config.lbm_config, 'time_step', 0.001)
-        physical_drag_force = _scale_momentum_exchange_force(drag_force, h, dt)
-        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, dt)
+        physical_drag_force = _scale_momentum_exchange_force(drag_force, h, getattr(self.config, 'mach_number', 0.0))
+        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, getattr(self.config, 'mach_number', 0.0))
         coeffs = _compute_force_coefficients(
             physical_drag_force,
             physical_lift_force,
