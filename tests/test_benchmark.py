@@ -27,6 +27,38 @@ class TestBenchmarkDiscovery(unittest.TestCase):
             self.assertEqual([p.name for p in stls], ['20mm_cube.stl', 'alpha.stl'])
             self.assertTrue(all(p.parent == root.resolve() for p in stls))
 
+    def test_discover_stls_supports_recursive_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '20mm_cube.stl').write_text('solid cube\nendsolid cube\n')
+            nested = root / 'nested'
+            nested.mkdir()
+            (nested / 'alpha.stl').write_text('solid alpha\nendsolid alpha\n')
+
+            root_only = benchmark.discover_stls(root)
+            recursive = benchmark.discover_stls(root, recursive=True)
+
+            self.assertEqual([p.name for p in root_only], ['20mm_cube.stl'])
+            self.assertEqual([p.name for p in recursive], ['20mm_cube.stl', 'alpha.stl'])
+
+    def test_discover_stls_accepts_explicit_files_globs_and_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / 'nested'
+            nested.mkdir()
+            alpha = root / 'alpha.stl'
+            beta = nested / 'beta.stl'
+            alpha.write_text('solid alpha\nendsolid alpha\n')
+            beta.write_text('solid beta\nendsolid beta\n')
+
+            explicit = benchmark.discover_stls(
+                root,
+                stl_files=f'{alpha},{nested / "*.stl"}',
+                max_stls=1,
+            )
+
+            self.assertEqual([p.name for p in explicit], ['alpha.stl'])
+
     def test_build_sweep_specs_cartesian_product(self):
         args = SimpleNamespace(
             grid_resolutions='24,32',

@@ -7,6 +7,7 @@ import math
 import json
 import os
 import re
+import glob
 import subprocess
 import tempfile
 import shutil
@@ -214,7 +215,21 @@ def ensure_openfoam_installed(install: bool, package: str = OPENFOAM_PACKAGE) ->
 
 
 def discover_root_stls(root: Path = REPO) -> List[Path]:
-    stls = [p.resolve() for p in root.glob('*.stl') if p.is_file()]
+    return _order_stl_paths(root.glob('*.stl'))
+
+
+def _order_stl_paths(paths) -> List[Path]:
+    stls = []
+    seen = set()
+    for path in paths:
+        p = Path(path).resolve()
+        if not p.is_file() or p.suffix.lower() != '.stl':
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        stls.append(p)
+
     prioritized = []
     remaining = []
     for stl in stls:
@@ -228,6 +243,54 @@ def discover_root_stls(root: Path = REPO) -> List[Path]:
     if ordered:
         return ordered
     return []
+
+
+def _split_path_specs(specs: Optional[str]) -> List[str]:
+    if not specs:
+        return []
+    return [part.strip() for part in str(specs).split(',') if part.strip()]
+
+
+def _expand_stl_spec(spec: str, root: Path, recursive: bool) -> List[Path]:
+    has_glob = any(ch in spec for ch in '*?[')
+    candidate = Path(spec)
+    candidates = [candidate]
+    if not candidate.is_absolute():
+        candidates.append(root / candidate)
+
+    matches: List[Path] = []
+    for path in candidates:
+        if has_glob:
+            matches.extend(Path(p) for p in glob.glob(str(path), recursive=True))
+        elif path.is_dir():
+            iterator = path.rglob('*.stl') if recursive else path.glob('*.stl')
+            matches.extend(iterator)
+        else:
+            matches.append(path)
+    return matches
+
+
+def discover_stls(
+    root: Path = REPO,
+    *,
+    recursive: bool = False,
+    stl_files: Optional[str] = None,
+    max_stls: Optional[int] = None,
+) -> List[Path]:
+    root = Path(root).resolve()
+    specs = _split_path_specs(stl_files)
+    if specs:
+        paths = []
+        for spec in specs:
+            paths.extend(_expand_stl_spec(spec, root, recursive))
+    else:
+        iterator = root.rglob('*.stl') if recursive else root.glob('*.stl')
+        paths = list(iterator)
+
+    ordered = _order_stl_paths(paths)
+    if max_stls is not None:
+        ordered = ordered[:max(0, int(max_stls))]
+    return ordered
 
 
 def mesh_to_geometry_mask(mesh, grid_resolution: int, domain_min: np.ndarray, domain_size: float) -> torch.Tensor:
@@ -1547,6 +1610,9 @@ def run_benchmark_for_stl(stl_path: Path, args) -> Dict[str, Any]:
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(description='Run the internal STL benchmark and OpenFOAM comparison.')
     parser.add_argument('--stl-dir', default=str(REPO), help='Directory containing root-level STL files.')
+    parser.add_argument('--stl-files', default=None, help='Optional comma-separated STL files, directories, or glob patterns to benchmark.')
+    parser.add_argument('--recursive-stls', action='store_true', help='Discover STL files recursively under --stl-dir or explicit STL directories.')
+    parser.add_argument('--max-stls', type=int, default=None, help='Optional cap on the number of STL files to benchmark.')
     parser.add_argument('--grid-resolution', type=int, default=DEFAULT_GRID_RESOLUTION, help='Fallback voxel grid resolution for the internal solver.')
     parser.add_argument('--grid-resolutions', default='24,32', help='Comma-separated grid resolutions to sweep.')
     parser.add_argument('--freestream-speed', type=float, default=OPENFOAM_FREESTREAM_SPEED, help='Fallback freestream speed in m/s.')
@@ -1569,29 +1635,45 @@ def main(argv: Optional[Sequence[str]] = None):
     args = parse_args(argv)
 
     stl_dir = Path(args.stl_dir).resolve()
-    stls = discover_root_stls(stl_dir)
-    if not stls:
-        fallback = stl_dir / '20mm_cube.stl'
-        if fallback.exists():
-            stls = [fallback]
+    stls = discover_stls(
+        stl_dir,
+        recursive=bool(getattr(args, 'recursive_stls', False)),
+        stl_files=getattr(args, 'stl_files', None),
+        max_stls=getattr(args, 'max_stls', None),
+    )
 
     results: Dict[str, Any] = {
         'benchmark_root': str(stl_dir),
         'stl_files': [str(p) for p in stls],
+        'stl_count': len(stls),
+        'recursive_stls': bool(getattr(args, 'recursive_stls', False)),
+        'max_stls': getattr(args, 'max_stls', None),
         'cases': [],
         'execution_speed': 125.5,
     }
 
     if not stls:
-        results['error'] = 'No root-level STL files were found.'
+        results['error'] = 'No STL files were found for the requested benchmark input.'
         print(json.dumps(results, indent=None if os.environ.get('GITHUB_ACTIONS') == 'true' else 2))
         return 1
 
     error_values: List[float] = []
+    sweep_case_count = 0
+    completed_sweep_case_count = 0
+    quality_counts = {
+        'high_accuracy': 0,
+        'minimum_acceptable': 0,
+        'not_acceptable': 0,
+    }
     for stl_path in stls:
         case_result = run_benchmark_for_stl(stl_path, args)
         results['cases'].append(case_result)
         for sweep_case in case_result.get('sweep_results', []):
+            sweep_case_count += 1
+            if sweep_case.get('openfoam', {}).get('status') == 'completed':
+                completed_sweep_case_count += 1
+            quality = sweep_case.get('surrogate_label_quality', 'not_acceptable')
+            quality_counts[quality] = quality_counts.get(quality, 0) + 1
             error_value = sweep_case.get('error_percentage')
             if isinstance(error_value, (int, float)) and math.isfinite(error_value):
                 error_values.append(float(error_value))
@@ -1601,6 +1683,9 @@ def main(argv: Optional[Sequence[str]] = None):
     else:
         results['error_percentage'] = None
     add_surrogate_quality_fields(results, results['error_percentage'])
+    results['sweep_case_count'] = sweep_case_count
+    results['completed_sweep_case_count'] = completed_sweep_case_count
+    results['quality_counts'] = quality_counts
 
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         print(json.dumps(results))
