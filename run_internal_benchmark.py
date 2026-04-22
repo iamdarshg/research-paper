@@ -942,6 +942,63 @@ def _parse_float_list(value, default: Sequence[float]) -> List[float]:
     return [float(v) for v in _parse_numeric_list(value, float, default)]
 
 
+def mesh_complexity_summary(mesh) -> Dict[str, Any]:
+    extents = np.asarray(getattr(mesh, 'extents', np.zeros(3)), dtype=float)
+    positive_extents = extents[extents > 1e-12]
+    aspect_ratio = (
+        float(np.max(positive_extents) / np.min(positive_extents))
+        if positive_extents.size
+        else 1.0
+    )
+    return {
+        'face_count': int(len(getattr(mesh, 'faces', []))),
+        'vertex_count': int(len(getattr(mesh, 'vertices', []))),
+        'extents': extents.tolist(),
+        'aspect_ratio': aspect_ratio,
+        'is_watertight': bool(getattr(mesh, 'is_watertight', False)),
+    }
+
+
+def estimate_adaptive_grid_resolutions(
+    mesh,
+    *,
+    min_resolution: int = 24,
+    max_resolution: int = 48,
+    count: int = 1,
+) -> List[int]:
+    summary = mesh_complexity_summary(mesh)
+    face_count = summary['face_count']
+    aspect_ratio = summary['aspect_ratio']
+
+    if face_count < 1_000:
+        base_resolution = 24
+    elif face_count < 5_000:
+        base_resolution = 32
+    elif face_count < 20_000:
+        base_resolution = 40
+    else:
+        base_resolution = 48
+
+    if aspect_ratio > 4.0:
+        base_resolution += 8
+    if not summary['is_watertight'] and face_count > 5_000:
+        base_resolution += 8
+
+    base_resolution = int(np.clip(base_resolution, min_resolution, max_resolution))
+    count = max(1, int(count))
+    if count == 1:
+        return [base_resolution]
+
+    resolutions = [base_resolution]
+    lower = max(min_resolution, base_resolution - 8)
+    upper = min(max_resolution, base_resolution + 8)
+    if lower != base_resolution:
+        resolutions.insert(0, lower)
+    if len(resolutions) < count and upper != base_resolution:
+        resolutions.append(upper)
+    return sorted(dict.fromkeys(resolutions[:count]))
+
+
 def _compute_dynamic_viscosity(freestream_speed: float, reference_length: float, reynolds_number: float, density: float = OPENFOAM_DENSITY) -> float:
     reynolds_number = max(float(reynolds_number), 1e-12)
     return density * float(freestream_speed) * float(reference_length) / reynolds_number
@@ -1351,8 +1408,17 @@ def _stage_case_for_openfoam(case: Path) -> Tuple[str, Optional[str]]:
     return wsl_case, distro
 
 
-def build_sweep_specs(args) -> Dict[str, Any]:
-    grid_resolutions = _parse_int_list(getattr(args, 'grid_resolutions', None), [getattr(args, 'grid_resolution', DEFAULT_GRID_RESOLUTION)])
+def build_sweep_specs(args, mesh=None) -> Dict[str, Any]:
+    adaptive_grids = bool(getattr(args, 'adaptive_grid_resolutions', False))
+    if adaptive_grids and mesh is not None:
+        grid_resolutions = estimate_adaptive_grid_resolutions(
+            mesh,
+            min_resolution=int(getattr(args, 'min_grid_resolution', 24)),
+            max_resolution=int(getattr(args, 'max_grid_resolution', 48)),
+            count=int(getattr(args, 'adaptive_grid_count', 1)),
+        )
+    else:
+        grid_resolutions = _parse_int_list(getattr(args, 'grid_resolutions', None), [getattr(args, 'grid_resolution', DEFAULT_GRID_RESOLUTION)])
     domain_scales = _parse_float_list(getattr(args, 'domain_scales', None), [getattr(args, 'domain_scale', DEFAULT_DOMAIN_SCALE)])
     freestream_speeds = _parse_float_list(getattr(args, 'freestream_speeds', None), [getattr(args, 'freestream_speed', OPENFOAM_FREESTREAM_SPEED)])
     reynolds_numbers = _parse_float_list(getattr(args, 'reynolds_numbers', None), [getattr(args, 'reynolds_number', 1e5)])
@@ -1381,6 +1447,7 @@ def build_sweep_specs(args) -> Dict[str, Any]:
             'reynolds_numbers': reynolds_numbers,
             'step_counts': step_counts,
         },
+        'adaptive_grid_resolutions': adaptive_grids,
         'combinations': combinations,
     }
 
@@ -1587,7 +1654,8 @@ def summarize_sweep_results(sweep_results: List[Dict[str, Any]]) -> Dict[str, An
 def run_benchmark_for_stl(stl_path: Path, args) -> Dict[str, Any]:
     try:
         mesh = _load_trimesh(stl_path)
-        sweep = build_sweep_specs(args)
+        complexity = mesh_complexity_summary(mesh)
+        sweep = build_sweep_specs(args, mesh=mesh)
         sweep_results = []
 
         for sweep_case in sweep['combinations']:
@@ -1595,7 +1663,9 @@ def run_benchmark_for_stl(stl_path: Path, args) -> Dict[str, Any]:
 
         return {
             'stl_path': str(stl_path),
+            'mesh_complexity': complexity,
             'sweep_axes': sweep['axes'],
+            'adaptive_grid_resolutions': sweep['adaptive_grid_resolutions'],
             'sweep_results': sweep_results,
             'summary': summarize_sweep_results(sweep_results),
         }
@@ -1613,6 +1683,10 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument('--stl-files', default=None, help='Optional comma-separated STL files, directories, or glob patterns to benchmark.')
     parser.add_argument('--recursive-stls', action='store_true', help='Discover STL files recursively under --stl-dir or explicit STL directories.')
     parser.add_argument('--max-stls', type=int, default=None, help='Optional cap on the number of STL files to benchmark.')
+    parser.add_argument('--adaptive-grid-resolutions', action='store_true', help='Choose grid resolution per STL from triangle count, aspect ratio, and watertightness.')
+    parser.add_argument('--adaptive-grid-count', type=int, default=1, help='Number of adaptive grid resolutions to run per STL.')
+    parser.add_argument('--min-grid-resolution', type=int, default=24, help='Minimum adaptive grid resolution.')
+    parser.add_argument('--max-grid-resolution', type=int, default=48, help='Maximum adaptive grid resolution.')
     parser.add_argument('--grid-resolution', type=int, default=DEFAULT_GRID_RESOLUTION, help='Fallback voxel grid resolution for the internal solver.')
     parser.add_argument('--grid-resolutions', default='24,32', help='Comma-separated grid resolutions to sweep.')
     parser.add_argument('--freestream-speed', type=float, default=OPENFOAM_FREESTREAM_SPEED, help='Fallback freestream speed in m/s.')

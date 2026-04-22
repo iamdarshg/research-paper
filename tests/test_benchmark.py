@@ -61,6 +61,7 @@ class TestBenchmarkDiscovery(unittest.TestCase):
 
     def test_build_sweep_specs_cartesian_product(self):
         args = SimpleNamespace(
+            adaptive_grid_resolutions=False,
             grid_resolutions='24,32',
             domain_scales='2.0',
             freestream_speeds='60,80',
@@ -81,6 +82,22 @@ class TestBenchmarkDiscovery(unittest.TestCase):
         self.assertEqual(sweep['combinations'][0]['freestream_speed'], 60.0)
         self.assertEqual(sweep['combinations'][0]['reynolds_number'], 50000.0)
         self.assertEqual(sweep['axes']['grid_resolutions'], [24, 32])
+
+    def test_adaptive_grid_resolution_scales_with_mesh_complexity(self):
+        class Mesh:
+            def __init__(self, face_count, extents, watertight):
+                self.faces = [(0, 1, 2)] * face_count
+                self.vertices = [(0.0, 0.0, 0.0)]
+                self.extents = benchmark.np.asarray(extents, dtype=float)
+                self.is_watertight = watertight
+
+        simple = Mesh(686, [15.0, 15.0, 10.0], True)
+        medium = Mesh(1_674, [236.0, 84.0, 340.0], True)
+        complex_open = Mesh(37_298, [171.0, 189.0, 59.0], False)
+
+        self.assertEqual(benchmark.estimate_adaptive_grid_resolutions(simple), [24])
+        self.assertEqual(benchmark.estimate_adaptive_grid_resolutions(medium), [40])
+        self.assertEqual(benchmark.estimate_adaptive_grid_resolutions(complex_open), [48])
 
     def test_make_case_uses_grid_resolution_for_block_mesh(self):
         with tempfile.TemporaryDirectory() as tmp:
