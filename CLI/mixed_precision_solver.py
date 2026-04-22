@@ -3,7 +3,7 @@ Achieves 2-3x speedup on modern GPUs with minimal accuracy loss
 
 Usage:
     from mixed_precision_solver import wrap_solver_mixed_precision
-    solver = GPULBMSolver(config, device, phys_config)
+    solver = D3Q27CascadedSolver(config, device, phys_config)
     solver_fp16 = wrap_solver_mixed_precision(solver)
 """
 import torch

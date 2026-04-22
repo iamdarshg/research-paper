@@ -588,7 +588,7 @@ class CFD_GUI(QMainWindow):
         adv_form.addRow("Grid Resolution:", self.grid_resolution_input)
 
         self.solver_selector = QComboBox()
-        self.solver_selector.addItems(["d3q19_mrt", "d3q27_cascaded"])
+        self.solver_selector.addItems(["d3q27_cascaded"])
         adv_form.addRow("Solver:", self.solver_selector)
 
         self.run_cfd_button = QPushButton("Run CFD Simulation")

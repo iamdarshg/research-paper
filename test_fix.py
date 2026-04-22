@@ -21,7 +21,6 @@ def test_tensor_dimension_alignment():
 
     # Test different solver configurations
     test_cases = [
-        {"solver": "D3Q19", "expected_res": 32},
         {"solver": "D3Q27", "expected_res": 16},
     ]
 

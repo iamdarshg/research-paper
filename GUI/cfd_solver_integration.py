@@ -11,7 +11,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
 try:
     from aircraft_diffusion_cfd import AdvancedCFDSimulator, CFDConfig, LBMPhysicsConfig
-    from advanced_lbm_solver import GPULBMSolver, D3Q27CascadedSolver
+    from advanced_lbm_solver import D3Q27CascadedSolver
     IMPORTS_SUCCESSFUL = True
 except Exception as e:
     print(f"Import error: {e}")
@@ -104,14 +104,10 @@ class CFDSolverWorker(QObject):
             cfd_config.lbm_config.compute_q_criterion = True
             cfd_config.lbm_config.use_vorticity_confinement = True
             
-            if self.solver_type == "d3q27_cascaded":
-                lbm_solver = D3Q27CascadedSolver(cfd_config, device, LBMPhysicsConfig)
-            elif self.solver_type == "d3q19_mrt":
-                lbm_solver = GPULBMSolver(cfd_config, device, LBMPhysicsConfig)
-            else:
-                simulator = AdvancedCFDSimulator(cfd_config, device)
-                lbm_solver = simulator.lbm_solver
-
+            if self.solver_type not in {"d3q27_cascaded", "D3Q27"}:
+                raise ValueError("Only the D3Q27 LBM solver is supported")
+            lbm_solver = D3Q27CascadedSolver(cfd_config, device, LBMPhysicsConfig)
+            
             # Apply mixed precision if enabled
             if self.use_mixed_precision and torch.cuda.is_available():
                 try:

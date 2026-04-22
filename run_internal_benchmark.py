@@ -31,6 +31,8 @@ KINEMATIC_VISCOSITY = 1.47e-5
 DEFAULT_GRID_RESOLUTION = 32
 DEFAULT_SIMULATION_STEPS = 200
 DEFAULT_DOMAIN_SCALE = 2.0
+HIGH_ACCURACY_ERROR_PERCENT = 1.0
+MINIMUM_ACCEPTABLE_ERROR_PERCENT = 5.0
 ROOT_STL_PRIORITY = ('20mm_cube.stl',)
 OPENFOAM_WSL_DISTRO = os.environ.get('OPENFOAM_WSL_DISTRO')
 
@@ -46,6 +48,30 @@ def _sanitize_name(name: str) -> str:
     if cleaned[0].isdigit():
         return f'geom_{cleaned}'
     return cleaned
+
+
+def classify_surrogate_label_quality(error_percentage: Optional[float]) -> str:
+    if error_percentage is None or not math.isfinite(float(error_percentage)):
+        return 'not_acceptable'
+    if float(error_percentage) < HIGH_ACCURACY_ERROR_PERCENT:
+        return 'high_accuracy'
+    if float(error_percentage) < MINIMUM_ACCEPTABLE_ERROR_PERCENT:
+        return 'minimum_acceptable'
+    return 'not_acceptable'
+
+
+def add_surrogate_quality_fields(target: Dict[str, Any], error_percentage: Optional[float]) -> None:
+    finite_error = (
+        error_percentage is not None
+        and math.isfinite(float(error_percentage))
+    )
+    target['surrogate_label_quality'] = classify_surrogate_label_quality(error_percentage)
+    target['meets_one_percent_target'] = (
+        finite_error and float(error_percentage) < HIGH_ACCURACY_ERROR_PERCENT
+    )
+    target['meets_five_percent_minimum'] = (
+        finite_error and float(error_percentage) < MINIMUM_ACCEPTABLE_ERROR_PERCENT
+    )
 
 
 def _default_openfoam_bashrc_candidates(package: str = OPENFOAM_PACKAGE) -> List[str]:
@@ -1315,10 +1341,17 @@ def run_benchmark_case(
         )
         cfg.lbm_config.physical_length_scale = domain_size
         cfg.lbm_config.grid_spacing = domain_size / cfg.base_grid_resolution
-        solver = D3Q27CascadedSolver(cfg, torch.device('cpu'), LBMPhysicsConfig)
+        requested_device = getattr(args, 'device', 'auto')
+        if requested_device == 'auto':
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device(requested_device)
+        solver = D3Q27CascadedSolver(cfg, device, LBMPhysicsConfig)
+        geometry_mask = geometry_mask.to(device, non_blocking=True)
         solver.collide_stream(geometry_mask, steps=sweep_case['steps'])
         internal = solver.compute_aerodynamic_coefficients(geometry_mask)
         internal['stl_name'] = stl_path.name
+        internal['solver_device'] = str(device)
         internal['domain_size'] = domain_size
         internal['max_extent'] = max_extent
         internal['sweep_case'] = sweep_case
@@ -1417,8 +1450,13 @@ def run_benchmark_case(
                                 case_result['error_percentage'] = abs(
                                     internal_cd - of_cd
                                 ) / abs(of_cd) * 100.0
+                                add_surrogate_quality_fields(
+                                    case_result,
+                                    case_result['error_percentage'],
+                                )
                             else:
                                 case_result['error_percentage'] = None
+                                add_surrogate_quality_fields(case_result, None)
                         except Exception as exc:
                             case_result['openfoam']['status'] = 'force_parse_failed'
                             case_result['openfoam']['error'] = repr(exc)
@@ -1464,6 +1502,7 @@ def summarize_sweep_results(sweep_results: List[Dict[str, Any]]) -> Dict[str, An
         'mean_openfoam_drag_coefficient': None,
         'mean_error_percentage': float(np.mean(finite_errors)) if finite_errors else None,
     }
+    add_surrogate_quality_fields(summary, summary['mean_error_percentage'])
     if completed:
         internal_cds = [
             float(case['internal']['drag_coefficient'])
@@ -1522,6 +1561,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument('--install-openfoam', action='store_true', help='Attempt to install OpenFOAM automatically if it is missing.')
     parser.add_argument('--openfoam-package', default=OPENFOAM_PACKAGE, help='OpenFOAM package name to install on Ubuntu/WSL.')
     parser.add_argument('--openfoam-timeout', type=int, default=1200, help='Timeout for each OpenFOAM command in seconds.')
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto', help='Device for the internal D3Q27 solver.')
     return parser.parse_args(argv)
 
 
@@ -1560,6 +1600,7 @@ def main(argv: Optional[Sequence[str]] = None):
         results['error_percentage'] = float(np.mean(error_values))
     else:
         results['error_percentage'] = None
+    add_surrogate_quality_fields(results, results['error_percentage'])
 
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         print(json.dumps(results))

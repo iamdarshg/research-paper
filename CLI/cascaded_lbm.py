@@ -123,7 +123,7 @@ class D3Q27CascadedSolver:
         self.f_temp = torch.zeros_like(self.f)+1e-12
         self.f_pre_stream = torch.empty_like(self.f)
 
-        # Structure of Arrays (SoA) layout matching GPULBMSolver interface
+        # Structure of Arrays (SoA) layout matching the D3Q27 solver interface
         self.velocity_x = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
         self.velocity_y = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12
         self.velocity_z = torch.zeros(self.resolution, self.resolution, self.resolution, device=device)+1e-12

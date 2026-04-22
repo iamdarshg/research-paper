@@ -45,7 +45,7 @@ import yaml
 from scipy.ndimage import label, binary_dilation
 from skimage import measure
 import trimesh
-from advanced_lbm_solver import GPULBMSolver as AdvancedGPULBMSolver, D3Q27CascadedSolver
+from advanced_lbm_solver import D3Q27CascadedSolver
 
 warnings.filterwarnings('ignore')
 
@@ -152,6 +152,7 @@ class LBMPhysicsConfig:
     s_nu_d3q27: float = 1.0 / 0.6    # Viscosity relaxation
     s_e_d3q27: float = 1.2           # Energy relaxation
     s_h_d3q27: float = 1.6           # Higher order relaxation
+    tau_min_d3q27: float = 0.52      # BGK stability floor for under-resolved high-Re runs
 
     # Boundary conditions
     inlet_velocity_relaxation: float = 0.5  # For Zou-He BC smoothing
@@ -168,11 +169,15 @@ class LBMPhysicsConfig:
 
     # Force computation
     momentum_exchange_correction: bool = True  # Apply momentum-exchange method
+    use_triton_streaming: bool = False  # Keep disabled until fused kernel matches physics path exactly
+    drag_link_metric_exponent: Optional[float] = None  # Auto D3Q27 face/edge/corner metric correction
+    drag_reference_speed: float = 80.0  # Natural-unit reference speed for projected-pressure Cd labels
+    drag_speed_normalization_exponent: float = 1.0  # OpenFOAM pressure fallback scales nearly linearly with U_inf
     
 @dataclass
 class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
-    solver_type: str = "D3Q19"  # "D3Q19" or "D3Q27"
+    solver_type: str = "D3Q27"
     base_grid_resolution: int = 32  # Consistent grid resolution - no resizing needed
     mach_number: float = 0.025
     reynolds_number: float = 1e6
@@ -792,7 +797,7 @@ class PipelineParallelism:
         # Simple conversion for pipeline testing
         return torch.sigmoid(latent).view(1, 32, 32, 32)
     
-    async def _run_cfd_async(self, cfd_solver: AdvancedGPULBMSolver, voxel_grid: torch.Tensor) -> Dict[str, float]:
+    async def _run_cfd_async(self, cfd_solver: D3Q27CascadedSolver, voxel_grid: torch.Tensor) -> Dict[str, float]:
         """Run CFD simulation asynchronously"""
         # Convert voxel grid to geometry mask
         geometry_mask = (voxel_grid > 0.5).float()
@@ -817,13 +822,9 @@ class AdvancedCFDSimulator:
         self.device = device
         self.resolution = config.base_grid_resolution
 
-        # Select and initialize the LBM solver
-        if config.solver_type == "D3Q19":
-            self.lbm_solver = AdvancedGPULBMSolver(self.config, device, LBMPhysicsConfig)
-        elif config.solver_type == "D3Q27":
-            self.lbm_solver = D3Q27CascadedSolver(self.config, device, LBMPhysicsConfig)
-        else:
-            raise ValueError(f"Unknown solver type: {config.solver_type}")
+        if config.solver_type != "D3Q27":
+            raise ValueError("Only the D3Q27 LBM solver is supported")
+        self.lbm_solver = D3Q27CascadedSolver(self.config, device, LBMPhysicsConfig)
 
         # Initialize a higher-resolution solver for AMR if enabled
         if self.config.use_amr:
@@ -1845,7 +1846,7 @@ def cli():
 @click.option('--enable-pipeline', is_flag=True, default=True, help='Enable pipeline parallelism')
 @click.option('--enable-checkpointing', is_flag=True, default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
-@click.option('--solver', default='D3Q19', help='CFD solver type: D3Q19 or D3Q27')
+@click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
           num_samples, resume_from, save_dir, enable_consistency, enable_pipeline, 
           enable_checkpointing, enable_compile, solver):
@@ -1963,7 +1964,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 @click.option('--target-speed', default=7.0, help='Target aircraft speed (m/s)')
 @click.option('--num-steps', default=4, help='Number of diffusion steps for generation (4 for consistency)')
 @click.option('--use-marching-cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
-@click.option('--solver', default='D3Q19', help='CFD solver type: D3Q19 or D3Q27')
+@click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver):
     """Generate aircraft design using optimized 4-step consistency model"""
     

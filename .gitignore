@@ -9,3 +9,4 @@ GUI/__pycache__
 CLI/checkpoints_sanity/final_optimized_model.pt
 *.pt
 deprecated/
+*.log

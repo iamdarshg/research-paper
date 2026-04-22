@@ -22,10 +22,10 @@ This guide details the implementation of mixed precision (FP16/FP32) in the LBM 
 
 ```python
 from mixed_precision_solver import wrap_solver_mixed_precision
-from advanced_lbm_solver import GPULBMSolver
+from advanced_lbm_solver import D3Q27CascadedSolver
 
 # Create standard solver
-solver = GPULBMSolver(config, device, phys_config)
+solver = D3Q27CascadedSolver(config, device, phys_config)
 
 # Wrap with mixed precision
 solver_fp16 = wrap_solver_mixed_precision(solver, enable_fp16=True)
@@ -191,10 +191,10 @@ print(f"Density error: {error:.2e}")  # Should be < 1e-4
 
 ## Advanced: Integrating into Existing Solver
 
-To add mixed precision to `GPULBMSolver` directly:
+To add mixed precision to `D3Q27CascadedSolver` directly:
 
 ```python
-class GPULBMSolver:
+class D3Q27CascadedSolver:
     def __init__(self, ..., use_fp16=False):
         self.use_fp16 = use_fp16
         dtype = torch.float16 if use_fp16 else torch.float32
