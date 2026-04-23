@@ -12,6 +12,9 @@ import subprocess
 import tempfile
 import shutil
 import tarfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -36,6 +39,10 @@ HIGH_ACCURACY_ERROR_PERCENT = 1.0
 MINIMUM_ACCEPTABLE_ERROR_PERCENT = 5.0
 ROOT_STL_PRIORITY = ('20mm_cube.stl',)
 OPENFOAM_WSL_DISTRO = os.environ.get('OPENFOAM_WSL_DISTRO')
+_OPENFOAM_DISCOVERY_LOCK = threading.Lock()
+_WSL_DISTRO_CACHE_READY = False
+_WSL_DISTRO_CACHE: Optional[str] = None
+_OPENFOAM_BASHRC_CACHE: Dict[str, Optional[str]] = {}
 
 
 def _is_windows_host() -> bool:
@@ -101,26 +108,45 @@ def _wsl_available() -> bool:
 
 
 def _detect_wsl_distro() -> Optional[str]:
+    global _WSL_DISTRO_CACHE_READY, _WSL_DISTRO_CACHE
     if OPENFOAM_WSL_DISTRO:
         return OPENFOAM_WSL_DISTRO
+    with _OPENFOAM_DISCOVERY_LOCK:
+        if _WSL_DISTRO_CACHE_READY:
+            return _WSL_DISTRO_CACHE
     if not _wsl_available():
+        with _OPENFOAM_DISCOVERY_LOCK:
+            _WSL_DISTRO_CACHE_READY = True
+            _WSL_DISTRO_CACHE = None
         return None
 
     proc = subprocess.run(['wsl', '-l', '-q'], text=True, capture_output=True)
     if proc.returncode != 0:
+        with _OPENFOAM_DISCOVERY_LOCK:
+            _WSL_DISTRO_CACHE_READY = True
+            _WSL_DISTRO_CACHE = None
         return None
 
     normalized = proc.stdout.replace('\x00', '')
     distros = [line.strip() for line in normalized.splitlines() if line.strip()]
     preferred = ['Ubuntu-24.04', 'Ubuntu-22.04', 'Ubuntu']
+    detected = None
     for name in preferred:
         for distro in distros:
             if distro.lower() == name.lower():
-                return distro
-    for distro in distros:
-        if distro.lower().startswith('ubuntu'):
-            return distro
-    return None
+                detected = distro
+                break
+        if detected:
+            break
+    if detected is None:
+        for distro in distros:
+            if distro.lower().startswith('ubuntu'):
+                detected = distro
+                break
+    with _OPENFOAM_DISCOVERY_LOCK:
+        _WSL_DISTRO_CACHE_READY = True
+        _WSL_DISTRO_CACHE = detected
+    return detected
 
 
 def _wsl_quote(value: str) -> str:
@@ -148,11 +174,22 @@ def resolve_openfoam_bashrc(package: str = OPENFOAM_PACKAGE) -> Optional[str]:
     env_bashrc = os.environ.get('OPENFOAM_BASHRC')
     if env_bashrc:
         return env_bashrc
+    cache_key = f"{'windows' if _is_windows_host() else 'posix'}:{package}"
+    with _OPENFOAM_DISCOVERY_LOCK:
+        if cache_key in _OPENFOAM_BASHRC_CACHE:
+            return _OPENFOAM_BASHRC_CACHE[cache_key]
     if _is_windows_host():
-        return _probe_wsl_for_bashrc(package)
+        bashrc = _probe_wsl_for_bashrc(package)
+        with _OPENFOAM_DISCOVERY_LOCK:
+            _OPENFOAM_BASHRC_CACHE[cache_key] = bashrc
+        return bashrc
     for candidate in _default_openfoam_bashrc_candidates(package):
         if Path(candidate).exists():
+            with _OPENFOAM_DISCOVERY_LOCK:
+                _OPENFOAM_BASHRC_CACHE[cache_key] = candidate
             return candidate
+    with _OPENFOAM_DISCOVERY_LOCK:
+        _OPENFOAM_BASHRC_CACHE[cache_key] = None
     return None
 
 
@@ -174,8 +211,20 @@ def run_openfoam(cmd: str, cwd: Path, timeout: int = 600, package: str = OPENFOA
         cwd_str = str(cwd)
         wsl_cwd = cwd_str if cwd_str.startswith('/') else windows_path_to_wsl_path(cwd)
         shell_cmd = f'cd {_wsl_quote(wsl_cwd)} && source {_wsl_quote(bashrc)} >/dev/null 2>&1 && {cmd}'
-        proc = subprocess.run(launcher + [shell_cmd], text=True, capture_output=True, timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr
+        for attempt in range(3):
+            proc = subprocess.run(launcher + [shell_cmd], text=True, capture_output=True, timeout=timeout)
+            combined = f'{proc.stdout}\n{proc.stderr}'
+            transient_wsl_failure = (
+                proc.returncode != 0
+                and (
+                    'Wsl/Service/E_UNEXPECTED' in combined
+                    or 'Catastrophic failure' in combined
+                    or 'Wsl/Service' in combined
+                )
+            )
+            if not transient_wsl_failure or attempt == 2:
+                return proc.returncode, proc.stdout, proc.stderr
+            time.sleep(1.5 * (attempt + 1))
 
     shell_cmd = f'source "{bashrc}" >/dev/null 2>&1 && {cmd}'
     proc = subprocess.run(launcher + [shell_cmd], cwd=cwd, text=True, capture_output=True, timeout=timeout)
@@ -1702,6 +1751,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument('--openfoam-package', default=OPENFOAM_PACKAGE, help='OpenFOAM package name to install on Ubuntu/WSL.')
     parser.add_argument('--openfoam-timeout', type=int, default=1200, help='Timeout for each OpenFOAM command in seconds.')
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto', help='Device for the internal D3Q27 solver.')
+    parser.add_argument('--parallel-stl-jobs', type=int, default=1, help='Number of STL benchmark jobs to run concurrently.')
     return parser.parse_args(argv)
 
 
@@ -1731,6 +1781,12 @@ def main(argv: Optional[Sequence[str]] = None):
         print(json.dumps(results, indent=None if os.environ.get('GITHUB_ACTIONS') == 'true' else 2))
         return 1
 
+    if _is_windows_host():
+        bashrc = resolve_openfoam_bashrc(args.openfoam_package)
+        if bashrc:
+            os.environ.setdefault('OPENFOAM_BASHRC', bashrc)
+        _detect_wsl_distro()
+
     error_values: List[float] = []
     sweep_case_count = 0
     completed_sweep_case_count = 0
@@ -1739,8 +1795,32 @@ def main(argv: Optional[Sequence[str]] = None):
         'minimum_acceptable': 0,
         'not_acceptable': 0,
     }
-    for stl_path in stls:
-        case_result = run_benchmark_for_stl(stl_path, args)
+
+    parallel_jobs = max(1, int(getattr(args, 'parallel_stl_jobs', 1)))
+    effective_parallel_jobs = min(parallel_jobs, len(stls))
+    indexed_results: List[Tuple[int, Dict[str, Any]]] = []
+    if effective_parallel_jobs > 1:
+        with ThreadPoolExecutor(max_workers=effective_parallel_jobs) as executor:
+            futures = {
+                executor.submit(run_benchmark_for_stl, stl_path, args): idx
+                for idx, stl_path in enumerate(stls)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    case_result = future.result()
+                except Exception as exc:  # pragma: no cover
+                    case_result = {
+                        'stl_path': str(stls[idx]),
+                        'status': 'failed',
+                        'error': repr(exc),
+                    }
+                indexed_results.append((idx, case_result))
+    else:
+        for idx, stl_path in enumerate(stls):
+            indexed_results.append((idx, run_benchmark_for_stl(stl_path, args)))
+
+    for _, case_result in sorted(indexed_results, key=lambda item: item[0]):
         results['cases'].append(case_result)
         for sweep_case in case_result.get('sweep_results', []):
             sweep_case_count += 1

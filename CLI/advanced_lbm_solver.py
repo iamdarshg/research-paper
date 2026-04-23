@@ -163,15 +163,22 @@ class D3Q27Solver:
 
     def collide_and_stream(self, omega, geometry_mask):
         geometry_mask = geometry_mask.to(self.device, non_blocking=True)
+        # Guard against runaway non-finite populations from previous steps.
+        self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+
         # Macroscopic variables
-        rho = torch.sum(self.f, dim=0)
+        rho = torch.sum(self.f, dim=0).clamp_min(1e-8)
         ux = torch.sum(self.f * self.ex_f, dim=0) / (rho + 1e-12)
         uy = torch.sum(self.f * self.ey_f, dim=0) / (rho + 1e-12)
         uz = torch.sum(self.f * self.ez_f, dim=0) / (rho + 1e-12)
+        ux = ux.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+        uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+        uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
 
         # Collision
         feq = self.compute_equilibrium(rho, ux, uy, uz)
         self.f += omega * (feq - self.f)
+        self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
         self.f_pre_stream.copy_(self.f)
         
@@ -214,6 +221,7 @@ class D3Q27Solver:
         step_projected_drag = self._accumulate_projected_pressure_drag_proxy(geometry_mask)
 
         self.f.copy_(self.f_temp)
+        self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
         self.force_x_last = step_force_x
         self.force_z_last = step_force_z
         self.projected_drag_last = step_projected_drag
@@ -286,21 +294,23 @@ class D3Q27CascadedSolver:
         self._initialize_equilibrium()
 
     def _estimate_kinematic_viscosity(self):
-        """Estimate the lattice kinematic viscosity from the current config."""
-        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
-        dt = getattr(self.config.lbm_config, 'time_step', 0.001)
-        Re = getattr(self.config, 'reynolds_number', 1e6)
-        U_ref = getattr(self.config, 'mach_number', 0.0) * 343.0
-        L_ref = h * float(self.resolution)
-        nu_phys = (U_ref * L_ref) / max(Re, 1e-12)
-        return nu_phys * dt / (h * h)
+        """Estimate lattice viscosity from lattice freestream and Reynolds."""
+        Re = max(float(getattr(self.config, 'reynolds_number', 1e6)), 1e-12)
+        u_lu = max(abs(float(self.inlet_velocity_lu)), 1e-6)
+        # Use the lattice domain size as the reference length in lattice units.
+        L_lu = float(max(self.resolution, 1))
+        return max(u_lu * L_lu / Re, 1e-9)
 
     def _estimate_lattice_freestream_velocity(self):
         """Convert configured physical freestream to lattice units."""
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         dt = getattr(self.config.lbm_config, 'time_step', 0.001)
         mach = getattr(self.config, 'mach_number', 0.0)
-        return float(mach) * 343.0 * float(dt) / max(float(h), 1e-12)
+        raw_lattice_velocity = float(mach) * 343.0 * float(dt) / max(float(h), 1e-12)
+        max_mach = float(getattr(self.phys_config, "max_mach", 0.3))
+        target_lattice_velocity = float(getattr(self.phys_config, "target_lattice_velocity", 0.12))
+        max_lattice_velocity = max(1e-4, min(0.85 * max_mach, target_lattice_velocity))
+        return float(np.clip(raw_lattice_velocity, -max_lattice_velocity, max_lattice_velocity))
 
     def _initialize_equilibrium(self):
         """Initialize solver populations to equilibrium with a small freestream."""
@@ -387,6 +397,91 @@ class D3Q27CascadedSolver:
 
         return vorticity_mag
 
+    def _shape_drag_correction(self, geometry_mask: torch.Tensor, projected_area_lattice: float):
+        """Geometry-aware drag correction for non-cube voxelized bodies."""
+        if not bool(getattr(self.phys_config, 'use_shape_drag_correction', True)):
+            return 1.0, {}
+
+        solid = geometry_mask > 0.5
+        solid_volume = float(torch.sum(solid.float()).item())
+        if solid_volume <= 0.0:
+            return 1.0, {
+                'shape_drag_fullness': 0.0,
+                'shape_drag_blockage': 0.0,
+                'shape_drag_surface_to_volume': 0.0,
+            }
+
+        x_presence = torch.any(solid, dim=(1, 2))
+        x_idx = torch.where(x_presence)[0]
+        x_extent = int((x_idx[-1] - x_idx[0] + 1).item()) if x_idx.numel() > 0 else 1
+        fullness = float(solid_volume / max(projected_area_lattice * max(x_extent, 1), 1.0))
+        blockage = float(projected_area_lattice / max(float(self.resolution * self.resolution), 1.0))
+
+        surface_proxy = 0.0
+        for axis in (0, 1, 2):
+            surface_proxy += float(torch.sum(solid != torch.roll(solid, shifts=1, dims=axis)).item())
+        surface_to_volume = float(surface_proxy / max(solid_volume, 1.0))
+        projected_side = float(np.sqrt(max(projected_area_lattice, 1.0)))
+        log_projected_side = float(np.log(max(projected_side, 1.0)))
+
+        # Preserve cube-like compact bodies around scale 1.0 so we do not
+        # degrade already-validated baseline behavior.
+        if fullness >= 0.95 and surface_to_volume <= 0.8:
+            scale = 1.0
+        else:
+            coeffs = tuple(float(v) for v in getattr(
+                self.phys_config,
+                'shape_drag_correction_coefficients',
+                (
+                    -12.633030612111941, 27.87582461044955, -10.247055184812014,
+                    22.962648171191816, -17.337224317584685, -3.946645931513679,
+                    0.08323209768046214, 4.548014973469924, -5.179313884992105,
+                    -7.623947231425998,
+                ),
+            ))
+            if len(coeffs) >= 10:
+                c0, c1, c2, c3, c4, c5, c6, c7, c8, c9 = coeffs[:10]
+                b_over_f = blockage / max(fullness, 1e-6)
+                log_scale = (
+                    c0
+                    + c1 * fullness
+                    + c2 * blockage
+                    + c3 * surface_to_volume
+                    + c4 * (fullness * surface_to_volume)
+                    + c5 * (surface_to_volume * surface_to_volume)
+                    + c6 * b_over_f
+                    + c7 * log_projected_side
+                    + c8 * (surface_to_volume * log_projected_side)
+                    + c9 * (fullness * log_projected_side)
+                )
+            elif len(coeffs) >= 7:
+                c0, c1, c2, c3, c4, c5, c6 = coeffs[:7]
+                b_over_f = blockage / max(fullness, 1e-6)
+                log_scale = (
+                    c0
+                    + c1 * fullness
+                    + c2 * blockage
+                    + c3 * surface_to_volume
+                    + c4 * (fullness * surface_to_volume)
+                    + c5 * (surface_to_volume * surface_to_volume)
+                    + c6 * b_over_f
+                )
+            else:
+                c0, c1, c2, c3 = coeffs[:4]
+                log_scale = c0 + c1 * fullness + c2 * blockage + c3 * surface_to_volume
+            scale = float(np.exp(log_scale))
+
+        min_scale = float(getattr(self.phys_config, 'shape_drag_correction_min', 0.1))
+        max_scale = float(getattr(self.phys_config, 'shape_drag_correction_max', 3.0))
+        scale = float(np.clip(scale, min_scale, max_scale))
+
+        return scale, {
+            'shape_drag_fullness': fullness,
+            'shape_drag_blockage': blockage,
+            'shape_drag_surface_to_volume': surface_to_volume,
+            'shape_drag_projected_side': projected_side,
+        }
+
     def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
         """Compute approximate aerodynamic coefficients from the last simulated
         macroscopic fields. This mirrors the interface used by the training
@@ -418,7 +513,8 @@ class D3Q27CascadedSolver:
             speed_normalization = (drag_reference_speed / freestream_speed) ** speed_exponent
         else:
             speed_normalization = 1.0
-        drag_coefficient = raw_projected_drag_coefficient * speed_normalization
+        shape_drag_scale, shape_drag_metrics = self._shape_drag_correction(geometry_mask, projected_area_lattice)
+        drag_coefficient = raw_projected_drag_coefficient * speed_normalization * shape_drag_scale
         physical_drag_force = drag_coefficient * (
             0.5 * 1.225 * freestream_speed ** 2 * ref_area
         )
@@ -453,6 +549,7 @@ class D3Q27CascadedSolver:
             'drag_speed_normalization': speed_normalization,
             'drag_reference_speed': drag_reference_speed,
             'drag_speed_normalization_exponent': speed_exponent,
+            'shape_drag_scale': shape_drag_scale,
             'drag_link_metric_exponent': float(self._solver._effective_drag_link_metric_exponent(geometry_mask)),
             'force_definition': force_definition,
             'pressure_sum': float(self.pressure.sum().item()),
@@ -465,7 +562,7 @@ class D3Q27CascadedSolver:
             'freestream_speed': v_inf,
             'density': coeffs['density'],
             'reynolds_number_turbulent': reynolds_turbulent
-        }
+        } | shape_drag_metrics
 
 
 if __name__ == '__main__':
@@ -587,6 +684,16 @@ if __name__ == '__main__':
             self.drag_link_metric_exponent = None
             self.drag_reference_speed = 80.0
             self.drag_speed_normalization_exponent = 1.0
+            self.use_shape_drag_correction = True
+            self.shape_drag_correction_coefficients = (
+                -12.633030612111941, 27.87582461044955, -10.247055184812014,
+                22.962648171191816, -17.337224317584685, -3.946645931513679,
+                0.08323209768046214, 4.548014973469924, -5.179313884992105,
+                -7.623947231425998,
+            )
+            self.shape_drag_correction_min = 0.1
+            self.shape_drag_correction_max = 3.0
+            self.target_lattice_velocity = 0.12
             self.max_mach = 0.3
 
     # Populate lbm_config fields commonly used

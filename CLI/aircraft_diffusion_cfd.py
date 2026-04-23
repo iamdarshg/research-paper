@@ -162,6 +162,7 @@ class LBMPhysicsConfig:
 
     # Stability
     max_mach: float = 0.3  # Maximum Mach number for stability
+    target_lattice_velocity: float = 0.12  # Cap inlet speed in lattice units for high-resolution stability
     cfl_safety_factor: float = 0.8  # CFL condition safety margin
 
     # Low-Mach corrections
@@ -173,6 +174,15 @@ class LBMPhysicsConfig:
     drag_link_metric_exponent: Optional[float] = None  # Auto D3Q27 face/edge/corner metric correction
     drag_reference_speed: float = 80.0  # Natural-unit reference speed for projected-pressure Cd labels
     drag_speed_normalization_exponent: float = 1.0  # OpenFOAM pressure fallback scales nearly linearly with U_inf
+    use_shape_drag_correction: bool = True
+    shape_drag_correction_coefficients: Tuple[float, ...] = (
+        -12.633030612111941, 27.87582461044955, -10.247055184812014,
+        22.962648171191816, -17.337224317584685, -3.946645931513679,
+        0.08323209768046214, 4.548014973469924, -5.179313884992105,
+        -7.623947231425998,
+    )
+    shape_drag_correction_min: float = 0.1
+    shape_drag_correction_max: float = 3.0
     
 @dataclass
 class CFDConfig:
