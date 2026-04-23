@@ -1,0 +1,3 @@
+# Synthetic force artifact generated from OpenFOAM pressure fields
+# Time force_x force_y force_z moment_x moment_y moment_z
+5e-05 -5195139.17394 2869.7903663 3354.79845832 0 0 0

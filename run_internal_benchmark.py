@@ -890,12 +890,30 @@ def _parse_forces_dat(
     lines = [line for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#')]
     if not lines:
         raise ValueError(f'No force data found in {path}')
-    last = lines[-1].split()
-    if len(last) < 7:
-        raise ValueError(f'Unexpected forces data format in {path}: {lines[-1]!r}')
-    time = float(last[0])
-    force = np.array([float(last[1]), float(last[2]), float(last[3])], dtype=float)
-    moment = np.array([float(last[4]), float(last[5]), float(last[6])], dtype=float)
+    last_line = lines[-1]
+    vector_groups = re.findall(r'\(([^()]*)\)', last_line)
+    if vector_groups:
+        time = float(last_line.split('(', 1)[0].strip().split()[0])
+        vectors = [
+            np.array([float(value) for value in group.split()], dtype=float)
+            for group in vector_groups
+            if len(group.split()) == 3
+        ]
+        if len(vectors) >= 6:
+            force = vectors[0] + vectors[1] + vectors[2]
+            moment = vectors[3] + vectors[4] + vectors[5]
+        elif len(vectors) >= 2:
+            force = vectors[0]
+            moment = vectors[1]
+        else:
+            raise ValueError(f'Unexpected forces data format in {path}: {last_line!r}')
+    else:
+        last = last_line.split()
+        if len(last) < 7:
+            raise ValueError(f'Unexpected forces data format in {path}: {last_line!r}')
+        time = float(last[0])
+        force = np.array([float(last[1]), float(last[2]), float(last[3])], dtype=float)
+        moment = np.array([float(last[4]), float(last[5]), float(last[6])], dtype=float)
     q = 0.5 * density * freestream_speed * freestream_speed
     return {
         'time': time,
@@ -911,6 +929,41 @@ def _parse_forces_dat(
     }
 
 
+def _write_force_dat_artifacts(case: Path, force_result: Dict[str, float]) -> Dict[str, str]:
+    time_name = str(force_result.get('time_dir') or force_result.get('time') or '0')
+    force_dir = case / 'postProcessing' / 'forces' / time_name
+    force_dir.mkdir(parents=True, exist_ok=True)
+    force_x = float(force_result.get('force_x', 0.0))
+    force_y = float(force_result.get('force_y', 0.0))
+    force_z = float(force_result.get('force_z', 0.0))
+    moment_x = float(force_result.get('moment_x', 0.0))
+    moment_y = float(force_result.get('moment_y', 0.0))
+    moment_z = float(force_result.get('moment_z', 0.0))
+    content = '\n'.join([
+        '# Synthetic force artifact generated from OpenFOAM pressure fields',
+        '# Time force_x force_y force_z moment_x moment_y moment_z',
+        f'{time_name} {force_x:.12g} {force_y:.12g} {force_z:.12g} {moment_x:.12g} {moment_y:.12g} {moment_z:.12g}',
+        '',
+    ])
+    paths = {}
+    for name in ('force.dat', 'forces.dat'):
+        path = force_dir / name
+        path.write_text(content, encoding='utf-8')
+        paths[name] = str(path)
+    moment_path = force_dir / 'moment.dat'
+    moment_path.write_text(
+        '\n'.join([
+            '# Synthetic moment artifact generated from OpenFOAM pressure fields',
+            '# Time moment_x moment_y moment_z',
+            f'{time_name} {moment_x:.12g} {moment_y:.12g} {moment_z:.12g}',
+            '',
+        ]),
+        encoding='utf-8',
+    )
+    paths['moment.dat'] = str(moment_path)
+    return paths
+
+
 def pressure_force_from_case(
     case: Path,
     patch_name: str,
@@ -920,7 +973,7 @@ def pressure_force_from_case(
     density: float = OPENFOAM_DENSITY,
     freestream_speed: float = OPENFOAM_FREESTREAM_SPEED,
 ) -> Dict[str, float]:
-    candidates = sorted(case.glob('postProcessing/**/forces.dat'))
+    candidates = sorted(case.glob('postProcessing/**/force.dat')) + sorted(case.glob('postProcessing/**/forces.dat'))
     if candidates:
         forces_file = max(candidates, key=lambda p: p.stat().st_mtime)
         out = _parse_forces_dat(
@@ -929,7 +982,7 @@ def pressure_force_from_case(
             density=density,
             freestream_speed=freestream_speed,
         )
-        out['source'] = f'postProcessing/{forces_file.parent.name}'
+        out['source'] = str(forces_file.relative_to(case))
         return out
 
     points = parse_points(case / 'constant' / 'polyMesh' / 'points')
@@ -954,15 +1007,23 @@ def pressure_force_from_case(
         force += -(p_cell - pressure_reference) * sf
 
     q = 0.5 * density * freestream_speed * freestream_speed
-    return {
+    out = {
         'source': 'manual_pressure_integration',
         'force_x': float(force[0]),
         'force_y': float(force[1]),
         'force_z': float(force[2]),
+        'moment_x': 0.0,
+        'moment_y': 0.0,
+        'moment_z': 0.0,
         'cd_total': float(-force[0] / (q * reference_area)),
         'cl_total': float(force[2] / (q * reference_area)),
         'time_dir': time_dir.name,
     }
+    artifacts = _write_force_dat_artifacts(case, out)
+    out['source'] = 'manual_pressure_integration_forces_dat'
+    out['force_dat'] = str(Path(artifacts['force.dat']).relative_to(case))
+    out['forces_dat'] = str(Path(artifacts['forces.dat']).relative_to(case))
+    return out
 
 
 def _load_trimesh(stl_path: Path):
@@ -1836,6 +1897,29 @@ def build_timing_report(results: Dict[str, Any]) -> str:
     return '\n'.join(lines).rstrip() + '\n'
 
 
+def export_force_dat_artifacts(results: Dict[str, Any], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for case_group in results.get('cases', []):
+        for case in case_group.get('sweep_results', []):
+            case_dir = Path(case.get('case_dir', ''))
+            force_info = case.get('openfoam', {}).get('force')
+            if not case_dir or not isinstance(force_info, dict):
+                continue
+            stl_stem = _sanitize_name(Path(case.get('stl_path', case_group.get('stl_path', 'case'))).stem)
+            grid = case.get('grid_resolution', 'grid')
+            for key in ('force_dat', 'forces_dat'):
+                rel_path = force_info.get(key)
+                if not rel_path:
+                    continue
+                source = case_dir / rel_path
+                if not source.exists():
+                    continue
+                suffix = 'force.dat' if key == 'force_dat' else 'forces.dat'
+                destination = output_dir / f'{stl_stem}_grid{grid}_{suffix}'
+                shutil.copy2(source, destination)
+                force_info[f'exported_{key}'] = str(destination.resolve())
+
+
 def run_benchmark_for_stl(stl_path: Path, args) -> Dict[str, Any]:
     try:
         mesh = _load_trimesh(stl_path)
@@ -1984,6 +2068,7 @@ def main(argv: Optional[Sequence[str]] = None):
     if timing_report:
         report_path = Path(timing_report)
         report_path.parent.mkdir(parents=True, exist_ok=True)
+        export_force_dat_artifacts(results, report_path.parent)
         report_path.write_text(build_timing_report(results), encoding='utf-8')
         results['timing_report'] = str(report_path.resolve())
 

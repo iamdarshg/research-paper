@@ -2,19 +2,19 @@
 
 Benchmark root: `D:\CodeProjects\research-paper`
 STL count: 1
-Total benchmark wall time: 51.194s
+Total benchmark wall time: 53.870s
 
 ## Case Summary
 
 | STL | Grid | Steps | Internal Solver Total | OpenFOAM Total | OpenFOAM/Internal | Error | Force Source | OpenFOAM Status |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| F-18_Hornet.stl | 32 | 200 | 4.572s | 46.051s | 10.07x | 0.000003% | manual_pressure_integration | completed |
+| F-18_Hornet.stl | 32 | 200 | 4.976s | 48.244s | 9.69x | 0.000003% | manual_pressure_integration_forces_dat | completed |
 
 ## Aggregate Timing
 
-Mean internal solver time: 4.572s
-Mean OpenFOAM time: 46.051s
-Mean OpenFOAM/internal ratio: 10.07x
+Mean internal solver time: 4.976s
+Mean OpenFOAM time: 48.244s
+Mean OpenFOAM/internal ratio: 9.69x
 
 ## OpenFOAM Command Breakdown
 
@@ -22,9 +22,9 @@ Mean OpenFOAM/internal ratio: 10.07x
 
 | Command | Return Code | Duration |
 | --- | ---: | ---: |
-| blockMesh | 0 | 0.684s |
-| surfaceFeatureExtract | 0 | 0.313s |
-| snappyHexMesh | 0 | 5.919s |
-| checkMesh | 0 | 1.123s |
-| sonicFoam | 0 | 34.293s |
-| forces | 0 | 0.516s |
+| blockMesh | 0 | 0.647s |
+| surfaceFeatureExtract | 0 | 0.273s |
+| snappyHexMesh | 0 | 5.887s |
+| checkMesh | 0 | 1.200s |
+| sonicFoam | 0 | 35.679s |
+| forces | 0 | 0.550s |

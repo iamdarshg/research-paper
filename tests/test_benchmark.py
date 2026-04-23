@@ -154,6 +154,76 @@ class TestBenchmarkDiscovery(unittest.TestCase):
             self.assertTrue(mesh.is_winding_consistent)
             self.assertEqual(len(mesh.faces), 12)
 
+    def test_parse_openfoam_force_dat_vector_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            force_dat = Path(tmp) / 'force.dat'
+            force_dat.write_text(
+                '# Time forces(pressure viscous porous) moment(pressure viscous porous)\n'
+                '0.1 (1 2 3) (4 5 6) (7 8 9) (0.1 0.2 0.3) (0.4 0.5 0.6) (0.7 0.8 0.9)\n'
+            )
+
+            parsed = benchmark._parse_forces_dat(
+                force_dat,
+                reference_area=2.0,
+                density=1.0,
+                freestream_speed=10.0,
+            )
+
+            self.assertEqual(parsed['force_x'], 12.0)
+            self.assertEqual(parsed['force_y'], 15.0)
+            self.assertEqual(parsed['force_z'], 18.0)
+            self.assertAlmostEqual(parsed['moment_z'], 1.8)
+
+    def test_write_force_dat_artifacts_creates_singular_and_plural_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Path(tmp)
+
+            artifacts = benchmark._write_force_dat_artifacts(case, {
+                'time_dir': '5e-05',
+                'force_x': -10.0,
+                'force_y': 1.0,
+                'force_z': 2.0,
+                'moment_x': 0.0,
+                'moment_y': 0.0,
+                'moment_z': 0.0,
+            })
+
+            self.assertTrue((case / 'postProcessing' / 'forces' / '5e-05' / 'force.dat').exists())
+            self.assertTrue((case / 'postProcessing' / 'forces' / '5e-05' / 'forces.dat').exists())
+            self.assertIn('force.dat', artifacts)
+
+    def test_export_force_dat_artifacts_copies_report_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            case = root / 'case'
+            force_dir = case / 'postProcessing' / 'forces' / '5e-05'
+            force_dir.mkdir(parents=True)
+            (force_dir / 'force.dat').write_text('0 -1 0 0 0 0 0\n')
+            (force_dir / 'forces.dat').write_text('0 -1 0 0 0 0 0\n')
+            results = {
+                'cases': [{
+                    'stl_path': str(REPO / 'F-18_Hornet.stl'),
+                    'sweep_results': [{
+                        'stl_path': str(REPO / 'F-18_Hornet.stl'),
+                        'case_dir': str(case),
+                        'grid_resolution': 32,
+                        'openfoam': {
+                            'force': {
+                                'force_dat': 'postProcessing/forces/5e-05/force.dat',
+                                'forces_dat': 'postProcessing/forces/5e-05/forces.dat',
+                            },
+                        },
+                    }],
+                }],
+            }
+
+            benchmark.export_force_dat_artifacts(results, root / 'out')
+
+            self.assertTrue((root / 'out' / 'F_18_Hornet_grid32_force.dat').exists())
+            self.assertTrue((root / 'out' / 'F_18_Hornet_grid32_forces.dat').exists())
+            force_info = results['cases'][0]['sweep_results'][0]['openfoam']['force']
+            self.assertIn('exported_force_dat', force_info)
+
     def test_build_timing_report_includes_solver_and_openfoam_totals(self):
         results = {
             'benchmark_root': str(REPO),
