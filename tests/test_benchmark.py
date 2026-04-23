@@ -130,7 +130,10 @@ class TestBenchmarkDiscovery(unittest.TestCase):
             )
             try:
                 block_mesh = (case / 'system' / 'blockMeshDict').read_text()
+                forces = (case / 'system' / 'forces').read_text()
                 self.assertIn('(18 18 18)', block_mesh)
+                self.assertIn('libs ("libforces.so")', forces)
+                self.assertNotIn('functionObjectLibs', forces)
             finally:
                 shutil.rmtree(case, ignore_errors=True)
 
@@ -150,6 +153,48 @@ class TestBenchmarkDiscovery(unittest.TestCase):
             self.assertTrue(mesh.is_watertight)
             self.assertTrue(mesh.is_winding_consistent)
             self.assertEqual(len(mesh.faces), 12)
+
+    def test_build_timing_report_includes_solver_and_openfoam_totals(self):
+        results = {
+            'benchmark_root': str(REPO),
+            'stl_count': 1,
+            'benchmark_total_seconds': 13.0,
+            'cases': [{
+                'stl_path': str(REPO / 'F-18_Hornet.stl'),
+                'sweep_results': [{
+                    'stl_path': str(REPO / 'F-18_Hornet.stl'),
+                    'grid_resolution': 32,
+                    'steps': 200,
+                    'error_percentage': 0.25,
+                    'timings': {
+                        'internal_solver_total_seconds': 2.0,
+                        'openfoam_total_seconds': 10.0,
+                        'openfoam_to_internal_speed_ratio': 5.0,
+                    },
+                    'openfoam': {
+                        'status': 'completed',
+                        'force': {
+                            'source': 'postProcessing/forces.dat',
+                        },
+                        'commands': {
+                            'sonicFoam': {
+                                'returncode': 0,
+                                'duration_seconds': 6.5,
+                            },
+                        },
+                    },
+                }],
+            }],
+        }
+
+        report = benchmark.build_timing_report(results)
+
+        self.assertIn('F-18_Hornet.stl', report)
+        self.assertIn('2.000s', report)
+        self.assertIn('10.000s', report)
+        self.assertIn('5.00x', report)
+        self.assertIn('postProcessing/forces.dat', report)
+        self.assertIn('sonicFoam', report)
 
 
 if __name__ == '__main__':

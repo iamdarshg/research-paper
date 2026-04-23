@@ -82,6 +82,15 @@ def add_surrogate_quality_fields(target: Dict[str, Any], error_percentage: Optio
     )
 
 
+def _sync_timing_device(device: torch.device) -> None:
+    if device.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _duration_since(start: float) -> float:
+    return float(time.perf_counter() - start)
+
+
 def _default_openfoam_bashrc_candidates(package: str = OPENFOAM_PACKAGE) -> List[str]:
     root = os.environ.get('OPENFOAM_ROOT')
     candidates = []
@@ -756,7 +765,7 @@ boundaryField
     object forces;
 }
 type forces;
-functionObjectLibs (\"libforces.so\");
+libs (\"libforces.so\");
 patches (cube);
 rho rho;
 rhoInf 1.225;
@@ -1425,7 +1434,7 @@ boundaryField
     object forces;
 }}
 type forces;
-functionObjectLibs ("libforces.so");
+libs ("libforces.so");
 patches ({patch_name});
 rho rho;
 rhoInf {density};
@@ -1508,10 +1517,17 @@ def run_benchmark_case(
     args,
 ) -> Dict[str, Any]:
     try:
+        case_started = time.perf_counter()
+        timings: Dict[str, Any] = {}
+
+        internal_started = time.perf_counter()
+        geometry_started = time.perf_counter()
         domain_min, domain_max, domain_size, max_extent = compute_geometry_frame(mesh, sweep_case['domain_scale'])
         patch_name = _sanitize_name(stl_path.stem)
         geometry_mask = mesh_to_geometry_mask(mesh, sweep_case['grid_resolution'], domain_min, domain_size)
+        timings['geometry_preparation_seconds'] = _duration_since(geometry_started)
 
+        setup_started = time.perf_counter()
         cfg = CFDConfig(
             base_grid_resolution=sweep_case['grid_resolution'],
             mach_number=sweep_case['freestream_speed'] / 343.0,
@@ -1527,8 +1543,19 @@ def run_benchmark_case(
             device = torch.device(requested_device)
         solver = D3Q27CascadedSolver(cfg, device, LBMPhysicsConfig)
         geometry_mask = geometry_mask.to(device, non_blocking=True)
+        _sync_timing_device(device)
+        timings['solver_setup_seconds'] = _duration_since(setup_started)
+
+        simulation_started = time.perf_counter()
         solver.collide_stream(geometry_mask, steps=sweep_case['steps'])
+        _sync_timing_device(device)
+        timings['solver_simulation_seconds'] = _duration_since(simulation_started)
+
+        coefficient_started = time.perf_counter()
         internal = solver.compute_aerodynamic_coefficients(geometry_mask)
+        _sync_timing_device(device)
+        timings['solver_coefficients_seconds'] = _duration_since(coefficient_started)
+        timings['internal_solver_total_seconds'] = _duration_since(internal_started)
         internal['stl_name'] = stl_path.name
         internal['solver_device'] = str(device)
         internal['domain_size'] = domain_size
@@ -1563,14 +1590,18 @@ def run_benchmark_case(
                 'status': 'skipped',
                 'available': False,
             },
+            'timings': timings,
         }
 
         try:
             if ensure_openfoam_installed(args.install_openfoam, args.openfoam_package):
+                openfoam_started = time.perf_counter()
                 openfoam_case = case
                 wsl_case = None
                 if _is_windows_host():
+                    staging_started = time.perf_counter()
                     openfoam_case, wsl_distro = _stage_case_for_openfoam(case)
+                    timings['openfoam_stage_to_wsl_seconds'] = _duration_since(staging_started)
                     wsl_case = str(openfoam_case)
                 else:
                     wsl_distro = None
@@ -1582,21 +1613,24 @@ def run_benchmark_case(
                     ('snappyHexMesh', 'snappyHexMesh -overwrite', True),
                     ('checkMesh', 'checkMesh -allTopology -allGeometry', False),
                     ('sonicFoam', 'sonicFoam > log.sonicFoam 2>&1', True),
-                    ('forces', 'postProcess -func forces -latestTime > log.forces 2>&1', False),
+                    ('forces', 'postProcess -dict system/forces -latestTime > log.forces 2>&1', False),
                 ]
                 openfoam_failed = False
                 try:
                     for key, cmd, fatal in commands:
+                        command_started = time.perf_counter()
                         code, out, err = run_openfoam(
                             cmd,
                             openfoam_case,
                             timeout=args.openfoam_timeout,
                             package=args.openfoam_package,
                         )
+                        command_seconds = _duration_since(command_started)
                         command_results[key] = {
                             'returncode': code,
                             'stdout': out[-4000:],
                             'stderr': err[-4000:],
+                            'duration_seconds': command_seconds,
                         }
                         if code != 0 and fatal:
                             openfoam_failed = True
@@ -1604,7 +1638,9 @@ def run_benchmark_case(
                             break
 
                     if wsl_case and wsl_distro:
+                        copy_back_started = time.perf_counter()
                         _copy_wsl_case_to_windows(wsl_case, case, distro=wsl_distro)
+                        timings['openfoam_copy_back_seconds'] = _duration_since(copy_back_started)
 
                     case_result['openfoam'].update({
                         'available': True,
@@ -1642,6 +1678,7 @@ def run_benchmark_case(
                     else:
                         case_result['openfoam']['status'] = 'command_failed'
                 finally:
+                    timings['openfoam_total_seconds'] = _duration_since(openfoam_started)
                     if wsl_case and wsl_distro:
                         _remove_wsl_case(wsl_case, distro=wsl_distro)
             else:
@@ -1652,6 +1689,16 @@ def run_benchmark_case(
             case_result['openfoam']['available'] = False
             case_result['openfoam']['status'] = 'error'
             case_result['openfoam']['error'] = repr(exc)
+
+        internal_total = timings.get('internal_solver_total_seconds')
+        openfoam_total = timings.get('openfoam_total_seconds')
+        if (
+            isinstance(internal_total, (int, float))
+            and isinstance(openfoam_total, (int, float))
+            and float(internal_total) > 0.0
+        ):
+            timings['openfoam_to_internal_speed_ratio'] = float(openfoam_total) / float(internal_total)
+        timings['case_total_seconds'] = _duration_since(case_started)
 
         return case_result
     except Exception as exc:
@@ -1698,6 +1745,95 @@ def summarize_sweep_results(sweep_results: List[Dict[str, Any]]) -> Dict[str, An
         if openfoam_cds:
             summary['mean_openfoam_drag_coefficient'] = float(np.mean(openfoam_cds))
     return summary
+
+
+def _format_seconds(value: Any) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return 'n/a'
+    return f'{float(value):.3f}s'
+
+
+def _format_percent(value: Any) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return 'n/a'
+    return f'{float(value):.6f}%'
+
+
+def build_timing_report(results: Dict[str, Any]) -> str:
+    lines = [
+        '# Solver Timing Report',
+        '',
+        f"Benchmark root: `{results.get('benchmark_root', '')}`",
+        f"STL count: {results.get('stl_count', 0)}",
+        f"Total benchmark wall time: {_format_seconds(results.get('benchmark_total_seconds', results.get('execution_speed')))}",
+        '',
+        '## Case Summary',
+        '',
+        '| STL | Grid | Steps | Internal Solver Total | OpenFOAM Total | OpenFOAM/Internal | Error | Force Source | OpenFOAM Status |',
+        '| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |',
+    ]
+
+    internal_totals: List[float] = []
+    openfoam_totals: List[float] = []
+
+    for case_group in results.get('cases', []):
+        for case in case_group.get('sweep_results', []):
+            timings = case.get('timings', {})
+            internal_total = timings.get('internal_solver_total_seconds')
+            openfoam_total = timings.get('openfoam_total_seconds')
+            if isinstance(internal_total, (int, float)) and math.isfinite(float(internal_total)):
+                internal_totals.append(float(internal_total))
+            if isinstance(openfoam_total, (int, float)) and math.isfinite(float(openfoam_total)):
+                openfoam_totals.append(float(openfoam_total))
+
+            ratio = timings.get('openfoam_to_internal_speed_ratio')
+            ratio_text = 'n/a'
+            if isinstance(ratio, (int, float)) and math.isfinite(float(ratio)):
+                ratio_text = f'{float(ratio):.2f}x'
+            lines.append(
+                '| {stl} | {grid} | {steps} | {internal} | {openfoam} | {ratio} | {error} | {force_source} | {status} |'.format(
+                    stl=Path(case.get('stl_path', case_group.get('stl_path', ''))).name,
+                    grid=case.get('grid_resolution', ''),
+                    steps=case.get('steps', ''),
+                    internal=_format_seconds(internal_total),
+                    openfoam=_format_seconds(openfoam_total),
+                    ratio=ratio_text,
+                    error=_format_percent(case.get('error_percentage')),
+                    force_source=case.get('openfoam', {}).get('force', {}).get('source', 'n/a'),
+                    status=case.get('openfoam', {}).get('status', ''),
+                )
+            )
+
+    if internal_totals or openfoam_totals:
+        lines.extend(['', '## Aggregate Timing', ''])
+        if internal_totals:
+            lines.append(f'Mean internal solver time: {_format_seconds(float(np.mean(internal_totals)))}')
+        if openfoam_totals:
+            lines.append(f'Mean OpenFOAM time: {_format_seconds(float(np.mean(openfoam_totals)))}')
+        if internal_totals and openfoam_totals and float(np.mean(internal_totals)) > 0.0:
+            lines.append(f'Mean OpenFOAM/internal ratio: {float(np.mean(openfoam_totals)) / float(np.mean(internal_totals)):.2f}x')
+
+    lines.extend(['', '## OpenFOAM Command Breakdown', ''])
+    for case_group in results.get('cases', []):
+        for case in case_group.get('sweep_results', []):
+            stl_name = Path(case.get('stl_path', case_group.get('stl_path', ''))).name
+            lines.extend([
+                f"### {stl_name} grid {case.get('grid_resolution', '')}",
+                '',
+                '| Command | Return Code | Duration |',
+                '| --- | ---: | ---: |',
+            ])
+            commands = case.get('openfoam', {}).get('commands', {})
+            for command_name, command_result in commands.items():
+                if not isinstance(command_result, dict):
+                    continue
+                lines.append(
+                    f"| {command_name} | {command_result.get('returncode', '')} | "
+                    f"{_format_seconds(command_result.get('duration_seconds'))} |"
+                )
+            lines.append('')
+
+    return '\n'.join(lines).rstrip() + '\n'
 
 
 def run_benchmark_for_stl(stl_path: Path, args) -> Dict[str, Any]:
@@ -1752,10 +1888,12 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument('--openfoam-timeout', type=int, default=1200, help='Timeout for each OpenFOAM command in seconds.')
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto', help='Device for the internal D3Q27 solver.')
     parser.add_argument('--parallel-stl-jobs', type=int, default=1, help='Number of STL benchmark jobs to run concurrently.')
+    parser.add_argument('--timing-report', default=None, help='Optional markdown report path for internal solver vs OpenFOAM timing.')
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None):
+    benchmark_started = time.perf_counter()
     args = parse_args(argv)
 
     stl_dir = Path(args.stl_dir).resolve()
@@ -1773,7 +1911,6 @@ def main(argv: Optional[Sequence[str]] = None):
         'recursive_stls': bool(getattr(args, 'recursive_stls', False)),
         'max_stls': getattr(args, 'max_stls', None),
         'cases': [],
-        'execution_speed': 125.5,
     }
 
     if not stls:
@@ -1840,6 +1977,15 @@ def main(argv: Optional[Sequence[str]] = None):
     results['sweep_case_count'] = sweep_case_count
     results['completed_sweep_case_count'] = completed_sweep_case_count
     results['quality_counts'] = quality_counts
+    results['benchmark_total_seconds'] = _duration_since(benchmark_started)
+    results['execution_speed'] = results['benchmark_total_seconds']
+
+    timing_report = getattr(args, 'timing_report', None)
+    if timing_report:
+        report_path = Path(timing_report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(build_timing_report(results), encoding='utf-8')
+        results['timing_report'] = str(report_path.resolve())
 
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         print(json.dumps(results))
