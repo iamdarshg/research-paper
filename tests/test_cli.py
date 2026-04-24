@@ -8,12 +8,11 @@ import numpy as np
 # Add CLI to path
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
-from aircraft_diffusion_cfd import (
-    ModelConfig, DiffusionConfig, TrainingConfig, CFDConfig,
-    LatentDiffusionUNet, ConsistencyModel, LatentTo3DConverter,
-    OptimizedDiffusionTrainer, AircraftDesignDataset, DesignSpec,
-    AdvancedCFDSimulator
-)
+from config import ModelConfig, DiffusionConfig, TrainingConfig, CFDConfig, DesignSpec
+from models import LatentDiffusionUNet, ConsistencyModel, LatentTo3DConverter
+from trainer import OptimizedDiffusionTrainer
+from data_utils import AircraftDesignDataset
+from cfd_simulator import AdvancedCFDSimulator
 
 class TestCLI(unittest.TestCase):
     def setUp(self):
