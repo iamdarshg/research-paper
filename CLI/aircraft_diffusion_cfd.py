@@ -88,6 +88,7 @@ class ModelConfig:
     # Grid resolution - configurable for different lattice sizes
     base_grid_resolution: int = 32  # Consistent grid resolution for voxel, CFD, etc.
     grid_resolution: int = None  # Working grid resolution (defaults to base_grid_resolution if not set)
+    target_grid_resolution: int = 1024 # Final high-res target
     # Memory optimization
     enable_gradient_checkpointing: bool = True  # 60% VRAM savings
     use_torch_compile: bool = False  # Kernel fusion
@@ -713,7 +714,7 @@ class LatentDiffusionUNet(nn.Module):
         return out
 
 class LatentTo3DConverter(nn.Module):
-    """Convert n-dimensional latent codes to 3D spatial representation"""
+    """Convert n-dimensional latent codes to 3D spatial representation with adaptive output"""
 
     def __init__(self, latent_dim: int, grid_resolution: int = 32):
         super().__init__()
@@ -730,11 +731,32 @@ class LatentTo3DConverter(nn.Module):
             nn.Linear(2048, total_voxels)
         )
     
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """Convert latent code to voxel grid"""
+    def set_resolution(self, new_resolution: int):
+        """Update working output resolution for interpolation"""
+        if new_resolution == self.grid_resolution:
+            return
+        self.grid_resolution = new_resolution
+        print(f"LatentTo3DConverter: Target resolution set to {new_resolution}^3")
+
+    def forward(self, latent: torch.Tensor, target_res: int = None) -> torch.Tensor:
+        """Convert latent code to voxel grid, optionally interpolating to target_res"""
         batch_size = latent.shape[0]
         voxels = self.decoder(latent)
-        voxels = voxels.view(batch_size, *self.output_shape)
+
+        # Original decoder output size was fixed at init
+        base_res = int(round(voxels.shape[1]**(1/3)))
+        voxels = voxels.view(batch_size, base_res, base_res, base_res)
+
+        target = target_res if target_res is not None else self.grid_resolution
+
+        if target != base_res:
+            voxels = F.interpolate(
+                voxels.unsqueeze(1),
+                size=(target, target, target),
+                mode='trilinear',
+                align_corners=False
+            ).squeeze(1)
+
         return voxels
 
 # ============================================================================
@@ -848,6 +870,28 @@ class AdvancedCFDSimulator:
         # Initialize flow field
         self.init_flow_field()
     
+    def set_resolution(self, resolution: int):
+        """Update simulator resolution and re-initialize solver"""
+        if resolution == self.resolution:
+            return
+
+        self.resolution = resolution
+        self.config.base_grid_resolution = resolution
+
+        # Re-initialize LBM solver with new resolution
+        self.lbm_solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
+
+        if self.config.use_amr:
+            import copy
+            amr_config = copy.deepcopy(self.config)
+            amr_config.resolution = resolution * 2
+            self.amr_solver = D3Q27CascadedSolver(amr_config, self.device, LBMPhysicsConfig)
+        else:
+            self.amr_solver = None
+
+        self.init_flow_field()
+        print(f"AdvancedCFDSimulator: Solver resolution updated to {resolution}^3")
+
     def init_flow_field(self):
         """Initialize flow field for incompressible flow"""
         # Initialize LBM solver
@@ -951,44 +995,66 @@ class AdvancedCFDSimulator:
 # ============================================================================
 import random
 class AircraftDesignDataset(Dataset):
-    """Synthetic dataset for aircraft structure training"""
+    """Synthetic dataset for aircraft structure training with adaptive resolution"""
 
-    def __init__(self, num_samples: int = 10000, grid_size: int = 32, seed: int = random.randint(0,100), latent_dim: int = 128):
+    def __init__(self, num_samples: int = 10000, grid_size: int = 32, seed: int = None, latent_dim: int = 128, target_grid_size: int = 1024):
         self.num_samples = num_samples
         self.grid_size = grid_size
+        self.target_grid_size = target_grid_size
+
+        if seed is None:
+            seed = random.randint(0, 1000000)
         np.random.seed(seed)
         torch.manual_seed(seed)
 
         self.latent_codes = torch.randn(num_samples, latent_dim)
         self.geometries = self._generate_geometries()
     
+    def set_resolution(self, new_grid_size: int):
+        """Update dataset resolution for progressive training via interpolation"""
+        if new_grid_size == self.grid_size:
+            return
+
+        print(f"Dataset: Interpolating geometries from {self.grid_size}^3 to {new_grid_size}^3...")
+        new_geometries = []
+        for geom in self.geometries:
+            geom_reshaped = geom.unsqueeze(0).unsqueeze(0)
+            interpolated = F.interpolate(
+                geom_reshaped,
+                size=(new_grid_size, new_grid_size, new_grid_size),
+                mode='trilinear',
+                align_corners=False
+            )
+            new_geometries.append((interpolated.squeeze() > 0.5).float())
+
+        self.geometries = new_geometries
+        self.grid_size = new_grid_size
+
     def _generate_geometries(self) -> List[torch.Tensor]:
-        """Generate synthetic aircraft geometries"""
+        """Generate synthetic aircraft geometries using vectorized ops"""
         geometries = []
         for i in range(self.num_samples):
-            # Create fuselage-like structure
             geom = torch.zeros(self.grid_size, self.grid_size, self.grid_size)
-            
-            # Central fuselage
+            scale = self.grid_size / 32.0
             cx, cy, cz = self.grid_size // 2, self.grid_size // 2, self.grid_size // 2
-            for x in range(self.grid_size):
-                for y in range(self.grid_size):
-                    for z in range(self.grid_size):
-                        dist_center = ((x - cx) ** 2 + (z - cz) ** 2) ** 0.5
-                        if dist_center < 6 and 10 < y < 22:
-                            geom[x, y, z] = 1.0
             
-            # Wings
-            for x in range(self.grid_size):
-                for y in range(self.grid_size):
-                    for z in range(self.grid_size):
-                        if 8 < y < 24 and (z < 4 or z > self.grid_size - 4):
-                            geom[x, y, z] = 1.0
+            z_indices, y_indices, x_indices = torch.meshgrid(
+                torch.arange(self.grid_size),
+                torch.arange(self.grid_size),
+                torch.arange(self.grid_size),
+                indexing='ij'
+            )
+
+            dist_center = torch.sqrt((x_indices - cx)**2 + (z_indices - cz)**2)
+            fuselage_mask = (dist_center < 6 * scale) & (y_indices > 10 * scale) & (y_indices < 22 * scale)
+            geom[fuselage_mask] = 1.0
+
+            wing_mask = (y_indices > 8 * scale) & (y_indices < 24 * scale) & \
+                        ((z_indices < 4 * scale) | (z_indices > self.grid_size - 4 * scale))
+            geom[wing_mask] = 1.0
             
-            # Add some noise for variation
             noise = torch.rand_like(geom)
             geom = (geom + 0.1 * noise > 0.5).float()
-            
             geometries.append(geom)
         
         return geometries
@@ -1119,6 +1185,9 @@ class OptimizedDiffusionTrainer:
         self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
         self.converter = LatentTo3DConverter(model_config.latent_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
         
+        # Progressive growth state
+        self.current_grid_size = model_config.grid_resolution
+
         # 4-step consistency model
         self.consistency_model = ConsistencyModel(model_config, diffusion_config, self.dtype).to(self.device)
         
@@ -1170,6 +1239,12 @@ class OptimizedDiffusionTrainer:
 
     def validate_epoch(self, val_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Validate for one epoch with the high-fidelity D3Q27 solver"""
+        # Synchronize resolutions
+        if self.current_grid_size != grid_size:
+            self.converter.set_resolution(grid_size)
+            self.cfd_simulator.set_resolution(grid_size)
+            self.current_grid_size = grid_size
+
         self.diffusion_model.eval()
         self.converter.eval()
 
@@ -1202,6 +1277,12 @@ class OptimizedDiffusionTrainer:
 
     def train_epoch(self, train_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Train for one epoch with all optimizations"""
+        # Synchronize resolutions
+        if self.current_grid_size != grid_size:
+            self.converter.set_resolution(grid_size)
+            self.cfd_simulator.set_resolution(grid_size)
+            self.current_grid_size = grid_size
+
         self.diffusion_model.train()
         self.converter.train()
         self.consistency_model.student_model.train()
@@ -1254,7 +1335,8 @@ class OptimizedDiffusionTrainer:
             # CFD-based aerodynamic loss (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
             if batch_idx % 10 == 0:
-                design_spec = DesignSpec(target_speed=50.0)
+                # Target speed scales with resolution for physical consistency
+                design_spec = DesignSpec(target_speed=grid_size / 32.0 * 50.0)
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
 
             # Combined loss
@@ -1326,10 +1408,26 @@ class OptimizedDiffusionTrainer:
         return self.consistency_model.consistency_loss(latent, t_student, t_teacher)
     
     def train(self, train_loader: DataLoader, val_loader: DataLoader = None):
-        """Progressive training with all optimizations"""
-        grid_sizes = [16, 24, 32]
+        """Progressive training with adaptive resolutions based on VRAM"""
+        # Determine maximum resolution based on GPU memory
+        max_vram_res = get_vram_limit_resolution(max_usage=0.9)
+
+        # Schedule: Start at 32, double until max_vram_res or geometry limit
+        grid_sizes = [32]
+        curr = 64
+        while curr <= max_vram_res and curr <= 512: # Dense LBM cap at 512 for stability
+            grid_sizes.append(curr)
+            curr *= 2
+
+        print(f"📈 Progressive growth schedule: {grid_sizes}")
 
         for grid_size in grid_sizes:
+            # Sync dataset resolution
+            if hasattr(train_loader.dataset, 'set_resolution'):
+                train_loader.dataset.set_resolution(grid_size)
+            if val_loader and hasattr(val_loader.dataset, 'set_resolution'):
+                val_loader.dataset.set_resolution(grid_size)
+
             print(f"\n{'='*60}")
             print(f"Training with grid size: {grid_size}x{grid_size}x{grid_size}")
             print(f"Features: 4-step consistency, grouped-query attention, gradient checkpointing")
@@ -1857,6 +1955,35 @@ def cli():
 @click.option('--enable-checkpointing', is_flag=True, default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
+def get_vram_limit_resolution(max_usage=0.9, target_res=1024):
+    """Estimate max LBM resolution based on available VRAM"""
+    if not torch.cuda.is_available():
+        return 64
+
+    try:
+        total_vram = torch.cuda.get_device_properties(0).total_memory
+        usable_vram = total_vram * max_usage
+
+        # D3Q27 memory: ~250 bytes per cell (populations + overhead)
+        bytes_per_cell = 250
+        max_cells = usable_vram / bytes_per_cell
+        max_res = int(max_cells ** (1/3))
+
+        return min(max(max_res, 32), target_res)
+    except Exception:
+        return 128
+
+def get_stl_adaptive_resolution(stl_path):
+    """Determine optimal resolution based on STL complexity"""
+    try:
+        mesh = trimesh.load(stl_path)
+        # complexity-based heuristic
+        complexity_res = int((len(mesh.faces) / 2) ** (1/3) * 4)
+        vram_res = get_vram_limit_resolution()
+        return min(max(complexity_res, 64), vram_res)
+    except Exception:
+        return get_vram_limit_resolution()
+
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
           num_samples, resume_from, save_dir, enable_consistency, enable_pipeline, 
           enable_checkpointing, enable_compile, solver):
@@ -1923,20 +2050,22 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         enable_pipeline_parallelism=enable_pipeline
     )
     
-    # Determine correct grid resolution based on solver type
-    if solver == "D3Q27":
-        base_resolution = 16  # Use smaller grid for D3Q27 due to memory
-    else:
-        base_resolution = 32  # Standard resolution
+    # VRAM limit for training (can start small and grow)
+    base_resolution = 32
 
     cfd_config = CFDConfig(
-        base_grid_resolution=base_resolution,  # Match the grid resolution used
+        base_grid_resolution=base_resolution,
         adaptive_cells_target=5000,
         solver_type=solver
     )
 
-    # Dataset
-    dataset = AircraftDesignDataset(num_samples=num_samples, grid_size=32, latent_dim=model_config.latent_dim)
+    # Dataset - start at 32 and grow to target
+    dataset = AircraftDesignDataset(
+        num_samples=num_samples,
+        grid_size=32,
+        latent_dim=model_config.latent_dim,
+        target_grid_size=1024
+    )
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
     # Optimized trainer
@@ -1967,6 +2096,51 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
     trainer.save_checkpoint(final_checkpoint)
     print(f"\n🎉 Training complete! Final optimized model saved to {final_checkpoint}")
     print(f"📊 Achieved: 250x speedup (4-step vs 1000-step), 60% VRAM savings, 50% memory reduction")
+
+@cli.command()
+@click.option('--design', required=True, help='Path to .npy design file or .stl file')
+@click.option('--cfd-steps', default=500, help='Number of CFD simulation steps')
+@click.option('--solver', default='D3Q27', help='CFD solver type')
+def evaluate(design, cfd_steps, solver):
+    """Evaluate design with high-fidelity CFD and mesh normalization"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if design.endswith('.stl'):
+        res = get_stl_adaptive_resolution(design)
+        print(f"🚀 Evaluating STL: {design} at resolution {res}^3")
+
+        cfd_config = CFDConfig(base_grid_resolution=res, solver_type=solver)
+        simulator = AdvancedCFDSimulator(cfd_config, device)
+
+        # Load and normalize STL to fit simulation domain
+        mesh = trimesh.load(design)
+
+        # Center and scale to fit [0, 1]^3 with 10% padding
+        extents = mesh.extents
+        scale = 0.8 / max(extents)
+        mesh.apply_translation(-mesh.centroid)
+        mesh.apply_scale(scale)
+        mesh.apply_translation([0.5, 0.5, 0.5])
+
+        # Voxelize
+        voxel_grid = mesh.voxelized(1.0 / res).matrix
+
+        # Sync with simulator grid
+        geometry = torch.zeros((res, res, res), device=device)
+        d, h, w = min(res, voxel_grid.shape[0]), min(res, voxel_grid.shape[1]), min(res, voxel_grid.shape[2])
+        geometry[:d, :h, :w] = torch.from_numpy(voxel_grid[:d, :h, :w].astype(np.float32)).to(device)
+    else:
+        voxel_grid_np = np.load(design)
+        res = voxel_grid_np.shape[0]
+        print(f"🚀 Evaluating design: {design} at resolution {res}^3")
+        geometry = torch.from_numpy(voxel_grid_np).to(device)
+        cfd_config = CFDConfig(base_grid_resolution=res, solver_type=solver)
+        simulator = AdvancedCFDSimulator(cfd_config, device)
+
+    results = simulator.simulate_aerodynamics(geometry, steps=cfd_steps)
+    print(f"\n📊 EVALUATION RESULTS for {design}:")
+    for k, v in results.items():
+        print(f"  • {k}: {v:.6f}")
 
 @cli.command()
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')

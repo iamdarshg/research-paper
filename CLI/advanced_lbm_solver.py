@@ -25,7 +25,12 @@ def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: floa
 
 
 class D3Q27Solver:
-    """Complete D3Q27 LBM solver"""
+    """Complete D3Q27 LBM solver
+
+    TODO: Implement sparse grid support (e.g., using Taichi or a custom sparse
+    tensor layout) to handle very high resolutions (up to 1024^3) without
+    exceeding VRAM limits of modern GPUs.
+    """
     def __init__(
         self,
         resolution,
