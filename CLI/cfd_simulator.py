@@ -72,10 +72,12 @@ class AdvancedCFDSimulator:
 
         external_results = self._run_external_validation(geometry)
         if external_results:
+            # For high-fidelity ground truth, if independent PDE results exist,
+            # they supersede the LBM surrogate entirely.
             results['external_ground_truth'] = external_results
-            results['drag_coefficient'] = 0.5 * results['drag_coefficient'] + 0.5 * external_results['drag_coefficient']
-            results['lift_coefficient'] = 0.5 * results['lift_coefficient'] + 0.5 * external_results['lift_coefficient']
-            results['pinn_ready'] = True
+            results['drag_coefficient'] = external_results['drag_coefficient']
+            results['lift_coefficient'] = external_results['lift_coefficient']
+            results['pinn_ready'] = external_results.get('pinn_ready', False)
         return results
 
     def _run_external_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
@@ -112,6 +114,15 @@ class AdvancedCFDSimulator:
                     if proc.returncode != 0:
                         return None
 
+                # Check for convergence in logs
+                log_sonic = case_path / "log.sonicFoam"
+                converged = False
+                if log_sonic.exists():
+                    log_content = log_sonic.read_text()
+                    # Check for "Final residual" below threshold or "End"
+                    if "End" in log_content:
+                        converged = True
+
                 force_file = case_path / "postProcessing" / "forces" / "0" / "force.dat"
                 if force_file.exists():
                     with open(force_file, 'r') as f:
@@ -122,7 +133,12 @@ class AdvancedCFDSimulator:
                             fz = float(last_line[3].replace(')', ''))
                             rho, U, ref_area = 1.225, 80.0, 1.0
                             dyn_pres = 0.5 * rho * U**2 * ref_area
-                            return {'drag_coefficient': fx / dyn_pres, 'lift_coefficient': fz / dyn_pres, 'source': 'OpenFOAM', 'pinn_ready': True}
+                            return {
+                                'drag_coefficient': fx / dyn_pres,
+                                'lift_coefficient': fz / dyn_pres,
+                                'source': 'OpenFOAM',
+                                'pinn_ready': converged
+                            }
                 return None
         except Exception as e:
             print(f"OpenFOAM validation failed: {e}")
@@ -144,8 +160,10 @@ class AdvancedCFDSimulator:
             print(f"STL conversion failed: {e}")
             return None
 
-    def _run_fluidx3d_fast(self, stl_path: str) -> Dict[str, float]:
-        return {'drag_coefficient': 0.05, 'lift_coefficient': 0.1}
+    def _run_fluidx3d_fast(self, stl_path: str) -> Optional[Dict[str, float]]:
+        # Hard-coded fallbacks removed to ensure data integrity
+        print("⚠️ FluidX3D placeholder reached. No ground truth returned.")
+        return None
 
     def export_openfoam_case(self, voxel_grid: torch.Tensor, case_dir: str) -> Dict[str, Any]:
         # Implementation from original AdvancedCFDSimulator (moved to AdvancedCFDSimulator for consistency)

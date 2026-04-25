@@ -137,8 +137,37 @@ class GroundTruthExporter:
         np.save(sample_path / "pressure.npy", pressure_field.cpu().numpy())
 
         serializable_meta = {k: v for k, v in metadata.items() if isinstance(v, (int, float, str, bool, list, dict))}
+        # Add nondimensionalization metadata
+        serializable_meta['units'] = {
+            'length': 'm',
+            'velocity': 'm/s',
+            'pressure': 'Pa',
+            'force': 'N',
+            'density': 'kg/m^3'
+        }
+        serializable_meta['manifest_version'] = '1.0'
+        serializable_meta['pde_target'] = 'Navier-Stokes (Incompressible/Low-Mach)'
+
         with open(sample_path / "metadata.json", "w") as f:
             json.dump(serializable_meta, f, indent=2)
+
+        # Create explicit manifest for PINN ingestion
+        manifest = {
+            'sample_id': sample_id,
+            'files': {
+                'geometry': 'geometry.npy',
+                'ux': 'velocity_x.npy',
+                'uy': 'velocity_y.npy',
+                'uz': 'velocity_z.npy',
+                'p': 'pressure.npy'
+            },
+            'pinn_ready': metadata.get('pinn_ready', False),
+            'force_stability': metadata.get('force_stability', 1.0),
+            'source': metadata.get('source', 'LBM-D3Q27')
+        }
+        with open(sample_path / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+
         print(f"✅ Exported ground truth sample to {sample_path}")
 
 class AerodynamicLoss(nn.Module):
