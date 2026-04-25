@@ -79,21 +79,28 @@ class AdvancedCFDSimulator:
             # they supersede the LBM surrogate entirely.
             results['external_ground_truth'] = external_results
 
-            # Promote metadata to top level
+            # Promote metadata to top level (Source promotion)
             results['drag_coefficient'] = external_results['drag_coefficient']
             results['lift_coefficient'] = external_results['lift_coefficient']
             results['physical_force_source'] = external_results.get('physical_force_source', results.get('physical_force_source'))
-            results['label_source'] = external_results.get('label_source', results.get('label_source'))
-            results['label_tier'] = external_results.get('label_tier', results.get('label_tier'))
-            results['source'] = external_results.get('source', 'External')
+            results['label_source'] = external_results.get('label_source', 'External')
+            results['label_tier'] = external_results.get('label_tier', 'external_pde')
+            results['source'] = results['label_source']
 
             # Attach external PDE fields if available
+            has_fields = False
             if 'velocity_fields' in external_results:
                 results['velocity_fields'] = external_results['velocity_fields']
+                has_fields = True
             if 'pressure_field' in external_results:
                 results['pressure_field'] = external_results['pressure_field']
 
-            results['pinn_ready'] = external_results.get('pinn_ready', False)
+            # PINN-ready gate: Tier must be external AND fields must be verified
+            results['pinn_ready'] = bool(
+                external_results.get('pinn_ready', False) and
+                results['label_tier'] == 'external_pde' and
+                has_fields
+            )
         return results
 
     def _run_external_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:

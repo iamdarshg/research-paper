@@ -121,6 +121,20 @@ class GroundTruthExporter:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _sanitize_metadata(self, obj: Any) -> Any:
+        """Recursively sanitize metadata for JSON serialization, stripping Tensors/Tuples"""
+        if isinstance(obj, dict):
+            return {k: self._sanitize_metadata(v) for k, v in obj.items() if not k.endswith('_fields') and k != 'pressure_field'}
+        elif isinstance(obj, list):
+            return [self._sanitize_metadata(i) for i in obj]
+        elif isinstance(obj, (int, float, str, bool)):
+            return obj
+        elif isinstance(obj, torch.Tensor):
+            return obj.item() if obj.numel() == 1 else obj.shape
+        elif obj is None:
+            return None
+        return str(obj)
+
     def export_sample(self, sample_id: str, geometry: torch.Tensor,
                       velocity_fields: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
                       pressure_field: torch.Tensor,
@@ -136,7 +150,9 @@ class GroundTruthExporter:
         np.save(sample_path / "velocity_z.npy", uz.cpu().numpy())
         np.save(sample_path / "pressure.npy", pressure_field.cpu().numpy())
 
-        serializable_meta = {k: v for k, v in metadata.items() if isinstance(v, (int, float, str, bool, list, dict))}
+        # Recursive JSON-safe serialization
+        serializable_meta = self._sanitize_metadata(metadata)
+
         # Add nondimensionalization metadata
         serializable_meta['units'] = {
             'length': 'm',
