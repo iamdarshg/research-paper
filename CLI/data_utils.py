@@ -166,7 +166,7 @@ class GroundTruthExporter:
             'label_source': metadata.get('label_source', 'lbm_d3q27'),
             'force_stability': metadata.get('force_stability', 1.0),
             'lbm_converged': metadata.get('lbm_converged', False),
-            'source': metadata.get('source', 'LBM-D3Q27')
+            'source': metadata.get('source', metadata.get('label_source', 'lbm_d3q27'))
         }
         with open(sample_path / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)

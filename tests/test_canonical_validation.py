@@ -42,7 +42,9 @@ class TestCanonicalValidation(unittest.TestCase):
 
         # Check for convergence/stability
         print(f"LBM Converged: {results.get('lbm_converged')}, PINN Ready: {results.get('pinn_ready')}")
-        self.assertTrue(results.get('lbm_converged', False) or results.get('pinn_ready', False))
+        self.assertTrue(results.get('lbm_converged', False))
+        self.assertFalse(results.get('pinn_ready', False)) # Should be false as no OpenFOAM pass triggered
+        self.assertEqual(results.get('label_source'), 'lbm_d3q27')
 
         # Drag coefficient check
         cd = results['drag_coefficient']

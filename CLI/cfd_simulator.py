@@ -78,8 +78,14 @@ class AdvancedCFDSimulator:
             # For high-fidelity ground truth, if independent PDE results exist,
             # they supersede the LBM surrogate entirely.
             results['external_ground_truth'] = external_results
+
+            # Promote metadata to top level
             results['drag_coefficient'] = external_results['drag_coefficient']
             results['lift_coefficient'] = external_results['lift_coefficient']
+            results['physical_force_source'] = external_results.get('physical_force_source', results.get('physical_force_source'))
+            results['label_source'] = external_results.get('label_source', results.get('label_source'))
+            results['label_tier'] = external_results.get('label_tier', results.get('label_tier'))
+            results['source'] = external_results.get('source', 'External')
 
             # Attach external PDE fields if available
             if 'velocity_fields' in external_results:
@@ -146,11 +152,10 @@ class AdvancedCFDSimulator:
                     residuals = re.findall(r"Final residual = ([\d.e-]+)", log_content)
                     if residuals:
                         last_residuals = [float(r) for r in residuals[-5:]]
+                        # All last residuals must be below threshold, and must have terminated correctly
                         if all(r < 1e-4 for r in last_residuals) and "End" in log_content:
                             converged = True
-                    elif "End" in log_content:
-                        # Fallback for cases with no residual logging but successful completion
-                        converged = True
+                    # Fail-closed: No fallback to simple "End" check to ensure PDE integrity
 
                 force_file = case_path / "postProcessing" / "forces" / "0" / "force.dat"
                 if force_file.exists():
@@ -170,38 +175,44 @@ class AdvancedCFDSimulator:
                                 'label_source': 'OpenFOAM',
                                 'label_tier': 'external_pde',
                                 'source': 'OpenFOAM',
-                                'pinn_ready': converged
+                                'pinn_ready': False # Default False, only True if converged AND fields present
                             }
 
                             # Extract sampled fields
                             res = self.config.base_grid_resolution
                             sample_dir = case_path / "postProcessing" / "sample"
 
+                            fields_present = False
                             if sample_dir.exists():
                                 time_dirs = [d for d in sample_dir.iterdir() if d.is_dir()]
                                 if time_dirs:
                                     # Find latest time dir in sample
                                     latest_sample_time = max(time_dirs, key=lambda d: float(d.name))
 
-                                    u_file = latest_sample_time / "voxelGrid_U.xy"
-                                    p_file = latest_sample_time / "voxelGrid_p.xy"
+                                    # Use glob patterns for robust matching
+                                    u_files = list(latest_sample_time.glob("*_U.xy"))
+                                    p_files = list(latest_sample_time.glob("*_p.xy"))
 
-                                    if u_file.exists() and p_file.exists():
+                                    if u_files and p_files:
+                                        u_file, p_file = u_files[0], p_files[0]
                                         u_data = np.loadtxt(u_file)
                                         p_data = np.loadtxt(p_file)
 
                                         if u_data.shape[0] == res**3 and p_data.shape[0] == res**3:
                                             # x, y, z, ux, uy, uz
-                                            ux = torch.from_numpy(u_data[:, 3]).view(res, res, res).float()
-                                            uy = torch.from_numpy(u_data[:, 4]).view(res, res, res).float()
-                                            uz = torch.from_numpy(u_data[:, 5]).view(res, res, res).float()
+                                            ux = torch.from_numpy(u_data[:, 3]).view(res, res, res).float().to(self.device)
+                                            uy = torch.from_numpy(u_data[:, 4]).view(res, res, res).float().to(self.device)
+                                            uz = torch.from_numpy(u_data[:, 5]).view(res, res, res).float().to(self.device)
                                             # x, y, z, p
-                                            p_field = torch.from_numpy(p_data[:, 3]).view(res, res, res).float()
+                                            p_field = torch.from_numpy(p_data[:, 3]).view(res, res, res).float().to(self.device)
 
                                             of_results['velocity_fields'] = (ux, uy, uz)
                                             of_results['pressure_field'] = p_field
+                                            fields_present = True
                                             print(f"✅ Successfully extracted OpenFOAM fields at {res}^3")
 
+                            # pinn_ready requires strict convergence AND field presence
+                            of_results['pinn_ready'] = converged and fields_present
                             return of_results
                 return None
         except Exception as e:
