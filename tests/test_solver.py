@@ -8,7 +8,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
 from advanced_lbm_solver import D3Q27CascadedSolver, D3Q27Lattice
-from aircraft_diffusion_cfd import CFDConfig, LBMPhysicsConfig
+from config import CFDConfig, LBMPhysicsConfig
 
 class TestLBMSolvers(unittest.TestCase):
     def setUp(self):

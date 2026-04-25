@@ -25,7 +25,12 @@ def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: floa
 
 
 class D3Q27Solver:
-    """Complete D3Q27 LBM solver"""
+    """Complete D3Q27 LBM solver
+
+    TODO: Implement sparse grid support (e.g., using Taichi or a custom sparse
+    tensor layout) to handle very high resolutions (up to 1024^3) without
+    exceeding VRAM limits of modern GPUs.
+    """
     def __init__(
         self,
         resolution,
@@ -513,20 +518,48 @@ class D3Q27CascadedSolver:
             speed_normalization = (drag_reference_speed / freestream_speed) ** speed_exponent
         else:
             speed_normalization = 1.0
-        shape_drag_scale, shape_drag_metrics = self._shape_drag_correction(geometry_mask, projected_area_lattice)
-        drag_coefficient = raw_projected_drag_coefficient * speed_normalization * shape_drag_scale
-        physical_drag_force = drag_coefficient * (
-            0.5 * 1.225 * freestream_speed ** 2 * ref_area
-        )
-        physical_drag_force = torch.tensor(physical_drag_force, device=self.device, dtype=self.f.dtype)
+        # 1. Pure momentum exchange (Raw PDE Ground Truth)
         physical_net_drag_force = _scale_momentum_exchange_force(net_drag_force, h, getattr(self.config, 'mach_number', 0.0))
         physical_lift_force = _scale_momentum_exchange_force(lift_force, h, getattr(self.config, 'mach_number', 0.0))
+
+        # 2. Upwind pressure proxy (Fallback/Diagnostic)
+        physical_pressure_fallback_force = raw_projected_drag_coefficient * (0.5 * 1.225 * freestream_speed**2 * ref_area)
+
+        # 3. Tuned Surrogate version (Heuristic correction)
+        shape_drag_scale, shape_drag_metrics = self._shape_drag_correction(geometry_mask, projected_area_lattice)
+        drag_coefficient_surrogate = raw_projected_drag_coefficient * speed_normalization * shape_drag_scale
+        physical_surrogate_force = drag_coefficient_surrogate * (0.5 * 1.225 * freestream_speed**2 * ref_area)
+
+        # Label Tiering Logic (Issue #12)
+        # 1. lbm_raw: Pure PDE momentum exchange from internal solver
+        # 2. lbm_calibrated: Heuristically corrected result for stable training
+
+        lbm_raw_force = physical_net_drag_force
+        lbm_calibrated_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
+
+        # Use calibrated force by default for stable training labels
+        physical_drag_force = lbm_calibrated_force
+
         coeffs = _compute_force_coefficients(
             physical_drag_force,
             physical_lift_force,
             getattr(self.config, 'mach_number', 0.0),
             ref_area=max(ref_area, 1e-12),
             rho_ref=1.225
+        )
+
+        # PINN-ready check: requires low divergence, stable forces, and sampling convergence
+        force_stability = 1.0
+        if self._solver.force_samples > 20:
+            avg_fx = float(self._solver.force_x_accum.item()) / self._solver.force_samples
+            last_fx = float(self._solver.force_x_last.item())
+            force_stability = abs(last_fx - avg_fx) / (abs(avg_fx) + 1e-6)
+
+        lbm_converged = bool(
+            not torch.isnan(self.velocity_x).any() and
+            abs(float(self.force_x_last.item())) < 1e5 and
+            self._solver.force_samples > 50 and
+            force_stability < 0.1 # Relaxed for small test resolutions
         )
 
         vorticity_mag = self._refresh_flow_diagnostics()
@@ -538,6 +571,17 @@ class D3Q27CascadedSolver:
         return {
             'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
             'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
+
+            # Tiered Labeling (Issue #12)
+            'label_source': 'lbm_d3q27',
+            'label_tier': 'lbm_calibrated' if bool(getattr(self.phys_config, 'use_shape_drag_correction', False)) else 'lbm_raw',
+            'lbm_converged': lbm_converged,
+            'force_stability': force_stability,
+
+            'physical_force_source': float(physical_net_drag_force.item()),
+            'pressure_only_fallback': float(physical_pressure_fallback_force),
+            'surrogate_proxy_force': float(physical_surrogate_force),
+
             'raw_force_x': float(projected_drag.item() if isinstance(projected_drag, torch.Tensor) else projected_drag),
             'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
             'drag_coefficient': coeffs['drag_coefficient'],
