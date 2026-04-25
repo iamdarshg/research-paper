@@ -55,8 +55,11 @@ class AdvancedCFDSimulator:
         geometry_mask = (geometry > 0.5).float()
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
         results = self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask)
+
+        # Initial fields from internal LBM
         results['velocity_fields'] = (self.lbm_solver.velocity_x, self.lbm_solver.velocity_y, self.lbm_solver.velocity_z)
         results['pressure_field'] = self.lbm_solver.pressure
+        results['pinn_ready'] = False # Default False, only True if external validated truth exists
 
         if self.amr_solver:
             amr_geometry = F.interpolate(
@@ -77,6 +80,13 @@ class AdvancedCFDSimulator:
             results['external_ground_truth'] = external_results
             results['drag_coefficient'] = external_results['drag_coefficient']
             results['lift_coefficient'] = external_results['lift_coefficient']
+
+            # Attach external PDE fields if available
+            if 'velocity_fields' in external_results:
+                results['velocity_fields'] = external_results['velocity_fields']
+            if 'pressure_field' in external_results:
+                results['pressure_field'] = external_results['pressure_field']
+
             results['pinn_ready'] = external_results.get('pinn_ready', False)
         return results
 
@@ -107,7 +117,13 @@ class AdvancedCFDSimulator:
                 if not OPENFOAM_AVAILABLE:
                     return None
 
-                commands = ["blockMesh", "surfaceFeatureExtract", "snappyHexMesh -overwrite", "sonicFoam"]
+                commands = [
+                    "blockMesh",
+                    "surfaceFeatureExtract",
+                    "snappyHexMesh -overwrite",
+                    "sonicFoam",
+                    "postProcess -func sample -latestTime"
+                ]
                 for cmd in commands:
                     log_file = case_path / f"log.{cmd.split()[0]}"
                     proc = sp_run(f"bash -lc 'source {OPENFOAM_ROOT}/etc/bashrc && {cmd}' > {log_file} 2>&1", shell=True, cwd=case_path)
@@ -119,8 +135,16 @@ class AdvancedCFDSimulator:
                 converged = False
                 if log_sonic.exists():
                     log_content = log_sonic.read_text()
-                    # Check for "Final residual" below threshold or "End"
-                    if "End" in log_content:
+                    # Stricter convergence gate: residuals must be below 1e-4
+                    import re
+                    # Look for lines like "Final residual = 1.234e-05"
+                    residuals = re.findall(r"Final residual = ([\d.e-]+)", log_content)
+                    if residuals:
+                        last_residuals = [float(r) for r in residuals[-5:]]
+                        if all(r < 1e-4 for r in last_residuals) and "End" in log_content:
+                            converged = True
+                    elif "End" in log_content:
+                        # Fallback for cases with no residual logging but successful completion
                         converged = True
 
                 force_file = case_path / "postProcessing" / "forces" / "0" / "force.dat"
@@ -133,12 +157,45 @@ class AdvancedCFDSimulator:
                             fz = float(last_line[3].replace(')', ''))
                             rho, U, ref_area = 1.225, 80.0, 1.0
                             dyn_pres = 0.5 * rho * U**2 * ref_area
-                            return {
+
+                            of_results = {
                                 'drag_coefficient': fx / dyn_pres,
                                 'lift_coefficient': fz / dyn_pres,
+                                'physical_force_source': fx,
                                 'source': 'OpenFOAM',
                                 'pinn_ready': converged
                             }
+
+                            # Extract sampled fields
+                            res = self.config.base_grid_resolution
+                            sample_dir = case_path / "postProcessing" / "sample"
+
+                            if sample_dir.exists():
+                                time_dirs = [d for d in sample_dir.iterdir() if d.is_dir()]
+                                if time_dirs:
+                                    # Find latest time dir in sample
+                                    latest_sample_time = max(time_dirs, key=lambda d: float(d.name))
+
+                                    u_file = latest_sample_time / "voxelGrid_U.xy"
+                                    p_file = latest_sample_time / "voxelGrid_p.xy"
+
+                                    if u_file.exists() and p_file.exists():
+                                        u_data = np.loadtxt(u_file)
+                                        p_data = np.loadtxt(p_file)
+
+                                        if u_data.shape[0] == res**3 and p_data.shape[0] == res**3:
+                                            # x, y, z, ux, uy, uz
+                                            ux = torch.from_numpy(u_data[:, 3]).view(res, res, res).float()
+                                            uy = torch.from_numpy(u_data[:, 4]).view(res, res, res).float()
+                                            uz = torch.from_numpy(u_data[:, 5]).view(res, res, res).float()
+                                            # x, y, z, p
+                                            p_field = torch.from_numpy(p_data[:, 3]).view(res, res, res).float()
+
+                                            of_results['velocity_fields'] = (ux, uy, uz)
+                                            of_results['pressure_field'] = p_field
+                                            print(f"✅ Successfully extracted OpenFOAM fields at {res}^3")
+
+                            return of_results
                 return None
         except Exception as e:
             print(f"OpenFOAM validation failed: {e}")
@@ -198,6 +255,21 @@ class AdvancedCFDSimulator:
         (constant / "thermophysicalProperties").write_text("""FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       dictionary;\n    location    \"constant\";\n    object      thermophysicalProperties;\n}\nthermoType { type hePsiThermo; mixture pureMixture; transport const; thermo hConst; equationOfState perfectGas; specie specie; energy sensibleInternalEnergy; }\nmixture { specie { molWeight 28.9; } thermodynamics { Cp 1005; Hf 0; } transport { mu 0; Pr 0.7; } }\n""")
         (constant / "turbulenceProperties").write_text("""FoamFile { version 2.0; format ascii; class dictionary; object turbulenceProperties; } simulationType laminar;\n""")
         (system / "forces").write_text("""FoamFile\n{ version 2.0; format ascii; class dictionary; object forces; }\ntype forces;\nfunctionObjectLibs (\"libforces.so\");\npatches (design);\nrho rho;\nrhoInf 1.225;\np p;\nU U;\nCofR (0 0 0);\n""")
+
+        # Add sampling for field extraction matching voxel grid
+        res = self.config.base_grid_resolution
+        points_str = ""
+        for x in range(res):
+            for y in range(res):
+                for z in range(res):
+                    # Map to centered unit cube [-0.5, 0.5]
+                    xp = (x / (res - 1)) - 0.5
+                    yp = (y / (res - 1)) - 0.5
+                    zp = (z / (res - 1)) - 0.5
+                    points_str += f"({xp} {yp} {zp})\n"
+
+        (system / "sample").write_text(f"""FoamFile\n{{ version 2.0; format ascii; class dictionary; object sample; }}\ntype sets;\nlibs ("libsampling.so");\ninterpolationScheme cell;\nsetFormat raw;\nsets\n(\n    voxelGrid\n    {{\n        type cloud;\n        axis xyz;\n        points\n        (\n            {points_str}\n        );\n    }}\n);\nfields (U p);\n""")
+
         (case_path / "0" / "U").write_text("""FoamFile\n{ version 2.0; format ascii; class volVectorField; object U; }\ndimensions [0 1 -1 0 0 0 0];\ninternalField uniform (80 0 0);\nboundaryField { inlet { type fixedValue; value uniform (80 0 0); } outlet { type pressureInletOutletVelocity; value uniform (80 0 0); } top { type slip; } bottom { type slip; } front { type symmetryPlane; } back { type symmetryPlane; } design { type noSlip; } }\n""")
         (case_path / "0" / "p").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object p; }\ndimensions [1 -1 -2 0 0 0 0];\ninternalField uniform 101325;\nboundaryField { inlet { type totalPressure; p0 uniform 101325; value uniform 101325; } outlet { type fixedValue; value uniform 101325; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")
         (case_path / "0" / "T").write_text("""FoamFile\n{ version 2.0; format ascii; class volScalarField; object T; }\ndimensions [0 0 0 1 0 0 0];\ninternalField uniform 300;\nboundaryField { inlet { type fixedValue; value uniform 300; } outlet { type zeroGradient; } top { type zeroGradient; } bottom { type zeroGradient; } front { type symmetryPlane; } back { type symmetryPlane; } design { type zeroGradient; } }\n""")

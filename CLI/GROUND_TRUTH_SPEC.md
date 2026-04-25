@@ -24,13 +24,14 @@ The ground truth targets the **Incompressible Navier-Stokes Equations**:
 2. **Momentum:** $\rho (\mathbf{u} \cdot \nabla) \mathbf{u} = -\nabla p + \mu \nabla^2 \mathbf{u} + \mathbf{f}$
 
 ## PINN-Ready Gate Requirements
-Data is only flagged as `pinn_ready: true` if it passes the following convergence criteria:
-1. **Stability:** Force stability $< 2\%$ over the final 100 sampling steps.
-2. **Convergence:** L2-norm of velocity change $< 10^{-5}$ (LBM) or successful "End" state (OpenFOAM).
-3. **No Blending:** Surrogate LBM results are *never* blended into independent PDE truth.
+Data is only flagged as `pinn_ready: true` if it passes the following **independent validation** criteria:
+1. **Source:** Only independent PDE solvers (e.g., OpenFOAM) or analytic solutions can set `pinn_ready`. Internal D3Q27 results are labeled `lbm_converged` but *never* `pinn_ready`.
+2. **Residuals:** OpenFOAM residuals must be below $10^{-4}$ for the final 5 iterations.
+3. **Fields:** Exported `velocity_*.npy` and `pressure.npy` files MUST contain the interpolated PDE data from the external solver, not the internal surrogate.
+4. **No Blending:** External PDE results supersede the internal surrogate entirely.
 
 ## Ground Truth Splitting
 The solver explicitly provides three force labels:
-1. `physical_force_source`: Raw PDE momentum exchange (Target for high-fidelity PINNs).
-2. `pressure_only_fallback`: Stable upwind pressure proxy.
-3. `surrogate_proxy_force`: Heuristically corrected value (Target for surrogate neural models).
+1. `physical_force_source`: Raw PDE momentum exchange from the external solver (Target for high-fidelity PINNs).
+2. `pressure_only_fallback`: Stable upwind pressure proxy from the external solver.
+3. `surrogate_proxy_force`: Heuristically corrected value from the internal surrogate (Target for surrogate neural models).
