@@ -30,8 +30,22 @@ Data is only flagged as `pinn_ready: true` if it passes the following **independ
 3. **Fields:** Exported `velocity_*.npy` and `pressure.npy` files MUST contain the interpolated PDE data from the external solver, not the internal surrogate.
 4. **No Blending:** External PDE results supersede the internal surrogate entirely.
 
+## Label Tiers and Sources
+The system employs a tiered labeling strategy to balance speed and fidelity:
+
+| Tier | Source | Logic | Use Case |
+| :--- | :--- | :--- | :--- |
+| `lbm_raw` | `lbm_d3q27` | Pure LBM momentum exchange. | Fast PDE training. |
+| `lbm_calibrated` | `lbm_d3q27` | LBM with heuristic corrections. | Stable surrogate training. |
+| `external_pde` | `OpenFOAM` | Validated NS solver (strict gates). | High-fidelity PINN ground truth. |
+
+## Sampling Strategy
+To maintain performance, independent PDE validation (`external_pde`) is performed sparsely. This is controlled by the `validation_probability` parameter in `CFDConfig`.
+- **Production:** `validation_probability = 0.0` (Use fast LBM labels).
+- **Calibration/Validation:** `validation_probability = 0.05` (5% OpenFOAM pass).
+
 ## Ground Truth Splitting
-The solver explicitly provides three force labels:
-1. `physical_force_source`: Raw PDE momentum exchange from the external solver (Target for high-fidelity PINNs).
-2. `pressure_only_fallback`: Stable upwind pressure proxy from the external solver.
-3. `surrogate_proxy_force`: Heuristically corrected value from the internal surrogate (Target for surrogate neural models).
+The solver provides detailed force decomposition in `metadata.json`:
+1. `physical_force_source`: Raw PDE momentum exchange (from the tier's source).
+2. `pressure_only_fallback`: Stable upwind pressure proxy.
+3. `surrogate_proxy_force`: Heuristically corrected value.

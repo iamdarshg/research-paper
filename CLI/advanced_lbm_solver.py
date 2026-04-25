@@ -530,12 +530,15 @@ class D3Q27CascadedSolver:
         drag_coefficient_surrogate = raw_projected_drag_coefficient * speed_normalization * shape_drag_scale
         physical_surrogate_force = drag_coefficient_surrogate * (0.5 * 1.225 * freestream_speed**2 * ref_area)
 
-        # Final reported coefficients - use raw PDE results as primary target for PINN labels
-        # if the resolution is sufficient, otherwise fallback to surrogate for model training stability.
-        # For Issue #12, we explicitly label these so the user can choose.
-        # For canonical LBM labels, we use the surrogate proxy by default for numerical stability
-        # in the training loop. Raw PDE ground truth is still explicitly labeled for PINN.
-        physical_drag_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
+        # Label Tiering Logic (Issue #12)
+        # 1. lbm_raw: Pure PDE momentum exchange from internal solver
+        # 2. lbm_calibrated: Heuristically corrected result for stable training
+
+        lbm_raw_force = physical_net_drag_force
+        lbm_calibrated_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
+
+        # Use calibrated force by default for stable training labels
+        physical_drag_force = lbm_calibrated_force
 
         coeffs = _compute_force_coefficients(
             physical_drag_force,
@@ -569,12 +572,15 @@ class D3Q27CascadedSolver:
             'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
             'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
 
-            # Ground Truth Splitting (Issue #12)
+            # Tiered Labeling (Issue #12)
+            'label_source': 'lbm_d3q27',
+            'label_tier': 'lbm_calibrated' if bool(getattr(self.phys_config, 'use_shape_drag_correction', False)) else 'lbm_raw',
+            'lbm_converged': lbm_converged,
+            'force_stability': force_stability,
+
             'physical_force_source': float(physical_net_drag_force.item()),
             'pressure_only_fallback': float(physical_pressure_fallback_force),
             'surrogate_proxy_force': float(physical_surrogate_force),
-            'lbm_converged': lbm_converged,
-            'force_stability': force_stability,
 
             'raw_force_x': float(projected_drag.item() if isinstance(projected_drag, torch.Tensor) else projected_drag),
             'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),

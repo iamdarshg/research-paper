@@ -146,6 +146,8 @@ class CFDConfig:
     use_amr: bool = False
     adaptive_cells_target: int = int(5e3)  # Target ~5k cells for AMR
     refinement_levels: int = 3
+    # Intelligent Sampling (Issue #12)
+    validation_probability: float = 0.0 # Prob of running external PDE validation (default 0.0)
     # LBM configuration
     lbm_config: LBMPhysicsConfig = None   # LBM parameters
     # Backwards compatibility parameter - default to base_grid_resolution

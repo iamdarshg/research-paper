@@ -91,6 +91,11 @@ class AdvancedCFDSimulator:
         return results
 
     def _run_external_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
+        import random
+        # Intelligent sampling: only run validation based on configured probability
+        if random.random() > self.config.validation_probability:
+            return None
+
         if OPENFOAM_AVAILABLE:
             return self._run_openfoam_validation(voxel_grid)
         try:
@@ -162,6 +167,8 @@ class AdvancedCFDSimulator:
                                 'drag_coefficient': fx / dyn_pres,
                                 'lift_coefficient': fz / dyn_pres,
                                 'physical_force_source': fx,
+                                'label_source': 'OpenFOAM',
+                                'label_tier': 'external_pde',
                                 'source': 'OpenFOAM',
                                 'pinn_ready': converged
                             }
