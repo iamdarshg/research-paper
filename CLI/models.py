@@ -12,10 +12,10 @@ class MissionEncoder(nn.Module):
         super().__init__()
         self.condition_dim = condition_dim
 
-        # Categorical embeddings
-        self.class_emb = nn.Embedding(4, 8)  # uav, light, airliner, fighter
-        self.prop_emb = nn.Embedding(3, 4)   # electric, turboprop, jet
-        self.mfg_emb = nn.Embedding(3, 4)    # 3d_print, composite, metal
+        # Categorical embeddings (with 'unknown' buckets)
+        self.class_emb = nn.Embedding(7, 8)  # 6 classes + unknown
+        self.prop_emb = nn.Embedding(5, 4)   # 4 types + unknown
+        self.mfg_emb = nn.Embedding(4, 4)    # 3 types + unknown
 
         # Numeric MLP for 10 physical fields
         self.numeric_mlp = nn.Sequential(
@@ -32,9 +32,9 @@ class MissionEncoder(nn.Module):
         )
 
         self.maps = {
-            "class": {"uav": 0, "light_aircraft": 1, "airliner": 2, "fighter": 3},
-            "prop": {"electric": 0, "turboprop": 1, "jet": 2},
-            "mfg": {"3d_print": 0, "composite": 1, "metal_sheet": 2}
+            "class": {"uav": 0, "fast_uav": 1, "light_aircraft": 2, "airliner": 3, "fighter": 4, "glider": 5, "unknown": 6},
+            "prop": {"electric": 0, "turboprop": 1, "jet": 2, "none": 3, "unknown": 4},
+            "mfg": {"3d_print": 0, "composite": 1, "metal_sheet": 2, "unknown": 3}
         }
 
     def forward(self, profiles: Union[MissionProfile, List[MissionProfile]]) -> torch.Tensor:
@@ -53,21 +53,21 @@ class MissionEncoder(nn.Module):
             def norm(val, scale): return math.log1p(val) / math.log1p(scale)
 
             num_data.append([
-                norm(p.payload, 1000.0),
-                norm(p.range, 5000.0),
-                norm(p.endurance, 24.0),
-                norm(p.cruise_speed, 300.0),
-                norm(p.cruise_altitude, 15000.0),
-                norm(p.max_takeoff_weight, 50000.0),
-                norm(p.stall_speed, 100.0),
-                norm(p.max_span, 50.0),
-                norm(p.max_length, 50.0),
-                norm(p.max_height, 20.0)
+                norm(p.payload_kg, 1000.0),
+                norm(p.range_km, 5000.0),
+                norm(p.endurance_hr, 24.0),
+                norm(p.cruise_speed_mps, 300.0),
+                norm(p.cruise_altitude_m, 15000.0),
+                norm(p.max_takeoff_weight_kg, 50000.0),
+                norm(p.stall_speed_mps, 100.0),
+                norm(p.max_span_m, 50.0),
+                norm(p.max_length_m, 50.0),
+                norm(p.max_height_m, 20.0)
             ])
             cat_data.append([
-                self.maps["class"].get(p.aircraft_class, 0),
-                self.maps["prop"].get(p.propulsion_type, 0),
-                self.maps["mfg"].get(p.manufacturing_method, 0)
+                self.maps["class"].get(p.aircraft_class, 6),
+                self.maps["prop"].get(p.propulsion_type, 4),
+                self.maps["mfg"].get(p.manufacturing_method, 3)
             ])
 
         num_t = torch.tensor(num_data, dtype=dtype, device=device).clamp(0, 2)

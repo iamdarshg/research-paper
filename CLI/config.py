@@ -175,35 +175,40 @@ OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", 
 @dataclass
 class MissionProfile:
     """Rich mission profile for conditioned aircraft design (Issue #14)"""
-    aircraft_class: str = "uav"  # uav, light_aircraft, airliner, fighter
-    payload: float = 10.0  # kg
-    range: float = 100.0  # km
-    endurance: float = 2.0  # hours
-    cruise_speed: float = 30.0  # m/s
-    cruise_altitude: float = 1000.0  # m
-    max_takeoff_weight: float = 50.0  # kg
-    stall_speed: float = 15.0  # m/s
-    propulsion_type: str = "electric"  # electric, turboprop, jet
+    aircraft_class: str = "uav"  # uav, fast_uav, light_aircraft, airliner, fighter, glider
+    payload_kg: float = 10.0
+    range_km: float = 100.0
+    endurance_hr: float = 2.0
+    cruise_speed_mps: float = 30.0
+    cruise_altitude_m: float = 1000.0
+    max_takeoff_weight_kg: float = 50.0
+    stall_speed_mps: float = 15.0
+    propulsion_type: str = "electric"  # electric, turboprop, jet, none
     manufacturing_method: str = "3d_print"  # 3d_print, composite, metal_sheet
-    max_span: float = 2.0  # m
-    max_length: float = 1.5  # m
-    max_height: float = 0.5  # m
+    max_span_m: float = 2.0
+    max_length_m: float = 1.5
+    max_height_m: float = 0.5
 
     def __post_init__(self):
         # Validation
-        if self.aircraft_class not in ["uav", "light_aircraft", "airliner", "fighter"]:
+        valid_classes = ["uav", "fast_uav", "light_aircraft", "airliner", "fighter", "glider"]
+        if self.aircraft_class not in valid_classes:
             raise ValueError(f"Invalid aircraft_class: {self.aircraft_class}")
-        if self.propulsion_type not in ["electric", "turboprop", "jet"]:
+        if self.propulsion_type not in ["electric", "turboprop", "jet", "none"]:
             raise ValueError(f"Invalid propulsion_type: {self.propulsion_type}")
         if self.manufacturing_method not in ["3d_print", "composite", "metal_sheet"]:
             raise ValueError(f"Invalid manufacturing_method: {self.manufacturing_method}")
 
         # Positivity checks
-        for field in ["payload", "range", "endurance", "cruise_speed", "cruise_altitude",
-                      "max_takeoff_weight", "stall_speed", "max_span", "max_length", "max_height"]:
+        for field in ["payload_kg", "range_km", "endurance_hr", "cruise_speed_mps", "cruise_altitude_m",
+                      "max_takeoff_weight_kg", "stall_speed_mps", "max_span_m", "max_length_m", "max_height_m"]:
             val = getattr(self, field)
             if val <= 0:
                 raise ValueError(f"{field} must be positive, got {val}")
+
+        # Physical constraints
+        if self.stall_speed_mps >= self.cruise_speed_mps:
+            raise ValueError(f"stall_speed ({self.stall_speed_mps}) must be less than cruise_speed ({self.cruise_speed_mps})")
 
 @dataclass
 class DesignSpec:
@@ -216,10 +221,11 @@ class DesignSpec:
     vital_components: Optional[List] = None
 
     def to_mission_profile(self) -> MissionProfile:
-        """Lossy legacy conversion"""
+        """Lossy legacy conversion (Deprecated)"""
+        # Mapping 1 voxel to 0.1m for reasonable scale fallback
         return MissionProfile(
-            cruise_speed=max(1.0, self.target_speed),
-            max_span=float(self.bounding_box[0]),
-            max_length=float(self.bounding_box[1]),
-            max_height=float(self.bounding_box[2])
+            cruise_speed_mps=max(1.0, self.target_speed),
+            max_span_m=float(self.bounding_box[0]) * 0.1,
+            max_length_m=float(self.bounding_box[1]) * 0.1,
+            max_height_m=float(self.bounding_box[2]) * 0.1
         )

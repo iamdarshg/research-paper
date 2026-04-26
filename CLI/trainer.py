@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List
 from dataclasses import asdict
 
 from config import ModelConfig, DiffusionConfig, TrainingConfig, CFDConfig, DesignSpec, MissionProfile
@@ -67,6 +67,21 @@ class OptimizedDiffusionTrainer:
         for ema_param, param in zip(self.ema_model.parameters(), self.diffusion_model.parameters()):
             ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
 
+    def _normalize_mission_batch(self, batch: Dict[str, Any], batch_size: int) -> List[MissionProfile]:
+        """Normalize mission data from dataset batch into MissionProfile objects"""
+        if 'mission_profile' in batch:
+            profiles = batch['mission_profile']
+            if isinstance(profiles, list) and len(profiles) > 0 and isinstance(profiles[0], MissionProfile):
+                return profiles
+            # Handle list of dicts or other formats if needed
+
+        # Fallback to synthesizing from available fields
+        profiles = []
+        speeds = batch.get('target_speed', torch.full((batch_size,), 50.0))
+        for i in range(batch_size):
+            profiles.append(MissionProfile(cruise_speed_mps=float(speeds[i].item())))
+        return profiles
+
     def train_epoch(self, train_loader, grid_size=32):
         if self.current_grid_size != grid_size:
             self.converter.set_resolution(grid_size)
@@ -79,20 +94,9 @@ class OptimizedDiffusionTrainer:
         pbar = tqdm(train_loader, desc=f"Training Grid {grid_size}")
         for batch_idx, batch in enumerate(pbar):
             latent = batch['latent'].to(self.device, dtype=self.dtype)
-
-            # Generate MissionProfiles for condition encoding
-            # In real usage, these would come from the dataset.
-            # Load mission profiles from batch if available, else fallback
             batch_size = latent.shape[0]
-            if 'mission_profile' in batch:
-                 mission_profiles = batch['mission_profile']
-            else:
-                # Synthesis fallback for testing/initial training
-                mission_profiles = []
-                speeds = batch.get('target_speed', torch.full((batch_size,), 50.0))
-                for i in range(batch_size):
-                    mission_profiles.append(MissionProfile(cruise_speed=float(speeds[i].item())))
 
+            mission_profiles = self._normalize_mission_batch(batch, batch_size)
             condition = self.mission_encoder(mission_profiles)
 
             voxel_grid = torch.sigmoid(self.converter(latent)).nan_to_num(0.0)
@@ -151,10 +155,13 @@ class OptimizedDiffusionTrainer:
         }
         torch.save(checkpoint, path)
 
-    def load_checkpoint(self, path):
+    def load_checkpoint(self, path, allow_legacy: bool = False):
         checkpoint = torch.load(path, map_location=self.device)
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
         self.converter.load_state_dict(checkpoint['converter'])
+
         if 'mission_encoder' in checkpoint:
             self.mission_encoder.load_state_dict(checkpoint['mission_encoder'])
+        elif not allow_legacy:
+            raise RuntimeError("Checkpoint missing 'mission_encoder'. Use allow_legacy=True to skip.")

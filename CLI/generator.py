@@ -44,7 +44,7 @@ class OptimizedAircraftGenerator:
         condition = self.mission_encoder(mission)
         latent_shape = (1, self.model_config.latent_dim)
 
-        print(f"Generating mission-conditioned design ({mission.aircraft_type})")
+        print(f"Generating mission-conditioned design ({mission.aircraft_class})")
         generated_latent = self.consistency_model.fast_inference(
             latent_shape,
             num_steps=num_steps,

@@ -10,7 +10,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
 from config import ModelConfig, DiffusionConfig, MissionProfile, DesignSpec
-from models import MissionEncoder, LatentDiffusionUNet, ConsistencyModel, ResidualBlock3D
+from models import MissionEncoder, LatentDiffusionUNet, ConsistencyModel, ResidualBlock3D, LatentTo3DConverter
 
 class TestMissionConditioning(unittest.TestCase):
     def setUp(self):
@@ -23,20 +23,23 @@ class TestMissionConditioning(unittest.TestCase):
     def test_mission_profile_validation(self):
         """Verify MissionProfile validates inputs"""
         with self.assertRaises(ValueError):
-            MissionProfile(cruise_speed=-10.0)
+            MissionProfile(cruise_speed_mps=-10.0)
         with self.assertRaises(ValueError):
             MissionProfile(aircraft_class="ufo")
+        with self.assertRaises(ValueError):
+            # stall >= cruise
+            MissionProfile(cruise_speed_mps=30, stall_speed_mps=30)
 
-        mp = MissionProfile(cruise_speed=100.0, aircraft_class="fighter")
-        self.assertEqual(mp.cruise_speed, 100.0)
+        mp = MissionProfile(cruise_speed_mps=100.0, aircraft_class="fighter", stall_speed_mps=40)
+        self.assertEqual(mp.cruise_speed_mps, 100.0)
 
     def test_mission_encoder_output(self):
         """Verify MissionEncoder returns correct shape"""
-        mp = MissionProfile(cruise_speed=60.0, manufacturing_method="composite")
+        mp = MissionProfile(cruise_speed_mps=60.0, manufacturing_method="composite", stall_speed_mps=20)
         condition = self.encoder(mp)
         self.assertEqual(condition.shape, (1, 32))
 
-        mps = [mp, MissionProfile(cruise_speed=40.0)]
+        mps = [mp, MissionProfile(cruise_speed_mps=40.0, stall_speed_mps=10)]
         condition_batch = self.encoder(mps)
         self.assertEqual(condition_batch.shape, (2, 32))
 
@@ -79,13 +82,14 @@ class TestMissionConditioning(unittest.TestCase):
         # Manually perturb conditioning weights so un-trained model shows difference
         for m in cm.student_model.modules():
             if isinstance(m, ResidualBlock3D) and m.condition_mlp is not None:
-                nn.init.normal_(m.condition_mlp[-1].weight, std=0.1)
+                nn.init.normal_(m.condition_mlp[-1].weight, std=10.0)
+                nn.init.normal_(m.condition_mlp[-1].bias, std=10.0)
 
         conv = LatentTo3DConverter(latent_dim=16, grid_resolution=16)
         initial_noise = torch.randn(1, 16)
 
-        mp1 = MissionProfile(cruise_speed=20.0, aircraft_class="uav")
-        mp2 = MissionProfile(cruise_speed=150.0, aircraft_class="fighter")
+        mp1 = MissionProfile(cruise_speed_mps=20.0, aircraft_class="uav", stall_speed_mps=10)
+        mp2 = MissionProfile(cruise_speed_mps=150.0, aircraft_class="fighter", stall_speed_mps=40)
 
         c1 = self.encoder(mp1)
         c2 = self.encoder(mp2)
@@ -98,15 +102,49 @@ class TestMissionConditioning(unittest.TestCase):
         v1 = torch.sigmoid(conv(l1))
         v2 = torch.sigmoid(conv(l2))
 
-        # Geometry statistics should differ
-        vol1 = v1.sum().item()
-        vol2 = v2.sum().item()
-        self.assertNotEqual(vol1, vol2)
+        # Acceptance-style test using thresholded occupancy
+        occ1 = (v1 > 0.5).float().sum().item()
+        occ2 = (v2 > 0.5).float().sum().item()
+        self.assertNotEqual(occ1, occ2)
 
         # Same condition should yield same geometry
         l1_again = cm.fast_inference((1, 16), num_steps=4, condition=c1, initial_noise=initial_noise)
         v1_again = torch.sigmoid(conv(l1_again))
         self.assertTrue(torch.allclose(v1, v1_again))
+
+    def test_generator_propagation(self):
+        """Verify generator correctly encodes mission and propagates to inference"""
+        from generator import OptimizedAircraftGenerator
+        from unittest.mock import MagicMock, patch
+
+        # Use a mock checkpoint
+        mock_checkpoint = {
+            'model_config': {'latent_dim': 16, 'condition_dim': 32, 'grid_resolution': 16},
+            'diffusion_config': {'timesteps': 100, 'beta_start': 0.0001, 'beta_end': 0.02, 'student_steps': 4, 'teacher_steps': 1000},
+            'consistency_model': {},
+            'diffusion_model': {},
+            'converter': {},
+            'mission_encoder': {}
+        }
+
+        with patch('torch.load', return_value=mock_checkpoint):
+            with patch.object(LatentDiffusionUNet, 'load_state_dict'):
+                with patch.object(LatentTo3DConverter, 'load_state_dict'):
+                    with patch.object(ConsistencyModel, 'load_state_dict'):
+                        with patch.object(MissionEncoder, 'load_state_dict'):
+                            gen = OptimizedAircraftGenerator("fake.pt")
+
+        gen.mission_encoder.forward = MagicMock(return_value=torch.randn(1, 32))
+        gen.consistency_model.fast_inference = MagicMock(return_value=torch.randn(1, 16))
+
+        mp = MissionProfile(cruise_speed_mps=50, stall_speed_mps=20)
+        gen.generate(mp)
+
+        # Verify encoder received the profile
+        gen.mission_encoder.forward.assert_called_with(mp)
+        # Verify inference received the condition
+        self.assertIn('condition', gen.consistency_model.fast_inference.call_args.kwargs)
+        self.assertIsNotNone(gen.consistency_model.fast_inference.call_args.kwargs['condition'])
 
     def test_propagation_spies(self):
         """Verify condition propagation using mock/spy techniques"""
