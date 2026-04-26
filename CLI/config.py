@@ -174,22 +174,36 @@ OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", 
 
 @dataclass
 class MissionProfile:
-    """Mission profile for conditioned aircraft design"""
-    target_speed: float = 50.0  # m/s
-    target_range: float = 1000.0  # km
-    payload_capacity: float = 500.0  # kg
-    max_altitude: float = 10000.0  # m
-    takeoff_distance: float = 500.0  # m
-    aircraft_type: str = "civilian"  # civilian, cargo, military
+    """Rich mission profile for conditioned aircraft design (Issue #14)"""
+    aircraft_class: str = "uav"  # uav, light_aircraft, airliner, fighter
+    payload: float = 10.0  # kg
+    range: float = 100.0  # km
+    endurance: float = 2.0  # hours
+    cruise_speed: float = 30.0  # m/s
+    cruise_altitude: float = 1000.0  # m
+    max_takeoff_weight: float = 50.0  # kg
+    stall_speed: float = 15.0  # m/s
+    propulsion_type: str = "electric"  # electric, turboprop, jet
+    manufacturing_method: str = "3d_print"  # 3d_print, composite, metal_sheet
+    max_span: float = 2.0  # m
+    max_length: float = 1.5  # m
+    max_height: float = 0.5  # m
 
     def __post_init__(self):
-        if self.target_speed <= 0: raise ValueError("target_speed must be positive")
-        if self.target_range <= 0: raise ValueError("target_range must be positive")
-        if self.payload_capacity < 0: raise ValueError("payload_capacity cannot be negative")
-        if self.max_altitude <= 0: raise ValueError("max_altitude must be positive")
-        if self.takeoff_distance <= 0: raise ValueError("takeoff_distance must be positive")
-        if self.aircraft_type not in ["civilian", "cargo", "military"]:
-            raise ValueError(f"invalid aircraft_type: {self.aircraft_type}")
+        # Validation
+        if self.aircraft_class not in ["uav", "light_aircraft", "airliner", "fighter"]:
+            raise ValueError(f"Invalid aircraft_class: {self.aircraft_class}")
+        if self.propulsion_type not in ["electric", "turboprop", "jet"]:
+            raise ValueError(f"Invalid propulsion_type: {self.propulsion_type}")
+        if self.manufacturing_method not in ["3d_print", "composite", "metal_sheet"]:
+            raise ValueError(f"Invalid manufacturing_method: {self.manufacturing_method}")
+
+        # Positivity checks
+        for field in ["payload", "range", "endurance", "cruise_speed", "cruise_altitude",
+                      "max_takeoff_weight", "stall_speed", "max_span", "max_length", "max_height"]:
+            val = getattr(self, field)
+            if val <= 0:
+                raise ValueError(f"{field} must be positive, got {val}")
 
 @dataclass
 class DesignSpec:
@@ -202,4 +216,10 @@ class DesignSpec:
     vital_components: Optional[List] = None
 
     def to_mission_profile(self) -> MissionProfile:
-        return MissionProfile(target_speed=max(1.0, self.target_speed))
+        """Lossy legacy conversion"""
+        return MissionProfile(
+            cruise_speed=max(1.0, self.target_speed),
+            max_span=float(self.bounding_box[0]),
+            max_length=float(self.bounding_box[1]),
+            max_height=float(self.bounding_box[2])
+        )

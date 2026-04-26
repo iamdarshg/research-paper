@@ -82,12 +82,16 @@ class OptimizedDiffusionTrainer:
 
             # Generate MissionProfiles for condition encoding
             # In real usage, these would come from the dataset.
-            # For synthesis, we create profiles based on target_speed in batch
+            # Load mission profiles from batch if available, else fallback
             batch_size = latent.shape[0]
-            mission_profiles = []
-            speeds = batch.get('target_speed', torch.full((batch_size,), 50.0))
-            for i in range(batch_size):
-                mission_profiles.append(MissionProfile(target_speed=float(speeds[i].item())))
+            if 'mission_profile' in batch:
+                 mission_profiles = batch['mission_profile']
+            else:
+                # Synthesis fallback for testing/initial training
+                mission_profiles = []
+                speeds = batch.get('target_speed', torch.full((batch_size,), 50.0))
+                for i in range(batch_size):
+                    mission_profiles.append(MissionProfile(cruise_speed=float(speeds[i].item())))
 
             condition = self.mission_encoder(mission_profiles)
 

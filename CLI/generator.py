@@ -20,12 +20,12 @@ class OptimizedAircraftGenerator:
         self.converter = LatentTo3DConverter(self.model_config.latent_dim, self.model_config.grid_resolution).to(self.device)
         self.consistency_model = ConsistencyModel(self.model_config, self.diffusion_config).to(self.device)
 
-        # Load mission encoder if present
+        # Load mission encoder (Required for conditioned generation)
+        if 'mission_encoder' not in checkpoint:
+            raise RuntimeError("Checkpoint missing 'mission_encoder'. This model does not support mission-conditioned generation.")
+
         self.mission_encoder = MissionEncoder(self.model_config.condition_dim).to(self.device)
-        if 'mission_encoder' in checkpoint:
-            self.mission_encoder.load_state_dict(checkpoint['mission_encoder'])
-        else:
-            print("⚠️ Checkpoint missing mission_encoder. Conditioning may fail or use default weights.")
+        self.mission_encoder.load_state_dict(checkpoint['mission_encoder'])
 
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])

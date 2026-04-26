@@ -23,20 +23,20 @@ class TestMissionConditioning(unittest.TestCase):
     def test_mission_profile_validation(self):
         """Verify MissionProfile validates inputs"""
         with self.assertRaises(ValueError):
-            MissionProfile(target_speed=-10.0)
+            MissionProfile(cruise_speed=-10.0)
         with self.assertRaises(ValueError):
-            MissionProfile(aircraft_type="ufo")
+            MissionProfile(aircraft_class="ufo")
 
-        mp = MissionProfile(target_speed=100.0, aircraft_type="military")
-        self.assertEqual(mp.target_speed, 100.0)
+        mp = MissionProfile(cruise_speed=100.0, aircraft_class="fighter")
+        self.assertEqual(mp.cruise_speed, 100.0)
 
     def test_mission_encoder_output(self):
         """Verify MissionEncoder returns correct shape"""
-        mp = MissionProfile(target_speed=60.0, aircraft_type="cargo")
+        mp = MissionProfile(cruise_speed=60.0, manufacturing_method="composite")
         condition = self.encoder(mp)
         self.assertEqual(condition.shape, (1, 32))
 
-        mps = [mp, MissionProfile(target_speed=40.0)]
+        mps = [mp, MissionProfile(cruise_speed=40.0)]
         condition_batch = self.encoder(mps)
         self.assertEqual(condition_batch.shape, (2, 32))
 
@@ -71,28 +71,73 @@ class TestMissionConditioning(unittest.TestCase):
         self.assertEqual(out.shape, (1, 16))
 
     def test_deterministic_ab_difference(self):
-        """Verify that different mission profiles yield different outputs under fixed noise"""
-        # We need a small trained-like state for measurable difference,
-        # but even random weights should show SOME difference if propagation works.
+        """Verify that different mission profiles yield different geometry under fixed noise"""
+        from models import LatentTo3DConverter
         torch.manual_seed(42)
         cm = ConsistencyModel(self.model_config, self.diffusion_config)
+
+        # Manually perturb conditioning weights so un-trained model shows difference
+        for m in cm.student_model.modules():
+            if isinstance(m, ResidualBlock3D) and m.condition_mlp is not None:
+                nn.init.normal_(m.condition_mlp[-1].weight, std=0.1)
+
+        conv = LatentTo3DConverter(latent_dim=16, grid_resolution=16)
         initial_noise = torch.randn(1, 16)
 
-        mp1 = MissionProfile(target_speed=20.0, aircraft_type="civilian")
-        mp2 = MissionProfile(target_speed=150.0, aircraft_type="military")
+        mp1 = MissionProfile(cruise_speed=20.0, aircraft_class="uav")
+        mp2 = MissionProfile(cruise_speed=150.0, aircraft_class="fighter")
 
         c1 = self.encoder(mp1)
         c2 = self.encoder(mp2)
 
-        out1 = cm.fast_inference((1, 16), num_steps=4, condition=c1, initial_noise=initial_noise)
-        out2 = cm.fast_inference((1, 16), num_steps=4, condition=c2, initial_noise=initial_noise)
+        # Latents
+        l1 = cm.fast_inference((1, 16), num_steps=4, condition=c1, initial_noise=initial_noise)
+        l2 = cm.fast_inference((1, 16), num_steps=4, condition=c2, initial_noise=initial_noise)
 
-        # Outputs should be different because conditions are different
-        self.assertFalse(torch.allclose(out1, out2, atol=1e-5))
+        # Voxel grids
+        v1 = torch.sigmoid(conv(l1))
+        v2 = torch.sigmoid(conv(l2))
 
-        # Same condition should yield same output
-        out1_again = cm.fast_inference((1, 16), num_steps=4, condition=c1, initial_noise=initial_noise)
-        self.assertTrue(torch.allclose(out1, out1_again))
+        # Geometry statistics should differ
+        vol1 = v1.sum().item()
+        vol2 = v2.sum().item()
+        self.assertNotEqual(vol1, vol2)
+
+        # Same condition should yield same geometry
+        l1_again = cm.fast_inference((1, 16), num_steps=4, condition=c1, initial_noise=initial_noise)
+        v1_again = torch.sigmoid(conv(l1_again))
+        self.assertTrue(torch.allclose(v1, v1_again))
+
+    def test_propagation_spies(self):
+        """Verify condition propagation using mock/spy techniques"""
+        from unittest.mock import MagicMock
+
+        # Mock student model to capture calls
+        cm = ConsistencyModel(self.model_config, self.diffusion_config)
+        cm.student_model.forward = MagicMock(side_effect=cm.student_model.forward)
+        cm.teacher_model.forward = MagicMock(side_effect=cm.teacher_model.forward)
+
+        condition = torch.randn(1, 32)
+
+        # Test inference propagation
+        cm.fast_inference((1, 16), num_steps=2, condition=condition)
+        # Check that student was called with condition at every step
+        self.assertEqual(cm.student_model.forward.call_count, 2)
+        for call in cm.student_model.forward.call_args_list:
+            self.assertTrue(torch.allclose(call.kwargs['condition'], condition))
+
+        # Test loss propagation
+        cm.student_model.forward.reset_mock()
+        x = torch.randn(1, 16)
+        t_s = torch.tensor([1])
+        t_t = torch.tensor([10])
+        cm.consistency_loss(x, t_s, t_t, condition=condition)
+
+        # Both teacher and student should have received condition
+        cm.student_model.forward.assert_called()
+        self.assertTrue(torch.allclose(cm.student_model.forward.call_args.kwargs['condition'], condition))
+        cm.teacher_model.forward.assert_called()
+        self.assertTrue(torch.allclose(cm.teacher_model.forward.call_args.kwargs['condition'], condition))
 
 if __name__ == '__main__':
     unittest.main()

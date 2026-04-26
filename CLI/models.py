@@ -1,3 +1,4 @@
+import math
 
 import torch
 import torch.nn as nn
@@ -6,52 +7,78 @@ from typing import Tuple, List, Dict, Union
 from config import ModelConfig, DiffusionConfig, MissionProfile
 
 class MissionEncoder(nn.Module):
-    """Encodes structured mission profiles into a fixed-size condition embedding"""
+    """Encodes rich mission profiles into stable condition embeddings (Issue #14)"""
     def __init__(self, condition_dim: int = 32):
         super().__init__()
         self.condition_dim = condition_dim
-        # Numeric fields: speed, range, payload, altitude, takeoff
-        # Categorical: aircraft_type (3 options)
-        self.type_embedding = nn.Embedding(3, 8)
+
+        # Categorical embeddings
+        self.class_emb = nn.Embedding(4, 8)  # uav, light, airliner, fighter
+        self.prop_emb = nn.Embedding(3, 4)   # electric, turboprop, jet
+        self.mfg_emb = nn.Embedding(3, 4)    # 3d_print, composite, metal
+
+        # Numeric MLP for 10 physical fields
         self.numeric_mlp = nn.Sequential(
-            nn.Linear(5, 16),
-            nn.ReLU(),
-            nn.Linear(16, 16)
+            nn.Linear(10, 32),
+            nn.SiLU(),
+            nn.Linear(32, 16)
         )
+
+        # Final fusion
         self.final_mlp = nn.Sequential(
-            nn.Linear(16 + 8, condition_dim),
-            nn.ReLU(),
+            nn.Linear(16 + 8 + 4 + 4, condition_dim),
+            nn.SiLU(),
             nn.Linear(condition_dim, condition_dim)
         )
-        self.type_map = {"civilian": 0, "cargo": 1, "military": 2}
+
+        self.maps = {
+            "class": {"uav": 0, "light_aircraft": 1, "airliner": 2, "fighter": 3},
+            "prop": {"electric": 0, "turboprop": 1, "jet": 2},
+            "mfg": {"3d_print": 0, "composite": 1, "metal_sheet": 2}
+        }
 
     def forward(self, profiles: Union[MissionProfile, List[MissionProfile]]) -> torch.Tensor:
         if isinstance(profiles, MissionProfile):
             profiles = [profiles]
 
         batch_size = len(profiles)
-        device = next(self.parameters()).device
+        # Use parameter dtype to avoid float32 risk
+        dtype = self.class_emb.weight.dtype
+        device = self.class_emb.weight.device
 
-        # Numeric normalization: roughly maps expected ranges to O(1)
-        numeric_data = []
-        type_indices = []
+        num_data = []
+        cat_data = []
         for p in profiles:
-            numeric_data.append([
-                p.target_speed / 100.0,
-                p.target_range / 2000.0,
-                p.payload_capacity / 1000.0,
-                p.max_altitude / 15000.0,
-                p.takeoff_distance / 1000.0
+            # Stable normalization: log scaling for wide ranges + clamping
+            def norm(val, scale): return math.log1p(val) / math.log1p(scale)
+
+            num_data.append([
+                norm(p.payload, 1000.0),
+                norm(p.range, 5000.0),
+                norm(p.endurance, 24.0),
+                norm(p.cruise_speed, 300.0),
+                norm(p.cruise_altitude, 15000.0),
+                norm(p.max_takeoff_weight, 50000.0),
+                norm(p.stall_speed, 100.0),
+                norm(p.max_span, 50.0),
+                norm(p.max_length, 50.0),
+                norm(p.max_height, 20.0)
             ])
-            type_indices.append(self.type_map.get(p.aircraft_type, 0))
+            cat_data.append([
+                self.maps["class"].get(p.aircraft_class, 0),
+                self.maps["prop"].get(p.propulsion_type, 0),
+                self.maps["mfg"].get(p.manufacturing_method, 0)
+            ])
 
-        numeric_tensor = torch.tensor(numeric_data, dtype=torch.float32, device=device)
-        type_tensor = torch.tensor(type_indices, dtype=torch.long, device=device)
+        num_t = torch.tensor(num_data, dtype=dtype, device=device).clamp(0, 2)
+        cat_t = torch.tensor(cat_data, dtype=torch.long, device=device)
 
-        num_emb = self.numeric_mlp(numeric_tensor)
-        type_emb = self.type_embedding(type_tensor)
+        num_feat = self.numeric_mlp(num_t)
+        class_feat = self.class_emb(cat_t[:, 0])
+        prop_feat = self.prop_emb(cat_t[:, 1])
+        mfg_feat = self.mfg_emb(cat_t[:, 2])
 
-        combined = torch.cat([num_emb, type_emb], dim=1)
+        combined = torch.cat([num_feat, class_feat, prop_feat, mfg_feat], dim=1)
         return self.final_mlp(combined)
 
 class GroupedQueryAttention(nn.Module):
@@ -342,6 +369,7 @@ class ConsistencyModel(nn.Module):
 
         teacher_config = ModelConfig(
             latent_dim=config.latent_dim,
+            condition_dim=config.condition_dim,
             encoder_channels=config.encoder_channels,
             decoder_channels=config.decoder_channels,
             attention_groups=config.attention_groups,
@@ -352,6 +380,7 @@ class ConsistencyModel(nn.Module):
 
         student_config = ModelConfig(
             latent_dim=config.latent_dim,
+            condition_dim=config.condition_dim,
             encoder_channels=[c // 2 for c in config.encoder_channels],
             decoder_channels=[c // 2 for c in config.decoder_channels],
             attention_groups=4,
@@ -362,11 +391,21 @@ class ConsistencyModel(nn.Module):
         self._initialize_student()
 
     def _initialize_student(self):
-        for param in self.student_model.parameters():
-            if param.dim() > 1:
+        for name, param in self.student_model.named_parameters():
+            if "condition_mlp" in name and name.endswith("weight") and param.shape[-1] == param.shape[0] // 2:
+                 # This is the final projection in ResidualBlock3D (proj to out_channels * 2)
+                 # We want to preserve zero-init for stability
+                 nn.init.zeros_(param)
+            elif param.dim() > 1:
                 nn.init.xavier_uniform_(param)
             else:
                 nn.init.zeros_(param)
+
+        # Explicit pass to ensure final condition projections are zero
+        for m in self.student_model.modules():
+            if isinstance(m, ResidualBlock3D) and m.condition_mlp is not None:
+                nn.init.zeros_(m.condition_mlp[-1].weight)
+                nn.init.zeros_(m.condition_mlp[-1].bias)
 
     def consistency_loss(self, x_0: torch.Tensor, t_student: torch.Tensor, t_teacher: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         batch_size = x_0.shape[0]
@@ -450,8 +489,9 @@ class NoiseSchedule:
         self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1.0)
 
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
+        view_shape = [-1] + [1] * (x_0.dim() - 1)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(*view_shape)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(*view_shape)
         return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
 
     def to(self, device, dtype=None):
