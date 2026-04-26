@@ -25,6 +25,7 @@ class DiffusionConfig:
 class ModelConfig:
     """Model architecture parameters with grouped-query attention"""
     latent_dim: int = 16
+    condition_dim: int = 32
     xyz_dim: int = 3
     encoder_channels: List[int] = None
     decoder_channels: List[int] = None
@@ -172,11 +173,61 @@ OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
 OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam"))
 
 @dataclass
+class MissionProfile:
+    """Rich mission profile for conditioned aircraft design (Issue #14)"""
+    aircraft_class: str = "uav"  # uav, fast_uav, light_aircraft, airliner, fighter, glider
+    payload_kg: float = 10.0
+    range_km: float = 100.0
+    endurance_hr: float = 2.0
+    cruise_speed_mps: float = 30.0
+    cruise_altitude_m: float = 1000.0
+    max_takeoff_weight_kg: float = 50.0
+    stall_speed_mps: float = 15.0
+    propulsion_type: str = "electric"  # electric, turboprop, jet, none
+    manufacturing_method: str = "3d_print"  # 3d_print, composite, metal_sheet
+    max_span_m: float = 2.0
+    max_length_m: float = 1.5
+    max_height_m: float = 0.5
+
+    def __post_init__(self):
+        # Validation
+        valid_classes = ["uav", "fast_uav", "light_aircraft", "airliner", "fighter", "glider"]
+        if self.aircraft_class not in valid_classes:
+            raise ValueError(f"Invalid aircraft_class: {self.aircraft_class}")
+        if self.propulsion_type not in ["electric", "turboprop", "jet", "none"]:
+            raise ValueError(f"Invalid propulsion_type: {self.propulsion_type}")
+        if self.manufacturing_method not in ["3d_print", "composite", "metal_sheet"]:
+            raise ValueError(f"Invalid manufacturing_method: {self.manufacturing_method}")
+
+        # Positivity checks
+        for field in ["payload_kg", "range_km", "endurance_hr", "cruise_speed_mps", "cruise_altitude_m",
+                      "max_takeoff_weight_kg", "stall_speed_mps", "max_span_m", "max_length_m", "max_height_m"]:
+            val = getattr(self, field)
+            if val <= 0:
+                raise ValueError(f"{field} must be positive, got {val}")
+
+        # Physical constraints
+        if self.stall_speed_mps >= self.cruise_speed_mps:
+            raise ValueError(f"stall_speed ({self.stall_speed_mps}) must be less than cruise_speed ({self.cruise_speed_mps})")
+
+@dataclass
 class DesignSpec:
-    """Aircraft design specification"""
+    """Aircraft design specification (Deprecated adapter)"""
     target_speed: float = 7.0  # m/s
     space_weight: float = 0.33*100
     drag_weight: float = 0.33*100
     lift_weight: float = 0.34*100
     bounding_box: Tuple[int, int, int] = (64, 64, 64)
     vital_components: Optional[List] = None
+
+    def to_mission_profile(self) -> MissionProfile:
+        """Lossy legacy conversion (Deprecated)"""
+        # Mapping 1 voxel to 0.1m for reasonable scale fallback
+        cruise = max(1.0, float(self.target_speed))
+        return MissionProfile(
+            cruise_speed_mps=cruise,
+            stall_speed_mps=max(0.1, min(0.5 * cruise, cruise - 1e-3)),
+            max_span_m=float(self.bounding_box[0]) * 0.1,
+            max_length_m=float(self.bounding_box[1]) * 0.1,
+            max_height_m=float(self.bounding_box[2]) * 0.1
+        )
