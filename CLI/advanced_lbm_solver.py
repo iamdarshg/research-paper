@@ -24,44 +24,13 @@ def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: floa
     return force * force_scale
 
 
-class MRTCollision:
-    """Vectorized MRT collision for D3Q27."""
-    MOMENT_KEYS = torch.tensor([(a, b, c) for a in range(3) for b in range(3) for c in range(3)], dtype=torch.float32)
-    MOMENT_NAMES = [f"{a}{b}{c}" for a, b, c in MOMENT_KEYS.tolist()]
-
-    @staticmethod
-    def build_moment_basis(ex, ey, ez):
-        ex = ex.to(dtype=torch.float32)
-        ey = ey.to(dtype=torch.float32)
-        ez = ez.to(dtype=torch.float32)
-        basis_rows = []
-        for a, b, c in MRTCollision.MOMENT_KEYS:
-            basis_rows.append((ex ** a) * (ey ** b) * (ez ** c))
-        return torch.stack(basis_rows, dim=0)
-
-    @staticmethod
-    def compute_equilibrium_moments(rho, ux, uy, uz, cs2=1/3):
-        # Optimized vectorized equilibrium moments
-        u = torch.stack([ux, uy, uz], dim=0) # [3, D, H, W]
-        # m1d components for orders 0, 1, 2
-        m0 = torch.ones_like(ux)
-        m1 = u
-        m2 = u * u + cs2
-
-        # We need to compute M_abc = rho * m_a(ux) * m_b(uy) * m_c(uz)
-        # where m_i is one of m0, m1[i], m2[i]
-
-        eq_moments = []
-        for a, b, c in MRTCollision.MOMENT_KEYS.int().tolist():
-            ma = m0 if a == 0 else (m1[0] if a == 1 else m2[0])
-            mb = m0 if b == 0 else (m1[1] if b == 1 else m2[1])
-            mc = m0 if c == 0 else (m1[2] if c == 1 else m2[2])
-            eq_moments.append(rho * ma * mb * mc)
-
-        return torch.stack(eq_moments, dim=0)
-
 class D3Q27Solver:
-    """Complete D3Q27 LBM solver with MRT support."""
+    """Complete D3Q27 LBM solver
+
+    TODO: Implement sparse grid support (e.g., using Taichi or a custom sparse
+    tensor layout) to handle very high resolutions (up to 1024^3) without
+    exceeding VRAM limits of modern GPUs.
+    """
     def __init__(
         self,
         resolution,
@@ -101,28 +70,7 @@ class D3Q27Solver:
         self._boundary_link_cache = None
         self.use_triton_streaming = bool(use_triton_streaming and stream_bounce_d3q27 is not None and device.type == "cuda")
 
-        # Moments setup
-        self.moment_basis = MRTCollision.build_moment_basis(self.ex, self.ey, self.ez).to(device=device)
-        self.moment_matrix_inv = torch.inverse(self.moment_basis)
-
-        # Pre-compute relaxation indices for vectorized collision
-        self.idx_shear = []
-        self.idx_bulk = []
-        self.idx_higher = []
-        for i, (a, b, c) in enumerate(MRTCollision.MOMENT_KEYS.int().tolist()):
-            if a + b + c == 2:
-                if a*b != 0 or a*c != 0 or b*c != 0: # 110, 101, 011
-                    self.idx_shear.append(i)
-                else: # 200, 020, 002
-                    self.idx_bulk.append(i)
-            elif a + b + c > 2:
-                self.idx_higher.append(i)
-
-        self.idx_shear = torch.tensor(self.idx_shear, device=device)
-        self.idx_bulk = torch.tensor(self.idx_bulk, device=device)
-        self.idx_higher = torch.tensor(self.idx_higher, device=device)
-
-        # 27 populations
+        # 27 populations instead of 19
         self.f = torch.zeros(27, resolution, resolution, resolution, device=device)
         self.f_temp = torch.zeros_like(self.f)
         self.f_pre_stream = torch.empty_like(self.f)
@@ -218,33 +166,24 @@ class D3Q27Solver:
         self.f_temp[:, :, :, 0] = self.f_temp[:, :, :, 1]
         self.f_temp[:, :, :, -1] = self.f_temp[:, :, :, -2]
 
-    def collide_and_stream(self, omega, geometry_mask, s_e=1.2, s_h=1.6):
+    def collide_and_stream(self, omega, geometry_mask):
         geometry_mask = geometry_mask.to(self.device, non_blocking=True)
-        # Check for convergence/stability issues
-        if not torch.isfinite(self.f).all():
-            self.f.nan_to_num_(nan=0.0, posinf=10.0, neginf=-10.0)
+        # Guard against runaway non-finite populations from previous steps.
+        self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
         # Macroscopic variables
         rho = torch.sum(self.f, dim=0).clamp_min(1e-8)
-        ux = (torch.sum(self.f * self.ex_f, dim=0) / rho).nan_to_num(0.0)
-        uy = (torch.sum(self.f * self.ey_f, dim=0) / rho).nan_to_num(0.0)
-        uz = (torch.sum(self.f * self.ez_f, dim=0) / rho).nan_to_num(0.0)
+        ux = torch.sum(self.f * self.ex_f, dim=0) / (rho + 1e-12)
+        uy = torch.sum(self.f * self.ey_f, dim=0) / (rho + 1e-12)
+        uz = torch.sum(self.f * self.ez_f, dim=0) / (rho + 1e-12)
+        ux = ux.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+        uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+        uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
 
-        # MRT Collision (Fully Vectorized)
-        K = torch.tensordot(self.moment_basis, self.f, dims=([1], [0]))
-        K_eq = MRTCollision.compute_equilibrium_moments(rho, ux, uy, uz)
-
-        # Build dynamic relaxation vector without Python loops
-        s = torch.zeros(27, 1, 1, 1, device=self.device)
-        s[self.idx_shear] = omega
-        s[self.idx_bulk] = s_e
-        s[self.idx_higher] = s_h
-
-        K += s * (K_eq - K)
-
-        # Inverse transform
-        f_flat = self.moment_matrix_inv @ K.view(27, -1)
-        self.f.copy_(f_flat.view(27, self.res, self.res, self.res))
+        # Collision
+        feq = self.compute_equilibrium(rho, ux, uy, uz)
+        self.f += omega * (feq - self.f)
+        self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
         self.f_pre_stream.copy_(self.f)
         
@@ -402,17 +341,18 @@ class D3Q27CascadedSolver:
         self.rho.copy_(rho)
 
     def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
-        """Run collide/stream for a number of steps using Cascaded MRT."""
+        """Run collide/stream for a number of steps. This adapts the simpler
+        D3Q27 solver's `collide_and_stream(omega, geometry_mask)` API.
+        """
         geometry_mask = geometry_mask.to(self.device, non_blocking=True)
+        # compute a nominal relaxation rate from config
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
+        dt = getattr(self.config.lbm_config, 'time_step', 0.001)
         nu = self._estimate_kinematic_viscosity()
         self.nu = nu
         tau_min = float(getattr(self.phys_config, "tau_min_d3q27", 0.52))
         tau = max(3.0 * nu + 0.5, tau_min)
         omega = 1.0 / max(tau, 1e-12)
-
-        s_e = float(getattr(self.phys_config, "s_bulk", 1.2))
-        s_h = float(getattr(self.phys_config, "s_higher", 1.6))
 
         sample_window = max(10, steps // 4)
         sample_start = max(0, steps - sample_window)
@@ -420,7 +360,7 @@ class D3Q27CascadedSolver:
 
         # run steps
         for _ in range(steps):
-            ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask, s_e=s_e, s_h=s_h)
+            ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask)
             # store fields for diagnostics
             self.velocity_x = ux
             self.velocity_y = uy

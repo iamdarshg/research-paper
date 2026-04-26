@@ -194,11 +194,6 @@ See `requirements.txt`. Key packages:
 
 *Note: A100 GPUs are ~2-3x faster than RTX 3090*
 
-## Performance Benchmarks
-
-<!-- BENCHMARK_START -->
-<!-- BENCHMARK_END -->
-
 ## Configuration
 
 ### Config File (`config.yaml`)

@@ -25,6 +25,7 @@ class DiffusionConfig:
 class ModelConfig:
     """Model architecture parameters with grouped-query attention"""
     latent_dim: int = 16
+    condition_dim: int = 32
     xyz_dim: int = 3
     encoder_channels: List[int] = None
     decoder_channels: List[int] = None
@@ -172,11 +173,33 @@ OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
 OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam"))
 
 @dataclass
+class MissionProfile:
+    """Mission profile for conditioned aircraft design"""
+    target_speed: float = 50.0  # m/s
+    target_range: float = 1000.0  # km
+    payload_capacity: float = 500.0  # kg
+    max_altitude: float = 10000.0  # m
+    takeoff_distance: float = 500.0  # m
+    aircraft_type: str = "civilian"  # civilian, cargo, military
+
+    def __post_init__(self):
+        if self.target_speed <= 0: raise ValueError("target_speed must be positive")
+        if self.target_range <= 0: raise ValueError("target_range must be positive")
+        if self.payload_capacity < 0: raise ValueError("payload_capacity cannot be negative")
+        if self.max_altitude <= 0: raise ValueError("max_altitude must be positive")
+        if self.takeoff_distance <= 0: raise ValueError("takeoff_distance must be positive")
+        if self.aircraft_type not in ["civilian", "cargo", "military"]:
+            raise ValueError(f"invalid aircraft_type: {self.aircraft_type}")
+
+@dataclass
 class DesignSpec:
-    """Aircraft design specification"""
+    """Aircraft design specification (Deprecated adapter)"""
     target_speed: float = 7.0  # m/s
     space_weight: float = 0.33*100
     drag_weight: float = 0.33*100
     lift_weight: float = 0.34*100
     bounding_box: Tuple[int, int, int] = (64, 64, 64)
     vital_components: Optional[List] = None
+
+    def to_mission_profile(self) -> MissionProfile:
+        return MissionProfile(target_speed=max(1.0, self.target_speed))
