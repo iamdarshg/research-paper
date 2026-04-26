@@ -223,8 +223,10 @@ class DesignSpec:
     def to_mission_profile(self) -> MissionProfile:
         """Lossy legacy conversion (Deprecated)"""
         # Mapping 1 voxel to 0.1m for reasonable scale fallback
+        cruise = max(1.0, float(self.target_speed))
         return MissionProfile(
-            cruise_speed_mps=max(1.0, self.target_speed),
+            cruise_speed_mps=cruise,
+            stall_speed_mps=max(0.1, min(0.5 * cruise, cruise - 1e-3)),
             max_span_m=float(self.bounding_box[0]) * 0.1,
             max_length_m=float(self.bounding_box[1]) * 0.1,
             max_height_m=float(self.bounding_box[2]) * 0.1

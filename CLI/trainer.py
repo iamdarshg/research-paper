@@ -71,15 +71,41 @@ class OptimizedDiffusionTrainer:
         """Normalize mission data from dataset batch into MissionProfile objects"""
         if 'mission_profile' in batch:
             profiles = batch['mission_profile']
-            if isinstance(profiles, list) and len(profiles) > 0 and isinstance(profiles[0], MissionProfile):
-                return profiles
-            # Handle list of dicts or other formats if needed
+
+            if isinstance(profiles, MissionProfile):
+                return [profiles] * batch_size
+
+            if isinstance(profiles, list):
+                if all(isinstance(p, MissionProfile) for p in profiles):
+                    if len(profiles) != batch_size:
+                         raise ValueError(f"Mission profile batch size mismatch: {len(profiles)} vs {batch_size}")
+                    return profiles
+                if all(isinstance(p, dict) for p in profiles):
+                    return [MissionProfile(**p) for p in profiles]
+
+            if isinstance(profiles, dict):
+                # dict of tensors/lists/scalars -> list[MissionProfile]
+                out = []
+                for i in range(batch_size):
+                    kwargs = {}
+                    for key, value in profiles.items():
+                        if torch.is_tensor(value):
+                            kwargs[key] = value[i].item() if value.ndim > 0 else value.item()
+                        elif isinstance(value, list):
+                            kwargs[key] = value[i]
+                        else:
+                            kwargs[key] = value
+                    out.append(MissionProfile(**kwargs))
+                return out
 
         # Fallback to synthesizing from available fields
         profiles = []
         speeds = batch.get('target_speed', torch.full((batch_size,), 50.0))
         for i in range(batch_size):
-            profiles.append(MissionProfile(cruise_speed_mps=float(speeds[i].item())))
+            # Safe default stall speed
+            cruise = float(speeds[i].item())
+            stall = max(0.1, min(0.5 * cruise, cruise - 1.0))
+            profiles.append(MissionProfile(cruise_speed_mps=cruise, stall_speed_mps=stall))
         return profiles
 
     def train_epoch(self, train_loader, grid_size=32):

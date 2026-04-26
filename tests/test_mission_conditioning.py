@@ -33,6 +33,19 @@ class TestMissionConditioning(unittest.TestCase):
         mp = MissionProfile(cruise_speed_mps=100.0, aircraft_class="fighter", stall_speed_mps=40)
         self.assertEqual(mp.cruise_speed_mps, 100.0)
 
+    def test_design_spec_adapter_validation(self):
+        """Verify DesignSpec adapter handles default and large speeds correctly"""
+        # Default
+        ds = DesignSpec()
+        mp = ds.to_mission_profile()
+        self.assertLess(mp.stall_speed_mps, mp.cruise_speed_mps)
+        self.assertEqual(mp.cruise_speed_mps, 7.0)
+
+        # Large speed
+        ds2 = DesignSpec(target_speed=200.0)
+        mp2 = ds2.to_mission_profile()
+        self.assertLess(mp2.stall_speed_mps, mp2.cruise_speed_mps)
+
     def test_mission_encoder_output(self):
         """Verify MissionEncoder returns correct shape"""
         mp = MissionProfile(cruise_speed_mps=60.0, manufacturing_method="composite", stall_speed_mps=20)
@@ -111,6 +124,41 @@ class TestMissionConditioning(unittest.TestCase):
         l1_again = cm.fast_inference((1, 16), num_steps=4, condition=c1, initial_noise=initial_noise)
         v1_again = torch.sigmoid(conv(l1_again))
         self.assertTrue(torch.allclose(v1, v1_again))
+
+    def test_trainer_normalization_formats(self):
+        """Verify trainer correctly normalizes diverse mission batch formats"""
+        from trainer import OptimizedDiffusionTrainer
+        from config import CFDConfig, TrainingConfig
+
+        trainer = OptimizedDiffusionTrainer(self.model_config, self.diffusion_config, TrainingConfig(), CFDConfig())
+
+        # Single MissionProfile
+        mp = MissionProfile(cruise_speed_mps=50, stall_speed_mps=20)
+        batch1 = {'mission_profile': mp}
+        res1 = trainer._normalize_mission_batch(batch1, 2)
+        self.assertEqual(len(res1), 2)
+        self.assertEqual(res1[0].cruise_speed_mps, 50)
+
+        # List of MissionProfile
+        batch2 = {'mission_profile': [mp, mp]}
+        res2 = trainer._normalize_mission_batch(batch2, 2)
+        self.assertEqual(res2[0].cruise_speed_mps, 50)
+
+        # List of dicts
+        batch3 = {'mission_profile': [{'cruise_speed_mps': 60, 'stall_speed_mps': 30}, {'cruise_speed_mps': 40, 'stall_speed_mps': 10}]}
+        res3 = trainer._normalize_mission_batch(batch3, 2)
+        self.assertEqual(res3[0].cruise_speed_mps, 60)
+        self.assertEqual(res3[1].cruise_speed_mps, 40)
+
+        # Dict of tensors
+        batch4 = {'mission_profile': {
+            'cruise_speed_mps': torch.tensor([80.0, 90.0]),
+            'stall_speed_mps': torch.tensor([40.0, 45.0]),
+            'aircraft_class': ['uav', 'fighter']
+        }}
+        res4 = trainer._normalize_mission_batch(batch4, 2)
+        self.assertEqual(res4[0].cruise_speed_mps, 80.0)
+        self.assertEqual(res4[1].aircraft_class, 'fighter')
 
     def test_generator_propagation(self):
         """Verify generator correctly encodes mission and propagates to inference"""
