@@ -10,7 +10,7 @@ from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
 from config import CFDConfig, LBMPhysicsConfig, OPENFOAM_AVAILABLE, OPENFOAM_ROOT, MissionProfile
-from constraints import ConstraintProjector
+from constraints import ConstraintProjector, ConstraintReport
 from geometry import TypedAircraftGeometry, AircraftPart
 
 class AdvancedCFDSimulator:
@@ -53,7 +53,9 @@ class AdvancedCFDSimulator:
         if self.amr_solver:
             self.amr_solver._initialize_equilibrium()
 
-    def simulate_aerodynamics(self, geometry: Union[torch.Tensor, TypedAircraftGeometry], steps: int = 100, mission: Optional[MissionProfile] = None) -> Dict[str, Any]:
+    def simulate_aerodynamics(self, geometry: Union[torch.Tensor, TypedAircraftGeometry], steps: int = 100,
+                               mission: Optional[MissionProfile] = None,
+                               existing_report: Optional[ConstraintReport] = None) -> Dict[str, Any]:
         # Handle TypedAircraftGeometry (Issue #16)
         if isinstance(geometry, TypedAircraftGeometry):
             typed_geom = geometry
@@ -64,7 +66,7 @@ class AdvancedCFDSimulator:
 
         # Apply Constraint Projection if mission is provided and not already done
         if mission:
-            projector = ConstraintProjector(self.resolution, device=self.device)
+            projector = ConstraintProjector(self.resolution, device=self.device, existing_report=existing_report)
             if typed_geom is None:
                 # If we only have raw geometry, treat as fuselage for legacy compatibility
                 typed_geom = TypedAircraftGeometry(self.resolution, device=self.device)
@@ -74,7 +76,7 @@ class AdvancedCFDSimulator:
             occupancy = typed_geom.get_combined_occupancy()
             constraint_report = projector.get_report(typed_geom)
         else:
-            constraint_report = {"valid": True, "repaired": False, "violations": []}
+            constraint_report = existing_report.to_dict() if existing_report else {"valid": True, "repaired": False, "violations": []}
 
         geometry_mask = (occupancy > 0.5).float()
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
@@ -82,7 +84,7 @@ class AdvancedCFDSimulator:
 
         # Add physics feasibility to report (Issue #16)
         if mission and typed_geom:
-            projector = ConstraintProjector(self.resolution, device=self.device)
+            projector = ConstraintProjector(self.resolution, device=self.device, existing_report=existing_report)
             feasibility = projector.check_feasibility(typed_geom, results, mission)
             # Refresh report after feasibility checks
             constraint_report = projector.get_report(typed_geom)

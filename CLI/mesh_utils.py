@@ -2,16 +2,28 @@
 import numpy as np
 import trimesh
 from skimage import measure
+from typing import Optional
 
 def voxels_to_stl(voxel_grid, output_path, physical_length_scale=1.0, resolution=32, use_marching_cubes=True):
-    """Convert voxel grid to STL file using marching cubes with optimizations"""
+    """Legacy wrapper for voxels_to_stl_checked."""
+    return voxels_to_stl_checked(voxel_grid, output_path, physical_length_scale, resolution, use_marching_cubes)
+
+def voxels_to_stl_checked(voxel_grid, output_path, physical_length_scale=1.0, resolution=32, use_marching_cubes=True, report=None):
+    """Convert voxel grid to STL with watertight checks and repair reporting (Issue #16)."""
     voxel_np = voxel_grid.cpu().numpy()
     binary_grid = (voxel_np > 0.5).astype(np.float32)
 
+    mesh = None
     if use_marching_cubes:
         try:
-            level = (voxel_np.min() + voxel_np.max()) / 2.0
-            vertices, faces, _, _ = measure.marching_cubes(binary_grid, level=level, spacing=(1.0, 1.0, 1.0))
+            # Ensure grid is padded to avoid non-watertight holes at boundaries
+            padded_grid = np.pad(binary_grid, 1, mode='constant', constant_values=0)
+            level = 0.5
+            vertices, faces, _, _ = measure.marching_cubes(padded_grid, level=level, spacing=(1.0, 1.0, 1.0))
+
+            # Undo padding shift
+            vertices -= 1.0
+
             h = physical_length_scale / float(resolution)
             vertices = vertices * h - (physical_length_scale * 0.5) + (0.5 * h)
 
@@ -20,14 +32,38 @@ def voxels_to_stl(voxel_grid, output_path, physical_length_scale=1.0, resolution
                 try:
                     mesh = mesh.simplify_quadratic_decimation(face_count=min(5000, len(mesh.faces)//2))
                 except Exception: pass
-            mesh.export(output_path)
         except Exception as e:
             print(f"Marching cubes failed: {e}. Writing voxel representation instead.")
-            _write_voxel_stl(binary_grid, output_path, physical_length_scale, resolution)
+            mesh = _get_voxel_mesh(binary_grid, physical_length_scale, resolution)
     else:
-        _write_voxel_stl(binary_grid, output_path, physical_length_scale, resolution)
+        mesh = _get_voxel_mesh(binary_grid, physical_length_scale, resolution)
 
-def _write_voxel_stl(binary_grid, path, physical_length_scale, resolution):
+    if mesh is not None and len(mesh.faces) > 0:
+        # Check watertightness
+        is_watertight = mesh.is_watertight
+        if not is_watertight:
+            if report:
+                report.add_violation("non_watertight_mesh", "major", "Generated STL mesh is not watertight. Attempting repair.")
+
+            # Attempt repair
+            mesh.fill_holes()
+            if mesh.is_watertight:
+                if report:
+                    report.mark_repaired()
+                    report.export_status = "repaired"
+            else:
+                if report:
+                    report.add_violation("repair_failed", "critical", "Could not repair mesh watertightness.")
+                    report.export_status = "rejected"
+        else:
+            if report:
+                report.export_status = "success"
+
+        mesh.export(output_path)
+        return True
+    return False
+
+def _get_voxel_mesh(binary_grid, physical_length_scale, resolution):
     triangles = []
     h = physical_length_scale / float(resolution)
     for x, y, z in np.argwhere(binary_grid > 0.5):
@@ -37,8 +73,8 @@ def _write_voxel_stl(binary_grid, path, physical_length_scale, resolution):
         for face in faces:
             triangles.append(vertices[face])
     if triangles:
-        mesh = trimesh.Trimesh(vertices=np.array(triangles).reshape(-1, 3), faces=np.arange(len(triangles)*3).reshape(-1, 3))
-        mesh.export(path)
+        return trimesh.Trimesh(vertices=np.array(triangles).reshape(-1, 3), faces=np.arange(len(triangles)*3).reshape(-1, 3))
+    return None
 
 def normalize_stl_mesh(mesh, padding: float = 0.1):
     extents = mesh.extents

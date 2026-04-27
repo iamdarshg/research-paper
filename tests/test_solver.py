@@ -70,29 +70,27 @@ class TestLBMSolvers(unittest.TestCase):
         solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
         geometry_mask = torch.zeros((8, 8, 8), device=self.device)
 
-        # Initial mass and momentum
-        rho_in = torch.sum(solver._solver.f, dim=0)
-        total_mass_in = torch.sum(rho_in).item()
+        # Initial mass
+        total_mass_in = torch.sum(solver._solver.f).item()
 
         # Perform 10 steps in an empty domain
         solver.collide_stream(geometry_mask, steps=10)
 
-        rho_out = torch.sum(solver._solver.f, dim=0)
-        total_mass_out = torch.sum(rho_out).item()
+        total_mass_out = torch.sum(solver._solver.f).item()
 
-        # Check mass conservation (relative tolerance)
+        # Check mass conservation
         self.assertAlmostEqual(total_mass_in, total_mass_out, places=4)
 
-        # Check momentum stability
-        # For D3Q27 MRT, we check the j indices in moment space
+        # Check momentum stability using conserved indices from solver
         m = torch.tensordot(solver._solver.moment_basis, solver._solver.f, dims=([1], [0]))
-        # Indices 1, 2, 3 are jx, jy, jz
-        jx = torch.sum(m[1]).item()
-        jy = torch.sum(m[2]).item()
-        jz = torch.sum(m[3]).item()
 
-        # Verify it doesn't explode
+        # Verify all moments remain finite
         self.assertTrue(torch.isfinite(m).all())
+
+        # Verify conserved moments (rho, jx, jy, jz) remain finite
+        c_idx = solver._solver.conserved_indices
+        for idx in c_idx:
+             self.assertTrue(torch.isfinite(m[idx]).all())
 
 if __name__ == '__main__':
     unittest.main()
