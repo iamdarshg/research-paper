@@ -226,32 +226,42 @@ class ConstraintProjector:
     def _check_manufacturing(self, geometry: TypedAircraftGeometry, mission: MissionProfile) -> TypedAircraftGeometry:
         """Apply manufacturing constraints based on the specific method."""
         method = mission.manufacturing_method
-        skin = geometry.get_part_mask(AircraftPart.SKIN).unsqueeze(0).unsqueeze(0)
+        skin_orig = geometry.get_part_mask(AircraftPart.SKIN)
+        skin = skin_orig.unsqueeze(0).unsqueeze(0)
 
         if method == '3d_print':
-            # Min wall thickness via dilation
-            thickened = F.max_pool3d(skin, kernel_size=3, stride=1, padding=1)
-            geometry.set_part_mask(AircraftPart.SKIN, thickened.squeeze())
-            self.report.add_violation("min_wall_thickness", "minor", "Skin thickened for 3D printing requirements.")
-            self.report.mark_repaired()
+            # Min wall thickness check: opening (erode then dilate)
+            eroded = -F.max_pool3d(-skin, kernel_size=3, stride=1, padding=1)
+            opened = F.max_pool3d(eroded, kernel_size=3, stride=1, padding=1)
+
+            # If opening significantly changes skin, it was too thin/fragmented
+            if torch.sum(torch.abs(opened - skin)) > (torch.sum(skin) * 0.05):
+                # Repair: Use dilation
+                thickened = F.max_pool3d(skin, kernel_size=3, stride=1, padding=1)
+                geometry.set_part_mask(AircraftPart.SKIN, thickened.squeeze())
+                self.report.add_violation("min_wall_thickness", "minor", "Skin thickened for 3D printing requirements.")
+                self.report.mark_repaired()
 
         elif method == 'composite':
-            # Composites require larger radii (no sharp concave corners)
-            # We can use a larger kernel for smoothing/dilation
-            thickened = F.max_pool3d(skin, kernel_size=5, stride=1, padding=2)
-            geometry.set_part_mask(AircraftPart.SKIN, thickened.squeeze())
-            self.report.add_violation("composite_radius", "minor", "Applied composite curvature smoothing to skin.")
-            self.report.mark_repaired()
+            # Radius check via Gaussian-like smoothing (average pool)
+            avg = F.avg_pool3d(skin, kernel_size=5, stride=1, padding=2)
+            diff = torch.abs(avg - skin)
+            if torch.max(diff) > 0.5:
+                thickened = F.max_pool3d(skin, kernel_size=5, stride=1, padding=2)
+                geometry.set_part_mask(AircraftPart.SKIN, thickened.squeeze())
+                self.report.add_violation("composite_radius", "minor", "Applied composite curvature smoothing to skin.")
+                self.report.mark_repaired()
 
         elif method == 'metal_sheet':
-            # Metal sheets must have constant thickness (shell-like)
-            # For now, we ensure skin exists and is not too thick/solid
-            # Repair: enforce single-layer shell via erode/dilate
-            eroded = -F.max_pool3d(-skin, kernel_size=3, stride=1, padding=1)
-            shell = skin - eroded
-            geometry.set_part_mask(AircraftPart.SKIN, shell.squeeze())
-            self.report.add_violation("metal_sheet_shell", "minor", "Enforced constant-thickness shell for metal sheet manufacturing.")
-            self.report.mark_repaired()
+            # Check for non-shell solidity
+            eroded_inner = -F.max_pool3d(-skin, kernel_size=5, stride=1, padding=2)
+            if torch.sum(eroded_inner) > (torch.sum(skin) * 0.1):
+                # If there's significant "interior" volume, it's not a shell
+                eroded = -F.max_pool3d(-skin, kernel_size=3, stride=1, padding=1)
+                shell = skin - eroded
+                geometry.set_part_mask(AircraftPart.SKIN, shell.squeeze())
+                self.report.add_violation("metal_sheet_shell", "minor", "Enforced constant-thickness shell for metal sheet manufacturing.")
+                self.report.mark_repaired()
 
         return geometry
 
@@ -290,26 +300,41 @@ class ConstraintProjector:
             geometry.set_part_mask(part, thick.squeeze())
         return geometry
 
+    def _check_connectivity(self, mask1: torch.Tensor, mask2: torch.Tensor) -> bool:
+        """Heuristic connectivity check between two binary masks."""
+        return torch.sum((mask1 > 0.5) & (mask2 > 0.5)).item() > 0.5
+
     def _repair_load_paths(self, geometry: TypedAircraftGeometry) -> TypedAircraftGeometry:
         """Verify and repair structural continuity."""
         spar = geometry.get_part_mask(AircraftPart.SPAR)
         fuselage = geometry.get_part_mask(AircraftPart.FUSELAGE)
         wing = geometry.get_part_mask(AircraftPart.WING)
         res = geometry.res
-        mid_y = res // 2
         mid_z = res // 2
+        mid_y = res // 2
 
-        # Check if spar intersects fuselage
-        mid_x = res // 2
-        if torch.sum(spar * (fuselage > 0.5)) < 1.0:
+        # 1. Spar-to-Fuselage connectivity
+        if not self._check_connectivity(spar, fuselage):
             self.report.add_violation("spar_continuity", "critical", "Main wing spar is not connected to the fuselage load path.")
             # Repair: Create a real bridge through the fuselage
             bridge = torch.zeros_like(spar)
-            # Create a centered longitudinal bridge that spans across Y
-            bridge[mid_z-1:mid_z+2, :, mid_x-1:mid_x+2] = 1.0
+            # Create a centered longitudinal bridge that spans across X (chordwise)
+            # Or spanwise bridge across Y that must intersect fuselage
+            bridge[mid_z-2:mid_z+3, mid_y-2:mid_y+3, :] = 1.0
 
-            # Ensure the bridge is constrained to fuselage interior or spans the wing root
-            geometry.set_part_mask(AircraftPart.SPAR, torch.maximum(spar, bridge * (fuselage + wing)))
+            # Ensure the bridge spans across the domain to connect disconnected parts
+            geometry.set_part_mask(AircraftPart.SPAR, torch.maximum(spar, bridge))
+            self.report.mark_repaired()
+
+        # 2. Hardpoint connectivity
+        hardpoint = geometry.get_part_mask(AircraftPart.HARDPOINT)
+        if torch.sum(hardpoint) > 0 and not self._check_connectivity(hardpoint, spar + fuselage):
+            self.report.add_violation("hardpoint_continuity", "major", "Propulsion hardpoint is floating and not connected to spar or fuselage.")
+            # Repair: connect hardpoint to nearest structural member (fuselage)
+            cx, cy, cz = int(res * 0.12), res // 2, res // 2
+            mount_extension = torch.zeros_like(hardpoint)
+            mount_extension[cz-2:cz+3, cy-2:cy+3, :cx+2] = 1.0
+            geometry.set_part_mask(AircraftPart.SPAR, torch.maximum(geometry.get_part_mask(AircraftPart.SPAR), mount_extension * fuselage))
             self.report.mark_repaired()
 
         return geometry

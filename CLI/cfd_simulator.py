@@ -99,7 +99,7 @@ class AdvancedCFDSimulator:
 
         if self.amr_solver:
             amr_geometry = F.interpolate(
-                geometry.unsqueeze(0).unsqueeze(0),
+                occupancy.unsqueeze(0).unsqueeze(0),
                 size=(self.amr_solver.resolution, self.amr_solver.resolution, self.amr_solver.resolution),
                 mode='nearest'
             ).squeeze(0).squeeze(0)
@@ -109,7 +109,7 @@ class AdvancedCFDSimulator:
             results['drag_coefficient'] = (results['drag_coefficient'] + amr_results['drag_coefficient']) / 2
             results['lift_coefficient'] = (results['lift_coefficient'] + amr_results['lift_coefficient']) / 2
 
-        external_results = self._run_external_validation(geometry)
+        external_results = self._run_external_validation(occupancy)
         if external_results:
             # For high-fidelity ground truth, if independent PDE results exist,
             # they supersede the LBM surrogate entirely.

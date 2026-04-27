@@ -55,13 +55,18 @@ def voxels_to_stl_checked(voxel_grid, output_path, physical_length_scale=1.0, re
                 if report:
                     report.add_violation("repair_failed", "critical", "Could not repair mesh watertightness.")
                     report.export_status = "rejected"
+                return False # Truly reject
         else:
             if report:
                 report.export_status = "success"
 
         mesh.export(output_path)
         return True
-    return False
+    else:
+        if report:
+            report.add_violation("empty_or_invalid_mesh", "critical", "Could not generate mesh from voxel grid.")
+            report.export_status = "rejected"
+        return False
 
 def _get_voxel_mesh(binary_grid, physical_length_scale, resolution):
     triangles = []

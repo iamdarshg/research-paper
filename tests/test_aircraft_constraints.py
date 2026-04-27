@@ -46,7 +46,7 @@ class TestAircraftConstraints(unittest.TestCase):
         """Verify that manufacturing method changes active constraints."""
         res = self.res
         skin = torch.zeros((res, res, res))
-        skin[10:22, 10:22, 10:22] = 1.0 # Solid block
+        skin[10:25, 10:25, 10:25] = 1.0 # Solid block
 
         # 1. Composite (Curvature smoothing)
         mission_comp = MissionProfile(manufacturing_method="composite")
