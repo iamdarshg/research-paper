@@ -129,12 +129,23 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
     design_spec = DesignSpec(target_speed=target_speed)
-    voxel_grid = generator.generate(design_spec, num_steps=num_steps)
+
+    # Request typed geometry to preserve semantic info for feasibility checks (Issue #16)
+    typed_geom = generator.generate(design_spec, num_steps=num_steps, return_typed=True)
+    voxel_grid = typed_geom.get_combined_occupancy()
+
     generator.save_stl(voxel_grid, output, use_marching_cubes=use_marching_cubes)
+
     cfd_config = CFDConfig(solver_type=solver)
     simulator = AdvancedCFDSimulator(cfd_config, device)
-    results = simulator.simulate_aerodynamics(voxel_grid, steps=100)
-    print(f"Drag: {results['drag_coefficient']}, Lift: {results['lift_coefficient']}")
+    results = simulator.simulate_aerodynamics(typed_geom, steps=100, mission=design_spec.to_mission_profile())
+
+    print(f"Drag: {results['drag_coefficient']:.6f}, Lift: {results['lift_coefficient']:.6f}")
+    if 'feasibility' in results:
+        f = results['feasibility']
+        print(f"Feasibility: Lift/Weight: {f['lift_ratio']:.2f}, Thrust Margin: {f['thrust_margin']:.2f}")
+    if 'constraints' in results:
+        print(f"Repaired: {results['constraints']['repaired']}, Violations: {len(results['constraints']['violations'])}")
 
 @cli.command()
 @click.option('--checkpoint', required=True)

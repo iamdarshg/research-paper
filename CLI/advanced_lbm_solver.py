@@ -81,15 +81,21 @@ class D3Q27Solver:
         # Precompute relaxation indices for MRT
         # 0: Conserved, 1: Energy, 2: Shear, 3: High-order
         self.s_indices = torch.zeros(27, dtype=torch.long, device=device)
+        self.conserved_indices = []
         for i, (a, b, c) in enumerate(self.moment_keys):
-            if a + b + c == 0 or (a <= 1 and b <= 1 and c <= 1 and a + b + c == 1):
-                self.s_indices[i] = 0  # rho, jx, jy, jz
+            # Conserved moments: rho(000), jx(100), jy(010), jz(001)
+            if (a == 0 and b == 0 and c == 0) or (a == 1 and b == 0 and c == 0) or \
+               (a == 0 and b == 1 and c == 0) or (a == 0 and b == 0 and c == 1):
+                self.s_indices[i] = 0
+                self.conserved_indices.append(i)
             elif (a, b, c) in [(2, 0, 0), (0, 2, 0), (0, 0, 2)]:
                 self.s_indices[i] = 1  # Energy
             elif (a, b, c) in [(1, 1, 0), (1, 0, 1), (0, 1, 1)]:
                 self.s_indices[i] = 2  # Shear (determines viscosity)
             else:
                 self.s_indices[i] = 3  # High-order
+
+        self.conserved_indices = torch.tensor(self.conserved_indices, dtype=torch.long, device=device)
         self.s_e = 1.1
         self.s_h = 1.1
 
@@ -202,8 +208,9 @@ class D3Q27Solver:
             # Vectorized inlet update: overwrite populations streaming INTO the domain
             self.f_temp[self._inlet_mask, 0, :, :] = feq_in[self._inlet_mask]
 
-        # Vectorized Neumann (Zero-Gradient) Outlet at X=-1
-        self.f_temp[self._outlet_mask, -1, :, :] = self.f[self._outlet_mask, -1, :, :]
+        # Vectorized Neumann (Zero-Gradient) Outlet at X=-1 (Issue #16 fix)
+        # Use interior plane after streaming but before BC for true zero-gradient
+        self.f_temp[self._outlet_mask, -1, :, :] = self.f_temp[self._outlet_mask, -2, :, :]
 
         # Slip Walls (Mirror) or Neumann for other boundaries - Vectorized slices
         self.f_temp[:, :, 0, :] = self.f_temp[:, :, 1, :]
@@ -237,8 +244,8 @@ class D3Q27Solver:
         # MRT relaxation towards equilibrium
         K_post = K + S * (Keq - K)
 
-        # Enforce exact conservation of mass and momentum
-        K_post[0:4] = Keq[0:4]
+        # Enforce exact conservation of mass and momentum (Issue #16 fix)
+        K_post[self.conserved_indices] = Keq[self.conserved_indices]
 
         # Transform back to populations using in-place copy
         self.f.copy_(torch.tensordot(self.moment_basis_inv, K_post, dims=([1], [0])))
@@ -565,12 +572,12 @@ class D3Q27CascadedSolver:
             projected_drag = self._solver.projected_drag_accum / self._solver.force_samples
             net_drag_force = self._solver.force_x_accum / self._solver.force_samples
             lift_force = self._solver.force_z_accum / self._solver.force_samples
-            force_definition = 'upwind projected D3Q27 wall-link pressure proxy averaged over the last-quarter window'
+            force_definition = 'raw bounce-back momentum exchange averaged over the last-quarter window'
         else:
             projected_drag = self._solver.projected_drag_last
             net_drag_force = self._solver.force_x_last
             lift_force = self._solver.force_z_last
-            force_definition = 'upwind projected D3Q27 wall-link pressure proxy from last streaming step'
+            force_definition = 'raw bounce-back momentum exchange from last streaming step'
 
         projected_area_lattice = max(torch.sum(torch.any(solid, dim=0).float()).item(), 1.0)
         raw_projected_drag_coefficient = float(projected_drag.item() / projected_area_lattice)
