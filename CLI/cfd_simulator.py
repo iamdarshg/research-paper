@@ -5,11 +5,13 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
-from config import CFDConfig, LBMPhysicsConfig, OPENFOAM_AVAILABLE, OPENFOAM_ROOT
+from config import CFDConfig, LBMPhysicsConfig, OPENFOAM_AVAILABLE, OPENFOAM_ROOT, MissionProfile
+from constraints import ConstraintProjector, ConstraintReport
+from geometry import TypedAircraftGeometry, AircraftPart
 
 class AdvancedCFDSimulator:
     """Advanced CFD simulator with FluidX3D integration and adaptive mesh refinement"""
@@ -51,10 +53,44 @@ class AdvancedCFDSimulator:
         if self.amr_solver:
             self.amr_solver._initialize_equilibrium()
 
-    def simulate_aerodynamics(self, geometry: torch.Tensor, steps: int = 100) -> Dict[str, Any]:
-        geometry_mask = (geometry > 0.5).float()
+    def simulate_aerodynamics(self, geometry: Union[torch.Tensor, TypedAircraftGeometry], steps: int = 100,
+                               mission: Optional[MissionProfile] = None,
+                               existing_report: Optional[ConstraintReport] = None) -> Dict[str, Any]:
+        # Handle TypedAircraftGeometry (Issue #16)
+        if isinstance(geometry, TypedAircraftGeometry):
+            typed_geom = geometry
+            occupancy = typed_geom.get_combined_occupancy()
+        else:
+            occupancy = geometry
+            typed_geom = None
+
+        # Apply Constraint Projection if mission is provided and not already done
+        if mission:
+            projector = ConstraintProjector(self.resolution, device=self.device, existing_report=existing_report)
+            if typed_geom is None:
+                # If we only have raw geometry, treat as fuselage for legacy compatibility
+                typed_geom = TypedAircraftGeometry(self.resolution, device=self.device)
+                typed_geom.set_part_mask(AircraftPart.FUSELAGE, occupancy)
+
+            typed_geom = projector.project(typed_geom, mission)
+            occupancy = typed_geom.get_combined_occupancy()
+            constraint_report = projector.get_report(typed_geom)
+        else:
+            constraint_report = existing_report.to_dict() if existing_report else {"valid": True, "repaired": False, "violations": []}
+
+        geometry_mask = (occupancy > 0.5).float()
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
         results = self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask)
+
+        # Add physics feasibility to report (Issue #16)
+        if mission and typed_geom:
+            projector = ConstraintProjector(self.resolution, device=self.device, existing_report=existing_report)
+            feasibility = projector.check_feasibility(typed_geom, results, mission)
+            # Refresh report after feasibility checks
+            constraint_report = projector.get_report(typed_geom)
+            results['feasibility'] = feasibility
+
+        results['constraints'] = constraint_report
 
         # Initial fields from internal LBM
         results['velocity_fields'] = (self.lbm_solver.velocity_x, self.lbm_solver.velocity_y, self.lbm_solver.velocity_z)
@@ -63,7 +99,7 @@ class AdvancedCFDSimulator:
 
         if self.amr_solver:
             amr_geometry = F.interpolate(
-                geometry.unsqueeze(0).unsqueeze(0),
+                occupancy.unsqueeze(0).unsqueeze(0),
                 size=(self.amr_solver.resolution, self.amr_solver.resolution, self.amr_solver.resolution),
                 mode='nearest'
             ).squeeze(0).squeeze(0)
@@ -73,7 +109,7 @@ class AdvancedCFDSimulator:
             results['drag_coefficient'] = (results['drag_coefficient'] + amr_results['drag_coefficient']) / 2
             results['lift_coefficient'] = (results['lift_coefficient'] + amr_results['lift_coefficient']) / 2
 
-        external_results = self._run_external_validation(geometry)
+        external_results = self._run_external_validation(occupancy)
         if external_results:
             # For high-fidelity ground truth, if independent PDE results exist,
             # they supersede the LBM surrogate entirely.

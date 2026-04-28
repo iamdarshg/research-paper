@@ -14,23 +14,24 @@ except Exception:  # pragma: no cover - optional acceleration path
 
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
-    """Convert raw lattice momentum exchange into a physical force scale."""
-    freestream_speed = float(mach_number) * 343.0
-    # Use analytic momentum-exchange to physical scaling:
-    # physical_force = raw_lattice_sum * (0.5 * rho * U_inf^2 * dx^2)
-    # The 0.5 factor aligns the momentum-exchange definition with the
-    # aerodynamic dynamic pressure used in the coefficient denominator.
-    force_scale = 0.5 * float(density) * freestream_speed * freestream_speed * float(grid_spacing) * float(grid_spacing)
-    return force * force_scale
+    """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
+
+    Standard LBM force scaling: F_phys = rho_phys * (dx^4 / dt^2) * F_lattice.
+    Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
+    This results in force_scale = rho_phys * dx^2 * (343.0 * sqrt(3))^2.
+
+    The D3Q27 momentum exchange sum corresponds to Delta p / Delta t in lattice units.
+    We apply the c_s^2 = 1/3 factor to align with the physical dynamic pressure definition.
+    """
+    dx = float(grid_spacing)
+    # velocity_ratio = sound_speed_phys / sound_speed_lattice = 343.0 * sqrt(3)
+    velocity_ratio = 343.0 * np.sqrt(3.0)
+    force_scale = float(density) * (dx**2) * (velocity_ratio**2)
+    return (1.0 / 3.0) * force * force_scale
 
 
 class D3Q27Solver:
-    """Complete D3Q27 LBM solver
-
-    TODO: Implement sparse grid support (e.g., using Taichi or a custom sparse
-    tensor layout) to handle very high resolutions (up to 1024^3) without
-    exceeding VRAM limits of modern GPUs.
-    """
+    """Complete D3Q27 LBM solver with vectorized Cascaded MRT collision operator."""
     def __init__(
         self,
         resolution,
@@ -61,16 +62,53 @@ class D3Q27Solver:
         self._force_ex = self.ex[self._force_dir_index].to(dtype=torch.float32).view(-1, 1, 1, 1)
         self._force_ez = self.ez[self._force_dir_index].to(dtype=torch.float32).view(-1, 1, 1, 1)
         self._force_speed = torch.sqrt(
-            self._force_ex * self._force_ex
-            + self.ey[self._force_dir_index].to(dtype=torch.float32).view(-1, 1, 1, 1) ** 2
-            + self._force_ez * self._force_ez
-        )
+            self.ex[self._force_dir_index].to(dtype=torch.float32)**2
+            + self.ey[self._force_dir_index].to(dtype=torch.float32)**2
+            + self.ez[self._force_dir_index].to(dtype=torch.float32)**2
+        ).view(-1, 1, 1, 1)
+
+        # Precompute moment basis for vectorized MRT Collision (Issue #16)
+        self.moment_keys = [(a, b, c) for a in range(3) for b in range(3) for c in range(3)]
+        basis_rows = []
+        ex_f_vec = self.ex.to(dtype=torch.float32)
+        ey_f_vec = self.ey.to(dtype=torch.float32)
+        ez_f_vec = self.ez.to(dtype=torch.float32)
+        for a, b, c in self.moment_keys:
+            basis_rows.append((ex_f_vec ** a) * (ey_f_vec ** b) * (ez_f_vec ** c))
+        self.moment_basis = torch.stack(basis_rows, dim=0).to(device)
+        self.moment_basis_inv = torch.inverse(self.moment_basis)
+
+        # Precompute relaxation indices for MRT
+        # 0: Conserved, 1: Energy, 2: Shear, 3: High-order
+        self.s_indices = torch.zeros(27, dtype=torch.long, device=device)
+        self.conserved_indices = []
+        for i, (a, b, c) in enumerate(self.moment_keys):
+            # Conserved moments: rho(000), jx(100), jy(010), jz(001)
+            if (a == 0 and b == 0 and c == 0) or (a == 1 and b == 0 and c == 0) or \
+               (a == 0 and b == 1 and c == 0) or (a == 0 and b == 0 and c == 1):
+                self.s_indices[i] = 0
+                self.conserved_indices.append(i)
+            elif (a, b, c) in [(2, 0, 0), (0, 2, 0), (0, 0, 2)]:
+                self.s_indices[i] = 1  # Energy
+            elif (a, b, c) in [(1, 1, 0), (1, 0, 1), (0, 1, 1)]:
+                self.s_indices[i] = 2  # Shear (determines viscosity)
+            else:
+                self.s_indices[i] = 3  # High-order
+
+        self.conserved_indices = torch.tensor(self.conserved_indices, dtype=torch.long, device=device)
+        self.s_e = 1.1
+        self.s_h = 1.1
+
+        # Cache masks for vectorized boundary population updates
+        self._inlet_mask = self.ex > 0
+        self._outlet_mask = self.ex < 0
+
         self.drag_link_metric_exponent = None
         self._boundary_cache_key = None
         self._boundary_link_cache = None
         self.use_triton_streaming = bool(use_triton_streaming and stream_bounce_d3q27 is not None and device.type == "cuda")
 
-        # 27 populations instead of 19
+        # 27 populations
         self.f = torch.zeros(27, resolution, resolution, resolution, device=device)
         self.f_temp = torch.zeros_like(self.f)
         self.f_pre_stream = torch.empty_like(self.f)
@@ -80,6 +118,18 @@ class D3Q27Solver:
         cu = self.ex_f * ux + self.ey_f * uy + self.ez_f * uz
         u_sq = ux**2 + uy**2 + uz**2
         return self.w.view(-1, 1, 1, 1) * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
+
+    def compute_moment_equilibrium(self, rho, ux, uy, uz):
+        """Equilibrium tensor-product moments for D3Q27 (Issue #16)."""
+        cs2 = 1.0 / 3.0
+        m1d_x = [torch.ones_like(rho), ux, ux * ux + cs2]
+        m1d_y = [torch.ones_like(rho), uy, uy * uy + cs2]
+        m1d_z = [torch.ones_like(rho), uz, uz * uz + cs2]
+
+        keq_list = []
+        for a, b, c in self.moment_keys:
+            keq_list.append(rho * m1d_x[a] * m1d_y[b] * m1d_z[c])
+        return torch.stack(keq_list, dim=0)
 
     def reset_force_accounting(self, sample_start: int = 0):
         """Reset momentum-exchange bookkeeping for a new simulation run."""
@@ -109,13 +159,7 @@ class D3Q27Solver:
         return float(np.clip(1.68 - 0.295 * (projected_side - 13.0), 0.5, 1.68))
 
     def _accumulate_projected_pressure_drag_proxy(self, geometry_mask):
-        """Coarse-grid pressure-drag proxy from upwind-facing D3Q27 wall links.
-
-        The OpenFOAM validation fallback integrates pressure on the body patch.
-        At this voxel resolution the full momentum-exchange wake balance is too
-        under-resolved, so the reported Cd uses the upwind projected wall-link
-        pressure proxy while retaining net momentum exchange as a diagnostic.
-        """
+        """Coarse-grid pressure-drag proxy from upwind-facing D3Q27 wall links."""
         boundary_links = self._boundary_links(geometry_mask)
         flow_sign = 1.0 if self.inlet_velocity_lu >= 0.0 else -1.0
         upwind = (self._force_ex * flow_sign) > 0.0
@@ -143,24 +187,32 @@ class D3Q27Solver:
         return self._boundary_link_cache
 
     def _apply_domain_boundaries(self):
-        """Apply simple external-flow box boundaries after streaming."""
+        """Apply vectorized non-periodic domain boundaries (Equilibrium Inlet, Neumann Outlet)."""
+        # Equilibrium Inlet at X=0
         if self.inlet_velocity_lu != 0.0:
             inlet_shape = self.f[:, 0, :, :].shape[1:]
-            rho = torch.ones(inlet_shape, device=self.device, dtype=self.f.dtype)
-            ux = torch.full_like(rho, self.inlet_velocity_lu)
-            uy = torch.zeros_like(rho)
-            uz = torch.zeros_like(rho)
+            rho_in = torch.ones(inlet_shape, device=self.device, dtype=self.f.dtype)
+            ux_in = torch.full_like(rho_in, self.inlet_velocity_lu)
+            uy_in = torch.zeros_like(rho_in)
+            uz_in = torch.zeros_like(rho_in)
+
             cu = (
-                self.ex.to(dtype=self.f.dtype).view(-1, 1, 1) * ux
-                + self.ey.to(dtype=self.f.dtype).view(-1, 1, 1) * uy
-                + self.ez.to(dtype=self.f.dtype).view(-1, 1, 1) * uz
+                self.ex.to(dtype=self.f.dtype).view(-1, 1, 1) * ux_in
+                + self.ey.to(dtype=self.f.dtype).view(-1, 1, 1) * uy_in
+                + self.ez.to(dtype=self.f.dtype).view(-1, 1, 1) * uz_in
             )
-            u_sq = ux**2 + uy**2 + uz**2
-            self.f_temp[:, 0, :, :] = self.w.to(dtype=self.f.dtype).view(-1, 1, 1) * rho * (
+            u_sq = ux_in**2 + uy_in**2 + uz_in**2
+            feq_in = self.w.to(dtype=self.f.dtype).view(-1, 1, 1) * rho_in * (
                 1 + 3 * cu + 4.5 * cu**2 - 1.5 * u_sq
             )
+            # Vectorized inlet update: overwrite populations streaming INTO the domain
+            self.f_temp[self._inlet_mask, 0, :, :] = feq_in[self._inlet_mask]
 
-        self.f_temp[:, -1, :, :] = self.f_temp[:, -2, :, :]
+        # Vectorized Neumann (Zero-Gradient) Outlet at X=-1 (Issue #16 fix)
+        # Use interior plane after streaming but before BC for true zero-gradient
+        self.f_temp[self._outlet_mask, -1, :, :] = self.f_temp[self._outlet_mask, -2, :, :]
+
+        # Slip Walls (Mirror) or Neumann for other boundaries - Vectorized slices
         self.f_temp[:, :, 0, :] = self.f_temp[:, :, 1, :]
         self.f_temp[:, :, -1, :] = self.f_temp[:, :, -2, :]
         self.f_temp[:, :, :, 0] = self.f_temp[:, :, :, 1]
@@ -180,9 +232,23 @@ class D3Q27Solver:
         uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
         uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
 
-        # Collision
-        feq = self.compute_equilibrium(rho, ux, uy, uz)
-        self.f += omega * (feq - self.f)
+        # Cascaded MRT Collision (Issue #16)
+        K = torch.tensordot(self.moment_basis, self.f, dims=([1], [0]))
+        Keq = self.compute_moment_equilibrium(rho, ux, uy, uz)
+
+        # Build S-vector (relaxation rates)
+        s_nu = float(omega)
+        s_vec = torch.tensor([0.0, self.s_e, s_nu, self.s_h], device=self.device)
+        S = s_vec[self.s_indices].view(27, 1, 1, 1)
+
+        # MRT relaxation towards equilibrium
+        K_post = K + S * (Keq - K)
+
+        # Enforce exact conservation of mass and momentum (Issue #16 fix)
+        K_post[self.conserved_indices] = Keq[self.conserved_indices]
+
+        # Transform back to populations using in-place copy
+        self.f.copy_(torch.tensordot(self.moment_basis_inv, K_post, dims=([1], [0])))
         self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
         self.f_pre_stream.copy_(self.f)
@@ -307,15 +373,19 @@ class D3Q27CascadedSolver:
         return max(u_lu * L_lu / Re, 1e-9)
 
     def _estimate_lattice_freestream_velocity(self):
-        """Convert configured physical freestream to lattice units."""
-        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
-        dt = getattr(self.config.lbm_config, 'time_step', 0.001)
+        """Convert configured physical freestream to lattice units (Issue #16).
+
+        For D3Q27, the sound speed c_s = 1/sqrt(3).
+        To maintain consistent Mach number, u_lattice = Ma * c_s = Ma / sqrt(3).
+        """
         mach = getattr(self.config, 'mach_number', 0.0)
-        raw_lattice_velocity = float(mach) * 343.0 * float(dt) / max(float(h), 1e-12)
+        u_lattice = float(mach) / np.sqrt(3.0)
+
         max_mach = float(getattr(self.phys_config, "max_mach", 0.3))
         target_lattice_velocity = float(getattr(self.phys_config, "target_lattice_velocity", 0.12))
-        max_lattice_velocity = max(1e-4, min(0.85 * max_mach, target_lattice_velocity))
-        return float(np.clip(raw_lattice_velocity, -max_lattice_velocity, max_lattice_velocity))
+        max_lattice_velocity = max(1e-4, min(0.85 * (max_mach / np.sqrt(3.0)), target_lattice_velocity))
+
+        return float(np.clip(u_lattice, -max_lattice_velocity, max_lattice_velocity))
 
     def _initialize_equilibrium(self):
         """Initialize solver populations to equilibrium with a small freestream."""
@@ -502,12 +572,12 @@ class D3Q27CascadedSolver:
             projected_drag = self._solver.projected_drag_accum / self._solver.force_samples
             net_drag_force = self._solver.force_x_accum / self._solver.force_samples
             lift_force = self._solver.force_z_accum / self._solver.force_samples
-            force_definition = 'upwind projected D3Q27 wall-link pressure proxy averaged over the last-quarter window'
+            force_definition = 'raw bounce-back momentum exchange averaged over the last-quarter window'
         else:
             projected_drag = self._solver.projected_drag_last
             net_drag_force = self._solver.force_x_last
             lift_force = self._solver.force_z_last
-            force_definition = 'upwind projected D3Q27 wall-link pressure proxy from last streaming step'
+            force_definition = 'raw bounce-back momentum exchange from last streaming step'
 
         projected_area_lattice = max(torch.sum(torch.any(solid, dim=0).float()).item(), 1.0)
         raw_projected_drag_coefficient = float(projected_drag.item() / projected_area_lattice)
@@ -537,8 +607,8 @@ class D3Q27CascadedSolver:
         lbm_raw_force = physical_net_drag_force
         lbm_calibrated_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
 
-        # Use calibrated force by default for stable training labels
-        physical_drag_force = lbm_calibrated_force
+        # Issue #16: Use pure PDE momentum exchange by default
+        physical_drag_force = lbm_raw_force
 
         coeffs = _compute_force_coefficients(
             physical_drag_force,
@@ -574,7 +644,7 @@ class D3Q27CascadedSolver:
 
             # Tiered Labeling (Issue #12)
             'label_source': 'lbm_d3q27',
-            'label_tier': 'lbm_calibrated' if bool(getattr(self.phys_config, 'use_shape_drag_correction', False)) else 'lbm_raw',
+            'label_tier': 'lbm_raw', # Updated to raw for Issue #16
             'lbm_converged': lbm_converged,
             'force_stability': force_stability,
 
@@ -781,4 +851,3 @@ if __name__ == '__main__':
         print('Could not compute aerodynamic coefficients:', e)
 
     print(f"Elapsed time: {t1 - t0:.2f}s")
-

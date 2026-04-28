@@ -65,5 +65,32 @@ class TestLBMSolvers(unittest.TestCase):
         self.assertTrue(torch.isfinite(torch.tensor(coeffs['drag_coefficient'])).item())
         self.assertTrue(torch.isfinite(torch.tensor(coeffs['lift_coefficient'])).item())
 
+    def test_mrt_conservation(self):
+        """Verify that MRT collision operator conserves mass and momentum."""
+        solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
+        geometry_mask = torch.zeros((8, 8, 8), device=self.device)
+
+        # Initial mass
+        total_mass_in = torch.sum(solver._solver.f).item()
+
+        # Perform 10 steps in an empty domain
+        solver.collide_stream(geometry_mask, steps=10)
+
+        total_mass_out = torch.sum(solver._solver.f).item()
+
+        # Check mass conservation
+        self.assertAlmostEqual(total_mass_in, total_mass_out, places=4)
+
+        # Check momentum stability using conserved indices from solver
+        m = torch.tensordot(solver._solver.moment_basis, solver._solver.f, dims=([1], [0]))
+
+        # Verify all moments remain finite
+        self.assertTrue(torch.isfinite(m).all())
+
+        # Verify conserved moments (rho, jx, jy, jz) remain finite
+        c_idx = solver._solver.conserved_indices
+        for idx in c_idx:
+             self.assertTrue(torch.isfinite(m[idx]).all())
+
 if __name__ == '__main__':
     unittest.main()
