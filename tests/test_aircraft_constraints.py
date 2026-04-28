@@ -98,8 +98,11 @@ class TestAircraftConstraints(unittest.TestCase):
 
         # Disconnected spar (Wing only)
         spar = torch.zeros((res, res, res))
-        spar[res//2, res-5:res, res//2] = 1.0
+        spar[16, 25:, 16] = 1.0
         geom.set_part_mask(AircraftPart.SPAR, spar)
+        fuselage = torch.zeros((res, res, res))
+        fuselage[16, 16, 0:5] = 1.0
+        geom.set_part_mask(AircraftPart.FUSELAGE, fuselage)
 
         report = ConstraintReport()
         projector = ConstraintProjector(self.res, device=self.device, existing_report=report)
