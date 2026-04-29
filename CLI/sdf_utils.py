@@ -22,22 +22,26 @@ def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
 
     # Combined SDF: fluid is positive, solid is negative
     # Subtracting 0.5 to place the zero-crossing at the voxel boundary interface
+    # Using 0.5 ensures that voxel centers [0, 1, 2...] are at +/- 0.5 from the interface
     sdf = dist_outside - dist_inside
 
     return torch.from_numpy(sdf).to(voxel_grid.device, dtype=torch.float32)
 
 def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor) -> torch.Tensor:
     """
-    Compute normalized wall distance 'q' for all 27 D3Q27 lattice directions.
+    Compute normalized wall distance 'q' for all 27 D3Q27 lattice directions (Issue #15).
     Returns tensor of shape [27, D, H, W].
     q = distance_to_wall / link_length (0 < q <= 1)
     """
     # Fix B: Support non-cubic tensors
+    if voxel_grid.ndim != 3:
+        raise ValueError(f"Expected 3D voxel grid, got {voxel_grid.ndim}D")
     shape = voxel_grid.shape
     sdf = compute_sdf(voxel_grid)
     num_dirs = ex.shape[0]
 
     # Fix C: Avoid boundary wraparound using padding
+    # We pad the SDF so that 'neighbors' outside the domain appear far away (fluid)
     sdf_padded = torch.nn.functional.pad(sdf, (1, 1, 1, 1, 1, 1), mode='constant', value=10.0)
 
     q_all = torch.ones((num_dirs, *shape), device=voxel_grid.device, dtype=torch.float32)

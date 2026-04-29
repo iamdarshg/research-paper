@@ -494,6 +494,26 @@ class AeroSurrogate(nn.Module):
             score = preds['Cl'] - 2.0 * preds['Cd'] + 2.0 * preds['convergence_score'] - preds['separation_risk']
         return score
 
+    def train_step(self, geometries, targets, condition_embedding, optimizer):
+        """Perform a single training step on a batch of labels (Issue #15)."""
+        self.train()
+        optimizer.zero_grad()
+
+        preds = self.forward(geometries, condition_embedding)
+
+        loss = 0.0
+        # Cd, Cl, Cm MSE
+        loss += F.mse_loss(preds['Cd'], targets['Cd'])
+        loss += F.mse_loss(preds['Cl'], targets['Cl'])
+        loss += F.mse_loss(preds['Cm'], targets['Cm'])
+        # Scores Binary Cross Entropy
+        loss += F.binary_cross_entropy(preds['convergence_score'], targets['convergence_score'])
+        loss += F.binary_cross_entropy(preds['separation_risk'], targets['separation_risk'])
+
+        loss.backward()
+        optimizer.step()
+        return loss.item()
+
 class LatentTo3DConverter(nn.Module):
     def __init__(self, latent_dim: int, grid_resolution: int = 32):
         super().__init__()

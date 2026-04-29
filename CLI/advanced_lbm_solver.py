@@ -132,12 +132,29 @@ class D3Q27Solver:
         self.ei_guo = torch.stack([self.ex_f, self.ey_f, self.ez_f], dim=1).view(27, 3, 1, 1, 1)
 
     def _get_q(self, geometry_mask):
-        """Get or compute sub-voxel distances for the given geometry."""
-        # Simple hash based on data_ptr and sum as a proxy for content
-        # For a more robust fix, we could use a proper hash
-        geom_key = (geometry_mask.data_ptr(), geometry_mask.sum().item(), geometry_mask.shape)
+        """Get or compute sub-voxel distances for the given geometry (Fix A/Issue #15)."""
+        # Fix A: Use a more complete sampling for the cache key to detect rotations/shifts
+        res = geometry_mask.shape[0]
+        # Diagonal samples
+        samples = []
+        for i in [0, res//4, res//2, 3*res//4, res-1]:
+            samples.append(float(geometry_mask[i, i, i].item()))
+            samples.append(float(geometry_mask[i, res-1-i, i].item()))
+
+        geom_key = (
+            float(geometry_mask.sum().item()),
+            geometry_mask.shape,
+            tuple(samples)
+        )
+
         if geom_key not in self._q_cache:
+            # CPU/SciPy cost is explicit here.
             self._q_cache[geom_key] = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
+
+        # Optional: Limit cache size to prevent OOM
+        if len(self._q_cache) > 100:
+            self._q_cache.pop(next(iter(self._q_cache)))
+
         return self._q_cache[geom_key]
 
     def compute_equilibrium(self, rho, ux, uy, uz):

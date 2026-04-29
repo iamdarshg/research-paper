@@ -162,7 +162,8 @@ class GroundTruthExporter:
                       velocity_fields: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
                       pressure_field: Optional[torch.Tensor] = None,
                       metadata: Dict[str, Any] = None):
-        """Export a simulation record as a reusable CFD label."""
+        """Export a simulation record as a reusable CFD label (Issue #15)."""
+        metadata = metadata or {}
         sample_path = self.output_dir / f"sample_{sample_id}"
         sample_path.mkdir(exist_ok=True)
 
@@ -204,12 +205,12 @@ class GroundTruthExporter:
         )
 
         label_dict = self._sanitize_metadata(asdict(label))
+        label_dict["tier"] = label.tier.value # Clean string serialization
 
         # Merge extra metadata for backward compatibility (Issue #15)
-        if metadata:
-            for k, v in metadata.items():
-                if k not in label_dict and k not in ('velocity_fields', 'pressure_field') and not k.endswith('_fields'):
-                    label_dict[k] = self._sanitize_metadata(v)
+        for k, v in metadata.items():
+            if k not in label_dict and k not in ('velocity_fields', 'pressure_field') and not k.endswith('_fields'):
+                label_dict[k] = self._sanitize_metadata(v)
 
         # Check for existing label to update/promote
         updated = False
@@ -250,6 +251,36 @@ class GroundTruthExporter:
             json.dump(manifest, f, indent=2)
 
         print(f"✅ Exported CFD label {sample_id} ({label_dict['tier']}) to {sample_path}")
+
+class CFDLabelDataset(Dataset):
+    """Dataset for training AeroSurrogate from CFD labels (Issue #15)"""
+    def __init__(self, labels_dir: str = "./ground_truth"):
+        self.labels_dir = Path(labels_dir)
+        self.labels_path = self.labels_dir / "cfd_labels.json"
+        if not self.labels_path.exists():
+            self.labels = []
+        else:
+            with open(self.labels_path, 'r') as f:
+                self.labels = json.load(f)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        record = self.labels[idx]
+        geom_path = self.labels_dir / record['geometry_ref']
+        geometry = torch.from_numpy(np.load(geom_path)).float()
+
+        # Extract targets
+        targets = {
+            'Cd': torch.tensor(record.get('cd', 0.1), dtype=torch.float32),
+            'Cl': torch.tensor(record.get('cl', 0.0), dtype=torch.float32),
+            'Cm': torch.tensor(record.get('cm', 0.0) if record.get('cm') is not None else 0.0, dtype=torch.float32),
+            'convergence_score': torch.tensor(record.get('convergence_score', 0.0), dtype=torch.float32),
+            'separation_risk': torch.tensor(record.get('separation_risk', 0.0), dtype=torch.float32)
+        }
+
+        return geometry, targets
 
 class AerodynamicLoss(nn.Module):
     """Loss based on aerodynamic properties using advanced CFD"""

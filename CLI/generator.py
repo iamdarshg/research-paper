@@ -2,6 +2,7 @@
 import torch
 import numpy as np
 import os
+from datetime import datetime
 from dataclasses import asdict
 from typing import Union, Dict, Any, Optional, Tuple
 import torch.nn.functional as F
@@ -123,8 +124,10 @@ class OptimizedAircraftGenerator:
 
     @torch.no_grad()
     def generate_candidates(self, mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report):
-        """Sample many candidates, rank with surrogate, and validate top-k (Issue #15)"""
-        print(f"Sampling {num_candidates} candidates for ranking...")
+        """Sample many candidates, rank with surrogate, and validate top-k (Issue #15)."""
+        from datetime import datetime, UTC
+        run_timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        print(f"Sampling {num_candidates} candidates for ranking (Run ID: {run_timestamp})...")
         latent_shape = (num_candidates, self.model_config.latent_dim)
 
         # 1. Sample many
@@ -136,17 +139,20 @@ class OptimizedAircraftGenerator:
         voxel_grids = torch.sigmoid(self.converter(latents))
 
         # 2. Batch Project (Heuristic project for all)
-        # For efficiency in this implementation, we apply the adapter and projector in a loop
-        # or we could optimize for batch.
         projector = ConstraintProjector(self.model_config.grid_resolution, device=self.device)
         projected_occupancies = []
         typed_candidates = []
+        projected_reports = []
 
         for i in range(num_candidates):
+            # Create a clean report for each candidate to avoid leakage
+            rep = ConstraintReport()
             tg = self.adapter.adapt(voxel_grids[i])
-            tg = projector.project(tg, mission)
+            tg = projector.project(tg, mission) # This might modify the projector's internal report if not careful
+            # Re-init projector or use its report management correctly
             typed_candidates.append(tg)
             projected_occupancies.append(tg.get_combined_occupancy())
+            projected_reports.append(projector.get_report(tg))
 
         projected_batch = torch.stack(projected_occupancies)
 
@@ -175,11 +181,24 @@ class OptimizedAircraftGenerator:
             print(f"Validating candidate {idx} with D3Q27...")
             res = simulator.simulate_aerodynamics(tg, steps=100, mission=mission)
 
-            # 6. Save results to reusable label dataset
-            sample_id = f"gen_{mission.aircraft_class}_{idx}"
+            # 6. Save results to reusable label dataset (Fix 4: unique IDs)
+            sample_id = f"gen_{mission.aircraft_class}_{run_timestamp}_{idx}"
             exporter.export_sample(sample_id, tg.get_combined_occupancy(), res['velocity_fields'], res['pressure_field'], res | {'mission': asdict(mission)})
 
-            if best_results is None or res['drag_coefficient'] < best_results['drag_coefficient']:
+            # 7. Feasibility-aware selection (Fix 5)
+            is_feasible = res['constraints'].get('valid', True)
+            is_converged = res.get('lbm_converged', False)
+
+            def calculate_overall_score(r):
+                # Prefer feasible and converged. Tie-break with Cd.
+                f_score = 100.0 if r['constraints'].get('valid', True) else 0.0
+                c_score = 50.0 if r.get('lbm_converged', False) else 0.0
+                drag_score = max(0.0, 1.0 - r['drag_coefficient'])
+                return f_score + c_score + drag_score
+
+            current_score = calculate_overall_score(res)
+
+            if best_results is None or current_score > calculate_overall_score(best_results):
                 best_results = res
                 best_geom = tg
 

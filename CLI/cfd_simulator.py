@@ -110,6 +110,7 @@ class AdvancedCFDSimulator:
             results['lift_coefficient'] = (results['lift_coefficient'] + amr_results['lift_coefficient']) / 2
 
         # Issue #15: Multi-fidelity promotion
+        external_results = None
         if mission and getattr(mission, 'force_external_validation', False):
             external_results = self._run_external_validation(occupancy, force=True)
         else:
