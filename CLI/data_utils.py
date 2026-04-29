@@ -140,13 +140,16 @@ class GroundTruthExporter:
     def _sanitize_metadata(self, obj: Any) -> Any:
         """Recursively sanitize metadata for JSON serialization, stripping Tensors/Tuples"""
         if isinstance(obj, dict):
-            return {k: self._sanitize_metadata(v) for k, v in obj.items() if not k.endswith('_fields') and k != 'pressure_field'}
+            return {k: self._sanitize_metadata(v) for k, v in obj.items()
+                    if not k.endswith('_fields') and k not in ('pressure_field', 'velocity_fields')}
+        elif isinstance(obj, (list, tuple)):
+            return [self._sanitize_metadata(i) for i in obj if not isinstance(i, (torch.Tensor, np.ndarray)) or i.numel() <= 1]
         elif isinstance(obj, list):
             return [self._sanitize_metadata(i) for i in obj]
         elif isinstance(obj, (int, float, str, bool)):
             return obj
         elif isinstance(obj, torch.Tensor):
-            return obj.item() if obj.numel() == 1 else obj.shape.tolist() if hasattr(obj, 'shape') else list(obj)
+            return obj.item() if obj.numel() == 1 else list(obj.shape)
         elif isinstance(obj, np.ndarray):
             return obj.tolist()
         elif isinstance(obj, LabelTier):
@@ -201,6 +204,12 @@ class GroundTruthExporter:
         )
 
         label_dict = self._sanitize_metadata(asdict(label))
+
+        # Merge extra metadata for backward compatibility (Issue #15)
+        if metadata:
+            for k, v in metadata.items():
+                if k not in label_dict and k not in ('velocity_fields', 'pressure_field') and not k.endswith('_fields'):
+                    label_dict[k] = self._sanitize_metadata(v)
 
         # Check for existing label to update/promote
         updated = False
