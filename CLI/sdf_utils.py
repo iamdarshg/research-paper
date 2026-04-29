@@ -32,19 +32,32 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
     Returns tensor of shape [27, D, H, W].
     q = distance_to_wall / link_length (0 < q <= 1)
     """
+    # Fix B: Support non-cubic tensors
+    shape = voxel_grid.shape
     sdf = compute_sdf(voxel_grid)
-    res = voxel_grid.shape[0]
     num_dirs = ex.shape[0]
 
-    q_all = torch.ones((num_dirs, res, res, res), device=voxel_grid.device, dtype=torch.float32)
+    # Fix C: Avoid boundary wraparound using padding
+    sdf_padded = torch.nn.functional.pad(sdf, (1, 1, 1, 1, 1, 1), mode='constant', value=10.0)
+
+    q_all = torch.ones((num_dirs, *shape), device=voxel_grid.device, dtype=torch.float32)
 
     for i in range(num_dirs):
         dx, dy, dz = int(ex[i].item()), int(ey[i].item()), int(ez[i].item())
         if dx == 0 and dy == 0 and dz == 0:
             continue
 
-        # Neighbor SDF values
-        sdf_neighbor = torch.roll(sdf, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
+        # Neighbor SDF values (using padded version to avoid wraparound)
+        # shifts in roll move elements from end to start.
+        # For neighbor at x+e, we need to look at shifted sdf.
+        # But padding is safer than roll for non-periodic.
+
+        # Extract the same shape as sdf but shifted
+        # Padded is [D+2, H+2, W+2]. If dx=1, we want [2:D+2]
+        d_slice = slice(1+dx, 1+dx+shape[0])
+        h_slice = slice(1+dy, 1+dy+shape[1])
+        w_slice = slice(1+dz, 1+dz+shape[2])
+        sdf_neighbor = sdf_padded[d_slice, h_slice, w_slice]
 
         # Links that cross the boundary: current is fluid (>0), neighbor is solid (<=0)
         crossing = (sdf > 0) & (sdf_neighbor <= 0)

@@ -56,6 +56,13 @@ class MixedPrecisionWrapper:
             # 4. Recover the computed FP32 field
             f_post = self._core.f
 
+            # Synchronize macroscopic fields (Fix nitpick)
+            if hasattr(self.solver, 'velocity_x'):
+                self.solver.velocity_x = self._core.velocity_x
+                self.solver.velocity_y = self._core.velocity_y
+                self.solver.velocity_z = self._core.velocity_z
+                self.solver.pressure = self._core.pressure
+
             # 5. Convert back to FP16 storage with DDF shift
             if self.enable_fp16:
                 if self.ddf_shift:

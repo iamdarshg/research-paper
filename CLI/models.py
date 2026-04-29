@@ -445,6 +445,55 @@ class ConsistencyModel(nn.Module):
             x_t = (x_t - (1 - alpha_t) * pred_noise) / sqrt_alpha_t
         return x_t
 
+class AeroSurrogate(nn.Module):
+    """Lightweight surrogate for aerodynamic metric ranking (Issue #15)"""
+    def __init__(self, condition_dim: int = 32, grid_resolution: int = 32):
+        super().__init__()
+        self.res = grid_resolution
+
+        # Simple 3D CNN to extract features from voxel grid
+        self.conv = nn.Sequential(
+            nn.Conv3d(1, 8, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool3d(2) # 16 x 2x2x2 = 128
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(128 + condition_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 5) # Cd, Cl, Cm, convergence, separation
+        )
+
+    def forward(self, voxel_grid, condition_embedding):
+        if voxel_grid.ndim == 3:
+            voxel_grid = voxel_grid.unsqueeze(0).unsqueeze(0)
+        elif voxel_grid.ndim == 4:
+            voxel_grid = voxel_grid.unsqueeze(1)
+
+        x = self.conv(voxel_grid).flatten(1)
+        x = torch.cat([x, condition_embedding], dim=1)
+        out = self.mlp(x)
+
+        return {
+            "Cd": out[:, 0],
+            "Cl": out[:, 1],
+            "Cm": out[:, 2],
+            "convergence_score": torch.sigmoid(out[:, 3]),
+            "separation_risk": torch.sigmoid(out[:, 4])
+        }
+
+    def rank(self, candidates: torch.Tensor, condition_embedding: torch.Tensor) -> torch.Tensor:
+        """Rank multiple candidates and return scores (higher is better)."""
+        self.eval()
+        with torch.no_grad():
+            preds = self.forward(candidates, condition_embedding)
+            # Heuristic score: High Cl/Cd, high convergence, low separation risk
+            # score = Cl - 2*Cd + 2*convergence - separation
+            score = preds['Cl'] - 2.0 * preds['Cd'] + 2.0 * preds['convergence_score'] - preds['separation_risk']
+        return score
+
 class LatentTo3DConverter(nn.Module):
     def __init__(self, latent_dim: int, grid_resolution: int = 32):
         super().__init__()

@@ -126,15 +126,27 @@ def accuracy_benchmark(stl, steps):
 @click.option('--num-steps', default=4)
 @click.option('--use-marching-cubes', is_flag=True, default=True)
 @click.option('--solver', default='D3Q27')
-def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver):
+@click.option('--num-candidates', default=1, help='Number of candidates to sample for surrogate ranking (Issue #15)')
+@click.option('--top-k', default=1, help='Number of top candidates to validate with D3Q27')
+def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver, num_candidates, top_k):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
     mission = DesignSpec(target_speed=target_speed).to_mission_profile()
 
     # Request typed geometry to preserve semantic info for feasibility checks (Issue #16)
     report = ConstraintReport()
-    typed_geom = generator.generate(mission, num_steps=num_steps, return_typed=True, existing_report=report)
 
+    # Issue #15: Multi-fidelity ranking loop
+    typed_geom = generator.generate(
+        mission,
+        num_steps=num_steps,
+        return_typed=True,
+        existing_report=report,
+        num_candidates=num_candidates,
+        top_k=top_k
+    )
+
+    # Re-simulate best to get final metrics if not already done in generate
     cfd_config = CFDConfig(solver_type=solver)
     simulator = AdvancedCFDSimulator(cfd_config, device)
     results = simulator.simulate_aerodynamics(typed_geom, steps=100, mission=mission, existing_report=report)

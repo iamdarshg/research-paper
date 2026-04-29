@@ -30,11 +30,13 @@ class TestIssue15Physics(unittest.TestCase):
         # BFL initialization triggered by collide_stream
         solver.collide_stream(geometry_mask, steps=1)
 
-        self.assertIsNotNone(solver._solver.q)
-        self.assertEqual(solver._solver.q.shape, (27, 16, 16, 16))
+        # Access through private cache helper
+        q = solver._solver._get_q(geometry_mask)
+        self.assertIsNotNone(q)
+        self.assertEqual(q.shape, (27, 16, 16, 16))
         # Wall distances should be between 0 and 1
-        self.assertTrue(torch.all(solver._solver.q > 0))
-        self.assertTrue(torch.all(solver._solver.q <= 1.0))
+        self.assertTrue(torch.all(q > 0))
+        self.assertTrue(torch.all(q <= 1.0))
 
     def test_guo_forcing_offset(self):
         """Verify Guo's macroscopic velocity offset calculation."""

@@ -114,12 +114,31 @@ class D3Q27Solver:
         self.f = torch.zeros(27, resolution, resolution, resolution, device=device)
         self.f_temp = torch.zeros_like(self.f)
         self.f_pre_stream = torch.empty_like(self.f)
+
+        # Macroscopic fields stored for diagnostics/synchronization
+        self.velocity_x = torch.zeros(resolution, resolution, resolution, device=device)
+        self.velocity_y = torch.zeros_like(self.velocity_x)
+        self.velocity_z = torch.zeros_like(self.velocity_x)
+        self.pressure = torch.zeros_like(self.velocity_x)
+        self.rho = torch.ones_like(self.velocity_x)
+
         self.reset_force_accounting()
         self.logger = LBMLogger()
-        self.q = None
+
+        # Cache for BFL distances keyed by geometry hash (Fix A)
+        self._q_cache = {}
 
         # Precompute Guo directions
         self.ei_guo = torch.stack([self.ex_f, self.ey_f, self.ez_f], dim=1).view(27, 3, 1, 1, 1)
+
+    def _get_q(self, geometry_mask):
+        """Get or compute sub-voxel distances for the given geometry."""
+        # Simple hash based on data_ptr and sum as a proxy for content
+        # For a more robust fix, we could use a proper hash
+        geom_key = (geometry_mask.data_ptr(), geometry_mask.sum().item(), geometry_mask.shape)
+        if geom_key not in self._q_cache:
+            self._q_cache[geom_key] = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
+        return self._q_cache[geom_key]
 
     def compute_equilibrium(self, rho, ux, uy, uz):
         cu = self.ex_f * ux + self.ey_f * uy + self.ez_f * uz
@@ -155,8 +174,7 @@ class D3Q27Solver:
         boundary_links = self._boundary_links(geometry_mask)
 
         # BFL wall distance q (shape: [26, D, H, W])
-        if self.q is None:
-            self.q = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
+        q = self._get_q(geometry_mask)
 
         step_force_x = torch.tensor(0.0, device=self.device)
         step_force_z = torch.tensor(0.0, device=self.device)
@@ -167,7 +185,7 @@ class D3Q27Solver:
             if not torch.any(active):
                 continue
 
-            qi = self.q[i][active]
+            qi = q[i][active]
 
             # Momentum exchange for BFL:
             # The simple BB exchange is 2 * fi_in.
@@ -251,8 +269,7 @@ class D3Q27Solver:
 
     def _apply_bfl_boundary(self, geometry_mask):
         """Bouzidi-Firdaouss-Lallemand (BFL) boundary condition."""
-        if self.q is None:
-            self.q = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
+        q = self._get_q(geometry_mask)
 
         # Standard bounce-back links
         mask = geometry_mask > 0.5
@@ -267,7 +284,7 @@ class D3Q27Solver:
             if not torch.any(active):
                 continue
 
-            qi = self.q[i][active]
+            qi = q[i][active]
 
             # BFL interpolation based on q
             # If q < 0.5: f_opp(x, t+1) = q(2q+1)f_i(x, t) + (1-2q)(1+2q)f_i(x-e, t) - q(1-2q)f_i(x-2e, t)
@@ -327,7 +344,7 @@ class D3Q27Solver:
         S = factor * self.w.view(27, 1, 1, 1) * (term1 + term2)
         return S
 
-    def collide_and_stream(self, omega, geometry_mask):
+    def collide_and_stream(self, omega, geometry_mask, ext_force=None):
         geometry_mask = geometry_mask.to(self.device, non_blocking=True)
         # Guard against runaway non-finite populations from previous steps.
         self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
@@ -337,8 +354,8 @@ class D3Q27Solver:
 
         # Macroscopic velocity with forcing offset (Guo's definition)
         # u = (sum fi ci + 0.5 F) / rho
-        # For now, external force F is zero, but we prepare the logic
-        ext_force = torch.zeros((3, *rho.shape), device=self.device)
+        if ext_force is None:
+            ext_force = torch.zeros((3, *rho.shape), device=self.device)
 
         ux_raw = torch.sum(self.f * self.ex_f, dim=0)
         uy_raw = torch.sum(self.f * self.ey_f, dim=0)
@@ -412,6 +429,15 @@ class D3Q27Solver:
 
         self.f.copy_(self.f_temp)
         self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+
+        # Update stored macroscopic fields
+        cs2 = 1.0 / 3.0
+        self.velocity_x = ux
+        self.velocity_y = uy
+        self.velocity_z = uz
+        self.pressure = rho * cs2
+        self.rho = rho
+
         self.force_x_last = step_force_x
         self.force_z_last = step_force_z
         self.projected_drag_last = step_projected_drag
@@ -529,13 +555,10 @@ class D3Q27CascadedSolver:
         self.pressure.copy_(rho * (1.0 / 3.0))
         self.rho.copy_(rho)
 
-    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100):
+    def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100, ext_force=None):
         """Run collide/stream for a number of steps. This adapts the simpler
         D3Q27 solver's `collide_and_stream(omega, geometry_mask)` API.
         """
-        if self._solver.q is None:
-             self._solver.q = compute_all_link_distances(geometry_mask, self._solver.ex, self._solver.ey, self._solver.ez)
-
         geometry_mask = geometry_mask.to(self.device, non_blocking=True)
         # compute a nominal relaxation rate from config
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
@@ -552,7 +575,7 @@ class D3Q27CascadedSolver:
 
         # run steps
         for _ in range(steps):
-            ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask)
+            ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask, ext_force=ext_force)
             # store fields for diagnostics
             self.velocity_x = ux
             self.velocity_y = uy

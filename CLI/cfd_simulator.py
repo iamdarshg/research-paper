@@ -109,7 +109,12 @@ class AdvancedCFDSimulator:
             results['drag_coefficient'] = (results['drag_coefficient'] + amr_results['drag_coefficient']) / 2
             results['lift_coefficient'] = (results['lift_coefficient'] + amr_results['lift_coefficient']) / 2
 
-        external_results = self._run_external_validation(occupancy)
+        # Issue #15: Multi-fidelity promotion
+        if mission and getattr(mission, 'force_external_validation', False):
+            external_results = self._run_external_validation(occupancy, force=True)
+        else:
+            external_results = self._run_external_validation(occupancy)
+
         if external_results:
             # For high-fidelity ground truth, if independent PDE results exist,
             # they supersede the LBM surrogate entirely.
@@ -139,10 +144,10 @@ class AdvancedCFDSimulator:
             )
         return results
 
-    def _run_external_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
+    def _run_external_validation(self, voxel_grid: torch.Tensor, force: bool = False) -> Optional[Dict[str, float]]:
         import random
         # Intelligent sampling: only run validation based on configured probability
-        if random.random() > self.config.validation_probability:
+        if not force and random.random() > self.config.validation_probability:
             return None
 
         if OPENFOAM_AVAILABLE:

@@ -2,10 +2,11 @@
 import torch
 import numpy as np
 import os
+from dataclasses import asdict
 from typing import Union, Dict, Any, Optional, Tuple
 import torch.nn.functional as F
 from config import ModelConfig, DiffusionConfig, DesignSpec, MissionProfile
-from models import LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel, MissionEncoder
+from models import LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel, MissionEncoder, AeroSurrogate
 from mesh_utils import voxels_to_stl
 from geometry import TypedAircraftGeometry, AircraftPart
 from constraints import ConstraintProjector, ConstraintReport
@@ -79,18 +80,25 @@ class OptimizedAircraftGenerator:
         self.consistency_model.student_model.eval()
 
         self.adapter = SemanticAdapter(self.model_config.grid_resolution, self.device)
+        self.surrogate = AeroSurrogate(self.model_config.condition_dim, self.model_config.grid_resolution).to(self.device)
+        if 'aero_surrogate' in checkpoint:
+            self.surrogate.load_state_dict(checkpoint['aero_surrogate'], strict=False)
 
     @torch.no_grad()
     def generate(self, mission: Union[MissionProfile, DesignSpec], num_steps: int = 4,
                  initial_noise: torch.Tensor = None, return_typed: bool = False,
-                 existing_report: ConstraintReport = None) -> Union[torch.Tensor, TypedAircraftGeometry, Tuple[TypedAircraftGeometry, ConstraintReport]]:
+                 existing_report: ConstraintReport = None,
+                 num_candidates: int = 1, top_k: int = 1) -> Union[torch.Tensor, TypedAircraftGeometry, Tuple[TypedAircraftGeometry, ConstraintReport]]:
 
         if isinstance(mission, DesignSpec):
             mission = mission.to_mission_profile()
 
         condition = self.mission_encoder(mission)
-        latent_shape = (1, self.model_config.latent_dim)
 
+        if num_candidates > 1:
+            return self.generate_candidates(mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report)
+
+        latent_shape = (1, self.model_config.latent_dim)
         print(f"Generating mission-conditioned design ({mission.aircraft_class})")
         generated_latent = self.consistency_model.fast_inference(
             latent_shape,
@@ -112,6 +120,78 @@ class OptimizedAircraftGenerator:
             return typed_geom
 
         return typed_geom.get_combined_occupancy()
+
+    @torch.no_grad()
+    def generate_candidates(self, mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report):
+        """Sample many candidates, rank with surrogate, and validate top-k (Issue #15)"""
+        print(f"Sampling {num_candidates} candidates for ranking...")
+        latent_shape = (num_candidates, self.model_config.latent_dim)
+
+        # 1. Sample many
+        latents = self.consistency_model.fast_inference(
+            latent_shape,
+            num_steps=num_steps,
+            condition=condition.repeat(num_candidates, 1)
+        )
+        voxel_grids = torch.sigmoid(self.converter(latents))
+
+        # 2. Batch Project (Heuristic project for all)
+        # For efficiency in this implementation, we apply the adapter and projector in a loop
+        # or we could optimize for batch.
+        projector = ConstraintProjector(self.model_config.grid_resolution, device=self.device)
+        projected_occupancies = []
+        typed_candidates = []
+
+        for i in range(num_candidates):
+            tg = self.adapter.adapt(voxel_grids[i])
+            tg = projector.project(tg, mission)
+            typed_candidates.append(tg)
+            projected_occupancies.append(tg.get_combined_occupancy())
+
+        projected_batch = torch.stack(projected_occupancies)
+
+        # 3. Rank with surrogate
+        print("Ranking candidates with AeroSurrogate...")
+        scores = self.surrogate.rank(projected_batch, condition.repeat(num_candidates, 1))
+
+        # 4. Select top-k
+        top_indices = torch.topk(scores, min(top_k, num_candidates)).indices.cpu().numpy()
+        print(f"Selected top {len(top_indices)} candidates for D3Q27 validation.")
+
+        from cfd_simulator import AdvancedCFDSimulator
+        from config import CFDConfig
+        from data_utils import GroundTruthExporter
+
+        sim_config = CFDConfig(base_grid_resolution=self.model_config.grid_resolution)
+        simulator = AdvancedCFDSimulator(sim_config, self.device)
+        exporter = GroundTruthExporter()
+
+        best_results = None
+        best_geom = None
+
+        for idx in top_indices:
+            tg = typed_candidates[idx]
+            # 5. Run D3Q27 on top candidates
+            print(f"Validating candidate {idx} with D3Q27...")
+            res = simulator.simulate_aerodynamics(tg, steps=100, mission=mission)
+
+            # 6. Save results to reusable label dataset
+            sample_id = f"gen_{mission.aircraft_class}_{idx}"
+            exporter.export_sample(sample_id, tg.get_combined_occupancy(), res['velocity_fields'], res['pressure_field'], res | {'mission': asdict(mission)})
+
+            if best_results is None or res['drag_coefficient'] < best_results['drag_coefficient']:
+                best_results = res
+                best_geom = tg
+
+        if existing_report is not None and best_results:
+            # Transfer constraints from best run
+            existing_report.violations = best_results['constraints']['violations']
+            existing_report.repaired = best_results['constraints']['repaired']
+
+        if return_typed:
+            return best_geom
+
+        return best_geom.get_combined_occupancy()
 
     def save_stl(self, voxel_grid: Union[torch.Tensor, TypedAircraftGeometry], output_path: str,
                  use_marching_cubes: bool = True, report: ConstraintReport = None):

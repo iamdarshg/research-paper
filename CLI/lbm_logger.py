@@ -3,19 +3,27 @@ import os
 from datetime import datetime
 
 class LBMLogger:
-    def __init__(self, log_file="lbm_debug.log"):
+    def __init__(self, log_file=None):
         self.logger = logging.getLogger("LBMSolver")
         self.logger.setLevel(logging.DEBUG)
 
         # Avoid duplicate handlers
         if not self.logger.handlers:
-            fh = logging.FileHandler(log_file)
-            fh.setLevel(logging.DEBUG)
+            # Add console handler by default
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+            ch.setFormatter(formatter)
+            self.logger.addHandler(ch)
 
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            fh.setFormatter(formatter)
+            if log_file:
+                fh = logging.FileHandler(log_file)
+                fh.setLevel(logging.DEBUG)
 
-            self.logger.addHandler(fh)
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                fh.setFormatter(formatter)
+
+                self.logger.addHandler(fh)
 
     def log_init(self, resolution, mach, reynolds, tau):
         self.logger.info(f"--- Solver Initialization ---")
