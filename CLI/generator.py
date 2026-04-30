@@ -82,6 +82,11 @@ class OptimizedAircraftGenerator:
 
         self.adapter = SemanticAdapter(self.model_config.grid_resolution, self.device)
         self.surrogate = AeroSurrogate(self.model_config.condition_dim, self.model_config.grid_resolution).to(self.device)
+        self.surrogate_mission_encoder = MissionEncoder(self.model_config.condition_dim).to(self.device)
+
+        # Default to main encoder if no standalone surrogate is loaded
+        self.surrogate_mission_encoder.load_state_dict(self.mission_encoder.state_dict())
+
         if 'aero_surrogate' in checkpoint:
             self.surrogate.load_state_dict(checkpoint['aero_surrogate'], strict=False)
 
@@ -90,7 +95,8 @@ class OptimizedAircraftGenerator:
                  initial_noise: torch.Tensor = None, return_typed: bool = False,
                  existing_report: ConstraintReport = None,
                  num_candidates: int = 1, top_k: int = 1,
-                 return_results: bool = False) -> Any:
+                 return_results: bool = False,
+                 external_val_mode: str = 'none') -> Any:
 
         if isinstance(mission, DesignSpec):
             mission = mission.to_mission_profile()
@@ -98,7 +104,7 @@ class OptimizedAircraftGenerator:
         condition = self.mission_encoder(mission)
 
         if num_candidates > 1:
-            return self.generate_candidates(mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report, return_results)
+            return self.generate_candidates(mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report, return_results, external_val_mode)
 
         latent_shape = (1, self.model_config.latent_dim)
         print(f"Generating mission-conditioned design ({mission.aircraft_class})")
@@ -123,9 +129,24 @@ class OptimizedAircraftGenerator:
             # For num_candidates=1, we still need to simulate if results are requested
             from cfd_simulator import AdvancedCFDSimulator
             from config import CFDConfig
+            from data_utils import GroundTruthExporter
+            from dataclasses import replace
+
+            # Apply external validation trigger (Review Feedback)
+            # Use replace to avoid in-place mutation of the original mission object
+            sim_mission = mission
+            if external_val_mode in ('final', 'top-k'):
+                sim_mission = replace(mission, force_external_validation=True)
+
             sim_config = CFDConfig(base_grid_resolution=self.model_config.grid_resolution)
             simulator = AdvancedCFDSimulator(sim_config, self.device)
-            results = simulator.simulate_aerodynamics(typed_geom, steps=100, mission=mission)
+            results = simulator.simulate_aerodynamics(typed_geom, steps=100, mission=sim_mission, existing_report=existing_report)
+
+            # Export single-candidate results to GroundTruthExporter (Review Feedback)
+            exporter = GroundTruthExporter()
+            run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+            sample_id = f"gen_single_{mission.aircraft_class}_{run_id}"
+            exporter.export_sample(sample_id, typed_geom.get_combined_occupancy(), results.get('velocity_fields'), results.get('pressure_field'), results | {'mission': asdict(mission)})
 
         final_geom = typed_geom if return_typed else typed_geom.get_combined_occupancy()
 
@@ -135,12 +156,15 @@ class OptimizedAircraftGenerator:
         return final_geom
 
     @torch.no_grad()
-    def generate_candidates(self, mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report, return_results=False):
+    def generate_candidates(self, mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report, return_results=False, external_val_mode='none'):
         """Sample many candidates, rank with surrogate, and validate top-k (Issue #15)."""
         from datetime import datetime, timezone
         run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         print(f"Sampling {num_candidates} candidates for ranking (Run ID: {run_timestamp})...")
         latent_shape = (num_candidates, self.model_config.latent_dim)
+
+        # Separate condition for ranking (Isolated surrogate encoder)
+        surr_condition = self.surrogate_mission_encoder(mission)
 
         # 1. Sample many
         latents = self.consistency_model.fast_inference(
@@ -170,8 +194,8 @@ class OptimizedAircraftGenerator:
         projected_batch = torch.stack(projected_occupancies)
 
         # 3. Rank with surrogate
-        if not self.surrogate.is_trained:
-            print("⚠️ AeroSurrogate is not trained. Using heuristic ranking (Cl - 2*Cd proxy)...")
+        if not self.surrogate.is_ready():
+            print(f"⚠️ AeroSurrogate is not ready (Samples: {self.surrogate.sample_count.item()}). Using heuristic ranking...")
             # Deterministic heuristic if surrogate is random
             # Use volume and bounding box as proxy for Cd if physics is unknown
             # For now, let's just fail or use a very basic heuristic.
@@ -180,7 +204,7 @@ class OptimizedAircraftGenerator:
             scores = torch.mean(projected_batch * 0.5, dim=(1, 2, 3))
         else:
             print("Ranking candidates with AeroSurrogate...")
-            scores = self.surrogate.rank(projected_batch, condition.repeat(num_candidates, 1))
+            scores = self.surrogate.rank(projected_batch, surr_condition.repeat(num_candidates, 1))
 
         # 4. Select top-k
         top_indices = torch.topk(scores, min(top_k, num_candidates)).indices.cpu().numpy()
@@ -198,12 +222,21 @@ class OptimizedAircraftGenerator:
         best_geom = None
         best_idx = -1
 
+        from dataclasses import replace
         for idx in top_indices:
             tg = typed_candidates[idx]
             cand_report = projected_reports[idx]
+
+            # Handle staged external validation (Review Feedback)
+            # Use replace to avoid cross-candidate side effects
+            if external_val_mode == 'top-k':
+                sim_mission = replace(mission, force_external_validation=True)
+            else:
+                sim_mission = replace(mission, force_external_validation=False)
+
             # 5. Run D3Q27 on top candidates
             print(f"Validating candidate {idx} with D3Q27...")
-            res = simulator.simulate_aerodynamics(tg, steps=100, mission=mission, existing_report=cand_report)
+            res = simulator.simulate_aerodynamics(tg, steps=100, mission=sim_mission, existing_report=cand_report)
 
             # 6. Save results to reusable label dataset (Fix 4: unique IDs)
             sample_id = f"gen_{mission.aircraft_class}_{run_timestamp}_{idx}"
@@ -229,6 +262,18 @@ class OptimizedAircraftGenerator:
                 best_geom = tg
                 best_idx = idx
 
+        # Final Selected Candidate External Validation (if mode is 'final')
+        if external_val_mode == 'final' and best_results:
+            # Check if it was already externally validated (it wouldn't be if mode was 'final')
+            if best_results.get('label_tier') != 'external_pde':
+                print(f"🚀 Running final external PDE validation for selected candidate...")
+                sim_mission = replace(mission, force_external_validation=True)
+                best_results = simulator.simulate_aerodynamics(best_geom, steps=100, mission=sim_mission, existing_report=projected_reports[best_idx])
+
+                # Re-export promoted result
+                sample_id = f"gen_{mission.aircraft_class}_{run_timestamp}_{best_idx}_promoted"
+                exporter.export_sample(sample_id, best_geom.get_combined_occupancy(), best_results.get('velocity_fields'), best_results.get('pressure_field'), best_results | {'mission': asdict(mission)})
+
         if existing_report is not None and best_results:
             # Use the selected candidate's isolated report for final status (Review Feedback)
             best_report = projected_reports[best_idx]
@@ -246,6 +291,7 @@ class OptimizedAircraftGenerator:
 
     def load_surrogate(self, surrogate_path: str):
         """Load a standalone surrogate checkpoint (Issue #15 Review Feedback)."""
+        # Isolated loading: Do not corrupt the main mission_encoder (diffusion path)
         print(f"Loading standalone surrogate from {surrogate_path}...")
         checkpoint = torch.load(surrogate_path, map_location=self.device)
         if 'model_state_dict' in checkpoint:
@@ -254,7 +300,7 @@ class OptimizedAircraftGenerator:
             self.surrogate.load_state_dict(checkpoint)
 
         if 'encoder_state_dict' in checkpoint:
-            self.mission_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            self.surrogate_mission_encoder.load_state_dict(checkpoint['encoder_state_dict'])
 
     def save_stl(self, voxel_grid: Union[torch.Tensor, TypedAircraftGeometry], output_path: str,
                  use_marching_cubes: bool = True, report: ConstraintReport = None):

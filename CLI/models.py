@@ -451,6 +451,9 @@ class AeroSurrogate(nn.Module):
         super().__init__()
         self.res = grid_resolution
         self.register_buffer("is_trained", torch.tensor(False))
+        # Metadata for quality gating (Review Feedback)
+        self.register_buffer("sample_count", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("last_val_mse", torch.tensor(1.0, dtype=torch.float32))
 
         # Simple 3D CNN to extract features from voxel grid
         self.conv = nn.Sequential(
@@ -495,10 +498,15 @@ class AeroSurrogate(nn.Module):
             score = preds['Cl'] - 2.0 * preds['Cd'] + 2.0 * preds['convergence_score'] - preds['separation_risk']
         return score
 
+    def is_ready(self, min_samples: int = 100) -> bool:
+        """Check if surrogate is qualified for generation-time ranking (Review Feedback)."""
+        return self.is_trained.item() and self.sample_count.item() >= min_samples
+
     def train_step(self, geometries, targets, condition_embedding, optimizer):
         """Perform a single training step on a batch of labels (Issue #15)."""
         self.train()
         self.is_trained.fill_(True)
+        self.sample_count += geometries.shape[0]
         optimizer.zero_grad()
 
         preds = self.forward(geometries, condition_embedding)

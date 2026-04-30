@@ -128,7 +128,7 @@ def accuracy_benchmark(stl, steps):
 @click.option('--solver', default='D3Q27')
 @click.option('--num-candidates', default=1, help='Number of candidates to sample for surrogate ranking (Issue #15)')
 @click.option('--top-k', default=1, help='Number of top candidates to validate with D3Q27')
-@click.option('--external-validation', is_flag=True, help='Force external PDE validation for the final design')
+@click.option('--external-validation', default='none', type=click.Choice(['none', 'final', 'top-k']), help='External PDE validation mode')
 @click.option('--surrogate-checkpoint', default=None, help='Load a standalone surrogate model checkpoint')
 def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver, num_candidates, top_k, external_validation, surrogate_checkpoint):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -136,7 +136,8 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
     if surrogate_checkpoint:
         generator.load_surrogate(surrogate_checkpoint)
     mission = DesignSpec(target_speed=target_speed).to_mission_profile()
-    mission.force_external_validation = external_validation
+    # mission.force_external_validation is still used as a boolean internally
+    # but we control when it's set based on the mode.
 
     # Request typed geometry to preserve semantic info for feasibility checks (Issue #16)
     report = ConstraintReport()
@@ -150,7 +151,8 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
         existing_report=report,
         num_candidates=num_candidates,
         top_k=top_k,
-        return_results=True
+        return_results=True,
+        external_val_mode=external_validation
     )
 
     # Save with watertightness check

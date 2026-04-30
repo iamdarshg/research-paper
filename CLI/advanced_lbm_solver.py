@@ -8,6 +8,7 @@ from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity, compute_velocity_gradients
 from sdf_utils import compute_all_link_distances
 from lbm_logger import LBMLogger
+from utils import compute_tensor_content_hash
 
 try:
     from d3q27_kernels import stream_bounce_d3q27
@@ -133,25 +134,8 @@ class D3Q27Solver:
 
     def _get_q(self, geometry_mask):
         """Get or compute sub-voxel distances for the given geometry (Fix A/Issue #15)."""
-        # Fix A: Use a robust content-based key to detect any geometric change (Review Feedback)
-        # Using integrated profiles (sums along axes) is fast and highly sensitive to shifts/rotations.
-        res = geometry_mask.shape
-
-        # We need to use float conversion for the sum tuples to ensure they are hashable
-        # and consistent across devices.
-        x_prof = geometry_mask.sum(dim=(1, 2)).cpu().tolist()
-        y_prof = geometry_mask.sum(dim=(0, 2)).cpu().tolist()
-        z_prof = geometry_mask.sum(dim=(0, 1)).cpu().tolist()
-
-        geom_key = (
-            float(geometry_mask.sum().item()),
-            res,
-            tuple(x_prof),
-            tuple(y_prof),
-            tuple(z_prof),
-            geometry_mask.device.type,
-            geometry_mask.dtype
-        )
+        # Fix A: Use a true content hash for the geometry key (Review Feedback)
+        geom_key = compute_tensor_content_hash(geometry_mask)
 
         if geom_key not in self._q_cache:
             # CPU/SciPy cost is explicit here.
@@ -242,12 +226,12 @@ class D3Q27Solver:
 
     def _boundary_links(self, geometry_mask):
         """Cache static fluid-solid links without boundary wraparound (Issue #15)."""
-        mask = geometry_mask > 0.5
-        # Improved cache key: include sum and sample as proxy for content
-        # Still not a full hash, but much safer than just data_ptr
-        cache_key = (mask.data_ptr(), mask.sum().item(), mask.shape, mask.device.type)
+        # Use true content hash for cache key (Review Feedback)
+        cache_key = compute_tensor_content_hash(geometry_mask)
         if cache_key == self._boundary_cache_key and self._boundary_link_cache is not None:
             return self._boundary_link_cache
+
+        mask = geometry_mask > 0.5
 
         links = []
         fluid = ~mask
