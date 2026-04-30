@@ -33,18 +33,19 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
     Returns tensor of shape [27, D, H, W].
     q = distance_to_wall / link_length (0 < q <= 1)
     """
-    # Fix B: Support non-cubic tensors
+    # Support non-cubic tensors
     if voxel_grid.ndim != 3:
         raise ValueError(f"Expected 3D voxel grid, got {voxel_grid.ndim}D")
-    shape = voxel_grid.shape
+    D, H, W = voxel_grid.shape
     sdf = compute_sdf(voxel_grid)
     num_dirs = ex.shape[0]
 
-    # Fix C: Avoid boundary wraparound using padding
+    # Avoid boundary wraparound using padding
     # We pad the SDF so that 'neighbors' outside the domain appear far away (fluid)
+    # Using 10.0 ensures we don't accidentally detect a boundary link to the opposite face
     sdf_padded = torch.nn.functional.pad(sdf, (1, 1, 1, 1, 1, 1), mode='constant', value=10.0)
 
-    q_all = torch.ones((num_dirs, *shape), device=voxel_grid.device, dtype=torch.float32)
+    q_all = torch.ones((num_dirs, D, H, W), device=voxel_grid.device, dtype=torch.float32)
 
     for i in range(num_dirs):
         dx, dy, dz = int(ex[i].item()), int(ey[i].item()), int(ez[i].item())
@@ -52,16 +53,14 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
             continue
 
         # Neighbor SDF values (using padded version to avoid wraparound)
-        # shifts in roll move elements from end to start.
-        # For neighbor at x+e, we need to look at shifted sdf.
-        # But padding is safer than roll for non-periodic.
+        # For neighbor at x+e, we look at the padded slice shifted by dx, dy, dz.
+        # Padded is [D+2, H+2, W+2]. Interior is at [1:D+1, 1:H+1, 1:W+1]
+        # Neighbor of (x,y,z) in direction (dx,dy,dz) is at (1+x+dx, 1+y+dy, 1+z+dz) in padded
+        d_start, d_end = 1 + dx, 1 + dx + D
+        h_start, h_end = 1 + dy, 1 + dy + H
+        w_start, w_end = 1 + dz, 1 + dz + W
 
-        # Extract the same shape as sdf but shifted
-        # Padded is [D+2, H+2, W+2]. If dx=1, we want [2:D+2]
-        d_slice = slice(1+dx, 1+dx+shape[0])
-        h_slice = slice(1+dy, 1+dy+shape[1])
-        w_slice = slice(1+dz, 1+dz+shape[2])
-        sdf_neighbor = sdf_padded[d_slice, h_slice, w_slice]
+        sdf_neighbor = sdf_padded[d_start:d_end, h_start:h_end, w_start:w_end]
 
         # Links that cross the boundary: current is fluid (>0), neighbor is solid (<=0)
         crossing = (sdf > 0) & (sdf_neighbor <= 0)

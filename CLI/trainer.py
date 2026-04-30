@@ -1,6 +1,8 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -12,7 +14,7 @@ from typing import Dict, Any, List
 from dataclasses import asdict
 
 from config import ModelConfig, DiffusionConfig, TrainingConfig, CFDConfig, DesignSpec, MissionProfile
-from models import LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel, NoiseSchedule, MissionEncoder
+from models import LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel, NoiseSchedule, MissionEncoder, AeroSurrogate
 from data_utils import ConnectivityLoss, AerodynamicLoss, GroundTruthExporter
 from cfd_simulator import AdvancedCFDSimulator
 
@@ -31,6 +33,7 @@ class OptimizedDiffusionTrainer:
         self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
         self.converter = LatentTo3DConverter(model_config.latent_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
         self.mission_encoder = MissionEncoder(model_config.condition_dim).to(self.device).to(self.dtype)
+        self.surrogate = AeroSurrogate(model_config.condition_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
 
         self.current_grid_size = model_config.grid_resolution
         self.consistency_model = ConsistencyModel(model_config, diffusion_config, self.dtype).to(self.device)
@@ -39,7 +42,8 @@ class OptimizedDiffusionTrainer:
         params = (list(self.diffusion_model.parameters()) +
                   list(self.converter.parameters()) +
                   list(self.consistency_model.student_model.parameters()) +
-                  list(self.mission_encoder.parameters()))
+                  list(self.mission_encoder.parameters()) +
+                  list(self.surrogate.parameters()))
         self.optimizer = AdamW(params, lr=training_config.learning_rate, weight_decay=training_config.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
         self.scaler = GradScaler()
@@ -144,7 +148,41 @@ class OptimizedDiffusionTrainer:
                 design_spec = DesignSpec(target_speed=grid_size / 32.0 * 50.0)
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator, gt_exporter=self.gt_exporter, sample_prefix=f"grid{grid_size}_step{self.global_step}")
 
-            total_loss_val = mse_loss_val + consist_loss_val + connectivity_loss_val + aero_loss_val
+            # Online surrogate training (Issue #15)
+            surrogate_loss_val = torch.tensor(0.0, device=self.device)
+            if len(self.gt_exporter._cache) >= self.training_config.batch_size:
+                # Sample a mini-batch from the labels cache
+                import random
+                samples = random.sample(self.gt_exporter._cache, self.training_config.batch_size)
+
+                # We need to load geometries and targets
+                batch_geoms = []
+                batch_targets = {'Cd': [], 'Cl': [], 'Cm': [], 'convergence_score': [], 'separation_risk': []}
+                batch_missions = []
+
+                for s in samples:
+                    geom_path = self.gt_exporter.output_dir / s['geometry_ref']
+                    if geom_path.exists():
+                        batch_geoms.append(torch.from_numpy(np.load(geom_path)).float())
+                        batch_targets['Cd'].append(s.get('cd', 0.0))
+                        batch_targets['Cl'].append(s.get('cl', 0.0))
+                        batch_targets['Cm'].append(s.get('cm', 0.0) or 0.0)
+                        batch_targets['convergence_score'].append(float(s.get('converged', False)))
+                        batch_targets['separation_risk'].append(s.get('separation_risk', 0.0))
+                        batch_missions.append(MissionProfile(**s.get('mission_profile', {})))
+
+                if batch_geoms:
+                    geoms_t = torch.stack(batch_geoms).to(self.device)
+                    targets_t = {k: torch.tensor(v, device=self.device, dtype=self.dtype) for k, v in batch_targets.items()}
+                    cond_surr = self.mission_encoder(batch_missions)
+
+                    preds = self.surrogate(geoms_t, cond_surr)
+                    surr_loss = F.mse_loss(preds['Cd'], targets_t['Cd']) + \
+                                F.mse_loss(preds['Cl'], targets_t['Cl']) + \
+                                F.binary_cross_entropy(preds['convergence_score'], targets_t['convergence_score'])
+                    surrogate_loss_val = surr_loss
+
+            total_loss_val = mse_loss_val + consist_loss_val + connectivity_loss_val + aero_loss_val + surrogate_loss_val
             self.optimizer.zero_grad()
             total_loss_val.backward()
             self.optimizer.step()
@@ -174,6 +212,7 @@ class OptimizedDiffusionTrainer:
             'consistency_model': self.consistency_model.state_dict(),
             'converter': self.converter.state_dict(),
             'mission_encoder': self.mission_encoder.state_dict(),
+            'aero_surrogate': self.surrogate.state_dict(),
             'ema_model': self.ema_model.state_dict(),
             'model_config': asdict(self.model_config),
             'diffusion_config': asdict(self.diffusion_config),
@@ -191,3 +230,6 @@ class OptimizedDiffusionTrainer:
             self.mission_encoder.load_state_dict(checkpoint['mission_encoder'])
         elif not allow_legacy:
             raise RuntimeError("Checkpoint missing 'mission_encoder'. Use allow_legacy=True to skip.")
+
+        if 'aero_surrogate' in checkpoint:
+            self.surrogate.load_state_dict(checkpoint['aero_surrogate'])

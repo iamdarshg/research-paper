@@ -137,26 +137,26 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
     report = ConstraintReport()
 
     # Issue #15: Multi-fidelity ranking loop
-    typed_geom = generator.generate(
+    # Return both geometry and results to avoid redundant simulation (Review Feedback)
+    typed_geom, results = generator.generate(
         mission,
         num_steps=num_steps,
         return_typed=True,
         existing_report=report,
         num_candidates=num_candidates,
-        top_k=top_k
+        top_k=top_k,
+        return_results=True
     )
-
-    # Re-simulate best to get final metrics if not already done in generate
-    cfd_config = CFDConfig(solver_type=solver)
-    simulator = AdvancedCFDSimulator(cfd_config, device)
-    results = simulator.simulate_aerodynamics(typed_geom, steps=100, mission=mission, existing_report=report)
 
     # Save with watertightness check
     generator.save_stl(typed_geom, output, use_marching_cubes=use_marching_cubes, report=report)
 
-    print(f"Drag: {results['drag_coefficient']:.6f}, Lift: {results['lift_coefficient']:.6f}")
+    if results:
+        print(f"Drag: {results['drag_coefficient']:.6f}, Lift: {results['lift_coefficient']:.6f}")
+        if 'feasibility' in results:
+            print(f"Feasibility: Lift/Weight: {results['feasibility']['lift_ratio']:.2f}")
+
     final_report = report.to_dict()
-    print(f"Feasibility: Lift/Weight: {results['feasibility']['lift_ratio']:.2f}")
     print(f"Repaired: {final_report['repaired']}, Violations: {len(final_report['violations'])}")
     print(f"Export Status: {final_report['export_status']}")
 
@@ -171,6 +171,57 @@ def batch_generate(checkpoint, output_dir, num_designs):
     for i in range(num_designs):
         voxel_grid = generator.generate(DesignSpec(target_speed=50.0))
         generator.save_stl(voxel_grid, os.path.join(output_dir, f'aircraft_{i+1:03d}.stl'))
+
+@cli.command()
+@click.option('--labels-dir', default='./ground_truth')
+@click.option('--epochs', default=50)
+@click.option('--lr', default=1e-3)
+@click.option('--batch-size', default=16)
+def train_surrogate(labels_dir, epochs, lr, batch_size):
+    """Train the AeroSurrogate model on collected CFD labels (Issue #15)"""
+    from models import AeroSurrogate, MissionEncoder
+    from data_utils import CFDLabelDataset
+    from torch.utils.data import DataLoader
+    from pathlib import Path
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dataset = CFDLabelDataset(labels_dir=labels_dir)
+    if len(dataset) == 0:
+        print(f"❌ No labels found in {labels_dir}. Run some 'generate' or 'train' steps first.")
+        return
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize models
+    model = AeroSurrogate(condition_dim=32).to(device)
+    encoder = MissionEncoder(condition_dim=32).to(device)
+
+    optimizer = torch.optim.Adam(list(model.parameters()) + list(encoder.parameters()), lr=lr)
+
+    print(f"🚀 Training AeroSurrogate on {len(dataset)} samples...")
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for geoms, targets, missions in loader:
+            geoms = geoms.to(device)
+            # targets is a dict of tensors
+            targets = {k: v.to(device) for k, v in targets.items()}
+
+            # Encode mission profiles
+            cond = encoder(missions)
+
+            loss = model.train_step(geoms, targets, cond, optimizer)
+            epoch_loss += loss
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(loader):.6f}")
+
+    # Save surrogate
+    save_path = Path(labels_dir) / "aero_surrogate.pt"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'encoder_state_dict': encoder.state_dict()
+    }, save_path)
+    print(f"✅ Saved trained surrogate to {save_path}")
 
 @cli.command()
 def info():

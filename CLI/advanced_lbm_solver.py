@@ -235,17 +235,28 @@ class D3Q27Solver:
         return torch.sum(torch.where(upwind, projected * boundary_links, torch.zeros_like(projected)))
 
     def _boundary_links(self, geometry_mask):
-        """Cache static fluid-solid links so force accounting avoids per-step host sync."""
+        """Cache static fluid-solid links without boundary wraparound (Issue #15)."""
         mask = geometry_mask > 0.5
-        cache_key = (mask.data_ptr(), tuple(mask.shape), mask.device.type, mask.device.index)
+        # Improved cache key: include sum and sample as proxy for content
+        # Still not a full hash, but much safer than just data_ptr
+        cache_key = (mask.data_ptr(), mask.sum().item(), mask.shape, mask.device.type)
         if cache_key == self._boundary_cache_key and self._boundary_link_cache is not None:
             return self._boundary_link_cache
 
         links = []
         fluid = ~mask
+        D, H, W = mask.shape
+        # Pad mask to detect neighbors without wraparound
+        mask_padded = torch.nn.functional.pad(mask, (1, 1, 1, 1, 1, 1), mode='constant', value=0)
+
         for i in self._force_dirs:
             dx, dy, dz = self._stream_shifts[i]
-            neighbor_is_solid = torch.roll(mask, shifts=(-dx, -dy, -dz), dims=(0, 1, 2))
+            # Neighbor at (x+dx, y+dy, z+dz).
+            # In mask_padded, this corresponds to (1+x+dx, 1+y+dy, 1+z+dz)
+            d_s, d_e = 1+dx, 1+dx+D
+            h_s, h_e = 1+dy, 1+dy+H
+            w_s, w_e = 1+dz, 1+dz+W
+            neighbor_is_solid = mask_padded[d_s:d_e, h_s:h_e, w_s:w_e]
             links.append(fluid & neighbor_is_solid)
 
         self._boundary_link_cache = torch.stack(links, dim=0)
@@ -303,16 +314,21 @@ class D3Q27Solver:
 
             qi = q[i][active]
 
-            # BFL interpolation based on q
-            # If q < 0.5: f_opp(x, t+1) = q(2q+1)f_i(x, t) + (1-2q)(1+2q)f_i(x-e, t) - q(1-2q)f_i(x-2e, t)
-            # If q >= 0.5: f_opp(x, t+1) = (1 / (q(2q+1))) * f_i(x, t) + ... (simplified linear version used here)
+            # Identify neighbors without wraparound (Issue #15)
+            dx, dy, dz = self._stream_shifts[i]
+            D, H, W = geometry_mask.shape
 
+            # Pad pre-stream populations to avoid roll wraparound
+            f_padded = torch.nn.functional.pad(self.f_pre_stream[i], (1, 1, 1, 1, 1, 1), mode='constant', value=0)
+            # Neighbor at x-e is at (1+x-dx, 1+y-dy, 1+z-dz) in padded
+            d_s, d_e = 1-dx, 1-dx+D
+            h_s, h_e = 1-dy, 1-dy+H
+            w_s, w_e = 1-dz, 1-dz+W
+            f_neighbor = f_padded[d_s:d_e, h_s:h_e, w_s:w_e][active]
+
+            # BFL interpolation based on q
             q_low = qi < 0.5
             q_high = ~q_low
-
-            # For BFL, we need populations from neighbors
-            dx, dy, dz = self._stream_shifts[i]
-            f_neighbor = torch.roll(self.f_pre_stream[i], shifts=(dx, dy, dz), dims=(0, 1, 2))[active]
 
             # Simplified BFL Linear Interpolation
             # f_opp(x, t+1) = (1-2q)f_i(x, t) + 2q f_i(x, t)_bb (if q < 0.5)
@@ -447,13 +463,20 @@ class D3Q27Solver:
         self.f.copy_(self.f_temp)
         self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
+        # Recompute macroscopic fields from updated populations (Issue #15 Fix 10)
+        rho_new = torch.sum(self.f, dim=0).clamp_min(1e-8)
+        # Use Guo's velocity definition: u = (sum fi ci + 0.5 F) / rho
+        ux_new = (torch.sum(self.f * self.ex_f, dim=0) + 0.5 * ext_force[0]) / (rho_new + 1e-12)
+        uy_new = (torch.sum(self.f * self.ey_f, dim=0) + 0.5 * ext_force[1]) / (rho_new + 1e-12)
+        uz_new = (torch.sum(self.f * self.ez_f, dim=0) + 0.5 * ext_force[2]) / (rho_new + 1e-12)
+
         # Update stored macroscopic fields
         cs2 = 1.0 / 3.0
-        self.velocity_x = ux
-        self.velocity_y = uy
-        self.velocity_z = uz
-        self.pressure = rho * cs2
-        self.rho = rho
+        self.velocity_x = ux_new.nan_to_num(0.0)
+        self.velocity_y = uy_new.nan_to_num(0.0)
+        self.velocity_z = uz_new.nan_to_num(0.0)
+        self.pressure = rho_new * cs2
+        self.rho = rho_new
 
         self.force_x_last = step_force_x
         self.force_z_last = step_force_z

@@ -136,10 +136,11 @@ class TestIssue15Pipeline(unittest.TestCase):
         dataset = CFDLabelDataset()
         self.assertGreater(len(dataset), 0)
 
-        g, targets = dataset[len(dataset)-1]
+        g, targets, mission = dataset[len(dataset)-1]
         self.assertEqual(g.shape, (16, 16, 16))
         self.assertAlmostEqual(targets['Cd'].item(), 0.3)
         self.assertAlmostEqual(targets['Cl'].item(), 0.4)
+        self.assertIsInstance(mission, MissionProfile)
 
     def test_feasibility_aware_selection(self):
         """Verify generation prefers feasible candidates even if they have higher drag."""

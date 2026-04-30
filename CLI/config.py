@@ -155,7 +155,10 @@ class CFDLabel:
 
     # Field references (Optional paths to stored fields)
     pressure_field_path: Optional[str] = None
-    velocity_field_path: Optional[str] = None
+    velocity_field_paths: Dict[str, str] = field(default_factory=dict) # ux, uy, uz
+
+    # Multi-fidelity history
+    fidelity_history: List[Dict[str, Any]] = field(default_factory=list)
 
     # Solver metadata
     solver_name: str = "D3Q27"

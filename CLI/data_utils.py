@@ -10,7 +10,7 @@ from pathlib import Path
 import json
 from dataclasses import asdict
 from datetime import datetime
-from config import DesignSpec, LabelTier, CFDLabel
+from config import DesignSpec, LabelTier, CFDLabel, MissionProfile
 
 class AircraftDesignDataset(Dataset):
     """Synthetic dataset for aircraft structure training with adaptive resolution"""
@@ -170,13 +170,13 @@ class GroundTruthExporter:
         geom_path = sample_path / "geometry.npy"
         np.save(geom_path, geometry.cpu().numpy())
 
-        px_path, vel_path = None, None
+        px_path, vel_paths = None, {}
         if velocity_fields is not None:
             ux, uy, uz = velocity_fields
-            np.save(sample_path / "velocity_x.npy", ux.cpu().numpy())
-            np.save(sample_path / "velocity_y.npy", uy.cpu().numpy())
-            np.save(sample_path / "velocity_z.npy", uz.cpu().numpy())
-            vel_path = str((sample_path / "velocity_x.npy").relative_to(self.output_dir))
+            for name, field_data in zip(['ux', 'uy', 'uz'], [ux, uy, uz]):
+                path = sample_path / f"velocity_{name}.npy"
+                np.save(path, field_data.cpu().numpy())
+                vel_paths[name] = str(path.relative_to(self.output_dir))
 
         if pressure_field is not None:
             np.save(sample_path / "pressure.npy", pressure_field.cpu().numpy())
@@ -193,7 +193,7 @@ class GroundTruthExporter:
             cl=metadata.get('lift_coefficient', 0.0),
             cm=metadata.get('moment_coefficient'),
             pressure_field_path=px_path,
-            velocity_field_path=vel_path,
+            velocity_field_paths=vel_paths,
             solver_name=metadata.get('label_source', 'D3Q27'),
             grid_resolution=(res[0], res[1], res[2]),
             num_steps=metadata.get('num_steps', 0),
@@ -212,13 +212,21 @@ class GroundTruthExporter:
             if k not in label_dict and k not in ('velocity_fields', 'pressure_field') and not k.endswith('_fields'):
                 label_dict[k] = self._sanitize_metadata(v)
 
-        # Check for existing label to update/promote
+        # Check for existing label to update/promote (Non-lossy promotion Fix 4)
         updated = False
         for i, existing in enumerate(self._cache):
             if existing['geometry_id'] == sample_id:
-                # Promotion logic: only overwrite if new tier is 'higher' or same
+                # Multi-fidelity preservation: add previous state to fidelity_history
+                if label_dict['tier'] != existing['tier']:
+                    history = existing.get('fidelity_history', [])
+                    # Snapshot current state into history before update
+                    snap = {k: v for k, v in existing.items() if k != 'fidelity_history'}
+                    history.append(snap)
+                    label_dict['fidelity_history'] = history
+
+                # Promotion logic: only update main record if tier is higher or same
                 tier_order = {"lbm_raw": 0, "lbm_calibrated": 1, "external_pde": 2}
-                if tier_order[label_dict['tier']] >= tier_order[existing['tier']]:
+                if tier_order[label_dict['tier']] >= tier_order.get(existing['tier'], 0):
                     self._cache[i] = label_dict
                 updated = True
                 break
@@ -232,12 +240,14 @@ class GroundTruthExporter:
         with open(sample_path / "metadata.json", "w") as f:
             json.dump(label_dict, f, indent=2)
 
-        # Explicit manifest for PINN ingestion
+        # Explicit manifest for PINN ingestion (Fix 3: include all components)
         manifest = {
             'sample_id': sample_id,
             'files': {
                 'geometry': 'geometry.npy',
-                'ux': 'velocity_x.npy' if vel_path else None,
+                'ux': 'velocity_ux.npy' if 'ux' in vel_paths else None,
+                'uy': 'velocity_uy.npy' if 'uy' in vel_paths else None,
+                'uz': 'velocity_uz.npy' if 'uz' in vel_paths else None,
                 'p': 'pressure.npy' if px_path else None
             },
             'pinn_ready': metadata.get('pinn_ready', False),
@@ -280,7 +290,11 @@ class CFDLabelDataset(Dataset):
             'separation_risk': torch.tensor(record.get('separation_risk', 0.0), dtype=torch.float32)
         }
 
-        return geometry, targets
+        # Extract mission profile for conditioning (Issue #15)
+        mission_dict = record.get('mission_profile', {})
+        mission = MissionProfile(**mission_dict) if mission_dict else MissionProfile()
+
+        return geometry, targets, mission
 
 class AerodynamicLoss(nn.Module):
     """Loss based on aerodynamic properties using advanced CFD"""

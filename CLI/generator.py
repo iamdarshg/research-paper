@@ -89,7 +89,8 @@ class OptimizedAircraftGenerator:
     def generate(self, mission: Union[MissionProfile, DesignSpec], num_steps: int = 4,
                  initial_noise: torch.Tensor = None, return_typed: bool = False,
                  existing_report: ConstraintReport = None,
-                 num_candidates: int = 1, top_k: int = 1) -> Union[torch.Tensor, TypedAircraftGeometry, Tuple[TypedAircraftGeometry, ConstraintReport]]:
+                 num_candidates: int = 1, top_k: int = 1,
+                 return_results: bool = False) -> Any:
 
         if isinstance(mission, DesignSpec):
             mission = mission.to_mission_profile()
@@ -97,7 +98,7 @@ class OptimizedAircraftGenerator:
         condition = self.mission_encoder(mission)
 
         if num_candidates > 1:
-            return self.generate_candidates(mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report)
+            return self.generate_candidates(mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report, return_results)
 
         latent_shape = (1, self.model_config.latent_dim)
         print(f"Generating mission-conditioned design ({mission.aircraft_class})")
@@ -123,10 +124,10 @@ class OptimizedAircraftGenerator:
         return typed_geom.get_combined_occupancy()
 
     @torch.no_grad()
-    def generate_candidates(self, mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report):
+    def generate_candidates(self, mission, condition, num_steps, num_candidates, top_k, return_typed, existing_report, return_results=False):
         """Sample many candidates, rank with surrogate, and validate top-k (Issue #15)."""
-        from datetime import datetime, UTC
-        run_timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        from datetime import datetime, timezone
+        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         print(f"Sampling {num_candidates} candidates for ranking (Run ID: {run_timestamp})...")
         latent_shape = (num_candidates, self.model_config.latent_dim)
 
@@ -183,7 +184,9 @@ class OptimizedAircraftGenerator:
 
             # 6. Save results to reusable label dataset (Fix 4: unique IDs)
             sample_id = f"gen_{mission.aircraft_class}_{run_timestamp}_{idx}"
-            exporter.export_sample(sample_id, tg.get_combined_occupancy(), res['velocity_fields'], res['pressure_field'], res | {'mission': asdict(mission)})
+            # Use a more compatible way to merge dicts for safety
+            metadata = {**res, 'mission': asdict(mission)}
+            exporter.export_sample(sample_id, tg.get_combined_occupancy(), res.get('velocity_fields'), res.get('pressure_field'), metadata)
 
             # 7. Feasibility-aware selection (Fix 5)
             is_feasible = res['constraints'].get('valid', True)
@@ -207,10 +210,12 @@ class OptimizedAircraftGenerator:
             existing_report.violations = best_results['constraints']['violations']
             existing_report.repaired = best_results['constraints']['repaired']
 
-        if return_typed:
-            return best_geom
+        final_geom = best_geom if return_typed else best_geom.get_combined_occupancy()
 
-        return best_geom.get_combined_occupancy()
+        if return_results:
+            return final_geom, best_results
+
+        return final_geom
 
     def save_stl(self, voxel_grid: Union[torch.Tensor, TypedAircraftGeometry], output_path: str,
                  use_marching_cubes: bool = True, report: ConstraintReport = None):
