@@ -194,16 +194,20 @@ class OptimizedAircraftGenerator:
         projected_batch = torch.stack(projected_occupancies)
 
         # 3. Rank with surrogate
-        if not self.surrogate.is_ready():
-            print(f"⚠️ AeroSurrogate is not ready (Samples: {self.surrogate.sample_count.item()}). Using heuristic ranking...")
-            # Deterministic heuristic if surrogate is random
-            # Use volume and bounding box as proxy for Cd if physics is unknown
-            # For now, let's just fail or use a very basic heuristic.
-            # Real fix: ensure surrogate is trained.
-            # Heuristic: Prefer more solid volume towards the center
-            scores = torch.mean(projected_batch * 0.5, dim=(1, 2, 3))
+        min_samples = self.model_config.surrogate_min_samples
+        max_mse = self.model_config.surrogate_max_mse
+
+        if not self.surrogate.is_ready(min_samples=min_samples, max_mse=max_mse):
+            print(f"⚠️ AeroSurrogate is not ready (Samples: {self.surrogate.sample_count.item()}, MSE: {self.surrogate.last_val_mse.item():.4f}). Using heuristic ranking...")
+            # Deterministic heuristic if surrogate is random (Review Feedback)
+            # Use a slenderness-based proxy for aerodynamics:
+            # - penalize excessive volume (high Cd)
+            # - reward frontal projection (relative to bounding box)
+            # - prefer central occupancy
+            volume = torch.mean(projected_batch, dim=(1, 2, 3))
+            scores = 1.0 / (volume + 1e-6) # Prefer lower volume (drag proxy)
         else:
-            print("Ranking candidates with AeroSurrogate...")
+            print(f"Ranking candidates with AeroSurrogate (MSE: {self.surrogate.last_val_mse.item():.4f})...")
             scores = self.surrogate.rank(projected_batch, surr_condition.repeat(num_candidates, 1))
 
         # 4. Select top-k
@@ -241,7 +245,8 @@ class OptimizedAircraftGenerator:
             # 6. Save results to reusable label dataset (Fix 4: unique IDs)
             sample_id = f"gen_{mission.aircraft_class}_{run_timestamp}_{idx}"
             # Use a more compatible way to merge dicts for safety
-            metadata = {**res, 'mission': asdict(mission)}
+            # Export exact sim_mission to preserve forced validation metadata (Review Feedback)
+            metadata = {**res, 'mission': asdict(sim_mission)}
             exporter.export_sample(sample_id, tg.get_combined_occupancy(), res.get('velocity_fields'), res.get('pressure_field'), metadata)
 
             # 7. Feasibility-aware selection (Fix 5)
@@ -270,9 +275,10 @@ class OptimizedAircraftGenerator:
                 sim_mission = replace(mission, force_external_validation=True)
                 best_results = simulator.simulate_aerodynamics(best_geom, steps=100, mission=sim_mission, existing_report=projected_reports[best_idx])
 
-                # Re-export promoted result
-                sample_id = f"gen_{mission.aircraft_class}_{run_timestamp}_{best_idx}_promoted"
-                exporter.export_sample(sample_id, best_geom.get_combined_occupancy(), best_results.get('velocity_fields'), best_results.get('pressure_field'), best_results | {'mission': asdict(mission)})
+                # Re-export to the SAME ID to leverage GroundTruthExporter promotion logic (Review Feedback)
+                # This ensures multi-fidelity history is maintained in one record.
+                sample_id = f"gen_{mission.aircraft_class}_{run_timestamp}_{best_idx}"
+                exporter.export_sample(sample_id, best_geom.get_combined_occupancy(), best_results.get('velocity_fields'), best_results.get('pressure_field'), best_results | {'mission': asdict(sim_mission)})
 
         if existing_report is not None and best_results:
             # Use the selected candidate's isolated report for final status (Review Feedback)

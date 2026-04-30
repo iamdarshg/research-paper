@@ -176,11 +176,21 @@ class OptimizedDiffusionTrainer:
                     targets_t = {k: torch.tensor(v, device=self.device, dtype=self.dtype) for k, v in batch_targets.items()}
                     cond_surr = self.mission_encoder(batch_missions)
 
+                    # Track tiers for online training too
+                    tiers = [s.get('tier', 'lbm_raw') for s in samples]
+
                     preds = self.surrogate(geoms_t, cond_surr)
                     surr_loss = F.mse_loss(preds['Cd'], targets_t['Cd']) + \
                                 F.mse_loss(preds['Cl'], targets_t['Cl']) + \
                                 F.binary_cross_entropy(preds['convergence_score'], targets_t['convergence_score'])
+
+                    # Register step but we backward the total_loss_val later
+                    # We manually call train_step-like logic here without a separate optimizer call
+                    self.surrogate.is_trained.fill_(True)
+                    self.surrogate.sample_count += batch_geoms[0].shape[0] # roughly
+
                     surrogate_loss_val = surr_loss
+                    self.surrogate.last_val_mse.copy_(0.95 * self.surrogate.last_val_mse + 0.05 * surr_loss.detach())
 
             total_loss_val = mse_loss_val + consist_loss_val + connectivity_loss_val + aero_loss_val + surrogate_loss_val
             self.optimizer.zero_grad()

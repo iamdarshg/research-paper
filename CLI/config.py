@@ -47,6 +47,9 @@ class ModelConfig:
     # Memory optimization
     enable_gradient_checkpointing: bool = True  # 60% VRAM savings
     use_torch_compile: bool = False  # Kernel fusion
+    # Surrogate gating (Review Feedback)
+    surrogate_min_samples: int = 100
+    surrogate_max_mse: float = 0.05
 
     def __post_init__(self):
         if self.encoder_channels is None:

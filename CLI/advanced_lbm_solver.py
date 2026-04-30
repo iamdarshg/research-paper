@@ -135,6 +135,7 @@ class D3Q27Solver:
     def _get_q(self, geometry_mask):
         """Get or compute sub-voxel distances for the given geometry (Fix A/Issue #15)."""
         # Fix A: Use a true content hash for the geometry key (Review Feedback)
+        # TODO: Move geometry hashing outside the per-step hot loop to reduce CPU-GPU sync overhead
         geom_key = compute_tensor_content_hash(geometry_mask)
 
         if geom_key not in self._q_cache:

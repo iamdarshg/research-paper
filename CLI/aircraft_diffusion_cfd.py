@@ -135,6 +135,10 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
     if surrogate_checkpoint:
         generator.load_surrogate(surrogate_checkpoint)
+
+    if external_validation == 'top-k':
+        click.confirm("⚠️ Mode 'top-k' will run external validation for ALL candidates in the validation set. This can be extremely slow. Continue?", abort=True)
+
     mission = DesignSpec(target_speed=target_speed).to_mission_profile()
     # mission.force_external_validation is still used as a boolean internally
     # but we control when it's set based on the mode.
@@ -226,7 +230,10 @@ def train_surrogate(labels_dir, epochs, lr, batch_size):
             # Encode mission profiles
             cond = encoder(profiles)
 
-            loss = model.train_step(geoms, targets, cond, optimizer)
+            # Retrieve tiers from dataset records if possible
+            tiers = mission_dicts.get('label_tier', ['lbm_raw'] * batch_size)
+
+            loss = model.train_step(geoms, targets, cond, optimizer, label_tiers=tiers)
             epoch_loss += loss
 
         if (epoch + 1) % 5 == 0:
