@@ -450,6 +450,7 @@ class AeroSurrogate(nn.Module):
     def __init__(self, condition_dim: int = 32, grid_resolution: int = 32):
         super().__init__()
         self.res = grid_resolution
+        self.register_buffer("is_trained", torch.tensor(False))
 
         # Simple 3D CNN to extract features from voxel grid
         self.conv = nn.Sequential(
@@ -497,6 +498,7 @@ class AeroSurrogate(nn.Module):
     def train_step(self, geometries, targets, condition_embedding, optimizer):
         """Perform a single training step on a batch of labels (Issue #15)."""
         self.train()
+        self.is_trained.fill_(True)
         optimizer.zero_grad()
 
         preds = self.forward(geometries, condition_embedding)

@@ -290,11 +290,13 @@ class CFDLabelDataset(Dataset):
             'separation_risk': torch.tensor(record.get('separation_risk', 0.0), dtype=torch.float32)
         }
 
-        # Extract mission profile for conditioning (Issue #15)
+        # Extract mission profile as collatable dict (Issue #15 Review Feedback)
         mission_dict = record.get('mission_profile', {})
-        mission = MissionProfile(**mission_dict) if mission_dict else MissionProfile()
+        # Ensure all required fields are present for collate
+        default_mission = asdict(MissionProfile())
+        full_mission_dict = {**default_mission, **mission_dict}
 
-        return geometry, targets, mission
+        return geometry, targets, full_mission_dict
 
 class AerodynamicLoss(nn.Module):
     """Loss based on aerodynamic properties using advanced CFD"""

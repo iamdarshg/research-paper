@@ -128,10 +128,15 @@ def accuracy_benchmark(stl, steps):
 @click.option('--solver', default='D3Q27')
 @click.option('--num-candidates', default=1, help='Number of candidates to sample for surrogate ranking (Issue #15)')
 @click.option('--top-k', default=1, help='Number of top candidates to validate with D3Q27')
-def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver, num_candidates, top_k):
+@click.option('--external-validation', is_flag=True, help='Force external PDE validation for the final design')
+@click.option('--surrogate-checkpoint', default=None, help='Load a standalone surrogate model checkpoint')
+def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver, num_candidates, top_k, external_validation, surrogate_checkpoint):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
+    if surrogate_checkpoint:
+        generator.load_surrogate(surrogate_checkpoint)
     mission = DesignSpec(target_speed=target_speed).to_mission_profile()
+    mission.force_external_validation = external_validation
 
     # Request typed geometry to preserve semantic info for feasibility checks (Issue #16)
     report = ConstraintReport()
@@ -201,13 +206,23 @@ def train_surrogate(labels_dir, epochs, lr, batch_size):
     print(f"🚀 Training AeroSurrogate on {len(dataset)} samples...")
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for geoms, targets, missions in loader:
+        for geoms, targets, mission_dicts in loader:
             geoms = geoms.to(device)
             # targets is a dict of tensors
             targets = {k: v.to(device) for k, v in targets.items()}
 
+            # Convert back to MissionProfile list for encoder compatibility
+            # (DataLoader collates dict of tensors, we need list of objects or handle dict in encoder)
+            # encoder.forward expects Union[MissionProfile, List[MissionProfile]]
+            from config import MissionProfile
+            batch_size = geoms.shape[0]
+            profiles = []
+            for i in range(batch_size):
+                kwargs = {k: (v[i].item() if torch.is_tensor(v) else v[i]) for k, v in mission_dicts.items()}
+                profiles.append(MissionProfile(**kwargs))
+
             # Encode mission profiles
-            cond = encoder(missions)
+            cond = encoder(profiles)
 
             loss = model.train_step(geoms, targets, cond, optimizer)
             epoch_loss += loss

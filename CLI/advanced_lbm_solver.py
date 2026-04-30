@@ -133,18 +133,24 @@ class D3Q27Solver:
 
     def _get_q(self, geometry_mask):
         """Get or compute sub-voxel distances for the given geometry (Fix A/Issue #15)."""
-        # Fix A: Use a more complete sampling for the cache key to detect rotations/shifts
-        res = geometry_mask.shape[0]
-        # Diagonal samples
-        samples = []
-        for i in [0, res//4, res//2, 3*res//4, res-1]:
-            samples.append(float(geometry_mask[i, i, i].item()))
-            samples.append(float(geometry_mask[i, res-1-i, i].item()))
+        # Fix A: Use a robust content-based key to detect any geometric change (Review Feedback)
+        # Using integrated profiles (sums along axes) is fast and highly sensitive to shifts/rotations.
+        res = geometry_mask.shape
+
+        # We need to use float conversion for the sum tuples to ensure they are hashable
+        # and consistent across devices.
+        x_prof = geometry_mask.sum(dim=(1, 2)).cpu().tolist()
+        y_prof = geometry_mask.sum(dim=(0, 2)).cpu().tolist()
+        z_prof = geometry_mask.sum(dim=(0, 1)).cpu().tolist()
 
         geom_key = (
             float(geometry_mask.sum().item()),
-            geometry_mask.shape,
-            tuple(samples)
+            res,
+            tuple(x_prof),
+            tuple(y_prof),
+            tuple(z_prof),
+            geometry_mask.device.type,
+            geometry_mask.dtype
         )
 
         if geom_key not in self._q_cache:
