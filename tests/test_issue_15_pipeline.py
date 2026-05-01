@@ -148,18 +148,19 @@ class TestIssue15Pipeline(unittest.TestCase):
         dataset = CFDLabelDataset()
         self.assertGreater(len(dataset), 0)
 
-        g, targets, mission_dict = dataset[len(dataset)-1]
+        g, targets, mission_dict, label_metadata = dataset[len(dataset)-1]
         self.assertEqual(g.shape, (16, 16, 16))
         self.assertAlmostEqual(targets['Cd'].item(), 0.3)
         self.assertAlmostEqual(targets['Cl'].item(), 0.4)
         self.assertIsInstance(mission_dict, dict)
         self.assertIn('aircraft_class', mission_dict)
+        self.assertEqual(label_metadata['tier'], 'lbm_raw')
 
         # Verify DataLoader compatibility (collate test)
         from torch.utils.data import DataLoader
         loader = DataLoader(dataset, batch_size=1)
         batch = next(iter(loader))
-        bg, bt, bm = batch
+        bg, bt, bm, blm = batch
         self.assertEqual(bg.shape, (1, 16, 16, 16))
         self.assertIsInstance(bm, dict)
         self.assertEqual(bm['aircraft_class'][0], 'uav')
@@ -333,9 +334,9 @@ class TestIssue15Pipeline(unittest.TestCase):
         cond_many = cond.repeat(10, 1)
         # Use target=0 loss to ensure MSE drops below threshold
         surr.train_step(geom_many, targets_many, cond_many, optimizer)
-        surr.last_val_mse.fill_(0.01) # Force quality gate to pass for test
+        surr.train_loss_ema.fill_(0.01) # Force quality gate to pass for test
 
-        self.assertTrue(surr.is_ready(min_samples=10, max_mse=0.1))
+        self.assertTrue(surr.is_ready(min_samples=10, max_loss=0.1))
 
     def test_single_candidate_export(self):
         """Verify single-candidate generation also exports to GroundTruthExporter."""

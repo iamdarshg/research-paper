@@ -296,7 +296,14 @@ class CFDLabelDataset(Dataset):
         default_mission = asdict(MissionProfile())
         full_mission_dict = {**default_mission, **mission_dict}
 
-        return geometry, targets, full_mission_dict
+        # Extract metadata (tier, source) for training tracking (Review Feedback Fix 1)
+        label_metadata = {
+            'tier': record.get('tier', 'lbm_raw'),
+            'source': record.get('source', 'internal'),
+            'solver': record.get('solver_name', 'D3Q27')
+        }
+
+        return geometry, targets, full_mission_dict, label_metadata
 
 class AerodynamicLoss(nn.Module):
     """Loss based on aerodynamic properties using advanced CFD"""

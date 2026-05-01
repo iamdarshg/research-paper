@@ -451,9 +451,9 @@ class AeroSurrogate(nn.Module):
         super().__init__()
         self.res = grid_resolution
         self.register_buffer("is_trained", torch.tensor(False))
-        # Metadata for quality gating (Review Feedback)
+        # Metadata for quality gating (Review Feedback Fix 2)
         self.register_buffer("sample_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("last_val_mse", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("train_loss_ema", torch.tensor(1.0, dtype=torch.float32))
         self.register_buffer("tier_counts", torch.zeros(3, dtype=torch.long)) # raw, calibrated, external
 
         # Simple 3D CNN to extract features from voxel grid
@@ -499,13 +499,12 @@ class AeroSurrogate(nn.Module):
             score = preds['Cl'] - 2.0 * preds['Cd'] + 2.0 * preds['convergence_score'] - preds['separation_risk']
         return score
 
-    def is_ready(self, min_samples: int = 100, max_mse: float = 0.1) -> bool:
-        """Check if surrogate is qualified for generation-time ranking (Review Feedback)."""
-        # Quality gate: training sample count AND validation performance
-        # (MSE must be below threshold if more than 1 batch has been seen)
+    def is_ready(self, min_samples: int = 100, max_loss: float = 0.1) -> bool:
+        """Check if surrogate is qualified for generation-time ranking (Review Feedback Fix 2)."""
+        # Quality gate: training sample count AND loss convergence
         return (self.is_trained.item() and
                 self.sample_count.item() >= min_samples and
-                self.last_val_mse.item() <= max_mse)
+                self.train_loss_ema.item() <= max_loss)
 
     def train_step(self, geometries, targets, condition_embedding, optimizer, label_tiers=None):
         """Perform a single training step on a batch of labels (Issue #15)."""
@@ -537,8 +536,8 @@ class AeroSurrogate(nn.Module):
         loss.backward()
         optimizer.step()
 
-        # Smoothly update validation proxy MSE
-        self.last_val_mse.copy_(0.95 * self.last_val_mse + 0.05 * loss.detach())
+        # Smoothly update training loss EMA (Review Feedback Fix 2)
+        self.train_loss_ema.copy_(0.95 * self.train_loss_ema + 0.05 * loss.detach())
 
         return loss.item()
 

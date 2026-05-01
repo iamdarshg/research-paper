@@ -142,11 +142,12 @@ class OptimizedAircraftGenerator:
             simulator = AdvancedCFDSimulator(sim_config, self.device)
             results = simulator.simulate_aerodynamics(typed_geom, steps=100, mission=sim_mission, existing_report=existing_report)
 
-            # Export single-candidate results to GroundTruthExporter (Review Feedback)
+            # Export single-candidate results to GroundTruthExporter (Review Feedback Fix 3)
             exporter = GroundTruthExporter()
             run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
             sample_id = f"gen_single_{mission.aircraft_class}_{run_id}"
-            exporter.export_sample(sample_id, typed_geom.get_combined_occupancy(), results.get('velocity_fields'), results.get('pressure_field'), results | {'mission': asdict(mission)})
+            # Ensure exact sim_mission is exported to preserve forced validation metadata
+            exporter.export_sample(sample_id, typed_geom.get_combined_occupancy(), results.get('velocity_fields'), results.get('pressure_field'), results | {'mission': asdict(sim_mission)})
 
         final_geom = typed_geom if return_typed else typed_geom.get_combined_occupancy()
 
@@ -195,24 +196,19 @@ class OptimizedAircraftGenerator:
 
         # 3. Rank with surrogate
         min_samples = self.model_config.surrogate_min_samples
-        max_mse = self.model_config.surrogate_max_mse
+        max_loss = self.model_config.surrogate_max_loss
 
-        if not self.surrogate.is_ready(min_samples=min_samples, max_mse=max_mse):
-            print(f"⚠️ AeroSurrogate is not ready (Samples: {self.surrogate.sample_count.item()}, MSE: {self.surrogate.last_val_mse.item():.4f}). Using heuristic ranking...")
-            # Deterministic heuristic if surrogate is random (Review Feedback)
-            # Use a slenderness-based proxy for aerodynamics:
-            # - penalize excessive volume (high Cd)
-            # - reward frontal projection (relative to bounding box)
-            # - prefer central occupancy
-            volume = torch.mean(projected_batch, dim=(1, 2, 3))
-            scores = 1.0 / (volume + 1e-6) # Prefer lower volume (drag proxy)
+        if not self.surrogate.is_ready(min_samples=min_samples, max_loss=max_loss):
+            print(f"⚠️ AeroSurrogate is not ready (Samples: {self.surrogate.sample_count.item()}, Loss EMA: {self.surrogate.train_loss_ema.item():.4f}).")
+            print(f"Evaluating ALL {min(top_k, num_candidates)} candidates directly with D3Q27 (Review Feedback Fix 2/5).")
+            # When surrogate is not ready, skip pre-ranking and just take first k
+            top_indices = np.arange(min(top_k, num_candidates))
         else:
-            print(f"Ranking candidates with AeroSurrogate (MSE: {self.surrogate.last_val_mse.item():.4f})...")
+            print(f"Ranking candidates with AeroSurrogate (Loss EMA: {self.surrogate.train_loss_ema.item():.4f})...")
             scores = self.surrogate.rank(projected_batch, surr_condition.repeat(num_candidates, 1))
-
-        # 4. Select top-k
-        top_indices = torch.topk(scores, min(top_k, num_candidates)).indices.cpu().numpy()
-        print(f"Selected top {len(top_indices)} candidates for D3Q27 validation.")
+            # 4. Select top-k
+            top_indices = torch.topk(scores, min(top_k, num_candidates)).indices.cpu().numpy()
+            print(f"Selected top {len(top_indices)} candidates for D3Q27 validation.")
 
         from cfd_simulator import AdvancedCFDSimulator
         from config import CFDConfig

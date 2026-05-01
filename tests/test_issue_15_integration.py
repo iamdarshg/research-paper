@@ -14,7 +14,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 from config import MissionProfile, CFDConfig, LabelTier, ModelConfig, DiffusionConfig
 from generator import OptimizedAircraftGenerator
 from data_utils import GroundTruthExporter, CFDLabelDataset
-from models import AeroSurrogate, MissionEncoder
+from models import AeroSurrogate, MissionEncoder, LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel
 
 class TestIssue15Integration(unittest.TestCase):
     def setUp(self):
@@ -22,19 +22,37 @@ class TestIssue15Integration(unittest.TestCase):
         self.test_dir.mkdir(exist_ok=True, parents=True)
         self.device = torch.device('cpu')
 
-        # Create a mock checkpoint
-        self.checkpoint_path = self.test_dir / "gen_model.pt"
-        self.model_config = ModelConfig(latent_dim=16, condition_dim=32, grid_resolution=16, surrogate_min_samples=5)
-        mock_checkpoint = {
+        # 1. CREATE REAL LIGHTWEIGHT COMPONENTS (Review Feedback Fix 4)
+        self.model_config = ModelConfig(
+            latent_dim=8,
+            condition_dim=8,
+            grid_resolution=16,
+            surrogate_min_samples=5,
+            surrogate_max_loss=10.0,
+            encoder_channels=[8, 8],
+            decoder_channels=[8, 8]
+        )
+        self.diff_config = DiffusionConfig(timesteps=10)
+
+        diff_model = LatentDiffusionUNet(self.model_config, self.diff_config)
+        converter = LatentTo3DConverter(8, 16)
+        consistency = ConsistencyModel(self.model_config, self.diff_config)
+        encoder = MissionEncoder(8)
+        surrogate = AeroSurrogate(8, 16)
+
+        # 2. SAVE REAL CHECKPOINT
+        self.checkpoint_path = self.test_dir / "real_lightweight_model.pt"
+        checkpoint = {
             'model_config': self.model_config.__dict__,
-            'diffusion_config': DiffusionConfig().__dict__,
-            'consistency_model': {},
-            'diffusion_model': {},
-            'converter': {},
-            'mission_encoder': MissionEncoder(32).state_dict(),
-            'aero_surrogate': AeroSurrogate(32, 16).state_dict()
+            'diffusion_config': self.diff_config.__dict__,
+            'diffusion_model': diff_model.state_dict(),
+            'converter': converter.state_dict(),
+            'consistency_model': consistency.state_dict(),
+            'mission_encoder': encoder.state_dict(),
+            'aero_surrogate': surrogate.state_dict(),
+            'ema_model': diff_model.state_dict()
         }
-        torch.save(mock_checkpoint, self.checkpoint_path)
+        torch.save(checkpoint, self.checkpoint_path)
 
     def tearDown(self):
         if self.test_dir.exists():
@@ -69,11 +87,11 @@ class TestIssue15Integration(unittest.TestCase):
         from torch.utils.data import DataLoader
         loader = DataLoader(dataset, batch_size=5)
 
-        surr = AeroSurrogate(32, 16)
-        enc = MissionEncoder(32)
+        surr = AeroSurrogate(8, 16)
+        enc = MissionEncoder(8)
         opt = torch.optim.Adam(list(surr.parameters()) + list(enc.parameters()))
 
-        for geoms, targets, missions in loader:
+        for geoms, targets, missions, meta in loader:
             # Reconstruct profiles from collated dict
             profiles = []
             for i in range(geoms.shape[0]):
@@ -83,31 +101,24 @@ class TestIssue15Integration(unittest.TestCase):
             surr.train_step(geoms, targets, cond, opt)
 
         # Verify surrogate is ready (met threshold of 5 in ModelConfig)
-        # Use high max_mse because model is random in test
-        self.assertTrue(surr.is_ready(min_samples=5, max_mse=10.0))
+        # Use high max_loss because model is random in test
+        self.assertTrue(surr.is_ready(min_samples=5, max_loss=10.0))
 
         surr_path = self.test_dir / "trained_surr.pt"
         torch.save({'model_state_dict': surr.state_dict(), 'encoder_state_dict': enc.state_dict()}, surr_path)
 
-        # 3. LOAD AND RANK
-        with patch('torch.load', return_value=torch.load(self.checkpoint_path)):
-            with patch('models.LatentDiffusionUNet.load_state_dict'), \
-                 patch('models.LatentTo3DConverter.load_state_dict'), \
-                 patch('models.ConsistencyModel.load_state_dict'), \
-                 patch('models.MissionEncoder.load_state_dict'), \
-                 patch('models.AeroSurrogate.load_state_dict'):
-                generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
+        # 3. LOAD AND RANK (No patching of load_state_dict!)
+        generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
 
         generator.load_surrogate(str(surr_path))
         # Override config thresholds for the test to ensure it uses the surrogate path
         generator.model_config.surrogate_min_samples = 5
-        generator.model_config.surrogate_max_mse = 10.0
+        generator.model_config.surrogate_max_loss = 10.0
 
-        self.assertTrue(generator.surrogate.is_ready(min_samples=5, max_mse=10.0))
+        self.assertTrue(generator.surrogate.is_ready(min_samples=5, max_loss=10.0))
 
-        # Mock generation components
-        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(2, 16))
-        generator.converter = MagicMock(return_value=torch.randn(2, 16, 16, 16))
+        # We only mock the expensive diffusion sampling, not the wiring
+        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(2, 8))
 
         # 4. GENERATE WITH PROMOTION
         mission = MissionProfile()

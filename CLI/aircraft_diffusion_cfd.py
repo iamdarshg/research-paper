@@ -212,14 +212,12 @@ def train_surrogate(labels_dir, epochs, lr, batch_size):
     print(f"🚀 Training AeroSurrogate on {len(dataset)} samples...")
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for geoms, targets, mission_dicts in loader:
+        for geoms, targets, mission_dicts, label_metadata in loader:
             geoms = geoms.to(device)
             # targets is a dict of tensors
             targets = {k: v.to(device) for k, v in targets.items()}
 
             # Convert back to MissionProfile list for encoder compatibility
-            # (DataLoader collates dict of tensors, we need list of objects or handle dict in encoder)
-            # encoder.forward expects Union[MissionProfile, List[MissionProfile]]
             from config import MissionProfile
             batch_size = geoms.shape[0]
             profiles = []
@@ -230,8 +228,8 @@ def train_surrogate(labels_dir, epochs, lr, batch_size):
             # Encode mission profiles
             cond = encoder(profiles)
 
-            # Retrieve tiers from dataset records if possible
-            tiers = mission_dicts.get('label_tier', ['lbm_raw'] * batch_size)
+            # Retrieve tiers from label_metadata (Review Feedback Fix 1)
+            tiers = label_metadata.get('tier', ['lbm_raw'] * batch_size)
 
             loss = model.train_step(geoms, targets, cond, optimizer, label_tiers=tiers)
             epoch_loss += loss
