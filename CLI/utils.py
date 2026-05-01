@@ -31,3 +31,18 @@ def get_stl_adaptive_resolution(stl_path):
         return min(max(complexity_res, 64), vram_res, 512)
     except Exception:
         return get_vram_limit_resolution()
+
+def compute_tensor_content_hash(tensor: torch.Tensor) -> str:
+    """Compute a robust content hash for a torch tensor (Review Feedback)."""
+    # Deterministic threshold for binary occupancy
+    binary = (tensor > 0.5).to(torch.uint8)
+
+    # We use CPU conversion and numpy for hash stability
+    import hashlib
+    data = binary.cpu().numpy().tobytes()
+
+    # Combine with shape and device info to prevent cross-resolution/device collisions
+    meta = f"{tensor.shape}_{tensor.device.type}_{tensor.dtype}"
+    h = hashlib.blake2b(data, digest_size=16)
+    h.update(meta.encode('utf-8'))
+    return h.hexdigest()

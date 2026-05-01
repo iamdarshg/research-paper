@@ -1,8 +1,15 @@
 
 import os
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import List, Tuple, Optional
+from dataclasses import dataclass, asdict, field
+from typing import List, Tuple, Optional, Dict, Any
+from enum import Enum
+from datetime import datetime
+
+class LabelTier(str, Enum):
+    LBM_RAW = "lbm_raw"
+    LBM_CALIBRATED = "lbm_calibrated"
+    EXTERNAL_PDE = "external_pde"
 
 @dataclass
 class DiffusionConfig:
@@ -40,6 +47,9 @@ class ModelConfig:
     # Memory optimization
     enable_gradient_checkpointing: bool = True  # 60% VRAM savings
     use_torch_compile: bool = False  # Kernel fusion
+    # Surrogate gating (Review Feedback)
+    surrogate_min_samples: int = 100
+    surrogate_max_loss: float = 0.05
 
     def __post_init__(self):
         if self.encoder_channels is None:
@@ -134,6 +144,40 @@ class LBMPhysicsConfig:
     shape_drag_correction_max: float = 3.0
 
 @dataclass
+class CFDLabel:
+    """Comprehensive simulation record for multi-fidelity CFD labels (Issue #15)"""
+    geometry_id: str
+    geometry_ref: Optional[str] = None # Path to .npy or .stl
+    mission_profile: Dict[str, Any] = field(default_factory=dict)
+    constraints_profile: Dict[str, Any] = field(default_factory=dict)
+
+    # Aerodynamic metrics
+    cd: float = 0.0
+    cl: float = 0.0
+    cm: Optional[float] = None
+
+    # Field references (Optional paths to stored fields)
+    pressure_field_path: Optional[str] = None
+    velocity_field_paths: Dict[str, str] = field(default_factory=dict) # ux, uy, uz
+
+    # Multi-fidelity history
+    fidelity_history: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Solver metadata
+    solver_name: str = "D3Q27"
+    grid_resolution: Tuple[int, int, int] = (32, 32, 32)
+    num_steps: int = 1000
+    converged: bool = False
+    convergence_score: float = 0.0
+    force_stability: float = 1.0
+
+    # Label metadata
+    tier: LabelTier = LabelTier.LBM_RAW
+    source: str = "internal"
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    version: str = "1.0"
+
+@dataclass
 class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
     solver_type: str = "D3Q27"
@@ -188,6 +232,9 @@ class MissionProfile:
     max_span_m: float = 2.0
     max_length_m: float = 1.5
     max_height_m: float = 0.5
+
+    # Issue #15 controls
+    force_external_validation: bool = False
 
     def __post_init__(self):
         # Validation

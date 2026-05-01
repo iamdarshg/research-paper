@@ -126,25 +126,48 @@ def accuracy_benchmark(stl, steps):
 @click.option('--num-steps', default=4)
 @click.option('--use-marching-cubes', is_flag=True, default=True)
 @click.option('--solver', default='D3Q27')
-def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver):
+@click.option('--num-candidates', default=1, help='Number of candidates to sample for surrogate ranking (Issue #15)')
+@click.option('--top-k', default=1, help='Number of top candidates to validate with D3Q27')
+@click.option('--external-validation', default='none', type=click.Choice(['none', 'final', 'top-k']), help='External PDE validation mode')
+@click.option('--surrogate-checkpoint', default=None, help='Load a standalone surrogate model checkpoint')
+def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver, num_candidates, top_k, external_validation, surrogate_checkpoint):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
+    if surrogate_checkpoint:
+        generator.load_surrogate(surrogate_checkpoint)
+
+    if external_validation == 'top-k':
+        click.confirm("⚠️ Mode 'top-k' will run external validation for ALL candidates in the validation set. This can be extremely slow. Continue?", abort=True)
+
     mission = DesignSpec(target_speed=target_speed).to_mission_profile()
+    # mission.force_external_validation is still used as a boolean internally
+    # but we control when it's set based on the mode.
 
     # Request typed geometry to preserve semantic info for feasibility checks (Issue #16)
     report = ConstraintReport()
-    typed_geom = generator.generate(mission, num_steps=num_steps, return_typed=True, existing_report=report)
 
-    cfd_config = CFDConfig(solver_type=solver)
-    simulator = AdvancedCFDSimulator(cfd_config, device)
-    results = simulator.simulate_aerodynamics(typed_geom, steps=100, mission=mission, existing_report=report)
+    # Issue #15: Multi-fidelity ranking loop
+    # Return both geometry and results to avoid redundant simulation (Review Feedback)
+    typed_geom, results = generator.generate(
+        mission,
+        num_steps=num_steps,
+        return_typed=True,
+        existing_report=report,
+        num_candidates=num_candidates,
+        top_k=top_k,
+        return_results=True,
+        external_val_mode=external_validation
+    )
 
     # Save with watertightness check
     generator.save_stl(typed_geom, output, use_marching_cubes=use_marching_cubes, report=report)
 
-    print(f"Drag: {results['drag_coefficient']:.6f}, Lift: {results['lift_coefficient']:.6f}")
+    if results:
+        print(f"Drag: {results['drag_coefficient']:.6f}, Lift: {results['lift_coefficient']:.6f}")
+        if 'feasibility' in results:
+            print(f"Feasibility: Lift/Weight: {results['feasibility']['lift_ratio']:.2f}")
+
     final_report = report.to_dict()
-    print(f"Feasibility: Lift/Weight: {results['feasibility']['lift_ratio']:.2f}")
     print(f"Repaired: {final_report['repaired']}, Violations: {len(final_report['violations'])}")
     print(f"Export Status: {final_report['export_status']}")
 
@@ -159,6 +182,68 @@ def batch_generate(checkpoint, output_dir, num_designs):
     for i in range(num_designs):
         voxel_grid = generator.generate(DesignSpec(target_speed=50.0))
         generator.save_stl(voxel_grid, os.path.join(output_dir, f'aircraft_{i+1:03d}.stl'))
+
+@cli.command()
+@click.option('--labels-dir', default='./ground_truth')
+@click.option('--epochs', default=50)
+@click.option('--lr', default=1e-3)
+@click.option('--batch-size', default=16)
+def train_surrogate(labels_dir, epochs, lr, batch_size):
+    """Train the AeroSurrogate model on collected CFD labels (Issue #15)"""
+    from models import AeroSurrogate, MissionEncoder
+    from data_utils import CFDLabelDataset
+    from torch.utils.data import DataLoader
+    from pathlib import Path
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dataset = CFDLabelDataset(labels_dir=labels_dir)
+    if len(dataset) == 0:
+        print(f"❌ No labels found in {labels_dir}. Run some 'generate' or 'train' steps first.")
+        return
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize models
+    model = AeroSurrogate(condition_dim=32).to(device)
+    encoder = MissionEncoder(condition_dim=32).to(device)
+
+    optimizer = torch.optim.Adam(list(model.parameters()) + list(encoder.parameters()), lr=lr)
+
+    print(f"🚀 Training AeroSurrogate on {len(dataset)} samples...")
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for geoms, targets, mission_dicts, label_metadata in loader:
+            geoms = geoms.to(device)
+            # targets is a dict of tensors
+            targets = {k: v.to(device) for k, v in targets.items()}
+
+            # Convert back to MissionProfile list for encoder compatibility
+            from config import MissionProfile
+            batch_size = geoms.shape[0]
+            profiles = []
+            for i in range(batch_size):
+                kwargs = {k: (v[i].item() if torch.is_tensor(v) else v[i]) for k, v in mission_dicts.items()}
+                profiles.append(MissionProfile(**kwargs))
+
+            # Encode mission profiles
+            cond = encoder(profiles)
+
+            # Retrieve tiers from label_metadata (Review Feedback Fix 1)
+            tiers = label_metadata.get('tier', ['lbm_raw'] * batch_size)
+
+            loss = model.train_step(geoms, targets, cond, optimizer, label_tiers=tiers)
+            epoch_loss += loss
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(loader):.6f}")
+
+    # Save surrogate
+    save_path = Path(labels_dir) / "aero_surrogate.pt"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'encoder_state_dict': encoder.state_dict()
+    }, save_path)
+    print(f"✅ Saved trained surrogate to {save_path}")
 
 @cli.command()
 def info():
