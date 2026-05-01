@@ -98,7 +98,15 @@ class TestIssue15Integration(unittest.TestCase):
                 kwargs = {k: (v[i].item() if torch.is_tensor(v) else v[i]) for k, v in missions.items()}
                 profiles.append(MissionProfile(**kwargs))
             cond = enc(profiles)
-            surr.train_step(geoms, targets, cond, opt)
+
+            # Use real tiers from metadata (Review Feedback Fix 1)
+            tiers = meta.get('tier', ['lbm_raw'] * geoms.shape[0])
+            surr.train_step(geoms, targets, cond, opt, label_tiers=tiers)
+
+        # Verify surrogate tracking (Review Feedback)
+        self.assertEqual(surr.sample_count.item(), 10)
+        self.assertEqual(surr.tier_counts[0].item(), 10) # all were lbm_raw
+        self.assertLess(surr.train_loss_ema.item(), 10.0)
 
         # Verify surrogate is ready (met threshold of 5 in ModelConfig)
         # Use high max_loss because model is random in test
@@ -107,7 +115,19 @@ class TestIssue15Integration(unittest.TestCase):
         surr_path = self.test_dir / "trained_surr.pt"
         torch.save({'model_state_dict': surr.state_dict(), 'encoder_state_dict': enc.state_dict()}, surr_path)
 
-        # 3. LOAD AND RANK (No patching of load_state_dict!)
+        # 3. VERIFY FALLBACK PATH (BEFORE LOADING TRAINED SURROGATE)
+        generator_fallback = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
+        generator_fallback.model_config.surrogate_min_samples = 100 # Not ready
+        generator_fallback.consistency_model.fast_inference = MagicMock(return_value=torch.randn(2, 8))
+
+        with patch('cfd_simulator.AdvancedCFDSimulator.simulate_aerodynamics') as mock_sim_fallback:
+             mock_sim_fallback.return_value = {'drag_coefficient': 0.1, 'lift_coefficient': 0.5, 'label_tier': 'lbm_raw', 'constraints': {'valid': True, 'violations': [], 'repaired': False}}
+             # Mode top-k should evaluate all candidates directly
+             generator_fallback.generate(MissionProfile(), num_candidates=2, top_k=2, return_results=True)
+             # Should be 2 calls (direct eval)
+             self.assertEqual(mock_sim_fallback.call_count, 2)
+
+        # 4. LOAD AND RANK (Surrogate ready)
         generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
 
         generator.load_surrogate(str(surr_path))

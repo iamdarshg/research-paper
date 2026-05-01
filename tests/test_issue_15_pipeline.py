@@ -10,10 +10,11 @@ import sys
 # Add CLI to path
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
-from config import MissionProfile, CFDConfig, LabelTier
+from config import MissionProfile, CFDConfig, LabelTier, ModelConfig, DiffusionConfig
 from generator import OptimizedAircraftGenerator
 from cfd_simulator import AdvancedCFDSimulator
 from data_utils import GroundTruthExporter
+from models import AeroSurrogate, MissionEncoder, LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel
 
 class TestIssue15Pipeline(unittest.TestCase):
     def setUp(self):
@@ -21,18 +22,37 @@ class TestIssue15Pipeline(unittest.TestCase):
         self.test_dir.mkdir(exist_ok=True)
         self.device = torch.device('cpu')
 
-        # Create a mock checkpoint
-        self.checkpoint_path = self.test_dir / "mock_model.pt"
-        mock_checkpoint = {
-            'model_config': {'latent_dim': 16, 'condition_dim': 32, 'grid_resolution': 16, 'base_grid_resolution': 16},
-            'diffusion_config': {'timesteps': 100, 'beta_start': 0.0001, 'beta_end': 0.02, 'student_steps': 4, 'teacher_steps': 1000},
-            'consistency_model': {},
-            'diffusion_model': {},
-            'converter': {},
-            'mission_encoder': {},
-            'aero_surrogate': {}
+        # 1. CREATE REAL LIGHTWEIGHT COMPONENTS (Review Feedback Fix 4)
+        self.model_config = ModelConfig(
+            latent_dim=8,
+            condition_dim=8,
+            grid_resolution=16,
+            surrogate_min_samples=5,
+            surrogate_max_loss=10.0,
+            encoder_channels=[8, 8],
+            decoder_channels=[8, 8]
+        )
+        self.diff_config = DiffusionConfig(timesteps=10)
+
+        diff_model = LatentDiffusionUNet(self.model_config, self.diff_config)
+        converter = LatentTo3DConverter(8, 16)
+        consistency = ConsistencyModel(self.model_config, self.diff_config)
+        encoder = MissionEncoder(8)
+        surrogate = AeroSurrogate(8, 16)
+
+        # 2. SAVE REAL CHECKPOINT
+        self.checkpoint_path = self.test_dir / "real_lightweight_model.pt"
+        checkpoint = {
+            'model_config': self.model_config.__dict__,
+            'diffusion_config': self.diff_config.__dict__,
+            'diffusion_model': diff_model.state_dict(),
+            'converter': converter.state_dict(),
+            'consistency_model': consistency.state_dict(),
+            'mission_encoder': encoder.state_dict(),
+            'aero_surrogate': surrogate.state_dict(),
+            'ema_model': diff_model.state_dict()
         }
-        torch.save(mock_checkpoint, self.checkpoint_path)
+        torch.save(checkpoint, self.checkpoint_path)
 
     def tearDown(self):
         if self.test_dir.exists():
@@ -61,17 +81,10 @@ class TestIssue15Pipeline(unittest.TestCase):
         """Verify the Sample -> Rank -> Validate flow works."""
         from unittest.mock import MagicMock, patch
 
-        with patch('torch.load', return_value=torch.load(self.checkpoint_path)):
-            with patch('models.LatentDiffusionUNet.load_state_dict'):
-                with patch('models.LatentTo3DConverter.load_state_dict'):
-                    with patch('models.ConsistencyModel.load_state_dict'):
-                        with patch('models.MissionEncoder.load_state_dict'):
-                             with patch('models.AeroSurrogate.load_state_dict'):
-                                 generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
+        generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
 
         # Mock dependencies for ranking
-        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(5, 16))
-        generator.converter = MagicMock(return_value=torch.randn(5, 16, 16, 16))
+        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(5, 8))
         generator.surrogate.rank = MagicMock(return_value=torch.tensor([0.1, 0.5, 0.2, 0.9, 0.3]))
 
         mission = MissionProfile(cruise_speed_mps=50, stall_speed_mps=20)
@@ -170,17 +183,10 @@ class TestIssue15Pipeline(unittest.TestCase):
         from unittest.mock import MagicMock, patch
         from config import ModelConfig, DiffusionConfig
 
-        # Mock generator setup
-        with patch('torch.load', return_value=torch.load(self.checkpoint_path)):
-            with patch('models.LatentDiffusionUNet.load_state_dict'), \
-                 patch('models.LatentTo3DConverter.load_state_dict'), \
-                 patch('models.ConsistencyModel.load_state_dict'), \
-                 patch('models.MissionEncoder.load_state_dict'), \
-                 patch('models.AeroSurrogate.load_state_dict'):
-                generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
+        # Real generator setup
+        generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
 
-        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(2, 16))
-        generator.converter = MagicMock(return_value=torch.randn(2, 16, 16, 16))
+        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(2, 8))
         # Surrogate likes candidate 0 (lower score here but we'll force selection)
         generator.surrogate.rank = MagicMock(return_value=torch.tensor([0.9, 0.8]))
 
@@ -280,14 +286,7 @@ class TestIssue15Pipeline(unittest.TestCase):
     def test_encoder_isolation(self):
         """Verify loading surrogate doesn't corrupt diffusion encoder."""
         from unittest.mock import patch
-        with patch('torch.load', return_value=torch.load(self.checkpoint_path)):
-            with patch('models.LatentDiffusionUNet.load_state_dict'), \
-                 patch('models.LatentTo3DConverter.load_state_dict'), \
-                 patch('models.ConsistencyModel.load_state_dict'), \
-                 patch('models.MissionEncoder.load_state_dict'), \
-                 patch('models.AeroSurrogate.load_state_dict'):
-                generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
-
+        generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
         # Original state
         orig_state = generator.mission_encoder.state_dict()
 
@@ -341,16 +340,9 @@ class TestIssue15Pipeline(unittest.TestCase):
     def test_single_candidate_export(self):
         """Verify single-candidate generation also exports to GroundTruthExporter."""
         from unittest.mock import MagicMock, patch
-        with patch('torch.load', return_value=torch.load(self.checkpoint_path)):
-             with patch('models.LatentDiffusionUNet.load_state_dict'), \
-                  patch('models.LatentTo3DConverter.load_state_dict'), \
-                  patch('models.ConsistencyModel.load_state_dict'), \
-                  patch('models.MissionEncoder.load_state_dict'), \
-                  patch('models.AeroSurrogate.load_state_dict'):
-                 generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
+        generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
 
-        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(1, 16))
-        generator.converter = MagicMock(return_value=torch.randn(1, 16, 16, 16))
+        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(1, 8))
         mission = MissionProfile()
 
         with patch('cfd_simulator.AdvancedCFDSimulator.simulate_aerodynamics') as mock_sim:
@@ -373,18 +365,12 @@ class TestIssue15Pipeline(unittest.TestCase):
     def test_external_validation_staged(self):
         """Verify 'final' mode only runs external validation on the selected candidate."""
         from unittest.mock import MagicMock, patch
-        with patch('torch.load', return_value=torch.load(self.checkpoint_path)):
-             with patch('models.LatentDiffusionUNet.load_state_dict'), \
-                  patch('models.LatentTo3DConverter.load_state_dict'), \
-                  patch('models.ConsistencyModel.load_state_dict'), \
-                  patch('models.MissionEncoder.load_state_dict'), \
-                  patch('models.AeroSurrogate.load_state_dict'):
-                 generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
+        generator = OptimizedAircraftGenerator(str(self.checkpoint_path), device=self.device)
 
-        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(3, 16))
-        generator.converter = MagicMock(return_value=torch.randn(3, 16, 16, 16))
+        generator.consistency_model.fast_inference = MagicMock(return_value=torch.randn(3, 8))
         generator.surrogate.is_trained.fill_(True)
         generator.surrogate.sample_count.fill_(1000)
+        generator.surrogate.train_loss_ema.fill_(0.01) # Ready
         generator.surrogate.rank = MagicMock(return_value=torch.tensor([0.1, 0.9, 0.2]))
 
         mission = MissionProfile()
