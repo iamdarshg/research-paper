@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - optional acceleration path
 
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
-    """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
+    """Convert raw lattice momentum exchange into a physical force scale (Issue #21).
 
     Standard LBM force scaling: F_phys = rho_phys * (dx^4 / dt^2) * F_lattice.
     Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
@@ -70,7 +70,7 @@ class D3Q27Solver:
             + self.ez[self._force_dir_index].to(dtype=torch.float32)**2
         ).view(-1, 1, 1, 1)
 
-        # Precompute moment basis for vectorized MRT Collision (Issue #16)
+        # Precompute moment basis for vectorized MRT Collision (Issue #21)
         self.moment_keys = [(a, b, c) for a in range(3) for b in range(3) for c in range(3)]
         basis_rows = []
         ex_f_vec = self.ex.to(dtype=torch.float32)
@@ -154,7 +154,7 @@ class D3Q27Solver:
         return self.w.view(-1, 1, 1, 1) * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
 
     def compute_moment_equilibrium(self, rho, ux, uy, uz):
-        """Equilibrium tensor-product moments for D3Q27 (Issue #16)."""
+        """Equilibrium tensor-product moments for D3Q27 (Issue #21)."""
         cs2 = 1.0 / 3.0
         m1d_x = [torch.ones_like(rho), ux, ux * ux + cs2]
         m1d_y = [torch.ones_like(rho), uy, uy * uy + cs2]
@@ -276,7 +276,7 @@ class D3Q27Solver:
             # Vectorized inlet update: overwrite populations streaming INTO the domain
             self.f_temp[self._inlet_mask, 0, :, :] = feq_in[self._inlet_mask]
 
-        # Vectorized Neumann (Zero-Gradient) Outlet at X=-1 (Issue #16 fix)
+        # Vectorized Neumann (Zero-Gradient) Outlet at X=-1 (Issue #21 fix)
         # Use interior plane after streaming but before BC for true zero-gradient
         self.f_temp[self._outlet_mask, -1, :, :] = self.f_temp[self._outlet_mask, -2, :, :]
 
@@ -393,7 +393,7 @@ class D3Q27Solver:
         uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
         uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
 
-        # Cascaded MRT Collision (Issue #16)
+        # Cascaded MRT Collision (Issue #21)
         K = torch.tensordot(self.moment_basis, self.f, dims=([1], [0]))
         Keq = self.compute_moment_equilibrium(rho, ux, uy, uz)
 
@@ -416,7 +416,7 @@ class D3Q27Solver:
             K_S = torch.tensordot(self.moment_basis, S_guo, dims=([1], [0]))
             K_post += K_S
 
-        # Enforce exact conservation of mass and momentum (Issue #16 fix)
+        # Enforce exact conservation of mass and momentum (Issue #21 fix)
         K_post[self.conserved_indices] = Keq[self.conserved_indices]
 
         # Transform back to populations using in-place copy
@@ -549,7 +549,7 @@ class D3Q27CascadedSolver:
         return max(u_lu * L_lu / Re, 1e-9)
 
     def _estimate_lattice_freestream_velocity(self):
-        """Convert configured physical freestream to lattice units (Issue #16).
+        """Convert configured physical freestream to lattice units (Issue #21).
 
         For D3Q27, the sound speed c_s = 1/sqrt(3).
         To maintain consistent Mach number, u_lattice = Ma * c_s = Ma / sqrt(3).
@@ -783,7 +783,7 @@ class D3Q27CascadedSolver:
         lbm_raw_force = physical_net_drag_force
         lbm_calibrated_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
 
-        # Issue #16: Use pure PDE momentum exchange by default
+        # Issue #21: Use pure PDE momentum exchange by default
         physical_drag_force = lbm_raw_force
 
         coeffs = _compute_force_coefficients(
@@ -820,7 +820,7 @@ class D3Q27CascadedSolver:
 
             # Tiered Labeling (Issue #12)
             'label_source': 'lbm_d3q27',
-            'label_tier': 'lbm_raw', # Updated to raw for Issue #16
+            'label_tier': 'lbm_raw', # Updated to raw for Issue #21
             'lbm_converged': lbm_converged,
             'force_stability': force_stability,
 
