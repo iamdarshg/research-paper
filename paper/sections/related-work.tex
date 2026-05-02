@@ -12,13 +12,13 @@ Table \ref{tab:literature_map} provides a structured summary of the literature b
 \label{tab:literature_map}
 \begin{tabular}{|p{2.5cm}|p{2cm}|p{3.5cm}|p{3.5cm}|p{3.5cm}|}
 \hline
-\textbf{Category} & \textbf{Key Papers} & \textbf{What they solve} & \textbf{What they do not solve} & \textbf{How this paper differs} \ \hline
-Diffusion Foundations & Ho \cite{ho2020denoising}, Song \cite{song2021score} & Robust 2D/3D sample diversity and training stability. & Computational cost of high-res 3D grids; physical constraints. & Utilizes a 128D latent space and progressive refinement for efficiency. \ \hline
-3D Shape Generation & Mescheder \cite{mescheder2019occupancy}, Zhou \cite{zhou2021voxel} & Accurate 3D reconstruction and voxel-based representation. & Structural manifold integrity; aerodynamic viability. & Integrates semantic part labeling and structural connectivity priors. \ \hline
-Topology Optimization & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Mathematically rigorous material distribution for load paths. & Sensitivity to initial conditions; high iteration counts. & Adopts a "Sample-Rank-Validate" loop for design-space exploration. \ \hline
-Aerodynamic Optimization & Chen \cite{chen2019deep}, Thuerey \cite{thuerey2020physics} & Surrogate-based and deep learning airfoil optimization. & Full 3D aircraft fuselage/wing integration in the loop. & Employs a 3D D3Q27 LBM solver for coupled 3D aerodynamic feedback. \ \hline
-Physics-Informed ML & Raissi \cite{raissi2019pinn}, Hu \cite{hu2023physics} & PDE-constrained learning for flow and structural fields. & Real-time generative feedback for complex 3D manifolds. & Uses OpenFOAM-calibrated LBM as a real-time simulation-in-the-loop. \ \hline
-Constraint-Aware Design & Bends{\o}e \cite{bendsoe2013topology}, Gupta \cite{hu2023physics} & Manufacturing and structural feasibility constraints. & Generalization to diverse aircraft mission profiles. & Implements a semantic Constraint Projector for aircraft-specific rules. \ \hline
+\textbf{Category} & \textbf{Key Papers} & \textbf{What they solve} & \textbf{What they do not solve} & \textbf{How this paper differs} \\ \hline
+Diffusion Foundations & Ho \cite{ho2020denoising}, Song \cite{song2021score} & Robust 2D/3D sample diversity and training stability. & Computational cost of high-res 3D grids; physical constraints. & Utilizes a 128D latent space and progressive refinement for efficiency. \\ \hline
+3D Shape Generation & Mescheder \cite{mescheder2019occupancy}, Zhou \cite{zhou2021voxel} & Accurate 3D reconstruction and voxel-based representation. & Structural manifold integrity; aerodynamic viability. & Integrates semantic part labeling and structural connectivity priors. \\ \hline
+Topology Optimization & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Mathematically rigorous material distribution for load paths. & Sensitivity to initial conditions; high iteration counts. & Adopts a "Sample-Rank-Validate" loop for design-space exploration. \\ \hline
+Aerodynamic Optimization & Chen \cite{chen2019deep}, Thuerey \cite{thuerey2020physics} & Surrogate-based and deep learning airfoil optimization. & Full 3D aircraft fuselage/wing integration in the loop. & Employs a 3D D3Q27 LBM solver for coupled 3D aerodynamic feedback. \\ \hline
+Physics-Informed ML & Raissi \cite{raissi2019pinn}, Hu \cite{hu2023physics} & PDE-constrained learning for flow and structural fields. & Real-time generative feedback for complex 3D manifolds. & Uses OpenFOAM-calibrated LBM as a real-time simulation-in-the-loop. \\ \hline
+Constraint-Aware Design & Bends{\o}e \cite{bendsoe2013topology}, Gupta \cite{hu2023physics} & Manufacturing and structural feasibility constraints. & Generalization to diverse aircraft mission profiles. & Implements a semantic Constraint Projector for aircraft-specific rules. \\ \hline
 \end{tabular}
 \end{table*}
 
