@@ -5,7 +5,7 @@ from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
-    """Convert raw lattice momentum exchange into a physical force scale (Issue #21).
+    """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
 
     Standard LBM force scaling: F_phys = rho_phys * (dx^4 / dt^2) * F_lattice.
     Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
