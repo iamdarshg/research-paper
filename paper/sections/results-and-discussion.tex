@@ -17,7 +17,7 @@ Figure \ref{fig:loss_curves} summarizes the observed losses across the three pro
 \end{figure}
 
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}
-We ran a compact sweep over generation step count and the new shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, downsampled the binary grid to 16\textsuperscript{3} for the CPU CFD pass, and computed occupancy, surface area, $, $, and /D$. The key observation is that the post-processing threshold materially changes the aerodynamic score: at 1 step the best setting reached /D=2.22$, while at 8 steps the best score was /D=0.59$ in this reduced CPU setup.
+We ran a compact sweep over generation step count and the new shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, downsampled the binary grid to 16\textsuperscript{3} for the CPU CFD pass, and computed occupancy, surface area, $C_L$, $C_D$, and $L/D$. The key observation is that the post-processing threshold materially changes the aerodynamic score: at 1 step the best setting reached $L/D=2.22$, while at 8 steps the best score was $L/D=0.59$ in this reduced CPU setup.
 
 \begin{figure}[!t]
 \centering
@@ -26,7 +26,7 @@ We ran a compact sweep over generation step count and the new shape-prior cleanu
 }{%
 \includegraphics[width=3.5in]{placeholder.png}%
 }
-\caption{Mean /D$ from the reduced sweep over consistency steps, aggregated across three post-processing thresholds. Error bars show sample standard deviation.}
+\caption{Mean $L/D$ from the reduced sweep over consistency steps, aggregated across three post-processing thresholds. Error bars show sample standard deviation.}
 \label{fig:ld_sweep}
 \end{figure}
 
@@ -37,7 +37,7 @@ We ran a compact sweep over generation step count and the new shape-prior cleanu
 }{%
 \includegraphics[width=3.5in]{placeholder.png}%
 }
-\caption{Occupancy versus /D$ for the same sweep. The post-processing prior reduces near-threshold voxel clouds and shifts the score distribution, but the relationship remains noisy under the CPU CFD path.}
+\caption{Occupancy versus $L/D$ for the same sweep. The post-processing prior reduces near-threshold voxel clouds and shifts the score distribution, but the relationship remains noisy under the CPU CFD path.}
 \label{fig:cfd_analysis}
 \end{figure}
 
@@ -55,24 +55,24 @@ This is still a pilot study. The numbers above should be interpreted as a valida
     \item CFD solver resolution and reference-area normalization.
 \end{itemize}
 
-At minimum, a publication-quality sweep should report both realism metrics (occupancy, connectedness, surface smoothness) and aerodynamic metrics ($, $, /D$) instead of optimizing only one side of the tradeoff.
+At minimum, a publication-quality sweep should report both realism metrics (occupancy, connectedness, surface smoothness) and aerodynamic metrics ($C_L$, $C_D$, $L/D$) instead of optimizing only one side of the tradeoff.
 
 \subsection{Internal Solver Validation against Canonical Benchmarks}
-To verify the physical realism of the internal D3Q27 solver, we compare its Drag Coefficient ($) results against canonical benchmarks for two standard geometries: a circular cylinder and a unit cube. These tests use the internal solver's momentum-exchange method with BFL boundary conditions, calibrated against OpenFOAM sonicFoam results.
+To verify the physical realism of the internal D3Q27 solver, we compare its Drag Coefficient ($C_d$) results against canonical benchmarks for two standard geometries: a circular cylinder and a unit cube. These tests use the internal solver's momentum-exchange method with BFL boundary conditions, calibrated against OpenFOAM sonicFoam results.
 
 \begin{table}[h]
 \centering
-\caption{Drag Coefficient ($) Validation Results}
+\caption{Drag Coefficient ($C_d$) Validation Results}
 \label{tab:cd_validation}
 \begin{tabular}{|l|c|c|c|}
 \hline
-\textbf{Geometry} & \textbf{Reynolds No.} & \textbf{Internal Solver $} & \textbf{Benchmark/Exp. $} \ \hline
-Circular Cylinder & 100 & 1.56 & 1.3 -- 1.4 \ \hline
-Unit Cube & 1000 & 1.04 & $\sim.05 \ \hline
+\textbf{Geometry} & \textbf{Reynolds No.} & \textbf{Internal Solver $C_d$} & \textbf{Benchmark/Exp. $C_d$} \\ \hline
+Circular Cylinder & 100 & 1.56 & 1.3 -- 1.4 \\ \hline
+Unit Cube & 1000 & 1.04 & $\sim$1.05 \\ \hline
 \end{tabular}
 \end{table}
 
-The results in Table \ref{tab:cd_validation} demonstrate that following two critical physics corrections—correction of the freestream lattice velocity to  = Ma / \sqrt{3}$ and standardization of the BFL weighting factor to .0/(1+2q)$—the solver provides $ values that align with physical expectations. Specifically, the cylinder result is within 15\% of the typical range for low-Reynolds flow, and the cube result is in excellent agreement with standard values. These calibrated physics enable the generation of reliable aerodynamic labels for surrogate training within our framework.
+The results in Table \ref{tab:cd_validation} demonstrate that following two critical physics corrections---correction of the freestream lattice velocity to $u = Ma / \sqrt{3}$ and standardization of the BFL weighting factor to $4.0/(1+2q)$---the solver provides $C_d$ values that align with physical expectations. Specifically, the cylinder result is within 15\% of the typical range for low-Reynolds flow, and the cube result is in excellent agreement with standard values. These calibrated physics enable the generation of reliable aerodynamic labels for surrogate training within our framework.
 
 \subsection{Discussion}
 The main takeaway is now a little sharper: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM validation case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline.
