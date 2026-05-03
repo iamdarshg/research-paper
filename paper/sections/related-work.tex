@@ -1,44 +1,50 @@
 \section{Related Work}
 \label{sec:related_work}
 
-The integration of generative modeling with computational engineering has provided new avenues for structural and aerodynamic design. This section contextualizes our framework within the broader literature of generative models, topology optimization, and physics-informed machine learning.
+The convergence of generative modeling and computational engineering has transformed the landscape of structural and aerodynamic design. This section contextualizes our framework within the broader literature of diffusion models, 3D generation, topology optimization, and physics-informed machine learning.
 
 \subsection{Literature Coverage Map}
-Table \ref{tab:literature_map} summarizes the literature categories addressed in this work, including representative papers, their contributions, and their implications for our experimental baselines.
+Table \ref{tab:literature_map} provide a structured summary of the research areas addressed in this work, including representative papers and their implications for our experimental baselines.
 
 \begin{table*}[t]
 \centering
 \caption{Literature Coverage and Positioning Map}
 \label{tab:literature_map}
-\begin{tabular}{|p{2.5cm}|p{2cm}|p{3cm}|p{3cm}|p{3.5cm}|p{2.5cm}|}
+\begin{tabular}{|p{2.5cm}|p{2cm}|p{2.5cm}|p{3cm}|p{3.5cm}|p{2.5cm}|}
 \hline
-\textbf{Category} & \textbf{Key Papers} & \textbf{What they solve} & \textbf{What they do not solve} & \textbf{How this paper differs} & \textbf{Baseline Implications} \\ \hline
-Diffusion Foundations & Ho \cite{ho2020denoising}, Song \cite{song2021score} & Sample diversity and training stability. & High-res 3D grid costs; physical constraints. & Utilizes a 128D latent space and progressive refinement. & Informs the 16--32 grid ablation. \\ \hline
-3D Shape Generation & Mescheder \cite{mescheder2019occupancy}, Zhou \cite{zhou2021voxel} & 3D reconstruction and voxel representations. & Structural manifold integrity; aerodynamic viability. & Integrates semantic part labeling and connectivity priors. & Validates against ShapeNet-style models. \\ \hline
-Generative Design \& TO & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Rigorous material distribution for load paths. & Sensitivity to initial conditions; iteration counts. & Adopts an exploratory "Sample-Rank-Validate" loop. & Comparison against gradient-based SIMP. \\ \hline
-Aerodynamic Optimization & Chen \cite{chen2019deep}, Thuerey \cite{thuerey2020physics} & Deep learning for airfoil optimization. & Full 3D aircraft/wing integration in the loop. & Employs a 3D D3Q27 LBM solver for coupled 3D feedback. & Reference for surrogate model accuracy. \\ \hline
-Physics-Informed ML & Raissi \cite{raissi2019pinn}, Lu \cite{lu2021deeponet} & PDE-constrained learning for flow fields. & Real-time generative feedback for 3D manifolds. & Uses LBM as a real-time simulation-in-the-loop. & Benchmark for PINN-ready truth data. \\ \hline
-Constraint-Aware Generation & Oh \cite{oh2019deep}, Hu \cite{hu2023physics} & Manufacturing and structural constraints. & Diverse aircraft mission profiles; repair hooks. & Implements a semantic Constraint Projector and Repair. & Evaluation of connectivity penalty. \\ \hline
+\textbf{Category} & \textbf{Method Families} & \textbf{Key Papers} & \textbf{What they solve} & \textbf{How this paper differs} & \textbf{Baseline Implications} \\ \hline
+Diffusion Foundations & DDPM, SDE, Latent, Consistency & Ho \cite{ho2020denoising}, Song \cite{song2021score}, Rombach \cite{rombach2022latent} & Training stability and sample diversity in high dimensions. & Maps a 128D latent space to a 3D physical domain via MLP. & Informs the progressive refinement ablation. \\ \hline
+3D Generative Modeling & Voxel, Point, Mesh, Implicit & Wu \cite{wu20163d}, Park \cite{park2019deepsdf}, Mescheder \cite{mescheder2019occupancy} & 3D reconstruction and latent representation of manifolds. & Prioritizes structural connectivity over visual fidelity. & Validates against ShapeNet-style 3D-GAN. \\ \hline
+Topology Optimization & SIMP, Neural TO & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Rigorous material distribution for load paths. & Uses diffusion to explore novel aerodynamic forms. & Benchmark against gradient-based SIMP. \\ \hline
+Aerodynamic Optimization & Airfoil, Wing, Adjoint, Surrogate & Jameson \cite{jameson1988aerodynamic}, Chen \cite{chen2019deep} & Sensitivity-based and surrogate airfoil design. & Integrates full 3D fuselage/wing feedback in-the-loop. & Reference for Cd/Cl surrogate accuracy. \\ \hline
+Physics-ML & PINNs, Neural Operators & Raissi \cite{raissi2019pinn}, Li \cite{li2020fourier} & PDE-constrained flow and structural approximation. & Uses LBM as a real-time simulator, not just a surrogate. & Benchmark for PINN ground truth. \\ \hline
+Constraint-Aware Design & Physicality, Repair, Manufacturability & Oh \cite{oh2019deep}, Hu \cite{hu2023physics} & Enforcing manufacturing and connectivity rules. & Implements a semantic Constraint Projector for aircraft. & Evaluation of the connectivity penalty. \\ \hline
 \end{tabular}
 \end{table*}
 
 \subsection{Diffusion and Generative Modeling Foundations}
-Foundational research into generative models has shifted from GANs and VAEs toward diffusion-based approaches. Denoising Diffusion Probabilistic Models (DDPM) \cite{ho2020denoising} and Score-Based models \cite{song2021score} have established a stable training objective for high-fidelity sampling. Our work leverages these foundations but addresses the computational bottleneck of 3D grids by operating in a compressed 128D latent space. This approach is evaluated in our progressive training experiments.
+Foundational research has shifted from GANs toward diffusion-based models. Denoising Diffusion Probabilistic Models (DDPM) \cite{ho2020denoising} and Score-Based models \cite{song2021score} provide stable objectives for high-fidelity generation. Latent Diffusion Models (LDM) \cite{rombach2022latent} further improve efficiency by operating in compressed spaces. Our work builds on these principles, utilizing a 128D latent space and a progressive grid refinement schedule (16--32\textsuperscript{3}), which we evaluate in our training convergence studies.
 
 \subsection{3D Shape Generation}
-Extending generative models to 3D has led to advancements in voxel-based representations and implicit functions. Occupancy Networks \cite{mescheder2019occupancy} learn 3D reconstruction in continuous function space, while recent diffusion models have been applied to grid-based 3D shapes \cite{zhou2021voxel}. Unlike general-purpose 3D models trained on datasets like ShapeNet \cite{chang2015shapenet}, our framework focuses on the physical manifold integrity required for aerospace components, which we evaluate using our semantic part-labeling ablation.
+Generative models for 3D data cover voxels \cite{wu20163d}, point clouds, and implicit surfaces \cite{park2019deepsdf, mescheder2019occupancy}. While these models achieve impressive visual results on datasets like ShapeNet \cite{chang2015shapenet}, they often produce "voxel clouds" that lack the structural integrity required for engineering. Our framework addresses this by integrating semantic part labeling and a structural connectivity prior, validated against traditional 3D-GAN baselines.
 
 \subsection{Generative Design and Topology Optimization}
-Topology Optimization (TO), specifically the SIMP method \cite{sigmund2001topology}, provides a rigorous mathematical basis for material distribution. Modern deep learning approaches \cite{sosnovik2019neural} attempt to accelerate TO. Our framework differs by using diffusion to explore a vast design space, identifying novel aerodynamic forms that might be unreachable by gradient-based material redistribution alone. We use classical SIMP as a baseline for structural efficiency.
+Topology Optimization (TO), particularly the SIMP method \cite{sigmund2001topology}, is the industry standard for material distribution. Recent neural TO approaches \cite{sosnovik2019neural} learn to map boundary conditions to optimized structures. Unlike TO, which is sensitive to initial seeds and local minima, our diffusion-based approach adopts a "Sample-Rank-Validate" loop to explore a wider design space. We compare our results against classical SIMP to evaluate structural efficiency.
 
 \subsection{Aerospace and Aerodynamic Shape Optimization}
-Deep learning for aerodynamics has historically focused on 2D airfoils \cite{chen2019deep}. Integrating high-fidelity Computational Fluid Dynamics (CFD) into the generative loop is often limited by simulation time. To address this, surrogates or Physics-Informed Neural Networks (PINNs) \cite{raissi2019pinn} are used to approximate flow \cite{thuerey2020physics}. Our implementation utilizes an optimized D3Q27 Lattice Boltzmann Method (LBM) solver to provide 3D aerodynamic feedback. The accuracy of this feedback is verified against OpenFOAM in Section \ref{sec:results}.
+Aerodynamic optimization has evolved from classical Hicks-Henneke parametrizations to adjoint-based methods \cite{jameson1988aerodynamic} and deep learning surrogates \cite{chen2019deep, thuerey2020physics}. While adjoint methods are efficient for local refinement, they struggle with global topology changes. Our framework uses a D3Q27 LBM solver to provide real-time 3D aerodynamic feedback, positioning it as an exploratory tool that complements local adjoint-based refinement.
 
 \subsection{Physics-Informed and Simulation-in-the-Loop ML}
-Physics-informed machine learning incorporates PDEs directly into the training process. Beyond PINNs, Neural Operators \cite{lu2021deeponet} have emerged as efficient flow simulators. Our framework employs a simulation-in-the-loop approach where the D3Q27 solver provides real-time guidance. This allows the model to adapt to complex 3D boundary conditions, a key requirement for the multi-fidelity label promotion tested in our pipeline.
+Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi2019pinn} or Neural Operators like FNO \cite{li2020fourier}. Our work follows the simulation-in-the-loop paradigm, where a GPU-accelerated LBM solver provides real-time guidance. This allows for multi-fidelity label promotion (from LBM to OpenFOAM), providing high-fidelity ground truth for the PINN-ready fields exported by our pipeline.
 
 \subsection{Constraint-Aware Generation}
-Enforcing physical constraints—such as structural connectivity and manufacturing feasibility—is a major challenge. Oh et al. \cite{oh2019deep} and Hu et al. \cite{hu2023physics} explored physics-constrained design using specialized loss functions. Our framework implements a specialized Connectivity Loss and a semantic geometry system to enforce aircraft-specific design rules. The effectiveness of these constraints is evaluated in our connectivity penalty sweep.
+Enforcing physical constraints is critical for engineering. Oh et al. \cite{oh2019deep} and Hu et al. \cite{hu2023physics} demonstrated physics-constrained design using specialized loss functions. Our implementation extends this through a persistent Constraint Report system and a semantic geometry adapter that ensures every generated aircraft complies with symmetry, clearance, and structural connectivity rules.
 
 \subsection{Novelty and Positioning}
-The novelty of this work lies in the synthesis of TRM/HRM principles with a real-time, 3D simulation-in-the-loop generative pipeline. While prior works have explored these components in isolation, our framework achieves a coupled loop where a latent space is mapped to a physical domain and validated against calibrated LBM physics. Our optimized D3Q27 solver provides a favorable stability-to-accuracy ratio for low-resolution 3D grids, enabling the generation of aerodynamically viable designs as demonstrated in Section \ref{sec:results}.
+The novelty of this work lies in the following distinctions:
+\begin{itemize}
+    \item \textbf{vs. 3D Diffusion:} Unlike models focused on visual synthesis, we prioritize physical manifold integrity and connectivity through a specialized BFL-consistent momentum exchange loss.
+    \item \textbf{vs. Topology Optimization:} We leverage the stochastic exploration of diffusion to identify aerodynamic forms that lie outside the convergence basin of gradient-based material redistribution.
+    \item \textbf{vs. CFD Surrogates:} Our framework uses real-time simulation-in-the-loop feedback rather than a static surrogate, allowing the model to adapt to complex 3D boundary conditions dynamically.
+\end{itemize}
+This "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) approach allows for the parallel exploration of the design space while maintaining the rigorous validation standards required for aerospace engineering.
