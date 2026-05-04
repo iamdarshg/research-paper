@@ -5,11 +5,20 @@ from lbm_utils import D3Q27Lattice, _compute_force_coefficients
 
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
-    """Convert raw lattice momentum exchange into a physical force scale."""
-    freestream_speed = float(mach_number) * 343.0
-    # Use consistent analytic scaling with dynamic pressure factor 0.5
-    force_scale = 0.5 * float(density) * freestream_speed * freestream_speed * float(grid_spacing) * float(grid_spacing)
-    return force * force_scale
+    """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
+
+    Standard LBM force scaling: F_phys = rho_phys * (dx^4 / dt^2) * F_lattice.
+    Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
+    This results in force_scale = rho_phys * dx^2 * (343.0 * sqrt(3))^2.
+
+    The D3Q27 momentum exchange sum corresponds to Delta p / Delta t in lattice units.
+    We apply the c_s^2 = 1/3 factor to align with the physical dynamic pressure definition.
+    """
+    dx = float(grid_spacing)
+    # velocity_ratio = sound_speed_phys / sound_speed_lattice = 343.0 * sqrt(3)
+    velocity_ratio = 343.0 * (3.0**0.5)
+    force_scale = float(density) * (dx**2) * (velocity_ratio**2)
+    return (1.0 / 3.0) * force * force_scale
 
 
 class CascadedLBM:

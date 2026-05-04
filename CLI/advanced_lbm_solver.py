@@ -198,9 +198,9 @@ class D3Q27Solver:
             # Momentum exchange for BFL:
             # The simple BB exchange is 2 * fi_in.
             # For BFL, we use the interpolated population that actually hits the wall.
-            # Weighting factor 2/(1+2q) is often used for sub-voxel force.
+            # Weighting factor 4/(1+2q) ensures consistency with bounce-back (2*fi) at q=0.5.
             # Simplified version: Use q to scale the momentum transfer.
-            bfl_factor = 2.0 / (1.0 + 2.0 * qi)
+            bfl_factor = 4.0 / (1.0 + 2.0 * qi)
 
             f_in = self.f_pre_stream[i][active]
             step_force_x += torch.sum(bfl_factor * self.ex[i] * f_in)
