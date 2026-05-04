@@ -17,7 +17,7 @@ Figure \ref{fig:loss_curves} summarizes the observed losses across the three pro
 \end{figure}
 
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}
-We ran a compact sweep over generation step count and the new shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, downsampled the binary grid to 16\textsuperscript{3} for the CPU CFD pass, and computed occupancy, surface area, $C_L$, $C_D$, and $L/D$. The key observation is that the post-processing threshold materially changes the aerodynamic score: at 1 step the best setting reached $L/D=2.22$, while at 8 steps the best score was $L/D=0.59$ in this reduced CPU setup.
+We ran a compact sweep over generation step count and the shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, and computed aerodynamic metrics using the CPU CFD path. The results in Figure \ref{fig:ld_sweep} provide a preliminary probe of how post-processing thresholds change the resulting aerodynamic score distribution.
 
 \begin{figure}[!t]
 \centering
@@ -42,20 +42,10 @@ We ran a compact sweep over generation step count and the new shape-prior cleanu
 \end{figure}
 
 \subsection{Freeform-object Geometry Summary}
-The generated freeform objects are still dense and near-threshold before cleanup, but the new plausibility prior reduces isolated components and slightly lowers the occupancy fraction. In this environment, that matters more than small changes in the raw voxel logits: the cleaned binary shapes are less fragmented and more suitable for downstream meshing/export.
+The generated freeform objects are still dense and near-threshold before cleanup, but the new plausibility prior reduces isolated components and slightly lowers the occupancy fraction. In this environment, the cleaned binary shapes are less fragmented and more suitable for downstream meshing and export.
 
 \subsection{Hyperparameter and Tuning Notes}
-The sweep was intentionally small but meaningful for the current codebase: it varied the inference path length and the new connected-component cleanup threshold, which are the two knobs that currently have the most direct effect on shape plausibility. The training-side improvement was also incremental: a voxel-shape prior was added to the loss to discourage midpoint noise, excess surface roughness, and disconnected fragments.
-
-This is still a pilot study. The numbers above should be interpreted as a validation of the code path and a first-pass tuning signal, not as evidence of a stable optimum. A larger study should sweep:
-\begin{itemize}
-    \item latent dimension (8, 16, 32),
-    \item the shape-prior weights and occupancy target,
-    \item consistency steps (1, 2, 4, 8, 16), and
-    \item CFD solver resolution and reference-area normalization.
-\end{itemize}
-
-At minimum, a publication-quality sweep should report both realism metrics (occupancy, connectedness, surface smoothness) and aerodynamic metrics ($C_L$, $C_D$, $L/D$) instead of optimizing only one side of the tradeoff.
+The sweep was intentionally small but meaningful for the current codebase: it varied the inference path length and the new connected-component cleanup threshold. The training-side improvement was also incremental: a voxel-shape prior was added to the loss to discourage midpoint noise and disconnected fragments. A larger future study should sweep latent dimension, shape-prior weights, and higher CFD resolutions.
 
 \subsection{Internal Solver Validation against Canonical Benchmarks}
 To verify the physical realism of the internal D3Q27 solver, we compare its Drag Coefficient ($C_d$) results against canonical benchmarks for two standard geometries: a circular cylinder and a unit cube. These tests use the internal solver's momentum-exchange method with BFL boundary conditions.
@@ -67,12 +57,12 @@ To verify the physical realism of the internal D3Q27 solver, we compare its Drag
 \begin{tabular}{|l|c|c|c|}
 \hline
 \textbf{Geometry} & \textbf{Reynolds No.} & \textbf{Internal Solver $C_d$} & \textbf{Benchmark $C_d$} \\ \hline
-Circular Cylinder & 100 & 1.56 & 1.3 -- 1.4 \\ \hline
-Unit Cube & 1000 & 1.04 & $\sim$1.05 \\ \hline
+Circular Cylinder & 100 & 1.56 & 1.3 -- 1.4 \cite{geier2015cascaded} \\ \hline
+Unit Cube & 1000 & 1.04 & $\sim$1.05 \cite{geier2015cascaded} \\ \hline
 \end{tabular}
 \end{table}
 
 The results in Table \ref{tab:cd_validation} provide a preliminary sanity check for our LBM implementation. Following physics corrections to the freestream lattice velocity ($u = Ma / \sqrt{3}$) and BFL weighting ($4.0/(1+2q)$), the solver yields $C_d$ values that align with physical expectations. Specifically, the cylinder result is within 15\% of the typical range for low-Reynolds flow, and the cube result is in agreement with standard values. These calibrated physics enable the generation of aerodynamic labels for surrogate training within our framework.
 
 \subsection{Discussion}
-The repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM validation case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline.
+The repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM validation case. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline.
