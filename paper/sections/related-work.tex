@@ -10,15 +10,16 @@ Table \ref{tab:literature_map} provides a structured summary of the research are
 \centering
 \caption{Literature Coverage and Positioning Map}
 \label{tab:literature_map}
-\begin{tabular}{|p{1.8cm}|p{2.2cm}|p{2.4cm}|p{2.4cm}|p{2.4cm}|p{2.0cm}|}
+\footnotesize
+\begin{tabular}{|p{1.6cm}|p{2.0cm}|p{2.4cm}|p{2.4cm}|p{2.4cm}|p{1.8cm}|}
 \hline
-\textbf{Category} & \textbf{Key Papers} & \textbf{What they solve} & \textbf{What they do not solve} & \textbf{How this paper differs} & \textbf{Baseline Implications} \\ \hline
-Diffusion Foundations & Ho \cite{ho2020denoising}, Nichol \cite{nichol2021improved}, Song \cite{song2023consistency} & High-fidelity sampling and training stability in high-dimensional latent spaces. & Direct enforcement of hard physical or structural connectivity constraints. & Integrates a persistent Constraint Projector for aircraft-specific validity. & Informs the multi-step vs. 1-step ablation. \\ \hline
-3D Generative Modeling & Wu \cite{wu20163d}, Achlioptas \cite{achlioptas2018point}, Wang \cite{wang2018pixel2mesh} & Latent representation and generation of complex 3D manifolds/surfaces. & Guaranteed manifold integrity for high-fidelity CFD-ready meshes. & Semantic part labeling and structural connectivity priors for CFD-readiness. & Planned voxel-GAN comparison. \\ \hline
-Generative Design \& TO & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Efficient material distribution for minimized compliance (load paths). & Global exploration of aerodynamic forms; sensitivity to initial seeds. & Diffusion-based global topological exploration beyond local gradient minima. & Planned comparison against SIMP material efficiency. \\ \hline
-Aerodynamic Optimization & Jameson \cite{jameson1988aerodynamic}, Chen \cite{chen2019aerospace} & Local adjoint-based refinement and efficient surrogate airfoil prediction. & Global topological exploration of coupled 3D fuselage/wings. & Integrated D3Q27 LBM for direct 3D simulation-in-the-loop feedback. & Reference for $C_d/C_l$ surrogate accuracy. \\ \hline
-Physics-ML & Raissi \cite{raissi2019pinn}, Li \cite{li2020fourier} & PDE-constrained flow and structural field approximation (PINNs/Operators). & Simulation-guided generation for complex 3D boundary conditions. & Hybrid multi-fidelity promotion (LBM to OpenFOAM) for training guidance. & Planned PINN-ready field benchmark. \\ \hline
-Constraint-Aware Generation & Oh \cite{oh2019deep}, Steinmetz \cite{steinmetz2022generative} & Enforcing manufacturing and connectivity rules via projection or neural priors. & Semantic aircraft-specific design rules (e.g., propulsion clearance). & Specialized \texttt{TypedAircraftGeometry} with semantic component cleanup. & Partially probed by cleanup-threshold sweep. \\ \hline
+\textbf{Category} & \textbf{Key Ref.} & \textbf{Contrib. (Solve)} & \textbf{Gaps (Not Solved)} & \textbf{How this paper differs} & \textbf{Baseline Imp.} \\ \hline
+Diffusion & Ho \cite{ho2020denoising}, Nichol \cite{nichol2021improved}, Song \cite{song2023consistency} & High-fidelity sampling and latent-space stability. & Direct enforcement of hard structural connectivity rules. & Persistent Constraint Projector for aircraft validity. & Multi-step vs. 1-step ablation. \\ \hline
+3D Gen & Wu \cite{wu20163d}, Achlioptas \cite{achlioptas2018point}, Wang \cite{wang2018pixel2mesh} & Latent 3D manifold representation. & Manifold integrity for high-fidelity CFD-ready meshes. & Semantic part labeling and connectivity priors. & Voxel-GAN comparison. \\ \hline
+Design \& TO & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Optimized load paths for minimized compliance. & Global aerodynamic exploration; sensitivity to seeds. & Topological exploration beyond local gradient minima. & SIMP material efficiency. \\ \hline
+Aero Opt & Jameson \cite{jameson1988aerodynamic}, Chen \cite{chen2019aerospace} & Local adjoint-based and surrogate airfoil refinement. & Global topological exploration of coupled 3D fuselages. & Simulation-in-the-loop 3D LBM feedback. & $C_d/C_l$ surrogate accuracy. \\ \hline
+Physics-ML & Raissi \cite{raissi2019pinn}, Li \cite{li2020fourier} & PDE-constrained field approximation. & Guided generation for complex 3D boundary conditions. & Multi-fidelity promotion for training guidance. & PINN-ready field benchmark. \\ \hline
+Constraint Gen & Oh \cite{oh2019deep}, Steinmetz \cite{steinmetz2022generative} & Enforcing manufacturing and connectivity rules. & Semantic aircraft design rules (e.g., clearance). & Specialized semantic component cleanup. & Cleanup-threshold sweep. \\ \hline
 \end{tabular}
 \end{table*}
 
