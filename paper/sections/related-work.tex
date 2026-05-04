@@ -1,14 +1,51 @@
 \section{Related Work}
 \label{sec:related_work}
-The confluence of generative models and engineering design has been a burgeoning area of research. In particular, the use of deep learning for the generation of 3D shapes has seen significant advancements. Early approaches, such as Generative Adversarial Networks (GANs) and Variational Autoencoders (VAEs), have been applied to 3D object generation, but often struggle with producing high-resolution and structurally complex shapes.
 
-More recently, diffusion models \cite{ho2020denoising, nichol2021improved} have emerged as a powerful class of generative models, capable of producing high-fidelity images and 3D shapes. The application of diffusion models to 3D shape generation is a rapidly evolving field.
+The convergence of generative modeling and computational engineering has been increasingly explored for structural and aerodynamic design \cite{chen2019aerospace, oh2019deep}. This section contextualizes our framework within the literature of diffusion models, 3D generation, topology optimization, and physics-informed machine learning.
 
-The concept of hierarchical representation has also been explored in the context of 3D shape generation. By representing shapes in a hierarchical manner, it is possible to capture both coarse and fine-grained details, leading to more realistic and detailed geometries. Our work builds upon these ideas, using a hierarchical representation to decode the latent vectors from our diffusion model.
+\subsection{Literature Coverage Map}
+Table \ref{tab:literature_map} provides a structured summary of the research areas addressed in this work, including representative papers, their contributions, and their implications for our experimental baselines.
 
-Furthermore, the integration of physics-based simulations into the generative process is a key area of research. By incorporating feedback from simulations, it is possible to generate designs that are not only aesthetically pleasing but also physically plausible and optimized for specific performance criteria. In the context of aerospace engineering, the use of CFD simulations to guide the design of aerodynamic shapes is a well-established practice. However, the integration of CFD solvers directly into the training loop of a generative model is a challenging endeavor, due to the computational cost of the simulations. Our work addresses this challenge by leveraging a GPU-accelerated CFD solver, which enables us to efficiently evaluate the aerodynamic performance of the generated designs during training.
+\begin{table*}[t]
+\centering
+\caption{Literature Coverage and Positioning Map}
+\label{tab:literature_map}
+\footnotesize
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}|p{1.4cm}|p{1.8cm}|p{2.4cm}|p{2.4cm}|p{2.4cm}|p{1.6cm}|}
+\hline
+\textbf{Category} & \textbf{Key Ref.} & \textbf{Contrib. (Solve)} & \textbf{Gaps (Not Solved)} & \textbf{How this paper differs} & \textbf{Baseline Imp.} \\ \hline
+Diffusion & Ho \cite{ho2020denoising}, Nichol \cite{nichol2021improved}, Song \cite{song2023consistency} & High-fidelity sampling and latent-space stability. & Direct enforcement of hard structural connectivity rules. & Persistent Constraint Projector for aircraft validity. & Multi-step vs. 1-step ablation. \\ \hline
+3D Gen & Wu \cite{wu20163d}, Achlioptas \cite{achlioptas2018point}, Wang \cite{wang2018pixel2mesh} & Latent 3D manifold representation. & Manifold integrity for high-fidelity CFD-ready meshes. & Semantic part labeling and connectivity priors. & Voxel-GAN comparison. \\ \hline
+Design \& TO & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Optimized load paths for minimized compliance. & Global aerodynamic exploration; sensitivity to seeds. & Topological exploration beyond local gradient minima. & SIMP material efficiency. \\ \hline
+Aero Opt & Jameson \cite{jameson1988aerodynamic}, Chen \cite{chen2019aerospace} & Local adjoint-based and surrogate airfoil refinement. & Global topological exploration of coupled 3D fuselages. & Simulation-in-the-loop 3D LBM feedback. & $C_d/C_l$ surrogate accuracy. \\ \hline
+Physics-ML & Raissi \cite{raissi2019pinn}, Li \cite{li2020fourier} & PDE-constrained field approximation. & Guided generation for complex 3D boundary conditions. & Multi-fidelity promotion for training guidance. & PINN-ready field benchmark. \\ \hline
+Constraint Gen & Oh \cite{oh2019deep}, Steinmetz \cite{steinmetz2022generative} & Enforcing manufacturing and connectivity rules. & Semantic aircraft design rules (e.g., clearance). & Specialized semantic component cleanup. & Cleanup-threshold sweep. \\ \hline
+\end{tabular*}
+\end{table*}
 
-The Transformer architecture, first introduced in \cite{vaswani2017attention}, has revolutionized the field of natural language processing and is now being applied to a wide range of computer vision and generative modeling tasks. The attention mechanism at the core of the Transformer allows the model to capture long-range dependencies and complex relationships in the data. In our work, we draw inspiration from the Transformer architecture in the design of our latent diffusion model.
+\subsection{Diffusion and Generative Modeling Foundations}
+Foundational research has established diffusion-based models as a stable alternative to GANs. Denoising Diffusion Probabilistic Models (DDPM) \cite{ho2020denoising} and their improved variants \cite{nichol2021improved} provide high-fidelity sampling. Score-based models \cite{song2021score} and Consistency Models \cite{song2023consistency} further improve training and inference speed. Our work builds on these foundations, utilizing a 128D latent space to manage the computational cost of 3D grids, which we evaluate through multi-step and 1-step ablations.
 
-Furthermore, this work is conceptually guided by two key principles: "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) and "Hierarchical Representation Mapping" (HRM). The LiDAR principle suggests a process where a vast design space is explored in parallel through a diffusion process, followed by a more structured, sequential evaluation. This mirrors the creative process of rapid ideation followed by critical analysis. The HRM principle, inspired by recursive models that demonstrate strong general reasoning on grid-based benchmarks, advocates for hierarchical and voxelized representations to effectively capture complex spatial relationships, which is particularly well-suited for structural design tasks.
+\subsection{3D Shape Generation}
+3D generative models cover voxels \cite{wu20163d}, point clouds \cite{achlioptas2018point}, meshes \cite{wang2018pixel2mesh}, and implicit surfaces \cite{mescheder2019occupancy}. While these models achieve strong results on visual datasets like ShapeNet \cite{chang2015shapenet}, they often prioritize visual mimicry over the physical manifold integrity required for engineering. Our framework addresses this by integrating semantic part labeling and a structural connectivity prior, which we intend to validate against traditional voxel-GAN baselines.
 
+\subsection{Generative Design and Topology Optimization}
+Topology Optimization (TO), specifically the SIMP method \cite{sigmund2001topology}, is the industry standard for load-path optimization \cite{sigmund2013topology}. Recent neural TO approaches \cite{sosnovik2019neural} accelerate this process. However, TO is often sensitive to local minima and initial conditions. Our diffusion-based approach identifies aerodynamic forms that might be unreachable by gradient-based material redistribution alone. We plan to compare our results against SIMP-optimized forms to evaluate structural material efficiency.
+
+\subsection{Aerospace and Aerodynamic Shape Optimization}
+Our framework uses an integrated D3Q27 LBM solver to provide simulation-in-the-loop 3D aerodynamic feedback, positioning it as an exploratory tool that complements local adjoint-based optimization. The preliminary accuracy of this feedback is documented in Section \ref{sec:results}.
+
+\subsection{Physics-Informed and Simulation-in-the-Loop ML}
+Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi2019pinn} or Neural Operators like FNO \cite{li2020fourier}. Our work follows a simulation-in-the-loop paradigm where a GPU-accelerated LBM solver provides guidance during training. This enables multi-fidelity label promotion (from LBM to OpenFOAM), which we intend to use for generating ground truth fields for our PINN-ready benchmarks.
+
+\subsection{Constraint-Aware Generation}
+Enforcing physical validity—such as manufacturability and connectivity—remains a core challenge. Oh et al. \cite{oh2019deep} demonstrated generative design for structures, while Steinmetz et al. \cite{steinmetz2022generative} utilized differentiable projection for manufacturing. Our implementation extends this through a persistent Constraint Projector and semantic repair adapter designed to ensure designs comply with aircraft-specific clearance and connectivity rules. The effectiveness of these constraints is partially probed by our cleanup-threshold sweep in Section \ref{sec:results}.
+
+\subsection{Novelty and Positioning}
+This work is distinguished from prior art as follows:
+\begin{itemize}
+    \item \textbf{vs. 3D Diffusion:} We prioritize physical manifold integrity and connectivity through a specialized semantic geometry system and BFL-consistent momentum exchange calculation.
+    \item \textbf{vs. Topology Optimization:} We leverage the exploratory power of diffusion to identify aerodynamic forms outside the convergence basin of gradient-based material redistribution.
+    \item \textbf{vs. CFD Surrogates:} Our framework uses simulation-in-the-loop feedback rather than a static surrogate, allowing for dynamic adaptation to 3D boundary conditions.
+\end{itemize}
+This "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) approach allows for Design Space exploration while documenting preliminary validation checks in Section \ref{sec:results}.

@@ -1,0 +1,102 @@
+\relax
+\citation{chen2019aerospace,oh2019deep}
+\citation{ho2020denoising}
+\citation{nichol2021improved}
+\citation{song2023consistency}
+\citation{wu20163d}
+\citation{achlioptas2018point}
+\citation{wang2018pixel2mesh}
+\citation{sigmund2001topology}
+\citation{sosnovik2019neural}
+\citation{jameson1988aerodynamic}
+\citation{chen2019aerospace}
+\citation{raissi2019pinn}
+\citation{li2020fourier}
+\citation{oh2019deep}
+\citation{steinmetz2022generative}
+\citation{ho2020denoising}
+\citation{nichol2021improved}
+\citation{song2021score}
+\citation{song2023consistency}
+\citation{wu20163d}
+\citation{achlioptas2018point}
+\citation{wang2018pixel2mesh}
+\citation{mescheder2019occupancy}
+\citation{chang2015shapenet}
+\citation{sigmund2001topology}
+\citation{sigmund2013topology}
+\citation{sosnovik2019neural}
+\@writefile{toc}{\contentsline {section}{\numberline {I}Introduction}{1}{}\protected@file@percent }
+\newlabel{sec:introduction}{{I}{1}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {II}Related Work}{1}{}\protected@file@percent }
+\newlabel{sec:related_work}{{II}{1}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-A}}Literature Coverage Map}{1}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-B}}Diffusion and Generative Modeling Foundations}{1}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-C}}3D Shape Generation}{1}{}\protected@file@percent }
+\citation{raissi2019pinn}
+\citation{li2020fourier}
+\citation{oh2019deep}
+\citation{steinmetz2022generative}
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Literature Coverage and Positioning Map}}{2}{}\protected@file@percent }
+\newlabel{tab:literature_map}{{I}{2}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-D}}Generative Design and Topology Optimization}{2}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-E}}Aerospace and Aerodynamic Shape Optimization}{2}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-F}}Physics-Informed and Simulation-in-the-Loop ML}{2}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-G}}Constraint-Aware Generation}{2}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-H}}Novelty and Positioning}{2}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {III}Methodology}{2}{}\protected@file@percent }
+\newlabel{sec:methodology}{{III}{2}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}Noise Scheduling}{2}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces The architecture of our proposed generative design framework. A latent vector is first sampled from a standard normal distribution. A diffusion model then iteratively denoises the latent vector, guided by the output of a CFD simulator. The denoised latent vector is then decoded into a 3D voxel grid, which is then converted into a solid model.}}{3}{}\protected@file@percent }
+\newlabel{fig:architecture}{{1}{3}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}Latent Diffusion UNet}{3}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Latent-to-3D Converter}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-D}}CFD Simulator}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-E}}Loss Function}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-F}}Rigorous Integration of CFD in Diffusion Training}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {IV}Results and Discussion}{4}{}\protected@file@percent }
+\newlabel{sec:results}{{IV}{4}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Observed sanity-run losses across progressive grid stages. This is a reduced CPU-only training trace, not a full convergence study.}}{4}{}\protected@file@percent }
+\newlabel{fig:loss_curves}{{2}{4}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-A}}Training Convergence}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-B}}Freeform-object Sweep: Steps vs. Shape Prior}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-C}}Freeform-object Geometry Summary}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-D}}Hyperparameter and Tuning Notes}{4}{}\protected@file@percent }
+\citation{geier2015cascaded}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Mean $L/D$ from the reduced sweep over consistency steps, aggregated across three post-processing thresholds. Error bars show sample standard deviation.}}{5}{}\protected@file@percent }
+\newlabel{fig:ld_sweep}{{3}{5}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Occupancy versus $L/D$ for the same sweep. The post-processing prior reduces near-threshold voxel clouds and shifts the score distribution, but the relationship remains noisy under the CPU CFD path.}}{5}{}\protected@file@percent }
+\newlabel{fig:cfd_analysis}{{4}{5}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-E}}Internal Solver Validation against Canonical Benchmarks}{5}{}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces Internal Solver $C_d$ Sanity Targets and Observations}}{5}{}\protected@file@percent }
+\newlabel{tab:cd_validation}{{II}{5}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-F}}Discussion}{5}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {V}Validation and Testing Standards}{5}{}\protected@file@percent }
+\newlabel{sec:validation}{{V}{5}{}{}{}}
+\bibstyle{IEEEtran}
+\bibdata{references}
+\bibcite{chen2019aerospace}{1}
+\bibcite{oh2019deep}{2}
+\bibcite{ho2020denoising}{3}
+\bibcite{nichol2021improved}{4}
+\bibcite{song2023consistency}{5}
+\bibcite{wu20163d}{6}
+\bibcite{achlioptas2018point}{7}
+\bibcite{wang2018pixel2mesh}{8}
+\bibcite{sigmund2001topology}{9}
+\bibcite{sosnovik2019neural}{10}
+\bibcite{jameson1988aerodynamic}{11}
+\bibcite{raissi2019pinn}{12}
+\bibcite{li2020fourier}{13}
+\bibcite{steinmetz2022generative}{14}
+\bibcite{song2021score}{15}
+\bibcite{mescheder2019occupancy}{16}
+\bibcite{chang2015shapenet}{17}
+\bibcite{sigmund2013topology}{18}
+\bibcite{geier2015cascaded}{19}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-A}}Verification}{6}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-B}}Validation}{6}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VI}Conclusion}{6}{}\protected@file@percent }
+\newlabel{sec:conclusion}{{VI}{6}{}{}{}}
+\@writefile{toc}{\contentsline {section}{References}{6}{}\protected@file@percent }
+\gdef \@abspage@last{6}
