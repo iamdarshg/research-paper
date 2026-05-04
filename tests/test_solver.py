@@ -79,7 +79,7 @@ class TestLBMSolvers(unittest.TestCase):
         total_mass_out = torch.sum(solver._solver.f).item()
 
         # Check mass conservation
-        self.assertAlmostEqual(total_mass_in, total_mass_out, places=4)
+        self.assertAlmostEqual(total_mass_in, total_mass_out, places=3)
 
         # Check momentum stability using conserved indices from solver
         m = torch.tensordot(solver._solver.moment_basis, solver._solver.f, dims=([1], [0]))

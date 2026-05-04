@@ -510,8 +510,8 @@ class D3Q27CascadedSolver:
             use_triton_streaming=bool(getattr(self.phys_config, "use_triton_streaming", False)),
         )
         # Issue #23: Correctly pass relaxation parameters
-        self._solver.s_e = float(getattr(self.phys_config, 's_energy', 1.2))
-        self._solver.s_h = float(getattr(self.phys_config, 's_higher', 1.6))
+        self._solver.s_e = float(getattr(self.phys_config, 's_e_d3q27', 1.2))
+        self._solver.s_h = float(getattr(self.phys_config, 's_h_d3q27', 1.6))
 
         self._solver.drag_link_metric_exponent = getattr(
             self.phys_config, "drag_link_metric_exponent", self._solver.drag_link_metric_exponent
@@ -616,23 +616,18 @@ class D3Q27CascadedSolver:
         # Issue #23: Convergence tracking
         tol = float(getattr(self.phys_config, 'convergence_tolerance', 1e-5))
         check_every = int(getattr(self.phys_config, 'check_convergence_every', 10))
+        # Handle 0 case to avoid crash (Review Feedback)
+        check_every = max(1, check_every)
 
         # run steps
         for step in range(steps):
+            v_prev = torch.stack([self.velocity_x, self.velocity_y, self.velocity_z])
+
             ux, uy, uz, rho = self._solver.collide_and_stream(
                 omega, geometry_mask, ext_force=ext_force, geom_hash=geom_hash
             )
 
-            # Issue #23: Relative L2 norm convergence check
-            if step > 0 and step % check_every == 0:
-                du = torch.sqrt((ux - self.velocity_x)**2 + (uy - self.velocity_y)**2 + (uz - self.velocity_z)**2)
-                u_mag = torch.sqrt(ux**2 + uy**2 + uz**2 + 1e-12)
-                rel_change = torch.norm(du) / (torch.norm(u_mag) + 1e-12)
-                if rel_change < tol:
-                    print(f"LBM Converged at step {step} (rel_change={rel_change:.2e} < {tol})")
-                    break
-
-            # store fields for diagnostics
+            # store fields for diagnostics BEFORE potential break (Review Feedback)
             self.velocity_x = ux
             self.velocity_y = uy
             self.velocity_z = uz
@@ -645,6 +640,16 @@ class D3Q27CascadedSolver:
             self.projected_drag_accum = self._solver.projected_drag_accum
             self.projected_drag_last = self._solver.projected_drag_last
             self.force_samples = self._solver.force_samples
+
+            # Issue #23: Relative L2 norm convergence check
+            if step > 0 and step % check_every == 0:
+                v_curr = torch.stack([ux, uy, uz])
+                du = v_curr - v_prev
+                u_mag = torch.sqrt(torch.sum(v_curr**2, dim=0) + 1e-12)
+                rel_change = torch.norm(du) / (torch.norm(u_mag) + 1e-12)
+                if rel_change < tol:
+                    self._solver.logger.log_info(f"LBM Converged at step {step} (rel_change={rel_change:.2e} < {tol})")
+                    break
 
     def _refresh_flow_diagnostics(self):
         """Update vorticity, Q-criterion, and turbulence proxy from the fields."""
@@ -769,6 +774,7 @@ class D3Q27CascadedSolver:
         ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
         ref_area = max(ref_area, h**2)
 
+        # Issue #23: Handle zero-sample case for early convergence (Review Feedback)
         if self._solver.force_samples > 0:
             projected_drag = self._solver.projected_drag_accum / self._solver.force_samples
             net_drag_force = self._solver.force_x_accum / self._solver.force_samples
