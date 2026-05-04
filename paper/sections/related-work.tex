@@ -1,7 +1,7 @@
 \section{Related Work}
 \label{sec:related_work}
 
-The convergence of generative modeling and computational engineering has transformed the landscape of structural and aerodynamic design \cite{chen2019aerospace, oh2019deep}. This section contextualizes our framework within the literature of diffusion models, 3D generation, topology optimization, and physics-informed machine learning.
+The convergence of generative modeling and computational engineering has been increasingly explored for structural and aerodynamic design \cite{chen2019aerospace, oh2019deep}. This section contextualizes our framework within the literature of diffusion models, 3D generation, topology optimization, and physics-informed machine learning.
 
 \subsection{Literature Coverage Map}
 Table \ref{tab:literature_map} provides a structured summary of the research areas addressed in this work, including representative papers, their contributions, and their implications for our experimental baselines.
@@ -10,15 +10,15 @@ Table \ref{tab:literature_map} provides a structured summary of the research are
 \centering
 \caption{Literature Coverage and Positioning Map}
 \label{tab:literature_map}
-\begin{tabular}{|p{2cm}|p{1.5cm}|p{2.5cm}|p{2.5cm}|p{2.5cm}|p{2cm}|}
+\begin{tabular}{|p{1.8cm}|p{2.2cm}|p{2.4cm}|p{2.4cm}|p{2.4cm}|p{2.0cm}|}
 \hline
-\textbf{Category} & \textbf{Method Families} & \textbf{What they solve} & \textbf{What they do not solve} & \textbf{How this paper differs} & \textbf{Baseline Implications} \\ \hline
-Diffusion Foundations & DDPM, Improved, SDE, Consistency & Ho \cite{ho2020denoising}, Nichol \cite{nichol2021improved}, Song \cite{song2023consistency} & Training stability and sample diversity in high dimensions. & Direct enforcement of hard structural connectivity constraints. & Informs the multi-step vs. 1-step ablation. \\ \hline
-3D Generative Modeling & Voxel, Point, Mesh, Implicit & Wu \cite{wu20163d}, Achlioptas \cite{achlioptas2018point}, Wang \cite{wang2018pixel2mesh} & Latent representation of complex 3D manifolds and surfaces. & Preservation of manifold integrity for CFD-ready meshes. & Planned voxel-GAN comparison. \\ \hline
-Generative Design \& TO & SIMP, Neural TO & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Rigorous material distribution for minimized compliance. & Sensitivity to initial seeds; exploratory design diversity. & Planned comparison against SIMP material efficiency. \\ \hline
-Aerodynamic Optimization & Airfoil, Adjoint, Surrogate & Jameson \cite{jameson1988aerodynamic}, Chen \cite{chen2019aerospace} & Local gradient-based and surrogate airfoil refinement. & Global topological exploration of coupled 3D fuselage/wings. & Reference for Cd/Cl surrogate accuracy. \\ \hline
-Physics-ML & PINNs, Neural Operators & Raissi \cite{raissi2019pinn}, Li \cite{li2020fourier} & PDE-constrained flow and structural field approximation. & Real-time, simulation-in-the-loop generative guidance. & Planned PINN-ready field benchmark. \\ \hline
-Constraint-Aware Generation & Manufacturability, Projection, Repair & Oh \cite{oh2019deep}, Steinmetz \cite{steinmetz2022generative} & Enforcing manufacturing and connectivity validity rules. & Semantic aircraft rules (e.g. clearance, part labeling). & Evaluated in our cleanup-threshold sweep. \\ \hline
+\textbf{Category} & \textbf{Key Papers} & \textbf{What they solve} & \textbf{What they do not solve} & \textbf{How this paper differs} & \textbf{Baseline Implications} \\ \hline
+Diffusion Foundations & Ho \cite{ho2020denoising}, Nichol \cite{nichol2021improved}, Song \cite{song2023consistency} & High-fidelity sampling and training stability in high-dimensional latent spaces. & Direct enforcement of hard physical or structural connectivity constraints. & Integrates a persistent Constraint Projector for aircraft-specific validity. & Informs the multi-step vs. 1-step ablation. \\ \hline
+3D Generative Modeling & Wu \cite{wu20163d}, Achlioptas \cite{achlioptas2018point}, Wang \cite{wang2018pixel2mesh} & Latent representation and generation of complex 3D manifolds/surfaces. & Guaranteed manifold integrity for high-fidelity CFD-ready meshes. & Semantic part labeling and structural connectivity priors for CFD-readiness. & Planned voxel-GAN comparison. \\ \hline
+Generative Design \& TO & Sigmund \cite{sigmund2001topology}, Sosnovik \cite{sosnovik2019neural} & Efficient material distribution for minimized compliance (load paths). & Global exploration of aerodynamic forms; sensitivity to initial seeds. & Diffusion-based global topological exploration beyond local gradient minima. & Planned comparison against SIMP material efficiency. \\ \hline
+Aerodynamic Optimization & Jameson \cite{jameson1988aerodynamic}, Chen \cite{chen2019aerospace} & Local adjoint-based refinement and efficient surrogate airfoil prediction. & Global topological exploration of coupled 3D fuselage/wings. & Integrated D3Q27 LBM for direct 3D simulation-in-the-loop feedback. & Reference for $C_d/C_l$ surrogate accuracy. \\ \hline
+Physics-ML & Raissi \cite{raissi2019pinn}, Li \cite{li2020fourier} & PDE-constrained flow and structural field approximation (PINNs/Operators). & Real-time generative guidance for complex 3D boundary conditions. & Hybrid multi-fidelity promotion (LBM to OpenFOAM) for training guidance. & Planned PINN-ready field benchmark. \\ \hline
+Constraint-Aware Generation & Oh \cite{oh2019deep}, Steinmetz \cite{steinmetz2022generative} & Enforcing manufacturing and connectivity rules via projection or neural priors. & Semantic aircraft-specific design rules (e.g., propulsion clearance). & Specialized \texttt{TypedAircraftGeometry} with semantic component cleanup. & Evaluated in our cleanup-threshold sweep. \\ \hline
 \end{tabular}
 \end{table*}
 
@@ -32,10 +32,10 @@ Foundational research has established diffusion-based models as a stable alterna
 Topology Optimization (TO), specifically the SIMP method \cite{sigmund2001topology}, is the industry standard for load-path optimization \cite{sigmund2013topology}. Recent neural TO approaches \cite{sosnovik2019neural} accelerate this process. However, TO is often sensitive to local minima and initial conditions. Our diffusion-based approach identifies aerodynamic forms that might be unreachable by gradient-based material redistribution alone. We plan to compare our results against SIMP-optimized forms to evaluate structural material efficiency.
 
 \subsection{Aerospace and Aerodynamic Shape Optimization}
-Aerodynamic design has evolved from adjoint-based methods \cite{jameson1988aerodynamic} to deep learning surrogates \cite{chen2019aerospace, thuerey2020physics}. While adjoint methods are efficient for local refinement, they struggle with global topological changes. Our framework uses an integrated D3Q27 LBM solver to provide real-time 3D aerodynamic feedback, positioning it as an exploratory tool that complements local adjoint-based optimization. The preliminary accuracy of this feedback is documented in Section \ref{sec:results}.
+Our framework uses an integrated D3Q27 LBM solver to provide low-latency 3D aerodynamic feedback, positioning it as an exploratory tool that complements local adjoint-based optimization. The preliminary accuracy of this feedback is documented in Section \ref{sec:results}.
 
 \subsection{Physics-Informed and Simulation-in-the-Loop ML}
-Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi2019pinn} or Neural Operators like FNO \cite{li2020fourier}. Our work follows a simulation-in-the-loop paradigm where a GPU-accelerated LBM solver provides real-time guidance during training. This enables multi-fidelity label promotion (from LBM to OpenFOAM), which we intend to use for generating ground truth fields for our PINN-ready benchmarks.
+Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi2019pinn} or Neural Operators like FNO \cite{li2020fourier}. Our work follows a simulation-in-the-loop paradigm where a GPU-accelerated LBM solver provides interactive-rate guidance during training. This enables multi-fidelity label promotion (from LBM to OpenFOAM), which we intend to use for generating ground truth fields for our PINN-ready benchmarks.
 
 \subsection{Constraint-Aware Generation}
 Enforcing physical validity—such as manufacturability and connectivity—remains a core challenge. Oh et al. \cite{oh2019deep} demonstrated generative design for structures, while Steinmetz et al. \cite{steinmetz2022generative} utilized differentiable projection for manufacturing. Our implementation extends this through a persistent Constraint Projector and semantic repair adapter designed to ensure designs comply with aircraft-specific clearance and connectivity rules. The effectiveness of these constraints is partially probed by our cleanup-threshold sweep in Section \ref{sec:results}.
@@ -45,6 +45,6 @@ This work is distinguished from prior art as follows:
 \begin{itemize}
     \item \textbf{vs. 3D Diffusion:} We prioritize physical manifold integrity and connectivity through a specialized semantic geometry system and BFL-consistent momentum exchange calculation.
     \item \textbf{vs. Topology Optimization:} We leverage the exploratory power of diffusion to identify aerodynamic forms outside the convergence basin of gradient-based material redistribution.
-    \item \textbf{vs. CFD Surrogates:} Our framework uses real-time simulation-in-the-loop feedback rather than a static surrogate, allowing for dynamic adaptation to 3D boundary conditions.
+    \item \textbf{vs. CFD Surrogates:} Our framework uses low-latency simulation-in-the-loop feedback rather than a static surrogate, allowing for dynamic adaptation to 3D boundary conditions.
 \end{itemize}
 This "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) approach allows for Design Space exploration while maintaining the validation standards documented in Section \ref{sec:results}.
