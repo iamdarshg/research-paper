@@ -58,7 +58,7 @@ To rigorously evaluate the proposed framework, we define a set of baseline compa
 We compare our method against three primary families of baselines:
 \begin{enumerate}
     \item \textbf{Classical Parametric Design:} We utilize a library of parametric aircraft primitives, specifically swept and tapered wings based on NACA 0012 and 4412 airfoil profiles. Parameters include aspect ratio (4--12), sweep angle (0--45$^\circ$), and taper ratio (0.4--1.0). This baseline represents traditional engineering "priors" and tests whether the generative model can discover forms with comparable or superior efficiency.
-    \item \textbf{Unconstrained Generative 3D:} We implement a voxel-GAN \cite{wu20163d} and a point-cloud diffusion model \cite{luo2021diffusion} trained on the same synthetic aircraft dataset but without the aerodynamic loss term or connectivity priors. These baselines isolate the contribution of our guidance mechanisms.
+    \item \textbf{Unconstrained Generative 3D:} We implement a voxel-GAN \cite{wu20163d}, a point-cloud diffusion model \cite{luo2021diffusion}, and an implicit occupancy network \cite{mescheder2019occupancy} trained on the same synthetic aircraft dataset but without the aerodynamic loss term or connectivity priors. These were selected as representative baselines for their respective 3D representations (voxel, point cloud, and implicit) to isolate the contribution of our specific guidance mechanisms.
     \item \textbf{Optimization-based Search:} We compare against two search strategies: (a) a SIMP-based topology optimization \cite{sigmund2001topology} for load-path efficiency, and (b) a surrogate-based search where 1,000 random design candidates are sampled and ranked by the same AeroSurrogate model used in our framework.
 \end{enumerate}
 
@@ -66,7 +66,9 @@ We compare our method against three primary families of baselines:
 We investigate the contribution of individual components through the following internal ablations:
 \begin{itemize}
     \item \textbf{Physics Ablation:} Training without the $\mathcal{L}_{aero}$ term to evaluate the specific impact of CFD guidance on the resulting $L/D$ distribution.
-    \item \textbf{Constraint Ablation:} Training without the $\mathcal{L}_{conn}$ term and disabling the `ConstraintProjector` during inference to measure the "natural" structural viability of the diffusion process.
+    \item \textbf{Connectivity Ablation:} Training without the $\mathcal{L}_{conn}$ term to measure the "natural" structural connectivity of the diffusion process.
+    \item \textbf{Cleanup Ablation:} Disabling the connected-component shape-prior cleanup hook to isolate the effect of post-processing on manifold integrity.
+    \item \textbf{Projection Ablation:} Disabling the semantic `ConstraintProjector` to evaluate the effectiveness of the repair-based projection versus the raw model output.
     \item \textbf{Consistency Sweep:} Evaluating inference performance and quality across consistency step counts $N \in \{1, 2, 4, 8\}$.
 \end{itemize}
 

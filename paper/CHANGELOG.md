@@ -9,6 +9,7 @@
 - Documented the current benchmark gap: the latest verified run still showed a large Cd mismatch, so the remaining work is focused on force accounting, sampling-window consistency, and lattice-to-physical conversion.
 - Retroactively recorded the next physics pass: `CLI/cascaded_lbm.py` now uses the lattice-consistent D3Q27 freestream scaling (`u = Ma / sqrt(3)`) instead of the earlier arbitrary freestream speed, and that fix is part of the ongoing benchmark history.
 - Added a GitHub Actions workflow to compile `paper/main.tex` into a PDF automatically and publish the artifact on push/PR.
-- Optimized D3Q27 solver performance by moving geometry content hashing outside the simulation hot loop and optimizing BFL boundary condition padding. (Issue #22)
-- Improved LBM solver stability and convergence by correctly passing MRT relaxation parameters and implementing a relative L2 norm convergence check for early termination. (Issue #23)
+- Implemented a rigorous, literature-driven baseline selection strategy in the research paper, covering classical, generative, and optimization-based families. (Issue #22)
+- Overhauled and audited the project bibliography (references.bib), adding missing categories for SDEs, 3D diffusion, and CFD validation standards. (Issue #23)
+- Optimized D3Q27 solver performance (geometry hashing, BFL padding) and improved stability via MRT parameter mapping and a relative L2 convergence monitor.
 - Moved the remaining extraction/workaround details out of the main paper and into this changelog so the paper stays focused on the validation result itself.
