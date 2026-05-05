@@ -24,7 +24,7 @@ Constraint Gen & Oh \cite{oh2019deep}, Steinmetz \cite{steinmetz2022generative} 
 \end{table*}
 
 \subsection{Diffusion and Generative Modeling Foundations}
-Foundational research has established diffusion-based models as a stable alternative to GANs. Denoising Diffusion Probabilistic Models (DDPM) \cite{ho2020denoising} and their improved variants \cite{nichol2021improved} provide high-fidelity sampling. Score-based models \cite{song2021score} and their continuous-time SDE formulations \cite{song2021score, karras2022elucidating} offer a rigorous mathematical framework for generation. Consistency Models \cite{song2023consistency} further improve training and inference speed by distilling these paths into fewer steps. Our work builds on these foundations, utilizing a 128D latent space to manage the computational cost of 3D grids, which we evaluate through multi-step and 1-step ablations.
+Foundational research has established diffusion-based models as a stable alternative to GANs. Denoising Diffusion Probabilistic Models (DDPM) \cite{ho2020denoising} and their improved variants \cite{nichol2021improved} provide high-fidelity sampling. Score-based models \cite{song2021score} and their continuous-time SDE formulations \cite{song2021score} offer a rigorous mathematical framework for generation, while recent work has further elucidated the broader design space and sampler choices for these diffusion models \cite{karras2022elucidating}. Consistency Models \cite{song2023consistency} further improve training and inference speed by distilling these paths into fewer steps. Our work builds on these foundations, utilizing a 128D latent space to manage the computational cost of 3D grids, which we evaluate through multi-step and 1-step ablations.
 
 \subsection{3D Shape Generation}
 3D generative models cover voxels \cite{wu20163d}, point clouds \cite{achlioptas2018point, luo2021diffusion}, meshes \cite{wang2018pixel2mesh}, and implicit surfaces \cite{mescheder2019occupancy}. While these models achieve strong results on visual datasets like ShapeNet \cite{chang2015shapenet} and PartNet \cite{mo2019partnet}, they often prioritize visual mimicry over the physical manifold integrity required for engineering. Our framework addresses this by integrating semantic part labeling and a structural connectivity prior, which we intend to validate against traditional voxel-GAN baselines.
@@ -33,7 +33,7 @@ Foundational research has established diffusion-based models as a stable alterna
 Topology Optimization (TO), specifically the SIMP method \cite{sigmund2001topology}, is the industry standard for load-path optimization \cite{sigmund2013topology}. Recent neural TO approaches \cite{sosnovik2019neural} accelerate this process. However, TO is often sensitive to local minima and initial conditions. Our diffusion-based approach identifies aerodynamic forms that might be unreachable by gradient-based material redistribution alone. We plan to compare our results against SIMP-optimized forms to evaluate structural material efficiency.
 
 \subsection{Aerospace and Aerodynamic Shape Optimization}
-Our framework uses an integrated D3Q27 LBM solver to provide simulation-in-the-loop 3D aerodynamic feedback, positioning it as an exploratory tool that complements local adjoint-based optimization. The preliminary accuracy of this feedback is documented in Section \ref{sec:results}.
+Modern aerodynamic shape optimization (ASO) relies on adjoint methods for gradient calculation \cite{jameson1988aerodynamic, jameson1995optimum} and surrogate modeling for efficient design space exploration \cite{forrester2008engineering}. Our framework uses an integrated D3Q27 LBM solver to provide simulation-in-the-loop 3D aerodynamic feedback, positioning it as an exploratory tool that complements local adjoint-based optimization. The preliminary accuracy of this feedback is documented in Section \ref{sec:results}.
 
 \subsection{Physics-Informed and Simulation-in-the-Loop ML}
 Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi2019pinn} or Neural Operators like FNO \cite{li2020fourier}. Our work follows a simulation-in-the-loop paradigm where a GPU-accelerated LBM solver provides guidance during training. This enables multi-fidelity label promotion (from LBM to OpenFOAM), which we intend to use for generating ground truth fields for our PINN-ready benchmarks.
@@ -49,3 +49,41 @@ This work is distinguished from prior art as follows:
     \item \textbf{vs. CFD Surrogates:} Our framework uses simulation-in-the-loop feedback rather than a static surrogate, allowing for dynamic adaptation to 3D boundary conditions.
 \end{itemize}
 This "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) approach allows for Design Space exploration while documenting preliminary validation checks in Section \ref{sec:results}.
+
+\subsection{Experimental Baseline Selection}
+\label{sec:baselines}
+To rigorously evaluate the proposed framework, we define a set of baseline comparisons and ablation studies. These baselines are selected to provide a fair context for evaluating generative expressiveness, aerodynamic efficiency, and structural viability.
+
+\subsubsection{Baseline Families}
+We compare our method against three primary families of baselines:
+\begin{enumerate}
+    \item \textbf{Classical Parametric Design:} We utilize a library of parametric aircraft primitives, specifically swept and tapered wings based on NACA 0012 and 4412 airfoil profiles. Parameters include aspect ratio (4--12), sweep angle (0--45$^\circ$), and taper ratio (0.4--1.0). This baseline represents traditional engineering "priors" and tests whether the generative model can discover forms with comparable or superior efficiency.
+    \item \textbf{Unconstrained Generative 3D:} We implement a voxel-GAN \cite{wu20163d} and a point-cloud diffusion model \cite{luo2021diffusion} trained on the same synthetic aircraft dataset but without the aerodynamic loss term or connectivity priors. These baselines isolate the contribution of our guidance mechanisms.
+    \item \textbf{Optimization-based Search:} We compare against two search strategies: (a) a SIMP-based topology optimization \cite{sigmund2001topology} for load-path efficiency, and (b) a surrogate-based search where 1,000 random design candidates are sampled and ranked by the same AeroSurrogate model used in our framework.
+\end{enumerate}
+
+\subsubsection{Ablation Studies}
+We investigate the contribution of individual components through the following internal ablations:
+\begin{itemize}
+    \item \textbf{Physics Ablation:} Training without the $\mathcal{L}_{aero}$ term to evaluate the specific impact of CFD guidance on the resulting $L/D$ distribution.
+    \item \textbf{Constraint Ablation:} Training without the $\mathcal{L}_{conn}$ term and disabling the `ConstraintProjector` during inference to measure the "natural" structural viability of the diffusion process.
+    \item \textbf{Consistency Sweep:} Evaluating inference performance and quality across consistency step counts $N \in \{1, 2, 4, 8\}$.
+\end{itemize}
+
+\subsubsection{Claim-to-Baseline Mapping}
+Table \ref{tab:experimental_plan} maps our primary research claims to specific baselines, metrics, and execution specifications.
+
+\begin{table*}[t]
+\centering
+\caption{Experimental Plan and Claim Mapping}
+\label{tab:experimental_plan}
+\footnotesize
+\begin{tabular}{|p{2.5cm}|p{3.0cm}|p{3.0cm}|p{5.0cm}|}
+\hline
+\textbf{Paper Claim} & \textbf{Baseline / Ablation} & \textbf{Metric} & \textbf{Execution Specification} \\ \hline
+Aerodynamic efficiency discovery & Classical parametric, No CFD loss ablation & $C_L/C_D$ (Lift-to-Drag ratio) & 500-step D3Q27 simulation at $128^3$ resolution; averaged over 50 samples. \\ \hline
+Structural manifold integrity & No connectivity prior, Voxel-GAN & Largest component ratio (\%); connectivity success rate & Component analysis of 100 generated designs at $32^3$ resolution. \\ \hline
+Design iteration speed & Surrogate-only search, DDPM (1000-step) & Runtime (s) vs. $L/D$ accuracy & 4-step Consistency vs. 1000-step DDPM on RTX 3090; 100 samples. \\ \hline
+Mission-conditioned diversity & Parametric primitives & MS-SSIM diversity score; parameter coverage & Batch generation of 10 designs per mission profile (6 profiles). \\ \hline
+\end{tabular}
+\end{table*}

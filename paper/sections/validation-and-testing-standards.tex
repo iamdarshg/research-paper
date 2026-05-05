@@ -21,39 +21,3 @@ Validation is now reproducible on a single local machine with OpenFOAM installed
 
 The paper therefore claims the following and nothing more: the export path is concrete, the benchmark comparison is measurable, and the shared validation geometry is documented explicitly so the solver-to-solver check can be repeated without ambiguity.
 
-\subsection{Experimental Design and Baseline Selection}
-To rigorously evaluate the proposed framework, we define a set of baseline comparisons and ablation studies. These baselines are selected to provide context for the generative performance and aerodynamic efficiency of our method.
-
-\subsubsection{Baseline Families}
-We compare our method against three primary families of baselines:
-\begin{enumerate}
-    \item \textbf{Classical Design:} Parametric aircraft primitives and hand-designed bodies based on standard NACA airfoils.
-    \item \textbf{Generative 3D:} Traditional voxel-GAN architectures and point-cloud diffusion models without aerodynamic guidance.
-    \item \textbf{Optimization-based:} SIMP-based topology optimization and surrogate-based aerodynamic shape optimization (ASO).
-\end{enumerate}
-
-\subsubsection{Ablation Studies}
-We investigate the contribution of individual components through the following ablations:
-\begin{itemize}
-    \item \textbf{No CFD Loss:} Evaluating the impact of aerodynamic guidance on shape efficiency.
-    \item \textbf{No Connectivity Prior:} Assessing structural viability without the connectivity loss term.
-    \item \textbf{Resolution Sweep:} Testing the scalability of the progressive training schedule across 16\textsuperscript{3}, 32\textsuperscript{3}, and 64\textsuperscript{3} resolutions.
-\end{itemize}
-
-\subsubsection{Claim-to-Baseline Mapping}
-Table \ref{tab:experimental_plan} summarizes our primary research claims and the corresponding experimental validation strategy.
-
-\begin{table}[h]
-\centering
-\caption{Experimental Plan and Claim Mapping}
-\label{tab:experimental_plan}
-\footnotesize
-\begin{tabular}{|p{2.5cm}|p{2.0cm}|p{1.5cm}|p{1.5cm}|}
-\hline
-\textbf{Paper Claim} & \textbf{Baseline / Ablation} & \textbf{Metric} & \textbf{Validation Run} \\ \hline
-Aerodynamic efficiency improvement & Classical design, No CFD loss & $L/D$ Ratio & High-res D3Q27 \\ \hline
-Structural connectivity & No connectivity prior & Label count & 32\textsuperscript{3} Generation \\ \hline
-Fast multi-fidelity design & ASO baseline, GAN baseline & Runtime vs. Accuracy & Multi-step sweep \\ \hline
-Generalization to mission profiles & Parametric primitives & Design diversity & Conditioned batch gen \\ \hline
-\end{tabular}
-\end{table}

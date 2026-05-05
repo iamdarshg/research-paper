@@ -79,6 +79,8 @@ class TestLBMSolvers(unittest.TestCase):
         total_mass_out = torch.sum(solver._solver.f).item()
 
         # Check mass conservation
+        # Note: 'places=3' is required to account for cumulative floating-point
+        # truncation during population updates and BFL interpolation on CPU.
         self.assertAlmostEqual(total_mass_in, total_mass_out, places=3)
 
         # Check momentum stability using conserved indices from solver
