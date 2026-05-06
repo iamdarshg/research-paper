@@ -36,10 +36,10 @@ Topology Optimization (TO), specifically the SIMP method \cite{sigmund2001topolo
 Modern aerodynamic shape optimization (ASO) relies on adjoint methods for gradient calculation \cite{jameson1988aerodynamic, jameson1995optimum} and surrogate modeling for efficient design space exploration \cite{forrester2008engineering}. Our framework uses an integrated D3Q27 LBM solver to provide simulation-in-the-loop 3D aerodynamic feedback, positioning it as an exploratory tool that complements local adjoint-based optimization. The preliminary accuracy of this feedback is documented in Section \ref{sec:results}.
 
 \subsection{Physics-Informed and Simulation-in-the-Loop ML}
-Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi2019pinn} or Neural Operators like FNO \cite{li2020fourier}. Our work follows a simulation-in-the-loop paradigm where a GPU-accelerated LBM solver provides guidance during training. This enables multi-fidelity label promotion (from LBM to OpenFOAM), which we intend to use for generating ground truth fields for our PINN-ready benchmarks.
+Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi2019pinn} or Neural Operators like FNO \cite{li2020fourier} and DeepONet \cite{lu2021deeponet}. Our work follows a simulation-in-the-loop paradigm where a GPU-accelerated LBM solver provides guidance during training \cite{vinuesa2022enhancing}. This enables multi-fidelity label promotion (from LBM to OpenFOAM), which we intend to use for generating ground truth fields for our PINN-ready benchmarks.
 
 \subsection{Constraint-Aware Generation}
-Enforcing physical validity—such as manufacturability and connectivity—remains a core challenge. Oh et al. \cite{oh2019deep} demonstrated generative design for structures, while Steinmetz et al. \cite{steinmetz2022generative} utilized differentiable projection for manufacturing. Our implementation extends this through a persistent Constraint Projector and semantic repair adapter designed to ensure designs comply with aircraft-specific clearance and connectivity rules. The effectiveness of these constraints is partially probed by our cleanup-threshold sweep in Section \ref{sec:results}.
+Enforcing physical validity—such as manufacturability and connectivity—remains a core challenge \cite{wang2023physics}. Oh et al. \cite{oh2019deep} demonstrated generative design for structures, while Steinmetz et al. \cite{steinmetz2022generative} utilized differentiable projection for manufacturing. Our implementation extends this through a persistent Constraint Projector and semantic repair adapter designed to ensure designs comply with aircraft-specific clearance and connectivity rules. The effectiveness of these constraints is partially probed by our planned cleanup-threshold sweep in Section \ref{sec:results}.
 
 \subsection{Novelty and Positioning}
 This work is distinguished from prior art as follows:
@@ -55,21 +55,20 @@ This "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) approach all
 To rigorously evaluate the proposed framework, we define a set of baseline comparisons and ablation studies. These baselines are selected to provide a fair context for evaluating generative expressiveness, aerodynamic efficiency, and structural viability.
 
 \subsubsection{Baseline Families}
-We compare our method against three primary families of baselines:
+We compare our method against four primary families of baselines, representing the state of the art in traditional and data-driven design:
 \begin{enumerate}
-    \item \textbf{Classical Parametric Design:} We utilize a library of parametric aircraft primitives, specifically swept and tapered wings based on NACA 0012 and 4412 airfoil profiles. Parameters include aspect ratio (4--12), sweep angle (0--45$^\circ$), and taper ratio (0.4--1.0). This baseline represents traditional engineering "priors" and tests whether the generative model can discover forms with comparable or superior efficiency.
-    \item \textbf{Unconstrained Generative 3D:} We implement a voxel-GAN \cite{wu20163d}, a point-cloud diffusion model \cite{luo2021diffusion}, and an implicit occupancy network \cite{mescheder2019occupancy} trained on the same synthetic aircraft dataset but without the aerodynamic loss term or connectivity priors. These were selected as representative baselines for their respective 3D representations (voxel, point cloud, and implicit) to isolate the contribution of our specific guidance mechanisms.
-    \item \textbf{Optimization-based Search:} We compare against two search strategies: (a) a SIMP-based topology optimization \cite{sigmund2001topology} for load-path efficiency, and (b) a surrogate-based search where 1,000 random design candidates are sampled and ranked by the same AeroSurrogate model used in our framework.
+    \item \textbf{Classical Primitives:} We utilize a library of hand-designed parametric aircraft primitives, specifically swept and tapered wings extruded from NACA 0012 and 4412 airfoil profiles. Parameters include aspect ratio (4--12), sweep angle (0--45$^\circ$), and taper ratio (0.4--1.0). These represent the "gold standard" of traditional aero-structural design.
+    \item \textbf{Unconstrained Generative 3D:} We will evaluate against representative models for voxel, point-cloud, and implicit representations, specifically voxel-GAN \cite{wu20163d}, point-cloud diffusion \cite{luo2021diffusion}, and implicit occupancy networks \cite{mescheder2019occupancy}. These models are trained on the same synthetic dataset but lack our aerodynamic guidance and connectivity priors, allowing us to isolate the impact of our constraints.
+    \item \textbf{Independent Optimization Search:} To benchmark the efficiency of the diffusion process, we compare against (a) a SIMP-based topology optimization \cite{sigmund2001topology} for material distribution, and (b) an independent random-search baseline where 1,000 design candidates are sampled and ranked directly by high-fidelity D3Q27 CFD simulations.
+    \item \textbf{Differentiable Aerodynamic Shape Optimization (ASO):} We include a baseline using adjoint-based gradient descent \cite{jameson1995optimum} to refine the mesh of a standard fuselage-wing primitive, testing whether generative exploration can find superior global optima compared to local refinement.
 \end{enumerate}
 
 \subsubsection{Ablation Studies}
-We investigate the contribution of individual components through the following internal ablations:
+We investigate the contribution of individual components through a planned experimental protocol:
 \begin{itemize}
     \item \textbf{Physics Ablation:} Training without the $\mathcal{L}_{aero}$ term to evaluate the specific impact of CFD guidance on the resulting $L/D$ distribution.
-    \item \textbf{Connectivity Ablation:} Training without the $\mathcal{L}_{conn}$ term to measure the "natural" structural connectivity of the diffusion process.
-    \item \textbf{Cleanup Ablation:} Disabling the connected-component shape-prior cleanup hook to isolate the effect of post-processing on manifold integrity.
-    \item \textbf{Projection Ablation:} Disabling the semantic `ConstraintProjector` to evaluate the effectiveness of the repair-based projection versus the raw model output.
-    \item \textbf{Consistency Sweep:} Evaluating inference performance and quality across consistency step counts $N \in \{1, 2, 4, 8\}$.
+    \item \textbf{Structural Ablation Suite:} To isolate the effects of our manifold integrity mechanisms, we compare (a) a "no-constraint" model (no $\mathcal{L}_{conn}$), (b) a "no-cleanup" model (disabling the connected-component post-processing hook), and (c) a "no-projection" model (disabling the semantic `ConstraintProjector`).
+    \item \textbf{Consistency Step Sweep:} Evaluating the Pareto frontier of design quality versus inference latency across step counts $N \in \{1, 2, 4, 8, 16\}$.
 \end{itemize}
 
 \subsubsection{Claim-to-Baseline Mapping}
@@ -80,12 +79,12 @@ Table \ref{tab:experimental_plan} maps our primary research claims to specific b
 \caption{Experimental Plan and Claim Mapping}
 \label{tab:experimental_plan}
 \footnotesize
-\begin{tabular}{|p{2.5cm}|p{3.0cm}|p{3.0cm}|p{5.0cm}|}
+\begin{tabular}{|p{2.2cm}|p{3.3cm}|p{3.5cm}|p{4.5cm}|}
 \hline
-\textbf{Paper Claim} & \textbf{Baseline / Ablation} & \textbf{Metric} & \textbf{Execution Specification} \\ \hline
-Aerodynamic efficiency discovery & Classical parametric, No CFD loss ablation & $C_L/C_D$ (Lift-to-Drag ratio) & 500-step D3Q27 simulation at $128^3$ resolution; averaged over 50 samples. \\ \hline
-Structural manifold integrity & No connectivity prior, Voxel-GAN & Largest component ratio (\%); connectivity success rate & Component analysis of 100 generated designs at $32^3$ resolution. \\ \hline
-Design iteration speed & Surrogate-only search, DDPM (1000-step) & Runtime (s) vs. $L/D$ accuracy & 4-step Consistency vs. 1000-step DDPM on RTX 3090; 100 samples. \\ \hline
-Mission-conditioned diversity & Parametric primitives & MS-SSIM diversity score; parameter coverage & Batch generation of 10 designs per mission profile (6 profiles). \\ \hline
+\textbf{Research Claim} & \textbf{Baseline / Ablation} & \textbf{Evaluation Metrics} & \textbf{Planned Protocol} \\ \hline
+Aerodynamic efficiency & Classical Primitives; Adjoint ASO; No-CFD-loss & $C_L/C_D$; Drag count ($C_D \times 10^4$) & 1,000-step D3Q27 at $128^3$ res; 50 samples per configuration. \\ \hline
+Manifold integrity & Voxel-GAN; Point-cloud Diffusion; No-cleanup & Connected component ratio (\%); Repair success rate (\%) & Voxel-connectivity analysis of 200 random designs at $32^3$ res. \\ \hline
+Computational efficiency & Random-search + CFD ranking; DDPM (1,000 steps) & Inference latency (s); VRAM (GB); $L/D$ convergence rate & Wall-clock timing on RTX 3090/A100; batch size 4; 100 samples. \\ \hline
+Generative diversity & Parametric Primitives (swept/tapered wing library) & MS-SSIM; Latent-space coverage; Parts-volume variance & Conditioned batch gen (10 designs $\times$ 6 classes $\times$ 5 missions). \\ \hline
 \end{tabular}
 \end{table*}

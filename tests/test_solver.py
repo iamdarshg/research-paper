@@ -80,9 +80,11 @@ class TestLBMSolvers(unittest.TestCase):
 
         total_mass_out = torch.sum(solver._solver.f).item()
 
-        # Check mass conservation (machine precision for float32 is ~1e-7 relative)
+        # Check mass conservation
         # Note: BFL interpolation and MRT moment transforms on CPU accumulate minor
-        # truncation errors over multiple steps in float32.
+        # truncation errors over multiple steps in float32. A delta of 1e-3 is
+        # accepted to account for these cumulative errors while still verifying
+        # that no major mass leaks occur.
         self.assertAlmostEqual(total_mass_in, total_mass_out, delta=1e-3)
 
         # Check momentum stability using conserved indices from solver
