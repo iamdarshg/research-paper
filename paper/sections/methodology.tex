@@ -35,10 +35,10 @@ The total loss function is a weighted sum of three components: the diffusion los
 \mathcal{L} = \lambda_{diff} \mathcal{L}_{diff} + \lambda_{conn} \mathcal{L}_{conn} + \lambda_{aero} \mathcal{L}_{aero}
 \end{equation}
 
-The diffusion loss is the mean squared error between the predicted noise and the actual noise. The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis. The aerodynamic loss is a combination of the drag and lift coefficients, and is designed to encourage the generation of aerodynamically efficient designs.
+The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis. The aerodynamic loss is a combination of the drag and lift coefficients, and is designed to encourage the generation of designs with improved aerodynamic characteristics.
 
-\subsection{Rigorous Integration of CFD in Diffusion Training}
-To ensure the generated geometries are physically viable, we integrate the CFD solver directly into the gradient-based optimization loop. This is achieved by differentiating through the LBM solver or by using the solver as a score-guidance function during the reverse diffusion process.
+\subsection{Integration of CFD in Diffusion Training}
+To improve the physical plausibility of the generated geometries, we integrate the CFD solver directly into the gradient-based optimization loop. This is achieved by differentiating through the LBM solver or by using the solver as a score-guidance function during the reverse diffusion process. This approach provides a first-order approximation of the aerodynamic manifold within the latent space.
 
 \begin{itemize}
     \item \textbf{Step 1:} Sample noisy latent $z_t$.

@@ -17,7 +17,7 @@ Figure \ref{fig:loss_curves} summarizes the observed losses across the three pro
 \end{figure}
 
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}
-We ran a compact sweep over generation step count and the shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, and computed aerodynamic metrics using the CPU CFD path. The results in Figure \ref{fig:ld_sweep} provide a preliminary probe of how post-processing thresholds change the resulting aerodynamic score distribution.
+We ran a compact sweep over generation step count and the shape-prior cleanup threshold to probe the framework's behavior. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, and computed aerodynamic metrics using the CPU CFD path. The results in Figure \ref{fig:ld_sweep} provide a preliminary code-path validation of how post-processing thresholds change the resulting aerodynamic score distribution.
 
 \begin{figure}[!t]
 \centering
@@ -62,7 +62,7 @@ Unit Cube & 1000 & 1.04 & $\sim$1.05 \cite{geier2015cascaded} \\ \hline
 \end{tabular}
 \end{table}
 
-The results in Table \ref{tab:cd_validation} provide an informal sanity check for our LBM implementation, framing the observations against typical literature targets for 3D flow. The tests were conducted in a $10L \times 5L \times 5L$ domain ($L$: characteristic length) using a $128^3$ grid, no-slip BFL wall conditions, and a Neumann outlet. We mapped physical velocity to $Ma=0.025$ ($u_{lattice} \approx 0.014$) and averaged forces over the final 125 steps of a 500-step simulation to ensure stability.
+The results in Table \ref{tab:cd_validation} provide an informal sanity check for our LBM implementation, framing the observations against typical literature targets for 3D flow. These results demonstrate that the internal solver can capture the broad physical trends required for generative guidance, though they do not yet constitute publication-grade validation. The tests were conducted in a $10L \times 5L \times 5L$ domain ($L$: characteristic length) using a $128^3$ grid, no-slip BFL wall conditions, and a Neumann outlet. We mapped physical velocity to $Ma=0.025$ ($u_{lattice} \approx 0.014$) and averaged forces over the final 125 steps of a 500-step simulation to ensure stability.
 
 Following physics corrections to the freestream lattice velocity initialization and BFL momentum exchange weighting ($4.0/(1+2q)$), the solver yields $C_d$ values that align with the broad expectations of the literature. While exact 3D benchmarks are sensitive to blockage ratios and averaging criteria, these results confirm the solver's utility for providing simulation-in-the-loop guidance. These calibrated physics enable the generation of aerodynamic labels for surrogate training, though rigorous validation remains tiered behind high-fidelity PDE solvers.
 

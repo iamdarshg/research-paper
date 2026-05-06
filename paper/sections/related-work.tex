@@ -41,14 +41,16 @@ Physics-informed machine learning incorporates PDEs through PINNs \cite{raissi20
 \subsection{Constraint-Aware Generation}
 Enforcing physical validity—such as manufacturability and connectivity—remains a core challenge \cite{wang2023physics}. Oh et al. \cite{oh2019deep} demonstrated generative design for structures, while Steinmetz et al. \cite{steinmetz2022generative} utilized differentiable projection for manufacturing. Our implementation extends this through a persistent Constraint Projector and semantic repair adapter designed to ensure designs comply with aircraft-specific clearance and connectivity rules. The effectiveness of these constraints is partially probed by our planned cleanup-threshold sweep in Section \ref{sec:results}.
 
-\subsection{Novelty and Positioning}
-This work is distinguished from prior art as follows:
-\begin{itemize}
-    \item \textbf{vs. 3D Diffusion:} We prioritize physical manifold integrity and connectivity through a specialized semantic geometry system and BFL-consistent momentum exchange calculation.
-    \item \textbf{vs. Topology Optimization:} We leverage the exploratory power of diffusion to identify aerodynamic forms outside the convergence basin of gradient-based material redistribution.
-    \item \textbf{vs. CFD Surrogates:} Our framework uses simulation-in-the-loop feedback rather than a static surrogate, allowing for dynamic adaptation to 3D boundary conditions.
-\end{itemize}
-This "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) approach allows for Design Space exploration while documenting preliminary validation checks in Section \ref{sec:results}.
+\subsection{Positioning and Novelty}
+This work addresses the gap between high-fidelity 3D generative modeling and physics-constrained engineering design. While standard diffusion models excel at capturing complex visual manifolds \cite{rombach2022latent, ho2020denoising}, they are often "physics-blind," producing geometries that may be visually plausible but aerodynamically inefficient or structurally fragmented. Our framework is distinguished from prior art as follows:
+
+\begin{enumerate}
+    \item \textbf{vs. 3D Diffusion (Luo \cite{luo2021diffusion}, Wu \cite{wu20163d}):} Most 3D diffusion work focuses on point clouds or unconstrained voxels for general object classes. We introduce a specialized semantic geometry system and a Bouzidi-Firdaouss-Lallemand (BFL) consistent momentum exchange calculation to prioritize physical manifold integrity specifically for aircraft structures.
+    \item \textbf{vs. Topology Optimization (Sigmund \cite{sigmund2001topology}):} Traditional TO is highly effective for local compliance minimization but is often sensitive to initial seeds and limited to local gradient-based material redistribution. We leverage the global exploratory power of diffusion to identify aerodynamic forms that may exist outside the local convergence basin of traditional TO.
+    \item \textbf{vs. CFD Surrogates (Chen \cite{chen2019aerospace}, Forrester \cite{forrester2008engineering}):} Many "AI-for-CFD" papers focus on building static surrogates to replace solvers. In contrast, we use a simulation-in-the-loop paradigm where the D3Q27 LBM solver provides dynamic guidance during the reverse diffusion process, allowing the model to adapt to 3D boundary conditions without a pre-computed dataset.
+\end{enumerate}
+
+This "Thinking in Diffusion and Speaking in Autoregression" (TiDAR) approach allows for expansive design space exploration while documenting preliminary validation checks in Section \ref{sec:results}. We explicitly distinguish this proof-of-concept pipeline validation from the full aerodynamic validation required for production aerospace designs, which remains future work.
 
 \subsection{Experimental Baseline Selection}
 \label{sec:baselines}
