@@ -99,8 +99,8 @@ class D3Q27Solver:
                 self.s_indices[i] = 3  # High-order
 
         self.conserved_indices = torch.tensor(self.conserved_indices, dtype=torch.long, device=device)
-        self.s_e = 1.1
-        self.s_h = 1.1
+        self.s_e = 1.2
+        self.s_h = 1.6
 
         # Cache masks for vectorized boundary population updates
         self._inlet_mask = self.ex > 0
@@ -132,11 +132,11 @@ class D3Q27Solver:
         # Precompute Guo directions
         self.ei_guo = torch.stack([self.ex_f, self.ey_f, self.ez_f], dim=1).view(27, 3, 1, 1, 1)
 
-    def _get_q(self, geometry_mask):
+    def _get_q(self, geometry_mask, geom_hash=None):
         """Get or compute sub-voxel distances for the given geometry (Fix A/Issue #15)."""
         # Fix A: Use a true content hash for the geometry key (Review Feedback)
-        # TODO: Move geometry hashing outside the per-step hot loop to reduce CPU-GPU sync overhead
-        geom_key = compute_tensor_content_hash(geometry_mask)
+        # Issue #22: Support pre-computed hash to reduce CPU-GPU sync overhead
+        geom_key = geom_hash if geom_hash is not None else compute_tensor_content_hash(geometry_mask)
 
         if geom_key not in self._q_cache:
             # CPU/SciPy cost is explicit here.
@@ -177,12 +177,12 @@ class D3Q27Solver:
         self._force_sample_start = max(0, int(sample_start))
         self._force_step = 0
 
-    def _accumulate_momentum_exchange_force(self, geometry_mask):
+    def _accumulate_momentum_exchange_force(self, geometry_mask, geom_hash=None):
         """Compute wall force from fluid-solid links using bounce-back exchange and BFL correction."""
-        boundary_links = self._boundary_links(geometry_mask)
+        boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
 
         # BFL wall distance q (shape: [26, D, H, W])
-        q = self._get_q(geometry_mask)
+        q = self._get_q(geometry_mask, geom_hash=geom_hash)
 
         step_force_x = torch.tensor(0.0, device=self.device)
         step_force_z = torch.tensor(0.0, device=self.device)
@@ -215,9 +215,9 @@ class D3Q27Solver:
         projected_side = float(np.sqrt(max(projected_cells, 1.0)))
         return float(np.clip(1.68 - 0.295 * (projected_side - 13.0), 0.5, 1.68))
 
-    def _accumulate_projected_pressure_drag_proxy(self, geometry_mask):
+    def _accumulate_projected_pressure_drag_proxy(self, geometry_mask, geom_hash=None):
         """Coarse-grid pressure-drag proxy from upwind-facing D3Q27 wall links."""
-        boundary_links = self._boundary_links(geometry_mask)
+        boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
         flow_sign = 1.0 if self.inlet_velocity_lu >= 0.0 else -1.0
         upwind = (self._force_ex * flow_sign) > 0.0
         metric_exponent = self._effective_drag_link_metric_exponent(geometry_mask)
@@ -225,10 +225,11 @@ class D3Q27Solver:
         projected = 2.0 * torch.abs(self._force_ex) * metric * self.f_pre_stream[self._force_dir_index]
         return torch.sum(torch.where(upwind, projected * boundary_links, torch.zeros_like(projected)))
 
-    def _boundary_links(self, geometry_mask):
+    def _boundary_links(self, geometry_mask, geom_hash=None):
         """Cache static fluid-solid links without boundary wraparound (Issue #15)."""
         # Use true content hash for cache key (Review Feedback)
-        cache_key = compute_tensor_content_hash(geometry_mask)
+        # Issue #22: Support pre-computed hash to reduce CPU-GPU sync overhead
+        cache_key = geom_hash if geom_hash is not None else compute_tensor_content_hash(geometry_mask)
         if cache_key == self._boundary_cache_key and self._boundary_link_cache is not None:
             return self._boundary_link_cache
 
@@ -286,13 +287,19 @@ class D3Q27Solver:
         self.f_temp[:, :, :, 0] = self.f_temp[:, :, :, 1]
         self.f_temp[:, :, :, -1] = self.f_temp[:, :, :, -2]
 
-    def _apply_bfl_boundary(self, geometry_mask):
+    def _apply_bfl_boundary(self, geometry_mask, geom_hash=None):
         """Bouzidi-Firdaouss-Lallemand (BFL) boundary condition."""
-        q = self._get_q(geometry_mask)
+        q = self._get_q(geometry_mask, geom_hash=geom_hash)
 
         # Standard bounce-back links
-        mask = geometry_mask > 0.5
-        boundary_links = self._boundary_links(geometry_mask)
+        boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
+
+        # Issue #22: Optimize padding by padding the entire tensor once if possible,
+        # but since directions vary, we still need to shift.
+        # We can at least pad the spatial dimensions of f_pre_stream once.
+        # self.f_pre_stream: [27, D, H, W]
+        D, H, W = geometry_mask.shape
+        f_pre_padded = torch.nn.functional.pad(self.f_pre_stream, (1, 1, 1, 1, 1, 1), mode='constant', value=0)
 
         for i in range(1, 27):
             opp_i = self._opposite_list[i]
@@ -307,15 +314,10 @@ class D3Q27Solver:
 
             # Identify neighbors without wraparound (Issue #15)
             dx, dy, dz = self._stream_shifts[i]
-            D, H, W = geometry_mask.shape
 
-            # Pad pre-stream populations to avoid roll wraparound
-            f_padded = torch.nn.functional.pad(self.f_pre_stream[i], (1, 1, 1, 1, 1, 1), mode='constant', value=0)
-            # Neighbor at x-e is at (1+x-dx, 1+y-dy, 1+z-dz) in padded
-            d_s, d_e = 1-dx, 1-dx+D
-            h_s, h_e = 1-dy, 1-dy+H
-            w_s, w_e = 1-dz, 1-dz+W
-            f_neighbor = f_padded[d_s:d_e, h_s:h_e, w_s:w_e][active]
+            # Neighbor at x-e_i is at (1-dx, 1-dy, 1-dz) in padded coords
+            # f_pre_padded has shape [27, D+2, H+2, W+2]
+            f_neighbor = f_pre_padded[i, 1-dx:1-dx+D, 1-dy:1-dy+H, 1-dz:1-dz+W][active]
 
             # BFL interpolation based on q
             q_low = qi < 0.5
@@ -368,7 +370,7 @@ class D3Q27Solver:
         S = factor * self.w.view(27, 1, 1, 1) * (term1 + term2)
         return S
 
-    def collide_and_stream(self, omega, geometry_mask, ext_force=None):
+    def collide_and_stream(self, omega, geometry_mask, ext_force=None, geom_hash=None):
         geometry_mask = geometry_mask.to(self.device, non_blocking=True)
         # Guard against runaway non-finite populations from previous steps.
         self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
@@ -444,12 +446,12 @@ class D3Q27Solver:
                 self.f_temp[i] = torch.roll(self.f[i], shifts=self._stream_shifts[i], dims=(0,1,2))
 
             # Sub-voxel boundary conditions
-            self._apply_bfl_boundary(geometry_mask)
+            self._apply_bfl_boundary(geometry_mask, geom_hash=geom_hash)
 
         self._apply_domain_boundaries()
 
-        step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask)
-        step_projected_drag = self._accumulate_projected_pressure_drag_proxy(geometry_mask)
+        step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask, geom_hash=geom_hash)
+        step_projected_drag = self._accumulate_projected_pressure_drag_proxy(geometry_mask, geom_hash=geom_hash)
 
         self.f.copy_(self.f_temp)
         self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
@@ -507,6 +509,10 @@ class D3Q27CascadedSolver:
             inlet_velocity_lu=self.inlet_velocity_lu,
             use_triton_streaming=bool(getattr(self.phys_config, "use_triton_streaming", False)),
         )
+        # Issue #23: Correctly pass relaxation parameters
+        self._solver.s_e = float(getattr(self.phys_config, 's_e_d3q27', 1.2))
+        self._solver.s_h = float(getattr(self.phys_config, 's_h_d3q27', 1.6))
+
         self._solver.drag_link_metric_exponent = getattr(
             self.phys_config, "drag_link_metric_exponent", self._solver.drag_link_metric_exponent
         )
@@ -604,10 +610,24 @@ class D3Q27CascadedSolver:
         sample_start = max(0, steps - sample_window)
         self._solver.reset_force_accounting(sample_start=sample_start)
 
+        # Issue #22: Compute hash once
+        geom_hash = compute_tensor_content_hash(geometry_mask)
+
+        # Issue #23: Convergence tracking
+        tol = float(getattr(self.phys_config, 'convergence_tolerance', 1e-5))
+        check_every = int(getattr(self.phys_config, 'check_convergence_every', 10))
+        # Handle 0 case to avoid crash (Review Feedback)
+        check_every = max(1, check_every)
+
         # run steps
-        for _ in range(steps):
-            ux, uy, uz, rho = self._solver.collide_and_stream(omega, geometry_mask, ext_force=ext_force)
-            # store fields for diagnostics
+        for step in range(steps):
+            v_prev = torch.stack([self.velocity_x, self.velocity_y, self.velocity_z])
+
+            ux, uy, uz, rho = self._solver.collide_and_stream(
+                omega, geometry_mask, ext_force=ext_force, geom_hash=geom_hash
+            )
+
+            # store fields for diagnostics BEFORE potential break (Review Feedback)
             self.velocity_x = ux
             self.velocity_y = uy
             self.velocity_z = uz
@@ -620,6 +640,16 @@ class D3Q27CascadedSolver:
             self.projected_drag_accum = self._solver.projected_drag_accum
             self.projected_drag_last = self._solver.projected_drag_last
             self.force_samples = self._solver.force_samples
+
+            # Issue #23: Relative L2 norm convergence check
+            if step > 0 and step % check_every == 0:
+                v_curr = torch.stack([ux, uy, uz])
+                du = v_curr - v_prev
+                u_mag = torch.sqrt(torch.sum(v_curr**2, dim=0) + 1e-12)
+                rel_change = torch.norm(du) / (torch.norm(u_mag) + 1e-12)
+                if rel_change < tol:
+                    self._solver.logger.log_info(f"LBM Converged at step {step} (rel_change={rel_change:.2e} < {tol})")
+                    break
 
     def _refresh_flow_diagnostics(self):
         """Update vorticity, Q-criterion, and turbulence proxy from the fields."""
@@ -744,6 +774,7 @@ class D3Q27CascadedSolver:
         ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
         ref_area = max(ref_area, h**2)
 
+        # Issue #23: Handle zero-sample case for early convergence (Review Feedback)
         if self._solver.force_samples > 0:
             projected_drag = self._solver.projected_drag_accum / self._solver.force_samples
             net_drag_force = self._solver.force_x_accum / self._solver.force_samples
