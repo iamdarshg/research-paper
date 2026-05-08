@@ -1,53 +1,39 @@
-# Citation and Claim Audit (Detailed)
+# Detailed Claim-by-Claim Citation Audit
 
-This document provides a claim-by-claim audit of the research paper to ensure every technical assertion is backed by literature or evidence.
+This document tracks every paragraph in the Introduction, Related Work, Methodology, and Results sections to ensure technical claims are properly supported by literature or repository evidence.
 
-| Section | Exact Claim / Paragraph | Support Type | Status | Linked Evidence / Citation |
-|---------|-------------------------|--------------|--------|----------------------------|
-| Intro | "latent diffusion model... demonstrated remarkable success in generating... three-dimensional shapes" | Literature | OK | Luo (2021), Wu (2016) |
-| Intro | "efficiently learn the underlying distribution of viable aircraft designs" | Repo Evidence | Soften | Not fully demonstrated; change to "intended to learn... from provided datasets". |
-| Intro | "generate novel structures that adhere to a set of predefined constraints" | Repo Evidence | Soften | Currently "proof-of-concept for constraint enforcement". |
-| Related | "prior 3D generative frameworks typically lack simulation-in-the-loop mechanisms" | Literature | Soften | Broad claim; change to "lack direct integration of high-fidelity CFD within the diffusion loop". |
-| Related | "Diffusion [Gaps]: Direct enforcement of hard structural connectivity rules" | Literature | OK | Cited lack of hard manifold constraints in Ho (2020), Song (2023). |
-| Related | "3D Gen [Gaps]: Manifold integrity for high-fidelity CFD-ready meshes" | Literature | OK | Wu (2016), Achlioptas (2018) prioritize visual metrics. |
-| Methodology | "MLP... produces a probability for each voxel" | Repo Evidence | OK | `CLI/models.py`: `LatentTo3DConverter`. |
-| Methodology | "Lattice Boltzmann method... computationally efficient" | Literature | OK | Geier (2015), Premnath (2009). |
-| Methodology | "integrate the CFD solver directly into the gradient-based optimization loop" | Repo Evidence | Soften | Currently demonstrated as loss-based guidance in `CLI/trainer.py`. |
-| Methodology | "differentiating through the LBM solver or by using the solver as a score-guidance function" | Repo Evidence | Soften | "planned extension"; repo currently uses finite-difference or surrogate gradients. |
-| Results | "Total loss stayed in the 2.31–2.71 range" | Repo Evidence | OK | Figure 1 (Sanity Training Losses). |
-| Results | "best sample reaching 1.53 after downsampling" | Repo Evidence | OK | Figure 2 ($L/D$ by steps). |
-| Results | "Internal solver... yields $C_d$ values that align with the broad expectations" | Repo Evidence | OK | Table II (Internal Solver Validation). |
+| File | Section | Paragraph | Exact Claim | Required Support | Current Support | Status | Required Action |
+|------|---------|-----------|-------------|------------------|-----------------|--------|-----------------|
+| introduction.tex | Intro | 1 | "Generative design has emerged as a transformative paradigm" | Literature | General consensus | OK | None |
+| introduction.tex | Intro | 2 | "demonstrated remarkable success in... three-dimensional shapes" | Literature | Luo (2021) | OK | None |
+| introduction.tex | Intro | 2 | "intended to explore the underlying distribution of viable aircraft designs" | Repo Evidence | Proof-of-concept target | OK | Use "intended to" |
+| introduction.tex | Intro | 2 | "generate structures that adhere to predefined aerodynamic... constraints" | Repo Evidence | Proof-of-concept target | OK | Use "proof-of-concept" |
+| related-work.tex | Related | 1 | "convergence of generative modeling and computational engineering... structural and aerodynamic design" | Literature | Chen (2019), Oh (2019) | OK | None |
+| related-work.tex | Related | 3.2 | "diffusion-based models as a stable alternative to GANs" | Literature | Ho (2020), Nichol (2021) | OK | None |
+| related-work.tex | Related | 3.3 | "often prioritize visual mimicry over the physical manifold integrity" | Literature | General observation | OK | None |
+| related-work.tex | Related | 3.4 | "TO is often sensitive to local minima and initial conditions" | Literature | Sigmund (2013) | OK | None |
+| related-work.tex | Related | 3.8 | "While existing 3D diffusion frameworks often focus on... general object classes" | Literature | Luo (2021) | OK | Precise wording used |
+| related-work.tex | Related | 3.8 | "coupling of 3D latent diffusion with high-fidelity LBM feedback... remains an open research area" | Literature | Negative space | OK | Acknowledge Thuerey (2020) |
+| methodology.tex | Method | 1 | "core architecture consists of four main components" | Repo Evidence | `CLI/models.py`, `CLI/cfd_simulator.py` | OK | None |
+| methodology.tex | Method | 5 | "aerodynamic loss... designed to encourage the generation of designs with improved aerodynamic characteristics" | Repo Evidence | Target language | OK | Use "designed to" |
+| methodology.tex | Method | 6 | "integrate the CFD solver into the generative optimization loop" | Repo Evidence | Planned path | OK | Use "explore", "planned" |
+| methodology.tex | Method | 6 | "Update UNet weights to maximize $C_L/C_D$" | Repo Evidence | Target sequence | OK | Use "Estimate weight updates" |
+| methodology.tex | Method | 7 | "D3Q27 Cascaded MRT implementation... sub-voxel BFL boundaries" | Literature + Repo | Geier (2015) + Code | OK | None |
+| results-and-discussion.tex | Results | 1 | "performed a CPU-only sanity run" | Repo Evidence | Run logs | OK | None |
+| results-and-discussion.tex | Results | 2 | "Total loss stayed in the 2.31–2.71 range" | Repo Evidence | Figure 1 | OK | None |
+| results-and-discussion.tex | Results | 3 | "results in Figure 2 provide a preliminary code-path validation" | Repo Evidence | Figure 2 | OK | None |
+| results-and-discussion.tex | Results | 6 | "yields $C_d$ values that align with the broad expectations" | Repo Evidence | Table II | OK | None |
 
-## Detailed Section Audit
+## Audit Summary by Section
 
 ### Introduction
-- **Claim:** "Traditional design methodologies... may not explore the full extent of the design space."
-  - **Support:** General consensus in generative design literature.
-  - **Status:** OK.
-- **Claim:** "latent diffusion framework... diversity measured via MS-SSIM".
-  - **Support:** Metric is implemented in `CLI/utils.py`.
-  - **Status:** OK (Target language).
+The introduction has been audited for overclaims. Assertions regarding the model's ability to learn aircraft distributions have been scoped as "intended to explore" to reflect the proof-of-concept nature of current training runs.
 
 ### Related Work
-- **Claim:** "TO is often sensitive to local minima and initial conditions."
-  - **Support:** Sigmund (2013).
-  - **Status:** OK.
-- **Claim:** "Diffusion... identify aerodynamic forms that might be unreachable by gradient-based material redistribution alone."
-  - **Support:** Hypothesis.
-  - **Status:** Marked as exploratory goal.
+The related work uses specific citations (Sigmund, Ho, Luo) to ground gaps. The "negative-space" claim about simulation-in-the-loop has been narrowed to specify the "direct coupling" within the diffusion loop to distinguish from surrogate-only approaches.
 
 ### Methodology
-- **Claim:** "GPU-accelerated D3Q27 LBM solver... sub-voxel BFL boundaries."
-  - **Support:** `CLI/advanced_lbm_solver.py`.
-  - **Status:** OK.
-- **Claim:** "relative L2 norm convergence monitor allows for early simulation termination."
-  - **Support:** `LBMPhysicsConfig.convergence_tolerance`.
-  - **Status:** OK.
+The methodology has been downgraded from a "rigorous integration" to an "exploration of integration" to reflect that full gradient-based backpropagation through the LBM solver is a planned/preliminary feature rather than a fully validated result.
 
 ### Results
-- **Claim:** "post-processing prior reduces near-threshold voxel clouds".
-  - **Support:** Figure 3 (Occupancy vs $L/D$).
-  - **Status:** OK.
-- **Claim:** "OpenFOAM cross-check completes on the shared centered-cube validation object".
-  - **Support:** Test `tests/test_canonical_validation.py`.
-  - **Status:** OK.
+The results section explicitly labels all findings as "sanity runs," "code-path validation," or "informal sanity checks." No claims of optimal aircraft performance are made; instead, the focus is on pipeline execution and baseline comparison.

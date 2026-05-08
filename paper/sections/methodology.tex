@@ -38,15 +38,16 @@ The total loss function is a weighted sum of three components: the diffusion los
 The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis. The aerodynamic loss is a combination of the drag and lift coefficients, and is designed to encourage the generation of designs with improved aerodynamic characteristics.
 
 \subsection{Integration of CFD in Diffusion Training}
-To improve the physical plausibility of the generated geometries, we integrate the CFD solver into the generative optimization loop. In this implementation, we utilize the LBM solver to compute aerodynamic loss gradients (via finite-difference or surrogate-proxy approximations) or as a score-guidance function during the reverse diffusion process. This approach provides a first-order approximation of the aerodynamic manifold within the latent space, guiding the model toward aerodynamically efficient forms.
+To improve the physical plausibility of the generated geometries, we explore the integration of the CFD solver into the generative optimization loop. In this planned guidance path, the LBM solver is utilized to compute aerodynamic loss gradients (via finite-difference or surrogate-proxy approximations) or as a score-guidance function during the reverse diffusion process. This approach is intended to provide a first-order approximation of the aerodynamic manifold within the latent space, guiding the model toward aerodynamically efficient forms.
 
+The proposed integration sequence follows:
 \begin{itemize}
     \item \textbf{Step 1:} Sample noisy latent $z_t$.
     \item \textbf{Step 2:} Predict $z_0$ using the UNet.
     \item \textbf{Step 3:} Decode $z_0$ to voxel grid $V$.
-    \item \textbf{Step 4:} Run GPU-accelerated LBM solver on $V$.
+    \item \textbf{Step 4:} Execute the LBM solver on $V$ (CPU or GPU-accelerated).
     \item \textbf{Step 5:} Compute aerodynamic coefficients $C_L, C_D$.
-    \item \textbf{Step 6:} Update UNet weights to maximize $C_L/C_D$.
+    \item \textbf{Step 6:} Estimate weight updates to improve $C_L/C_D$ metrics.
 \end{itemize}
 
 The D3Q27 Cascaded MRT implementation provides design guidance by utilizing vectorized moment-space relaxation and sub-voxel BFL boundaries \cite{geier2015cascaded}. Performance optimizations, such as geometry-content hashing, are employed to minimize CPU-GPU synchronization overhead. Additionally, a relative L2 norm convergence monitor allows for early simulation termination, improving the efficiency of the aerodynamic feedback loop during generative optimization.
