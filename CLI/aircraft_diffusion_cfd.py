@@ -2044,10 +2044,18 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
         base_grid_resolution=int(voxel_grid.shape[-1]),
     )
     simulator = AdvancedCFDSimulator(cfd_config, device)
-    results = simulator.simulate_aerodynamics(voxel_grid, steps=1000)
+    quick_cfd_steps = 100
+    results = simulator.simulate_aerodynamics(voxel_grid, steps=quick_cfd_steps)
+    drag = results.get('drag_coefficient', float('nan'))
+    lift = results.get('lift_coefficient', float('nan'))
     print("CFD Analysis Results:")
-    print(f"  Drag Coefficient: {results['drag_coefficient']}")
-    print(f"  Lift Coefficient: {results['lift_coefficient']}")
+    if np.isfinite(drag) and np.isfinite(lift):
+        print(f"  Drag Coefficient: {drag}")
+        print(f"  Lift Coefficient: {lift}")
+        print(f"  Note: quick {quick_cfd_steps}-step smoke analysis only")
+    else:
+        print("  Warning: CFD analysis became non-finite")
+        print("  Treat this export as a smoke artifact, not a validated aerodynamic result")
 
 @cli.command()
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')
