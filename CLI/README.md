@@ -1,13 +1,20 @@
 # Aircraft Structural Design via Diffusion Models + FluidX3D CFD
 
-A sophisticated PyTorch-based system that combines **Transformer-based Radiance Mapping (TRM)** and **Hierarchical Representation Mapping (HRM)** principles with **diffusion models** to generate viable aircraft structures. Features GPU-accelerated CFD simulation (FluidX3D-inspired), connectivity constraints, and marching cubes STL export—all optimized for **8–13GB VRAM**.
+This directory contains the proof-of-concept CLI for the research repository. The current implementation combines a latent generator, a voxel decoder, connectivity heuristics, and CFD-informed scoring on synthetic data. It supports code-path validation and benchmarking; it does not yet support a validated aircraft-design workflow or conditioning on mission/manufacturing inputs.
+
+## Scope Note
+
+- The current dataset is synthetic.
+- The current generator uses `target_speed` plus scalar loss weights, not a full flight-profile schema.
+- Connectivity penalties are heuristics, not structural proof.
+- Local 8 GB GPUs are suitable for smoke runs, not for strong final-claim training.
 
 ## Features
 
 ✅ **Diffusion-based 3D Generation**: Latent diffusion model with n-dimensional latent space compressed to 3D geometry  
 ✅ **TRM/HRM Principles**: Hierarchical structural representation with importance weighting  
 ✅ **GPU-Accelerated CFD**: FluidX3D-like compressible flow simulation on GPU  
-✅ **Connectivity Constraints**: Penalizes disconnected voxel groups (critical for structural integrity)  
+✅ **Connectivity Constraints**: Penalizes disconnected voxel groups as a geometry heuristic  
 ✅ **Marching Cubes Export**: Convert volumetric output to production-ready STL meshes  
 ✅ **Progressive Training**: Start on 16³, scale to 32³ to prevent overfitting and reduce VRAM  
 ✅ **Pipelined Execution**: Sparse voxel grids and batch processing for memory efficiency  
@@ -96,16 +103,16 @@ python aircraft_diffusion_cfd.py train \
 
 Total training time: ~4–6 hours on A100, ~12–18 hours on RTX 3090.
 
-### 2. Generate Aircraft Design
+### 2. Generate Aircraft-Like Design
 
-Generate a single aircraft design:
+Generate a single voxel design artifact:
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint ./checkpoints/final_model.pt \
+  --checkpoint ./checkpoints/final_optimized_model.pt \
   --output aircraft_design.stl \
   --target-speed 50.0 \
-  --num-steps 250 \
+  --num-steps 4 \
   --use-marching-cubes
 ```
 
@@ -113,7 +120,7 @@ python aircraft_diffusion_cfd.py generate \
 - `--checkpoint`: Path to trained model (required)
 - `--output`: Output STL filename (default: aircraft.stl)
 - `--target-speed`: Target speed in m/s (default: 50.0)
-- `--num-steps`: Number of diffusion steps (default: 250; higher = more iterations, slower)
+- `--num-steps`: Number of diffusion steps (default: 4; higher = slower and currently only lightly tested)
 - `--use-marching-cubes`: Enable marching cubes refinement (default: True)
 
 ### 3. Batch Generation
@@ -122,7 +129,7 @@ Generate multiple aircraft designs:
 
 ```bash
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint ./checkpoints/final_model.pt \
+  --checkpoint ./checkpoints/final_optimized_model.pt \
   --output-dir ./generated_aircraft \
   --num-designs 5
 ```
@@ -262,7 +269,7 @@ If `forceCoeffs` is unreliable on your OpenFOAM install, use the exported `syste
 Ensure path is correct:
 ```bash
 ls -la ./checkpoints/
-python aircraft_diffusion_cfd.py generate --checkpoint ./checkpoints/final_model.pt
+python aircraft_diffusion_cfd.py generate --checkpoint ./checkpoints/final_optimized_model.pt
 ```
 
 ## References

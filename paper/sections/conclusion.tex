@@ -1,6 +1,8 @@
 \section{Conclusion}
 \label{sec:conclusion}
-The present implementation demonstrates a working generative-design pipeline and a reduced freeform-object experiment that can be executed in the installed environment. The observed step sweep suggests that longer consistency sampling can improve the reported $L/D$ in this specific sanity setting, with the best sample reaching 1.53 after downsampling and CPU CFD evaluation.
+The present implementation demonstrates a working proof-of-concept generative-design pipeline and a reduced freeform-object experiment that can be executed in the installed environment. The observed step sweep suggests that longer consistency sampling can change the reported $L/D$ in this specific sanity setting, but those numbers remain tied to downsampled freeform objects and CPU CFD evaluation.
 
 The OpenFOAM cross-check completes on the shared centered-cube validation object and gives the repository a reproducible external CFD reference path. The next revision should therefore prioritize solver calibration and a larger ablation study before presenting stronger aerodynamic conclusions.
+
+Most importantly, the repository should not yet be described as a fully AI-driven airplane generator conditioned on flight profile, manufacturing method, or structural requirements. Reaching that point would require a real aircraft-like dataset, explicit conditional modeling, stronger structural and aerodynamic gates, and hardware or cloud runs beyond the present sanity-run budget.
 

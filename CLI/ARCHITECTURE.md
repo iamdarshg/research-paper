@@ -1,5 +1,7 @@
 # Architecture Deep Dive & Technical Documentation
 
+> Scope note: this document describes the current proof-of-concept implementation. The repository currently demonstrates synthetic-data training, freeform voxel generation, and CFD-informed scoring/benchmarking. It does not yet justify claims of full aircraft validity, mission conditioning, or manufacturing conditioning.
+
 ## System Overview
 
 This is a **diffusion-based 3D generative model** for aircraft structural design that combines:
@@ -336,10 +338,10 @@ Actual usage (with margins)         ~10-12 GB
 
 ### Optimizations Applied
 
-1. **Gradient checkpointing** (future): Recompute forward pass instead of storing
-2. **Mixed precision** (future): fp16 for activations, fp32 for weights
-3. **Sparse tensors** (future): Only track occupied voxels
-4. **Batch accumulation** (future): Effective large batches with small actual batches
+1. **Gradient checkpointing**: implemented in the current codebase as a memory-reduction mechanism
+2. **Mixed precision**: partially documented but still needs careful end-to-end validation on the local hardware path
+3. **Sparse tensors**: not yet implemented
+4. **Batch accumulation**: not yet implemented
 
 ---
 
@@ -509,13 +511,14 @@ ModelConfig(latent_dim=256)
 
 **Short-term (2 weeks):**
 - [ ] Add mixed precision training (fp16)
-- [ ] Implement gradient checkpointing
 - [ ] Profile memory usage per component
+- [ ] Define an 8 GB smoke-run protocol
 
 **Mid-term (1-2 months):**
 - [ ] Integrate actual FluidX3D library
 - [ ] Implement sparse voxel grids
 - [ ] Add batch accumulation
+- [ ] Add structured conditioning for mission and manufacturing constraints
 
 **Long-term (3+ months):**
 - [ ] Generative adversarial losses

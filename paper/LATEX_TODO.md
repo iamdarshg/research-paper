@@ -2,6 +2,13 @@
 
 > Track progress on converting and completing the research paper using LaTeX files.
 
+## Current Issue-Driven Priorities
+
+- [ ] Close GitHub issue `#24` by tightening novelty and contribution wording.
+- [ ] Close GitHub issue `#25` by completing `paper/CITATION_AUDIT.md` and updating the cited sections.
+- [ ] Close GitHub issue `#26` by enforcing `paper/FINAL_RUN_GATES.md` before any final-run claim.
+- [ ] Keep all paper claims linked to explicit evidence, a citation, or clearly labeled future work.
+
 ## Paper Structure
 
 ### Core LaTeX Files

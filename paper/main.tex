@@ -19,7 +19,7 @@
 
 \begin{document}
 
-\title{Generative Design of Aircraft Structures using Diffusion Models and CFD-based Optimization}
+\title{Toward Generative Design of Aircraft-Like Structures with Diffusion Models and CFD-Informed Evaluation}
 \author{Darsh Gupta, National Public School, HSR Layout, Bengaluru \\ darshgu77@gmail.com}
 
 % Paper header metadata
@@ -31,7 +31,7 @@
 \maketitle
 
 \begin{abstract}
-This paper presents a generative design pipeline for aircraft structures that combines latent diffusion models, hierarchical structural representation, and computational fluid dynamics (CFD) based optimization. Our method produces three-dimensional aircraft geometries that are intended to be structurally viable and aerodynamically efficient. The core of the approach is a latent diffusion model operating in a compressed latent space, paired with a hierarchical decoder and connectivity-aware loss terms. We also integrate a GPU-accelerated CFD solver into the training loop so the geometry is scored directly on aerodynamic metrics during optimization. In addition to describing the architecture and progressive training schedule, we report a small CPU-only sanity experiment on the single freeform-object path, including loss traces and lift-to-drag measurements from a short step-count sweep. The reported experiment is intentionally limited and should be read as a validation of the code path rather than a full-scale aerodynamic study.
+This paper documents a proof-of-concept generative-design pipeline for aircraft-like voxel geometries. The repository combines a latent diffusion-style model, a voxel decoder, connectivity heuristics, and a CFD-informed scoring path built around an internal lattice-Boltzmann solver plus an external OpenFOAM export route. The present implementation is intentionally scoped: training data are synthetic, the reported experiment is a reduced sanity run, and the evidence should be read as code-path validation rather than publication-grade aerodynamic or structural validation. In addition to describing the architecture and benchmark workflow, we use the current experiments to clarify which claims the codebase supports today and which claims, including mission-conditioned or manufacturing-conditioned aircraft generation, remain future work.
 \end{abstract}
 
 \begin{IEEEkeywords}

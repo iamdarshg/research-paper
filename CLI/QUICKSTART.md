@@ -47,7 +47,7 @@ This runs for ~2-3 hours on RTX 3090 and generates a basic trained model.
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_model.pt \
+  --checkpoint checkpoints/final_optimized_model.pt \
   --output my_aircraft.stl
 ```
 
@@ -120,7 +120,7 @@ python aircraft_diffusion_cfd.py train \
 
 # Generate one design
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_model.pt
+  --checkpoint checkpoints/final_optimized_model.pt
 
 # You'll have: aircraft.stl
 ```
@@ -138,7 +138,7 @@ python aircraft_diffusion_cfd.py train \
 
 # Generate batch
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_model.pt \
+  --checkpoint checkpoints/final_optimized_model.pt \
   --num-designs 10 \
   --output-dir ./aircraft_designs
 ```
@@ -241,7 +241,7 @@ Check the path:
 ```bash
 ls -la checkpoints/
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint ./checkpoints/final_model.pt
+  --checkpoint ./checkpoints/final_optimized_model.pt
 ```
 
 ### "Module 'aircraft_diffusion_cfd' not found"

@@ -1,10 +1,25 @@
-# Aircraft Diffusion CFD - CLI Project
+# Aircraft Diffusion CFD - Research Repo
 
-> A production-ready command-line tool for generating and optimizing aircraft structures using diffusion models and GPU-accelerated CFD simulation.
+> Current status: a proof-of-concept research codebase for synthetic voxel generation, CFD-informed scoring, and reproducible benchmarking. It is not yet a validated aircraft-design system or a mission/manufacturing-conditioned airplane generator.
 
 ## Overview
 
-This CLI project combines **generative diffusion models**, **hierarchical structural representation (HRM)**, and **GPU-accelerated computational fluid dynamics** to automatically design viable aircraft structures optimized for aerodynamic efficiency.
+This repository combines a latent generative model, voxel decoding, internal lattice-Boltzmann-style scoring, and an OpenFOAM export path. The current experiments are intentionally narrow: they use synthetic training data and reduced sanity runs to validate the code path, not to establish publication-grade aerodynamic or structural performance.
+
+## Current Scope
+
+- Proof-of-concept latent generation of freeform or aircraft-like voxel geometries
+- Internal D3Q27/OpenFOAM benchmark path for solver cross-checks
+- STL export and reproducible local validation tooling
+- Small-scale training smoke runs on commodity hardware
+
+## Not Yet Implemented At Claimable Quality
+
+- Flight-profile-conditioned generation
+- Manufacturing-method-conditioned generation
+- Real aircraft dataset training
+- Structural validation beyond connectivity heuristics
+- Publication-grade aerodynamic optimization claims
 
 ### Key Features
 
@@ -50,21 +65,33 @@ python aircraft_diffusion_cfd.py train \
   --save-dir ./checkpoints
 ```
 
+For an honest local smoke run on 8 GB hardware, use much smaller settings first:
+
+```bash
+python aircraft_diffusion_cfd.py train \
+  --num-epochs 1 \
+  --batch-size 1 \
+  --num-samples 2 \
+  --save-dir ./checkpoints_smoke
+```
+
 ### 4. Generate Designs
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_model.pt \
-  --num-samples 10 \
-  --output-dir ./designs
+  --checkpoint checkpoints/final_optimized_model.pt \
+  --output ./designs\design_0.stl \
+  --target-speed 50.0 \
+  --num-steps 4
 ```
 
-### 5. Evaluate a Design
+### 5. Batch Generation
 
 ```bash
-python aircraft_diffusion_cfd.py evaluate \
-  --design designs/design_0.npy \
-  --cfd-steps 1000
+python aircraft_diffusion_cfd.py batch-generate \
+  --checkpoint checkpoints/final_optimized_model.pt \
+  --output-dir ./designs \
+  --num-designs 5
 ```
 
 ### 6. Run the Validation Benchmark
@@ -105,50 +132,41 @@ Generate new aircraft designs using a trained model.
 
 **Key Arguments:**
 - `--checkpoint` (str): Path to trained model checkpoint (required)
-- `--num-samples` (int): Number of designs to generate (default: 10)
-- `--grid-size` (int): Voxel grid resolution (default: 32)
-- `--output-dir` (str): Directory for saving generated designs (default: ./designs)
-- `--guidance-scale` (float): Classifier-free guidance strength (default: 7.5)
+- `--output` (str): Output STL path (default: `aircraft_optimized.stl`)
+- `--target-speed` (float): Scalar design target carried through the current CLI (default: `7.0`)
+- `--num-steps` (int): Number of consistency-model sampling steps (default: `4`)
+- `--use-marching-cubes` (bool flag): Export via marching cubes when possible
 
 **Example:**
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_model.pt \
-  --num-samples 50 \
-  --guidance-scale 5.0 \
-  --output-dir ./generated_designs
+  --checkpoint checkpoints/final_optimized_model.pt \
+  --output ./generated_designs\design_0.stl \
+  --target-speed 50.0 \
+  --num-steps 4
 ```
 
-### `evaluate`
-Run CFD evaluation on a single design.
+### `batch-generate`
+Generate multiple STL artifacts from a trained checkpoint.
 
 **Key Arguments:**
-- `--design` (str): Path to .npy design file (required)
-- `--cfd-steps` (int): CFD simulation steps (default: 1000)
-- `--output-file` (str): Save evaluation results (optional)
+- `--checkpoint` (str): Path to trained model checkpoint (required)
+- `--output-dir` (str): Output directory for generated STL files
+- `--num-designs` (int): Number of STL files to emit
 
 **Example:**
 ```bash
-python aircraft_diffusion_cfd.py evaluate \
-  --design designs/design_0.npy \
-  --cfd-steps 2000 \
-  --output-file evaluation.json
+python aircraft_diffusion_cfd.py batch-generate \
+  --checkpoint checkpoints/final_optimized_model.pt \
+  --output-dir ./generated_designs \
+  --num-designs 5
 ```
 
-### `export`
-Convert voxel designs to STL mesh format.
+### `info`
+Print the runtime environment and optimization status.
 
-**Key Arguments:**
-- `--design` (str): Path to .npy design file (required)
-- `--output` (str): Output STL file path (default: design.stl)
-- `--simplify` (bool): Apply mesh simplification (default: false)
-
-**Example:**
 ```bash
-python aircraft_diffusion_cfd.py export \
-  --design designs/design_0.npy \
-  --output aircraft_design.stl \
-  --simplify true
+python aircraft_diffusion_cfd.py info
 ```
 
 ### `info`
@@ -252,10 +270,10 @@ python aircraft_diffusion_cfd.py train \
 
 ### Example 2: Generate 100 Designs
 ```bash
-python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_model.pt \
-  --num-samples 100 \
-  --guidance-scale 7.5
+python aircraft_diffusion_cfd.py batch-generate \
+  --checkpoint checkpoints/final_optimized_model.pt \
+  --output-dir ./generated_designs \
+  --num-designs 100
 ```
 
 ### Example 3: Full Pipeline
@@ -265,18 +283,16 @@ python aircraft_diffusion_cfd.py train --num-epochs 100
 
 # Generate
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_model.pt \
-  --num-samples 20
+  --checkpoint checkpoints/final_optimized_model.pt \
+  --output best_aircraft.stl \
+  --target-speed 50.0 \
+  --num-steps 4
 
-# Evaluate best design
-python aircraft_diffusion_cfd.py evaluate \
-  --design designs/design_0.npy \
-  --cfd-steps 2000
-
-# Export to STL
-python aircraft_diffusion_cfd.py export \
-  --design designs/design_0.npy \
-  --output best_aircraft.stl
+# Optional batch generation
+python aircraft_diffusion_cfd.py batch-generate \
+  --checkpoint checkpoints/final_optimized_model.pt \
+  --output-dir ./designs \
+  --num-designs 20
 ```
 
 ## Monitoring Training

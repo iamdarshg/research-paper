@@ -1,6 +1,6 @@
 # Validation and Data Harvesting TODO
 
-This document outlines a comprehensive plan for the validation and data harvesting process for the generative design of aircraft structures.
+This document outlines future validation work. It should not be treated as evidence already satisfied by the current repository. The current codebase has a reduced sanity benchmark and a solver cross-check path, but the experiments below remain future gates until they are executed and tied to explicit claim IDs in the paper audit.
 
 ## 1. Experimental Plan
 

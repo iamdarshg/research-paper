@@ -49,6 +49,18 @@ from advanced_lbm_solver import D3Q27CascadedSolver
 
 warnings.filterwarnings('ignore')
 
+
+def _configure_console_output() -> None:
+    """Prefer UTF-8 console output when the host stream supports reconfiguration."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 OPENFOAM_ROOT = Path(os.environ.get("OPENFOAM_ROOT", "/home/darsh/.openclaw/openfoam/usr/share/openfoam"))
 OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
 OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam"))
@@ -1326,8 +1338,8 @@ class OptimizedDiffusionTrainer:
         return self.consistency_model.consistency_loss(latent, t_student, t_teacher)
     
     def train(self, train_loader: DataLoader, val_loader: DataLoader = None):
-        """Progressive training with all optimizations"""
-        grid_sizes = [16, 24, 32]
+        """Train at the model's configured voxel resolution."""
+        grid_sizes = [self.model_config.grid_resolution]
 
         for grid_size in grid_sizes:
             print(f"\n{'='*60}")
@@ -1339,7 +1351,7 @@ class OptimizedDiffusionTrainer:
 
             torch.cuda.empty_cache()
 
-            epochs = self.training_config.num_epochs if grid_size == 32 else max(1, self.training_config.num_epochs // 2)
+            epochs = self.training_config.num_epochs
 
             for epoch in range(epochs):
                 print(f"\nGrid {grid_size} - Epoch {epoch + 1}/{epochs}")
@@ -1380,6 +1392,7 @@ class OptimizedDiffusionTrainer:
             'model_config': asdict(self.model_config),
             'diffusion_config': asdict(self.diffusion_config),
             'training_config': asdict(self.training_config),
+            'cfd_config': asdict(self.cfd_config),
         }
         torch.save(checkpoint, path)
         print(f"Optimized checkpoint saved to {path}")
@@ -1413,6 +1426,14 @@ class OptimizedAircraftGenerator:
         
         self.model_config = ModelConfig(**checkpoint['model_config'])
         self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
+        cfd_payload = checkpoint.get('cfd_config')
+        if cfd_payload is not None:
+            cfd_payload = dict(cfd_payload)
+            if isinstance(cfd_payload.get('lbm_config'), dict):
+                cfd_payload['lbm_config'] = LBMPhysicsConfig(**cfd_payload['lbm_config'])
+            self.config = CFDConfig(**cfd_payload)
+        else:
+            self.config = CFDConfig(base_grid_resolution=self.model_config.grid_resolution)
         
         self.diffusion_model = LatentDiffusionUNet(self.model_config, self.diffusion_config).to(self.device)
         self.converter = LatentTo3DConverter(self.model_config.latent_dim, self.model_config.grid_resolution).to(self.device)
@@ -1834,12 +1855,11 @@ import click
 
 @click.group()
 def cli():
-    """Aircraft Structural Design via Diffusion Models + CFD (Fully Optimized)"""
-    print("🚀 TRM/HRM Recursive Style Implementation")
-    print("✨ Features: 4-step consistency, grouped-query attention, gradient checkpointing")
-    print("⚡ Performance: 60% VRAM savings, 50% KV-cache reduction, adaptive mesh refinement")
-    print("🎯 CFD: FluidX3D + GPU LBM solver with SoA layout and 256-thread blocks")
-    print("🔄 Pipeline: CFD computation overlapped with diffusion sampling")
+    """Aircraft structural design proof-of-concept CLI."""
+    _configure_console_output()
+    print("Aircraft structural design proof-of-concept CLI")
+    print("Features: latent generation, connectivity heuristics, CFD-informed scoring")
+    print("Status: synthetic-data pipeline plus sanity-run and benchmark tooling")
     pass
 
 @cli.command()
@@ -1935,8 +1955,16 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         solver_type=solver
     )
 
+    # Keep the generator/CFD resolutions aligned for the current training run.
+    model_config.base_grid_resolution = base_resolution
+    model_config.grid_resolution = base_resolution
+
     # Dataset
-    dataset = AircraftDesignDataset(num_samples=num_samples, grid_size=32, latent_dim=model_config.latent_dim)
+    dataset = AircraftDesignDataset(
+        num_samples=num_samples,
+        grid_size=base_resolution,
+        latent_dim=model_config.latent_dim,
+    )
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
     # Optimized trainer
@@ -2011,7 +2039,10 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
 
     # Add final CFD analysis
     print(f"🚀 Running final CFD analysis with {solver} solver...")
-    cfd_config = CFDConfig(solver_type=solver)
+    cfd_config = CFDConfig(
+        solver_type=solver,
+        base_grid_resolution=int(voxel_grid.shape[-1]),
+    )
     simulator = AdvancedCFDSimulator(cfd_config, device)
     results = simulator.simulate_aerodynamics(voxel_grid, steps=1000)
     print("CFD Analysis Results:")
@@ -2081,7 +2112,8 @@ def performance_benchmark():
 @cli.command()
 def info():
     """Print system and optimization information"""
-    print(f"\n🚀 TRM/HRM Recursive Style Implementation")
+    _configure_console_output()
+    print(f"\nAircraft structural design proof-of-concept")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     

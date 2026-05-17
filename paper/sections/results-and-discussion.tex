@@ -42,7 +42,7 @@ We ran a compact sweep over generation step count and the new shape-prior cleanu
 \end{figure}
 
 \subsection{Freeform-object Geometry Summary}
-The generated freeform objects are still dense and near-threshold before cleanup, but the new plausibility prior reduces isolated components and slightly lowers the occupancy fraction. In this environment, that matters more than small changes in the raw voxel logits: the cleaned binary shapes are less fragmented and more suitable for downstream meshing/export.
+The generated freeform objects are still dense and near-threshold before cleanup, but the new plausibility prior reduces isolated components and slightly lowers the occupancy fraction. In this environment, that matters more than small changes in the raw voxel logits: the cleaned binary shapes are less fragmented and more suitable for downstream meshing and export. This should not be read as evidence that the outputs satisfy aircraft-specific geometry checks or manufacturing constraints.
 
 \subsection{Hyperparameter and Tuning Notes}
 The sweep was intentionally small but meaningful for the current codebase: it varied the inference path length and the new connected-component cleanup threshold, which are the two knobs that currently have the most direct effect on shape plausibility. The training-side improvement was also incremental: a voxel-shape prior was added to the loss to discourage midpoint noise, excess surface roughness, and disconnected fragments.
@@ -58,7 +58,7 @@ This is still a pilot study. The numbers above should be interpreted as a valida
 At minimum, a publication-quality sweep should report both realism metrics (occupancy, connectedness, surface smoothness) and aerodynamic metrics ($C_L$, $C_D$, $L/D$) instead of optimizing only one side of the tradeoff.
 
 \subsection{Discussion}
-The main takeaway is now a little sharper: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM validation case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline.
+The main takeaway is now a little sharper: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM validation case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline. The result supports a reproducible implementation path, not a claim of aircraft-level aerodynamic optimization.
 
 The OpenFOAM export path now writes a plain \texttt{forces} function-object dictionary, and the resulting force vector is normalized manually to recover coefficients when coefficient output is not available. The current benchmark still shows a substantial Cd gap, which we are now treating as a solver- and sampling-consistency issue rather than a paper-level normalization issue. A higher-confidence CFD comparison will still need a more systematic hyperparameter sweep and consistent normalization of reference area and flow conditions.
 
