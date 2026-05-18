@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import threading
 import multiprocessing as mp
+import random
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict
@@ -93,6 +94,7 @@ class ModelConfig:
     xyz_dim: int = 3
     encoder_channels: List[int] = None
     decoder_channels: List[int] = None
+    conditioning_dim: int = 0
     # Grouped-query attention instead of multi-head
     attention_groups: int = 8  # 4 groups instead of 8 heads (50% KV-cache reduction)
     attention_kv_groups: int = 8  # Groups for key/value
@@ -127,6 +129,7 @@ class TrainingConfig:
     precision: str = 'float32'
     save_interval: int = 5
     val_interval: int = 2
+    geometry_reconstruction_weight: float = 1.0
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
@@ -236,8 +239,403 @@ class DesignSpec:
     space_weight: float = 0.33*100
     drag_weight: float = 0.33*100
     lift_weight: float = 0.34*100
+    wingspan_limit_m: float = 1.8
+    thrust_to_weight_min: float = 0.45
+    turn_rate_min_deg_s: float = 18.0
+    required_static_thrust_n: float = 180.0
+    engine_diameter_mm: int = 140
+    engine_length_mm: int = 260
+    engine_count_min: int = 1
+    engine_count_max: int = 2
+    payload_mass_min_g: int = 500
+    payload_mass_max_g: int = 2000
+    takeoff_distance_min_m: int = 120
+    takeoff_distance_max_m: int = 250
+    wall_thickness_min_mm: int = 1
+    wall_thickness_max_mm: int = 2
+    part_count_min: int = 1
+    part_count_max: int = 8
+    wingspan_limit_bucket: Optional[float] = None  # backwards-compatible alias
+    manufacturing_method: str = "fdm_pla_0p4mm"
+    payload_bucket: Optional[str] = None  # deprecated alias
+    takeoff_distance_bucket: Optional[str] = None  # deprecated alias
+    min_wall_thickness_bucket: Optional[str] = None  # deprecated alias
+    max_part_count_bucket: Optional[str] = None  # deprecated alias
     bounding_box: Tuple[int, int, int] = (64, 64, 64)
     vital_components: np.ndarray = None
+
+
+CONDITIONING_SCHEMA_PATH = Path(__file__).with_name("conditioning_schema.yaml")
+
+
+def load_conditioning_schema(schema_path: Optional[Path] = None) -> Dict[str, Any]:
+    path = Path(schema_path) if schema_path is not None else CONDITIONING_SCHEMA_PATH
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+CONDITIONING_SCHEMA = load_conditioning_schema()
+CONDITIONING_TENSOR_DTYPE = getattr(
+    torch,
+    CONDITIONING_SCHEMA.get("tensor_dtype", "float32"),
+    torch.float32,
+)
+CONDITIONING_SCALAR_FEATURES = tuple(
+    feature["name"] for feature in CONDITIONING_SCHEMA["scalar_features"]
+)
+CONDITIONING_SCALAR_DEFAULTS = {
+    feature["name"]: feature["default"]
+    for feature in CONDITIONING_SCHEMA["scalar_features"]
+}
+CONDITIONING_CATEGORICAL_FEATURES = {
+    feature_name: tuple(feature_schema["categories"])
+    for feature_name, feature_schema in CONDITIONING_SCHEMA["categorical_features"].items()
+}
+CONDITIONING_CATEGORICAL_DEFAULTS = {
+    feature_name: feature_schema["default"]
+    for feature_name, feature_schema in CONDITIONING_SCHEMA["categorical_features"].items()
+}
+DEFAULT_CONDITIONING_PAYLOAD = {
+    **CONDITIONING_SCALAR_DEFAULTS,
+    **CONDITIONING_CATEGORICAL_DEFAULTS,
+}
+MANUFACTURING_METHOD_VOCAB = CONDITIONING_CATEGORICAL_FEATURES["manufacturing_method"]
+
+
+def condition_vector_layout() -> List[str]:
+    layout = list(CONDITIONING_SCALAR_FEATURES)
+    for feature_name, categories in CONDITIONING_CATEGORICAL_FEATURES.items():
+        layout.extend(f"{feature_name}__{category}" for category in categories)
+    return layout
+
+
+def _safe_spec_value(value: Optional[float], default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    return float(value)
+
+
+def _resolve_category(feature_name: str, value: Optional[str]) -> str:
+    categories = CONDITIONING_CATEGORICAL_FEATURES[feature_name]
+    if value in categories:
+        return value
+    return DEFAULT_CONDITIONING_PAYLOAD[feature_name]
+
+
+def design_spec_to_condition_payload(design_spec: Optional[DesignSpec] = None) -> Dict[str, Any]:
+    spec = design_spec or DesignSpec()
+    wingspan_limit = spec.wingspan_limit_m
+    if wingspan_limit is None:
+        wingspan_limit = spec.wingspan_limit_bucket
+
+    return {
+        "target_speed_mps": _safe_spec_value(
+            spec.target_speed,
+            DEFAULT_CONDITIONING_PAYLOAD["target_speed_mps"],
+        ),
+        "wingspan_limit_m": _safe_spec_value(
+            wingspan_limit,
+            DEFAULT_CONDITIONING_PAYLOAD["wingspan_limit_m"],
+        ),
+        "thrust_to_weight_min": _safe_spec_value(
+            spec.thrust_to_weight_min,
+            DEFAULT_CONDITIONING_PAYLOAD["thrust_to_weight_min"],
+        ),
+        "turn_rate_min_deg_s": _safe_spec_value(
+            spec.turn_rate_min_deg_s,
+            DEFAULT_CONDITIONING_PAYLOAD["turn_rate_min_deg_s"],
+        ),
+        "required_static_thrust_n": _safe_spec_value(
+            spec.required_static_thrust_n,
+            DEFAULT_CONDITIONING_PAYLOAD["required_static_thrust_n"],
+        ),
+        "engine_diameter_mm": _safe_spec_value(
+            spec.engine_diameter_mm,
+            DEFAULT_CONDITIONING_PAYLOAD["engine_diameter_mm"],
+        ),
+        "engine_length_mm": _safe_spec_value(
+            spec.engine_length_mm,
+            DEFAULT_CONDITIONING_PAYLOAD["engine_length_mm"],
+        ),
+        "engine_count_min": _safe_spec_value(
+            spec.engine_count_min,
+            DEFAULT_CONDITIONING_PAYLOAD["engine_count_min"],
+        ),
+        "engine_count_max": _safe_spec_value(
+            spec.engine_count_max,
+            DEFAULT_CONDITIONING_PAYLOAD["engine_count_max"],
+        ),
+        "payload_mass_min_g": _safe_spec_value(
+            spec.payload_mass_min_g,
+            DEFAULT_CONDITIONING_PAYLOAD["payload_mass_min_g"],
+        ),
+        "payload_mass_max_g": _safe_spec_value(
+            spec.payload_mass_max_g,
+            DEFAULT_CONDITIONING_PAYLOAD["payload_mass_max_g"],
+        ),
+        "takeoff_distance_min_m": _safe_spec_value(
+            spec.takeoff_distance_min_m,
+            DEFAULT_CONDITIONING_PAYLOAD["takeoff_distance_min_m"],
+        ),
+        "takeoff_distance_max_m": _safe_spec_value(
+            spec.takeoff_distance_max_m,
+            DEFAULT_CONDITIONING_PAYLOAD["takeoff_distance_max_m"],
+        ),
+        "wall_thickness_min_mm": _safe_spec_value(
+            spec.wall_thickness_min_mm,
+            DEFAULT_CONDITIONING_PAYLOAD["wall_thickness_min_mm"],
+        ),
+        "wall_thickness_max_mm": _safe_spec_value(
+            spec.wall_thickness_max_mm,
+            DEFAULT_CONDITIONING_PAYLOAD["wall_thickness_max_mm"],
+        ),
+        "part_count_min": _safe_spec_value(
+            spec.part_count_min,
+            DEFAULT_CONDITIONING_PAYLOAD["part_count_min"],
+        ),
+        "part_count_max": _safe_spec_value(
+            spec.part_count_max,
+            DEFAULT_CONDITIONING_PAYLOAD["part_count_max"],
+        ),
+        "manufacturing_method": _resolve_category(
+            "manufacturing_method",
+            spec.manufacturing_method,
+        ),
+    }
+
+
+def infer_conditioning_dim() -> int:
+    return len(condition_vector_layout())
+
+
+def build_condition_vector(design_spec: Optional[DesignSpec] = None) -> torch.Tensor:
+    payload = design_spec_to_condition_payload(design_spec)
+    values = [float(payload[feature_name]) for feature_name in CONDITIONING_SCALAR_FEATURES]
+    for feature_name, categories in CONDITIONING_CATEGORICAL_FEATURES.items():
+        selected = payload[feature_name]
+        values.extend(1.0 if selected == category else 0.0 for category in categories)
+    return torch.tensor(values, dtype=CONDITIONING_TENSOR_DTYPE)
+
+
+def sample_design_spec(rng: Optional[random.Random] = None) -> DesignSpec:
+    rng = rng or random.Random()
+    return DesignSpec(
+        target_speed=rng.uniform(30.0, 90.0),
+        thrust_to_weight_min=rng.uniform(0.28, 0.85),
+        turn_rate_min_deg_s=rng.uniform(10.0, 28.0),
+        required_static_thrust_n=rng.uniform(90.0, 320.0),
+        engine_diameter_mm=rng.randint(90, 220),
+        engine_length_mm=rng.randint(180, 420),
+        engine_count_min=rng.randint(1, 2),
+        engine_count_max=rng.randint(2, 4),
+        payload_mass_min_g=rng.randint(250, 1500),
+        payload_mass_max_g=rng.randint(1500, 6000),
+        takeoff_distance_min_m=rng.randint(80, 200),
+        takeoff_distance_max_m=rng.randint(180, 700),
+        wall_thickness_min_mm=rng.randint(1, 2),
+        wall_thickness_max_mm=rng.randint(2, 4),
+        part_count_min=rng.randint(1, 3),
+        part_count_max=rng.randint(4, 20),
+        wingspan_limit_m=rng.uniform(1.2, 2.4),
+        manufacturing_method=rng.choice(MANUFACTURING_METHOD_VOCAB),
+    )
+
+
+def _bucket_to_scale(value: str, categories: Tuple[str, ...]) -> float:
+    index = categories.index(value)
+    if len(categories) == 1:
+        return 0.0
+    return index / float(len(categories) - 1)
+
+
+def _desired_shell_fraction(design_spec: DesignSpec) -> float:
+    max_thickness = max(
+        float(design_spec.wall_thickness_min_mm),
+        float(design_spec.wall_thickness_max_mm),
+    )
+    if max_thickness <= 1.0:
+        return 0.95
+    if max_thickness >= 3.0:
+        return 0.65
+    return 0.8
+
+
+def _manufacturing_wall_thickness(design_spec: DesignSpec) -> int:
+    method = _resolve_category("manufacturing_method", design_spec.manufacturing_method)
+    requested_thickness = max(
+        float(design_spec.wall_thickness_min_mm),
+        float(design_spec.wall_thickness_max_mm),
+    )
+    base = {
+        "foam_core_hotwire": 2,
+        "fdm_pla_0p4mm": 2,
+        "fdm_pla_0p6mm": 3,
+        "sheet_balsa_tabbed": 1,
+        "composite_wet_layup": 2,
+    }.get(method, 1)
+    if requested_thickness >= 3.0:
+        base += 1
+    elif requested_thickness <= 1.0:
+        base = max(1, base - 1)
+    return base
+
+
+def _part_complexity_bonus(design_spec: DesignSpec) -> float:
+    part_count_cap = max(float(design_spec.part_count_min), float(design_spec.part_count_max))
+    if part_count_cap <= 4:
+        return 0.0
+    if part_count_cap <= 8:
+        return 0.25
+    if part_count_cap <= 16:
+        return 0.5
+    return 0.75
+
+
+def _procedural_aircraft_geometry(
+    design_spec: DesignSpec,
+    grid_size: int,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    geom = torch.zeros((grid_size, grid_size, grid_size), dtype=torch.float32)
+    cx, cy, cz = grid_size // 2, grid_size // 2, grid_size // 2
+
+    avg_payload_g = 0.5 * (
+        float(design_spec.payload_mass_min_g) + float(design_spec.payload_mass_max_g)
+    )
+    avg_takeoff_distance_m = 0.5 * (
+        float(design_spec.takeoff_distance_min_m)
+        + float(design_spec.takeoff_distance_max_m)
+    )
+    payload_scale = np.clip((avg_payload_g - 250.0) / 5750.0, 0.0, 1.0)
+    runway_scale = np.clip((avg_takeoff_distance_m - 80.0) / 620.0, 0.0, 1.0)
+    speed_scale = np.clip((float(design_spec.target_speed) - 30.0) / 60.0, 0.0, 1.0)
+    span_scale = np.clip(
+        (_safe_spec_value(design_spec.wingspan_limit_m, 1.8) - 1.2) / 1.2,
+        0.0,
+        1.0,
+    )
+    maneuver_scale = np.clip(
+        (float(design_spec.turn_rate_min_deg_s) - 10.0) / 18.0,
+        0.0,
+        1.0,
+    )
+    thrust_scale = np.clip(
+        (float(design_spec.required_static_thrust_n) - 90.0) / 230.0,
+        0.0,
+        1.0,
+    )
+    engine_diameter_scale = np.clip(
+        (float(design_spec.engine_diameter_mm) - 90.0) / 130.0,
+        0.0,
+        1.0,
+    )
+    engine_length_scale = np.clip(
+        (float(design_spec.engine_length_mm) - 180.0) / 240.0,
+        0.0,
+        1.0,
+    )
+    engine_count = int(
+        max(float(design_spec.engine_count_min), float(design_spec.engine_count_max))
+    )
+
+    fuselage_half_width = max(
+        1,
+        int(round(1 + payload_scale + 0.4 * thrust_scale + 0.4 * engine_diameter_scale)),
+    )
+    fuselage_half_height = max(
+        1,
+        int(round(1 + 0.5 * payload_scale + 0.3 * engine_diameter_scale)),
+    )
+    fuselage_length = max(
+        grid_size // 3,
+        int(round(grid_size * (0.42 + 0.16 * speed_scale + 0.08 * engine_length_scale - 0.05 * maneuver_scale))),
+    )
+    y0 = max(1, cy - fuselage_length // 2)
+    y1 = min(grid_size - 1, y0 + fuselage_length)
+
+    wall_thickness = _manufacturing_wall_thickness(design_spec)
+    wing_half_span = max(
+        2,
+        int(round(grid_size * (0.18 + 0.16 * span_scale + 0.08 * (1.0 - runway_scale) + 0.05 * maneuver_scale))),
+    )
+    wing_half_chord = max(
+        1,
+        int(round(grid_size * (0.05 + 0.03 * (1.0 - speed_scale) + 0.02 * payload_scale + 0.03 * maneuver_scale))),
+    )
+    wing_z_thickness = max(1, wall_thickness)
+    wing_y = int(round(cy + grid_size * (0.05 - 0.08 * speed_scale - 0.03 * maneuver_scale)))
+    tail_y = min(grid_size - 2, y1 - max(2, grid_size // 8))
+    vertical_tail_height = max(
+        2,
+        int(round(1 + wall_thickness + thrust_scale + 0.5 * maneuver_scale)),
+    )
+
+    for y in range(y0, y1):
+        taper = 1.0 - abs(y - cy) / max(1, fuselage_length)
+        radius_x = max(1.0, fuselage_half_width * (0.65 + 0.35 * taper))
+        radius_z = max(1.0, fuselage_half_height * (0.7 + 0.3 * taper))
+        for x in range(
+            max(0, cx - fuselage_half_width - 1),
+            min(grid_size, cx + fuselage_half_width + 2),
+        ):
+            for z in range(
+                max(0, cz - fuselage_half_height - 1),
+                min(grid_size, cz + fuselage_half_height + 2),
+            ):
+                norm = ((x - cx) / radius_x) ** 2 + ((z - cz) / radius_z) ** 2
+                if norm <= 1.0:
+                    geom[x, y, z] = 1.0
+
+    geom[
+        max(0, cx - wing_half_span):min(grid_size, cx + wing_half_span + 1),
+        max(0, wing_y - wing_half_chord):min(grid_size, wing_y + wing_half_chord + 1),
+        max(0, cz - wing_z_thickness):min(grid_size, cz + wing_z_thickness + 1),
+    ] = 1.0
+
+    tail_half_span = max(1, wing_half_span // 2)
+    geom[
+        max(0, cx - tail_half_span):min(grid_size, cx + tail_half_span + 1),
+        max(0, tail_y - 1):min(grid_size, tail_y + 2),
+        max(0, cz - 1):min(grid_size, cz + 2),
+    ] = 1.0
+    geom[
+        max(0, cx - 1):min(grid_size, cx + 2),
+        max(0, tail_y - 1):min(grid_size, tail_y + 2),
+        cz:min(grid_size, cz + vertical_tail_height),
+    ] = 1.0
+
+    if _part_complexity_bonus(design_spec) > 0.5 and grid_size >= 12:
+        pod_offset = max(1, wing_half_span // 2)
+        geom[
+            max(0, cx - pod_offset - 1):min(grid_size, cx - pod_offset + 1),
+            max(0, wing_y - 1):min(grid_size, wing_y + 2),
+            max(0, cz - 1):min(grid_size, cz + 1),
+        ] = 1.0
+        geom[
+            max(0, cx + pod_offset - 1):min(grid_size, cx + pod_offset + 1),
+            max(0, wing_y - 1):min(grid_size, wing_y + 2),
+            max(0, cz - 1):min(grid_size, cz + 1),
+        ] = 1.0
+
+    if engine_count > 0:
+        pod_half_length = max(1, int(round(1 + engine_length_scale)))
+        pod_half_height = max(1, int(round(1 + engine_diameter_scale)))
+        span_positions = np.linspace(
+            max(1, cx - wing_half_span + 1),
+            min(grid_size - 2, cx + wing_half_span - 1),
+            num=min(engine_count, max(1, 2 if grid_size < 12 else engine_count)),
+        )
+        for span_pos in span_positions:
+            x_center = int(round(float(span_pos)))
+            geom[
+                max(0, x_center - 1):min(grid_size, x_center + 2),
+                max(0, wing_y - pod_half_length):min(grid_size, wing_y + pod_half_length + 1),
+                max(0, cz - pod_half_height):min(grid_size, cz + pod_half_height + 1),
+            ] = 1.0
+
+    noise = torch.rand((grid_size, grid_size, grid_size), generator=generator)
+    geom = torch.where(noise > 0.995, torch.ones_like(geom), geom)
+    return geom.clamp(0.0, 1.0)
 
 # ============================================================================
 # GROUPED-QUERY ATTENTION (50% KV-CACHE REDUCTION)
@@ -344,6 +742,7 @@ class ConsistencyModel(nn.Module):
             latent_dim=config.latent_dim,
             encoder_channels=config.encoder_channels,
             decoder_channels=config.decoder_channels,
+            conditioning_dim=config.conditioning_dim,
             attention_groups=config.attention_groups,
             enable_gradient_checkpointing=config.enable_gradient_checkpointing,
             use_torch_compile=False  # Disable torch.compile for teacher to avoid overflow errors
@@ -355,6 +754,7 @@ class ConsistencyModel(nn.Module):
             latent_dim=config.latent_dim,
             encoder_channels=[c // 2 for c in config.encoder_channels],  # Smaller
             decoder_channels=[c // 2 for c in config.decoder_channels],
+            conditioning_dim=config.conditioning_dim,
             attention_groups=4,
             enable_gradient_checkpointing=True,
             use_torch_compile=False  # Disable torch.compile for student to avoid overflow errors
@@ -374,7 +774,13 @@ class ConsistencyModel(nn.Module):
             else:
                 nn.init.zeros_(param)
     
-    def consistency_loss(self, x_0: torch.Tensor, t_student: torch.Tensor, t_teacher: torch.Tensor) -> torch.Tensor:
+    def consistency_loss(
+        self,
+        x_0: torch.Tensor,
+        t_student: torch.Tensor,
+        t_teacher: torch.Tensor,
+        condition: torch.Tensor = None,
+    ) -> torch.Tensor:
         """Consistency training loss between teacher and student models"""
         batch_size = x_0.shape[0]
         device = x_0.device
@@ -383,11 +789,11 @@ class ConsistencyModel(nn.Module):
         noise = torch.randn_like(x_0)
         x_t_teacher = self._add_noise(x_0, t_teacher, noise)
         with torch.no_grad():
-            pred_teacher = self.teacher_model(x_t_teacher, t_teacher)
+            pred_teacher = self.teacher_model(x_t_teacher, t_teacher, condition=condition)
         
         # Student prediction at low resolution
         x_t_student = self._add_noise(x_0, t_student, noise)
-        pred_student = self.student_model(x_t_student, t_student)
+        pred_student = self.student_model(x_t_student, t_student, condition=condition)
         
         # Consistency loss: make student predictions close to teacher
         loss = F.mse_loss(pred_student, pred_teacher.detach())
@@ -423,13 +829,16 @@ class ConsistencyModel(nn.Module):
 
             for batch in tqdm(dataloader, desc=f"Computing loss {target_steps} steps"):
                 x_0 = batch['latent'].to(device)
+                condition = batch.get('condition_vector')
+                if condition is not None:
+                    condition = condition.to(device=device, dtype=x_0.dtype)
 
                 # Sample random timesteps
                 t_student = torch.randint(0, target_steps, (x_0.shape[0],), device=device)
                 t_teacher = torch.randint(0, self.teacher_steps, (x_0.shape[0],), device=device)
 
                 # Compute consistency loss
-                loss = self.consistency_loss(x_0, t_student, t_teacher)
+                loss = self.consistency_loss(x_0, t_student, t_teacher, condition=condition)
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -443,7 +852,7 @@ class ConsistencyModel(nn.Module):
 
         return distillation_results
     
-    def fast_inference(self, shape: Tuple[int, ...], num_steps: int = 4) -> torch.Tensor:
+    def fast_inference(self, shape: Tuple[int, ...], num_steps: int = 4, condition: torch.Tensor = None) -> torch.Tensor:
         """Fast 4-step inference using student model"""
         # Get device and dtype from model parameters
         device = next(self.student_model.parameters()).device
@@ -461,7 +870,7 @@ class ConsistencyModel(nn.Module):
             t = torch.full((shape[0],), current_step, device=device, dtype=dtype)
 
             # Predict noise using student model
-            pred_noise = self.student_model(x_t, t)
+            pred_noise = self.student_model(x_t, t, condition=condition)
 
             # Remove noise using simplified DDIM step
             # Calculate alpha_t = alpha_t^2 (since we're denoising from noise to signal)
@@ -498,9 +907,17 @@ class NoiseSchedule:
     
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Forward diffusion process: x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise"""
-        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
+        view_shape = (t.shape[0],) + (1,) * (x_0.ndim - 1)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(view_shape)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(view_shape)
         return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
+
+    def predict_x0(self, x_t: torch.Tensor, t: torch.Tensor, pred_noise: torch.Tensor) -> torch.Tensor:
+        """Estimate the clean sample x_0 from a noisy latent and predicted noise."""
+        view_shape = (t.shape[0],) + (1,) * (x_t.ndim - 1)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(view_shape)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(view_shape)
+        return (x_t - sqrt_one_minus_alpha * pred_noise) / (sqrt_alpha + 1e-8)
     
     def to(self, device, dtype=None):
         self.betas = self.betas.to(device, dtype=dtype if dtype is not None else self.betas.dtype)
@@ -597,6 +1014,18 @@ class LatentDiffusionUNet(nn.Module):
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim)
         )
+        self.conditioning_dim = config.conditioning_dim
+        if self.conditioning_dim > 0:
+            self.condition_time_projection = nn.Sequential(
+                nn.Linear(self.conditioning_dim, time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, time_emb_dim),
+            )
+            self.condition_projection = nn.Sequential(
+                nn.Linear(self.conditioning_dim, time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, self.encoder_out_dim),
+            )
 
         # Encoder: project latent to spatial
         self.encoder = nn.Sequential(
@@ -686,11 +1115,16 @@ class LatentDiffusionUNet(nn.Module):
         Forward pass with memory optimizations.
         x: [B, latent_dim] - noisy latent codes
         timestep: [B] - diffusion timesteps
-        condition: [B, C, D, H, W] - optional spatial conditioning
+        condition: [B, conditioning_dim] - optional structured conditioning
         """
         b = x.shape[0]
         
         t_emb = self.time_embedding(timestep.to(self.time_embedding[0].weight.dtype).unsqueeze(1) / self.diffusion_config.timesteps)
+        condition_embedding = None
+        if condition is not None and self.conditioning_dim > 0 and condition.ndim == 2:
+            condition = condition.to(self.time_embedding[0].weight.dtype)
+            t_emb = t_emb + self.condition_time_projection(condition)
+            condition_embedding = self.condition_projection(condition)
         
         # Expand latent to 3D spatial (2x2x2)
         h = self.encoder(x)
@@ -702,7 +1136,9 @@ class LatentDiffusionUNet(nn.Module):
             h = torch.cat([h, h.new_zeros(b, target_size - h.size(1))], dim=1)
         h = h.view(b, self.config.encoder_channels[0], 2, 2, 2)
         
-        if condition is not None and condition.shape == h.shape:
+        if condition_embedding is not None:
+            h = h + condition_embedding.view(b, self.config.encoder_channels[0], 2, 2, 2)
+        elif condition is not None and condition.shape == h.shape:
             h = h + condition
         
         # U-Net forward pass
@@ -962,57 +1398,75 @@ class AdvancedCFDSimulator:
 # DATASET & DATA LOADING
 # ============================================================================
 import random
+
+
 class AircraftDesignDataset(Dataset):
-    """Synthetic dataset for aircraft structure training"""
+    """Synthetic conditioned dataset for aircraft structure training"""
 
-    def __init__(self, num_samples: int = 10000, grid_size: int = 32, seed: int = random.randint(0,100), latent_dim: int = 128):
-        self.num_samples = num_samples
+    def __init__(
+        self,
+        num_samples: int = 10000,
+        grid_size: int = 32,
+        seed: int = random.randint(0, 100),
+        latent_dim: int = 128,
+        artifact_path: Optional[str] = None,
+    ):
         self.grid_size = grid_size
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+        self.latent_dim = latent_dim
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.torch_generator = torch.Generator().manual_seed(seed)
 
-        self.latent_codes = torch.randn(num_samples, latent_dim)
+        if artifact_path:
+            payload = torch.load(artifact_path, map_location="cpu")
+            self.latent_codes = payload["latents"].float()
+            self.geometries = [geometry.float() for geometry in payload["geometries"]]
+            self.condition_vectors = payload["condition_vectors"].float()
+            self.design_specs = [
+                spec if isinstance(spec, DesignSpec) else DesignSpec(**spec)
+                for spec in payload.get("design_specs", [])
+            ]
+            if not self.design_specs:
+                self.design_specs = [sample_design_spec(self.rng) for _ in range(len(self.geometries))]
+            self.num_samples = len(self.geometries)
+            if self.geometries:
+                self.grid_size = int(self.geometries[0].shape[-1])
+            return
+
+        self.num_samples = num_samples
+        self.latent_codes = torch.randn(
+            num_samples,
+            latent_dim,
+            generator=self.torch_generator,
+        )
+        self.design_specs = [sample_design_spec(self.rng) for _ in range(num_samples)]
+        self.condition_vectors = torch.stack(
+            [build_condition_vector(spec) for spec in self.design_specs]
+        )
         self.geometries = self._generate_geometries()
-    
+
     def _generate_geometries(self) -> List[torch.Tensor]:
-        """Generate synthetic aircraft geometries"""
-        geometries = []
-        for i in range(self.num_samples):
-            # Create fuselage-like structure
-            geom = torch.zeros(self.grid_size, self.grid_size, self.grid_size)
-            
-            # Central fuselage
-            cx, cy, cz = self.grid_size // 2, self.grid_size // 2, self.grid_size // 2
-            for x in range(self.grid_size):
-                for y in range(self.grid_size):
-                    for z in range(self.grid_size):
-                        dist_center = ((x - cx) ** 2 + (z - cz) ** 2) ** 0.5
-                        if dist_center < 6 and 10 < y < 22:
-                            geom[x, y, z] = 1.0
-            
-            # Wings
-            for x in range(self.grid_size):
-                for y in range(self.grid_size):
-                    for z in range(self.grid_size):
-                        if 8 < y < 24 and (z < 4 or z > self.grid_size - 4):
-                            geom[x, y, z] = 1.0
-            
-            # Add some noise for variation
-            noise = torch.rand_like(geom)
-            geom = (geom + 0.1 * noise > 0.5).float()
-            
-            geometries.append(geom)
-        
-        return geometries
+        """Generate procedural aircraft geometries tied to design metadata."""
+        return [
+            _procedural_aircraft_geometry(
+                design_spec,
+                self.grid_size,
+                generator=self.torch_generator,
+            )
+            for design_spec in self.design_specs
+        ]
     
     def __len__(self) -> int:
         return self.num_samples
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        design_spec = self.design_specs[idx]
         return {
             'latent': self.latent_codes[idx],
             'geometry': self.geometries[idx],
-            'target_speed': torch.tensor(self.grid_size / 32 * 50.0)
+            'target_speed': torch.tensor(float(design_spec.target_speed), dtype=torch.float32),
+            'condition_vector': self.condition_vectors[idx],
+            'design_spec': design_spec,
         }
 
 # ============================================================================
@@ -1149,6 +1603,7 @@ class OptimizedDiffusionTrainer:
         
         # Losses
         self.mse_loss = nn.MSELoss()
+        self.geometry_loss = nn.BCEWithLogitsLoss()
         self.connectivity_loss = ConnectivityLoss(penalty=training_config.disconnection_penalty)
         self.aero_loss = AerodynamicLoss()
         
@@ -1192,14 +1647,23 @@ class OptimizedDiffusionTrainer:
         with torch.no_grad():
             for batch_idx, batch in enumerate(pbar):
                 latent = batch['latent'].to(self.device, dtype=self.dtype)
+                condition = batch.get('condition_vector')
+                if condition is not None:
+                    condition = condition.to(self.device, dtype=self.dtype)
+                design_spec = batch.get('design_spec', DesignSpec(target_speed=50.0))
+                if isinstance(design_spec, list):
+                    design_spec = design_spec[0]
 
                 # Generate a design using the consistency model
-                generated_latent = self.consistency_model.fast_inference(latent.shape, num_steps=4)
+                generated_latent = self.consistency_model.fast_inference(
+                    latent.shape,
+                    num_steps=4,
+                    condition=condition,
+                )
                 voxel_grid = self.converter(generated_latent).nan_to_num(0.0)
                 voxel_grid = torch.sigmoid(voxel_grid).nan_to_num(0.0)
 
                 # CFD-based aerodynamic loss with the D3Q27 solver
-                design_spec = DesignSpec(target_speed=50.0)
                 aero_loss_val = self.aero_loss(voxel_grid, design_spec, self.val_cfd_simulator).nan_to_num(0.0)
 
                 total_aero_loss += aero_loss_val.item()
@@ -1220,6 +1684,7 @@ class OptimizedDiffusionTrainer:
         
         total_loss = 0.0
         total_mse = 0.0
+        total_geometry = 0.0
         total_consistency = 0.0
         total_connectivity = 0.0
         total_aero = 0.0
@@ -1229,6 +1694,12 @@ class OptimizedDiffusionTrainer:
         for batch_idx, batch in enumerate(pbar):
             latent = batch['latent'].to(self.device, dtype=self.dtype)
             geometry_target = batch['geometry'].to(self.device, dtype=self.dtype)
+            condition = batch.get('condition_vector')
+            if condition is not None:
+                condition = condition.to(self.device, dtype=self.dtype)
+            design_spec = batch.get('design_spec', DesignSpec(target_speed=50.0))
+            if isinstance(design_spec, list):
+                design_spec = design_spec[0]
 
             # Resize geometry to current grid size
             if grid_size != geometry_target.shape[1]:
@@ -1238,27 +1709,30 @@ class OptimizedDiffusionTrainer:
                     mode='nearest'
                 ).squeeze(1)
 
-            # Convert latent to voxel grid
-            voxel_grid = self.converter(latent).nan_to_num(0.0)
-            voxel_grid = torch.sigmoid(voxel_grid).nan_to_num(0.0)
-
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
             if batch_idx % 20 == 0:  # Every 20 batches
-                consistency_loss = self._compute_consistency_loss(latent)
+                consistency_loss = self._compute_consistency_loss(latent, condition=condition)
 
             # Random timestep for diffusion training
-            t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device).nan_to_num(0.0)
+            t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device)
 
             # Forward diffusion
             noise = torch.randn_like(latent)
             noisy_latent = self.noise_schedule.q_sample(latent, t, noise).nan_to_num(0.0)
 
             # Model prediction
-            pred_noise = self.diffusion_model(noisy_latent, t).nan_to_num(0.0)
+            pred_noise = self.diffusion_model(noisy_latent, t, condition=condition).nan_to_num(0.0)
+            x0_pred = self.noise_schedule.predict_x0(noisy_latent, t, pred_noise).nan_to_num(0.0)
+            geom_logits = self.converter(x0_pred).nan_to_num(0.0)
+            voxel_grid = torch.sigmoid(geom_logits).nan_to_num(0.0)
 
             # MSE loss
             mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
+            geometry_loss_val = self.geometry_loss(
+                geom_logits.float(),
+                geometry_target.float(),
+            ).nan_to_num(0.0)
 
             # Connectivity loss
             connectivity_loss_val = self.connectivity_loss(voxel_grid).nan_to_num(0.0)
@@ -1266,11 +1740,16 @@ class OptimizedDiffusionTrainer:
             # CFD-based aerodynamic loss (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
             if batch_idx % 10 == 0:
-                design_spec = DesignSpec(target_speed=50.0)
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
 
             # Combined loss
-            total_loss_val = mse_loss_val + consistency_loss + connectivity_loss_val + aero_loss_val
+            total_loss_val = (
+                mse_loss_val
+                + self.training_config.geometry_reconstruction_weight * geometry_loss_val
+                + consistency_loss
+                + connectivity_loss_val
+                + aero_loss_val
+            )
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -1290,6 +1769,7 @@ class OptimizedDiffusionTrainer:
             # Logging
             total_loss += total_loss_val.item()
             total_mse += mse_loss_val.item()
+            total_geometry += geometry_loss_val.item()
             total_consistency += consistency_loss.item()
             total_connectivity += connectivity_loss_val.item()
             total_aero += aero_loss_val.item()
@@ -1297,6 +1777,7 @@ class OptimizedDiffusionTrainer:
             pbar.set_postfix({
                 'loss': total_loss_val.item(),
                 'mse': mse_loss_val.item(),
+                'geom': geometry_loss_val.item(),
                 'consistency': consistency_loss.item(),
                 'conn': connectivity_loss_val.item(),
                 'aero': aero_loss_val.item()
@@ -1313,6 +1794,7 @@ class OptimizedDiffusionTrainer:
         # Log to tensorboard
         self.writer.add_scalar('Loss/total', avg_loss, self.global_step)
         self.writer.add_scalar('Loss/mse', total_mse / len(train_loader), self.global_step)
+        self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/connectivity', total_connectivity / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/aerodynamic', total_aero / len(train_loader), self.global_step)
@@ -1320,12 +1802,17 @@ class OptimizedDiffusionTrainer:
         return {
             'loss': avg_loss,
             'mse': total_mse / len(train_loader),
+            'geometry_reconstruction': total_geometry / len(train_loader),
             'consistency': total_consistency / len(train_loader),
             'connectivity': total_connectivity / len(train_loader),
             'aerodynamic': total_aero / len(train_loader)
         }
     
-    def _compute_consistency_loss(self, latent: torch.Tensor) -> torch.Tensor:
+    def _compute_consistency_loss(
+        self,
+        latent: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute consistency loss for progressive distillation"""
         batch_size = latent.shape[0]
         device = latent.device
@@ -1335,7 +1822,12 @@ class OptimizedDiffusionTrainer:
         t_teacher = torch.randint(0, self.diffusion_config.teacher_steps, (batch_size,), device=device)
         
         # Compute consistency loss
-        return self.consistency_model.consistency_loss(latent, t_student, t_teacher)
+        return self.consistency_model.consistency_loss(
+            latent,
+            t_student,
+            t_teacher,
+            condition=condition,
+        )
     
     def train(self, train_loader: DataLoader, val_loader: DataLoader = None):
         """Train at the model's configured voxel resolution."""
@@ -1458,13 +1950,17 @@ class OptimizedAircraftGenerator:
         250x faster than original 1000-step diffusion!
         """
         latent_shape = (1, self.model_config.latent_dim)
-        x_t = torch.randn(latent_shape, device=self.device)
+        condition = build_condition_vector(design_spec).unsqueeze(0).to(self.device)
         
         print(f"Generating with 4-step consistency model (vs 1000-step diffusion)")
         
         # Use fast 4-step consistency model
-        voxel_grid = self.consistency_model.fast_inference(latent_shape, num_steps=num_steps)
-        voxel_grid = torch.sigmoid(self.converter(voxel_grid))
+        latent = self.consistency_model.fast_inference(
+            latent_shape,
+            num_steps=num_steps,
+            condition=condition,
+        )
+        voxel_grid = torch.sigmoid(self.converter(latent))
         print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
 
@@ -1870,6 +2366,7 @@ def cli():
 @click.option('--precision', default='float32', help='Precision: float64, float32, float16, bfloat16, float8')
 @click.option('--disconnection-penalty', default=30.0, help='Penalty for disconnected voxels')
 @click.option('--num-samples', default=500, help='Number of training samples')
+@click.option('--dataset-artifact', default=None, help='Optional densified dataset artifact (.pt)')
 @click.option('--resume-from', default=None, help='Resume from checkpoint')
 @click.option('--save-dir', default='./checkpoints', help='Directory to save checkpoints')
 @click.option('--enable-consistency', is_flag=True, default=True, help='Enable 4-step consistency model')
@@ -1878,7 +2375,7 @@ def cli():
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
-          num_samples, resume_from, save_dir, enable_consistency, enable_pipeline, 
+          num_samples, dataset_artifact, resume_from, save_dir, enable_consistency, enable_pipeline, 
           enable_checkpointing, enable_compile, solver):
     """Train the optimized diffusion model with all TRM/HRM features"""
     import os
@@ -1928,6 +2425,8 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         enable_gradient_checkpointing=enable_checkpointing,
         use_torch_compile=enable_compile  # Respect the enable-compile flag
     )
+    if model_config_override is None and model_config.conditioning_dim == 0:
+        model_config.conditioning_dim = infer_conditioning_dim()
     
     diffusion_config = DiffusionConfig(
         teacher_steps=1000,
@@ -1964,6 +2463,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         num_samples=num_samples,
         grid_size=base_resolution,
         latent_dim=model_config.latent_dim,
+        artifact_path=dataset_artifact,
     )
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 

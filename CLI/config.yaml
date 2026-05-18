@@ -37,8 +37,37 @@ cfd:
   output_interval: 50
   device_id: 0
 
+# Experimental conditioning schema for the condition-vector seam.
+# The detailed categorical vocabulary and scalar constraint layout now live in
+# `conditioning_schema.yaml` so dataset generation, training, and offline
+# densification all share the same source of truth.
+conditioning:
+  schema_path: conditioning_schema.yaml
+  vector_dim: 22
+  notes:
+    - public CLI still only wires `target_speed` on the direct `generate` path
+    - offline densification and synthetic dataset generation should use the full schema
+    - scalar constraints now include thrust-to-weight, turn-rate, and explicit min/max bounds
+
 design:
   target_speed: 50.0
+  wingspan_limit_m: 1.8
+  thrust_to_weight_min: 0.45
+  turn_rate_min_deg_s: 18.0
+  required_static_thrust_n: 180.0
+  engine_diameter_mm: 140
+  engine_length_mm: 260
+  engine_count_min: 1
+  engine_count_max: 2
+  payload_mass_min_g: 500
+  payload_mass_max_g: 2000
+  takeoff_distance_min_m: 120
+  takeoff_distance_max_m: 250
+  wall_thickness_min_mm: 1
+  wall_thickness_max_mm: 2
+  part_count_min: 1
+  part_count_max: 8
+  manufacturing_method: fdm_pla_0p4mm
   space_weight: 0.33
   drag_weight: 0.33
   lift_weight: 0.34
@@ -55,4 +84,5 @@ design:
 # diff_cfg = DiffusionConfig(**config['diffusion'])
 # train_cfg = TrainingConfig(**config['training'])
 # cfd_cfg = CFDConfig(**config['cfd'])
+# conditioning_cfg = config['conditioning']  # Includes schema_path for the documented tensor seam
 # design_cfg = DesignSpec(**config['design'])

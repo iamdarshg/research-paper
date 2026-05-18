@@ -32,12 +32,47 @@ Start with one constrained family:
 
 Train on a structured condition vector with fields such as:
 - cruise speed,
-- takeoff distance bucket,
-- payload bucket,
+- takeoff distance min/max bounds,
+- payload mass min/max bounds,
 - wingspan limit,
+- minimum thrust-to-weight ratio,
+- minimum turn-rate target,
+- required static thrust,
+- engine diameter, length, and count bounds,
 - manufacturing method,
-- minimum wall-thickness bucket,
-- maximum part count bucket.
+- wall-thickness min/max bounds,
+- part-count min/max bounds.
+
+#### Documented seam contract
+
+The repo now documents a minimal condition-vector seam in `CLI/conditioning_schema.yaml`, with `CLI/config.yaml` pointing to that schema file. Treat this as a schema and checkpoint contract first, not as proof that the full generation pipeline is already conditioned.
+
+- Tensor shape: `[batch, 22]`
+- Tensor dtype: `float32`
+- Scalar slots:
+  - `target_speed_mps`
+  - `wingspan_limit_m`
+  - `thrust_to_weight_min`
+  - `turn_rate_min_deg_s`
+  - `required_static_thrust_n`
+  - `engine_diameter_mm`
+  - `engine_length_mm`
+  - `engine_count_min`
+  - `engine_count_max`
+  - `payload_mass_min_g`
+  - `payload_mass_max_g`
+  - `takeoff_distance_min_m`
+  - `takeoff_distance_max_m`
+  - `wall_thickness_min_mm`
+  - `wall_thickness_max_mm`
+  - `part_count_min`
+  - `part_count_max`
+- One-hot categorical group:
+  - `manufacturing_method`: `foam_core_hotwire`, `fdm_pla_0p4mm`, `fdm_pla_0p6mm`, `sheet_balsa_tabbed`, `composite_wet_layup`
+
+That ordering matters. Dataset preprocessing, any future condition encoder, and checkpoint metadata should all emit the same flat vector layout.
+
+The public CLI still only wires `target_speed`, and `batch-generate` still uses a fixed `DesignSpec(target_speed=50.0)`. So this seam is best described as the smallest stable interface for future conditioned work, not as finished end-user conditioning.
 
 ### 3. Replace the synthetic dataset
 
