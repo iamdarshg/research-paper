@@ -39,6 +39,22 @@ HIGH_ACCURACY_ERROR_PERCENT = 1.0
 MINIMUM_ACCEPTABLE_ERROR_PERCENT = 5.0
 ROOT_STL_PRIORITY = ('20mm_cube.stl',)
 OPENFOAM_WSL_DISTRO = os.environ.get('OPENFOAM_WSL_DISTRO')
+SANITY_BENCHMARK_ALLOWED_CLAIM = (
+    'The repository contains a proof-of-concept latent generative pipeline with a '
+    'CFD-informed scoring path, STL export, and a reproducible sanity benchmark on '
+    'synthetic/freeform data.'
+)
+SANITY_BENCHMARK_BLOCKED_CLAIMS = (
+    'Generates aircraft structures',
+    'Aerodynamically optimized',
+    'Structurally viable',
+    'CFD-guided training',
+    'Outperforms prior approaches',
+    'Publication-quality validation',
+    'Conditioned on flight profile and manufacturing method',
+)
+SANITY_BENCHMARK_FALLBACK = 'Current evidence is limited to sanity checks and code-path validation'
+SANITY_BENCHMARK_GATE_REFERENCE = 'paper/FINAL_RUN_GATES.md'
 _OPENFOAM_DISCOVERY_LOCK = threading.Lock()
 _WSL_DISTRO_CACHE_READY = False
 _WSL_DISTRO_CACHE: Optional[str] = None
@@ -80,6 +96,93 @@ def add_surrogate_quality_fields(target: Dict[str, Any], error_percentage: Optio
     target['meets_five_percent_minimum'] = (
         finite_error and float(error_percentage) < MINIMUM_ACCEPTABLE_ERROR_PERCENT
     )
+
+
+def build_benchmark_gate(
+    total_case_count: int,
+    completed_comparison_count: int,
+    error_percentage: Optional[float],
+) -> Dict[str, Any]:
+    total_case_count = max(int(total_case_count), 0)
+    completed_comparison_count = max(int(completed_comparison_count), 0)
+    finite_error = (
+        error_percentage is not None
+        and math.isfinite(float(error_percentage))
+    )
+    error_value = float(error_percentage) if finite_error else None
+
+    if completed_comparison_count > 0 and finite_error:
+        status = 'pass'
+        achieved_evidence_level = 'solver_validation'
+        summary = (
+            f'PASS: {completed_comparison_count}/{total_case_count} sweep cases completed an '
+            'OpenFOAM comparison with finite error metrics. This benchmark is sanity evidence '
+            'only and does not unlock stronger paper claims.'
+        )
+    elif completed_comparison_count > 0:
+        status = 'fail'
+        achieved_evidence_level = 'code_path_validation'
+        summary = (
+            f'FAIL: {completed_comparison_count}/{total_case_count} sweep cases completed an '
+            'OpenFOAM comparison, but no finite comparison error was recorded, so the solver '
+            'sanity gate is not yet satisfied.'
+        )
+    elif total_case_count > 0:
+        status = 'fail'
+        achieved_evidence_level = 'code_path_validation'
+        summary = (
+            f'FAIL: 0/{total_case_count} sweep cases completed an OpenFOAM comparison, so the '
+            'benchmark currently supports setup/code-path evidence only.'
+        )
+    else:
+        status = 'fail'
+        achieved_evidence_level = 'not_started'
+        summary = 'FAIL: No benchmark sweep cases were executed.'
+
+    return {
+        'name': 'paper_sanity_benchmark',
+        'status': status,
+        'achieved_evidence_level': achieved_evidence_level,
+        'claim_scope': 'sanity_only',
+        'supports_sanity_claim': status == 'pass',
+        'supports_claim_upgrade': False,
+        'completed_comparison_count': completed_comparison_count,
+        'total_case_count': total_case_count,
+        'mean_error_percentage': error_value,
+        'pass_criteria': 'At least one completed OpenFOAM comparison with finite error metrics.',
+        'allowed_claim': SANITY_BENCHMARK_ALLOWED_CLAIM,
+        'blocked_claims': list(SANITY_BENCHMARK_BLOCKED_CLAIMS),
+        'fallback_if_failed': SANITY_BENCHMARK_FALLBACK,
+        'reference_gate_doc': SANITY_BENCHMARK_GATE_REFERENCE,
+        'summary': summary,
+    }
+
+
+def _infer_benchmark_gate_inputs(results: Dict[str, Any]) -> Tuple[int, int, Optional[float]]:
+    case_groups = results.get('cases')
+    if isinstance(case_groups, list) and case_groups:
+        total_case_count = 0
+        completed_comparison_count = 0
+        error_values: List[float] = []
+        for case_group in case_groups:
+            if not isinstance(case_group, dict):
+                continue
+            for case in case_group.get('sweep_results', []):
+                if not isinstance(case, dict):
+                    continue
+                total_case_count += 1
+                if case.get('openfoam', {}).get('status') == 'completed':
+                    completed_comparison_count += 1
+                error_value = case.get('error_percentage')
+                if isinstance(error_value, (int, float)) and math.isfinite(float(error_value)):
+                    error_values.append(float(error_value))
+        mean_error = float(np.mean(error_values)) if error_values else None
+        return total_case_count, completed_comparison_count, mean_error
+
+    total_case_count = results.get('sweep_case_count', results.get('case_count', 0))
+    completed_comparison_count = results.get('completed_sweep_case_count', results.get('completed_count', 0))
+    error_percentage = results.get('error_percentage', results.get('mean_error_percentage'))
+    return int(total_case_count or 0), int(completed_comparison_count or 0), error_percentage
 
 
 def _sync_timing_device(device: torch.device) -> None:
@@ -1790,6 +1893,11 @@ def summarize_sweep_results(sweep_results: List[Dict[str, Any]]) -> Dict[str, An
         'mean_error_percentage': float(np.mean(finite_errors)) if finite_errors else None,
     }
     add_surrogate_quality_fields(summary, summary['mean_error_percentage'])
+    summary['benchmark_gate'] = build_benchmark_gate(
+        total_case_count=summary['case_count'],
+        completed_comparison_count=summary['completed_count'],
+        error_percentage=summary['mean_error_percentage'],
+    )
     if completed:
         internal_cds = [
             float(case['internal']['drag_coefficient'])
@@ -1821,12 +1929,35 @@ def _format_percent(value: Any) -> str:
 
 
 def build_timing_report(results: Dict[str, Any]) -> str:
+    gate = results.get('benchmark_gate')
+    if not isinstance(gate, dict):
+        total_case_count, completed_comparison_count, mean_error_percentage = _infer_benchmark_gate_inputs(results)
+        gate = build_benchmark_gate(
+            total_case_count=total_case_count,
+            completed_comparison_count=completed_comparison_count,
+            error_percentage=mean_error_percentage,
+        )
     lines = [
         '# Solver Timing Report',
         '',
         f"Benchmark root: `{results.get('benchmark_root', '')}`",
         f"STL count: {results.get('stl_count', 0)}",
         f"Total benchmark wall time: {_format_seconds(results.get('benchmark_total_seconds', results.get('execution_speed')))}",
+        '',
+        '## Benchmark Gate',
+        '',
+        f"Status: {str(gate.get('status', 'fail')).upper()}",
+        f"Achieved evidence level: {gate.get('achieved_evidence_level', 'not_started')}",
+        f"Claim scope: {gate.get('claim_scope', 'sanity_only')}",
+        f"Supports sanity claim: {'yes' if gate.get('supports_sanity_claim') else 'no'}",
+        f"Supports claim upgrade: {'yes' if gate.get('supports_claim_upgrade') else 'no'}",
+        f"Completed solver comparisons: {gate.get('completed_comparison_count', 0)}/{gate.get('total_case_count', 0)}",
+        f"Mean comparison error: {_format_percent(gate.get('mean_error_percentage'))}",
+        f"Allowed claim: {gate.get('allowed_claim', SANITY_BENCHMARK_ALLOWED_CLAIM)}",
+        f"Fallback if failed: {gate.get('fallback_if_failed', SANITY_BENCHMARK_FALLBACK)}",
+        f"Reference gate doc: {gate.get('reference_gate_doc', SANITY_BENCHMARK_GATE_REFERENCE)}",
+        f"Blocked claim upgrades: {', '.join(gate.get('blocked_claims', [])) or 'n/a'}",
+        f"Summary: {gate.get('summary', '')}",
         '',
         '## Case Summary',
         '',
@@ -2061,6 +2192,11 @@ def main(argv: Optional[Sequence[str]] = None):
     results['sweep_case_count'] = sweep_case_count
     results['completed_sweep_case_count'] = completed_sweep_case_count
     results['quality_counts'] = quality_counts
+    results['benchmark_gate'] = build_benchmark_gate(
+        total_case_count=sweep_case_count,
+        completed_comparison_count=completed_sweep_case_count,
+        error_percentage=results['error_percentage'],
+    )
     results['benchmark_total_seconds'] = _duration_since(benchmark_started)
     results['execution_speed'] = results['benchmark_total_seconds']
 

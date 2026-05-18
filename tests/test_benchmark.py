@@ -1,9 +1,13 @@
+import io
+import json
 import tempfile
 import unittest
 import shutil
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -265,6 +269,102 @@ class TestBenchmarkDiscovery(unittest.TestCase):
         self.assertIn('5.00x', report)
         self.assertIn('postProcessing/forces.dat', report)
         self.assertIn('sonicFoam', report)
+
+    def test_summarize_sweep_results_adds_sanity_gate_metadata(self):
+        summary = benchmark.summarize_sweep_results([{
+            'error_percentage': 0.25,
+            'internal': {
+                'drag_coefficient': 0.31,
+            },
+            'openfoam': {
+                'status': 'completed',
+                'force': {
+                    'cd_total': 0.33,
+                },
+            },
+        }])
+
+        gate = summary['benchmark_gate']
+        self.assertEqual(gate['status'], 'pass')
+        self.assertEqual(gate['achieved_evidence_level'], 'solver_validation')
+        self.assertEqual(gate['claim_scope'], 'sanity_only')
+        self.assertTrue(gate['supports_sanity_claim'])
+        self.assertFalse(gate['supports_claim_upgrade'])
+        self.assertIn('Publication-quality validation', gate['blocked_claims'])
+        self.assertIn('sanity', gate['summary'].lower())
+
+    def test_build_timing_report_includes_benchmark_gate_section(self):
+        results = {
+            'benchmark_root': str(REPO),
+            'stl_count': 1,
+            'benchmark_total_seconds': 13.0,
+            'cases': [{
+                'stl_path': str(REPO / '20mm_cube.stl'),
+                'sweep_results': [{
+                    'stl_path': str(REPO / '20mm_cube.stl'),
+                    'grid_resolution': 24,
+                    'steps': 200,
+                    'error_percentage': 0.5,
+                    'timings': {
+                        'internal_solver_total_seconds': 1.0,
+                        'openfoam_total_seconds': 2.0,
+                        'openfoam_to_internal_speed_ratio': 2.0,
+                    },
+                    'openfoam': {
+                        'status': 'completed',
+                        'force': {
+                            'source': 'postProcessing/forces.dat',
+                        },
+                        'commands': {},
+                    },
+                }],
+            }],
+        }
+
+        report = benchmark.build_timing_report(results)
+
+        self.assertIn('## Benchmark Gate', report)
+        self.assertIn('Status: PASS', report)
+        self.assertIn('Claim scope: sanity_only', report)
+        self.assertIn('Supports claim upgrade: no', report)
+        self.assertIn('Publication-quality validation', report)
+
+    def test_main_prints_top_level_benchmark_gate_metadata(self):
+        stl_path = REPO / '20mm_cube.stl'
+        fake_result = {
+            'stl_path': str(stl_path),
+            'sweep_results': [{
+                'stl_path': str(stl_path),
+                'grid_resolution': 24,
+                'steps': 200,
+                'error_percentage': 0.5,
+                'surrogate_label_quality': 'high_accuracy',
+                'openfoam': {
+                    'status': 'completed',
+                    'force': {
+                        'cd_total': 0.2,
+                    },
+                },
+            }],
+            'summary': {},
+        }
+
+        with patch.object(benchmark, 'discover_stls', return_value=[stl_path]), patch.object(
+            benchmark,
+            'run_benchmark_for_stl',
+            return_value=fake_result,
+        ), patch.object(benchmark, '_is_windows_host', return_value=False):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = benchmark.main(['--stl-dir', str(REPO)])
+
+        payload = json.loads(stdout.getvalue())
+        gate = payload['benchmark_gate']
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(gate['status'], 'pass')
+        self.assertEqual(gate['claim_scope'], 'sanity_only')
+        self.assertTrue(gate['supports_sanity_claim'])
+        self.assertFalse(gate['supports_claim_upgrade'])
 
 
 if __name__ == '__main__':
