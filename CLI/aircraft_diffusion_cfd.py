@@ -2500,10 +2500,27 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')
 @click.option('--output', default='aircraft_optimized.stl', help='Output STL file path')
 @click.option('--target-speed', default=7.0, help='Target aircraft speed (m/s)')
+@click.option('--required-static-thrust-n', default=180.0, help='Required static thrust (N)')
+@click.option('--engine-diameter-mm', default=140, help='Nominal engine diameter (mm)')
+@click.option('--engine-length-mm', default=260, help='Nominal engine length (mm)')
+@click.option('--engine-count-min', default=1, help='Minimum engine count')
+@click.option('--engine-count-max', default=2, help='Maximum engine count')
 @click.option('--num-steps', default=4, help='Number of diffusion steps for generation (4 for consistency)')
 @click.option('--use-marching-cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
-def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, solver):
+def generate(
+    checkpoint,
+    output,
+    target_speed,
+    required_static_thrust_n,
+    engine_diameter_mm,
+    engine_length_mm,
+    engine_count_min,
+    engine_count_max,
+    num_steps,
+    use_marching_cubes,
+    solver,
+):
     """Generate aircraft design using optimized 4-step consistency model"""
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -2520,6 +2537,11 @@ def generate(checkpoint, output, target_speed, num_steps, use_marching_cubes, so
     # Design specification
     design_spec = DesignSpec(
         target_speed=target_speed,
+        required_static_thrust_n=required_static_thrust_n,
+        engine_diameter_mm=engine_diameter_mm,
+        engine_length_mm=engine_length_mm,
+        engine_count_min=engine_count_min,
+        engine_count_max=engine_count_max,
         space_weight=0.33,
         drag_weight=0.33,
         lift_weight=0.34

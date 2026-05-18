@@ -60,6 +60,11 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("--checkpoint", result.output)
         self.assertIn("--output", result.output)
         self.assertIn("--target-speed", result.output)
+        self.assertIn("--required-static-thrust-n", result.output)
+        self.assertIn("--engine-diameter-mm", result.output)
+        self.assertIn("--engine-length-mm", result.output)
+        self.assertIn("--engine-count-min", result.output)
+        self.assertIn("--engine-count-max", result.output)
         self.assertIn("--num-steps", result.output)
         self.assertIn("--use-marching-cubes", result.output)
         self.assertIn("--solver", result.output)
@@ -139,6 +144,16 @@ class TestCLISmokePipeline(unittest.TestCase):
                     "design.stl",
                     "--target-speed",
                     "42.0",
+                    "--required-static-thrust-n",
+                    "180.0",
+                    "--engine-diameter-mm",
+                    "140",
+                    "--engine-length-mm",
+                    "260",
+                    "--engine-count-min",
+                    "1",
+                    "--engine-count-max",
+                    "2",
                     "--num-steps",
                     "6",
                 ],
@@ -149,6 +164,11 @@ class TestCLISmokePipeline(unittest.TestCase):
         fake_generator.generate.assert_called_once()
         design_spec = fake_generator.generate.call_args.args[0]
         self.assertEqual(design_spec.target_speed, 42.0)
+        self.assertEqual(design_spec.required_static_thrust_n, 180.0)
+        self.assertEqual(design_spec.engine_diameter_mm, 140)
+        self.assertEqual(design_spec.engine_length_mm, 260)
+        self.assertEqual(design_spec.engine_count_min, 1)
+        self.assertEqual(design_spec.engine_count_max, 2)
         self.assertEqual(fake_generator.generate.call_args.kwargs["num_steps"], 6)
         self.assertEqual(mock_simulator_cls.call_args.args[0].base_grid_resolution, 12)
         fake_generator.voxels_to_stl.assert_called_once_with(
