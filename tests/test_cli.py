@@ -11,7 +11,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 from aircraft_diffusion_cfd import (
     ModelConfig, DiffusionConfig, TrainingConfig, CFDConfig,
     LatentDiffusionUNet, ConsistencyModel, LatentTo3DConverter,
-    OptimizedDiffusionTrainer, AircraftDesignDataset, DesignSpec,
+    OptimizedDiffusionTrainer, AircraftDesignDataset, DesignSpec, aircraft_collate_fn,
     AdvancedCFDSimulator
 )
 
@@ -54,6 +54,31 @@ class TestCLI(unittest.TestCase):
         results = simulator.simulate_aerodynamics(geometry, steps=1)
         self.assertIn('drag_coefficient', results)
         self.assertIn('lift_coefficient', results)
+
+    def test_aircraft_collate_fn_preserves_design_spec_objects(self):
+        batch = [
+            {
+                "latent": torch.zeros(16),
+                "geometry": torch.zeros((8, 8, 8)),
+                "condition_vector": torch.ones(4),
+                "design_spec": DesignSpec(target_speed=42.0),
+            },
+            {
+                "latent": torch.ones(16),
+                "geometry": torch.ones((8, 8, 8)),
+                "condition_vector": torch.zeros(4),
+                "design_spec": DesignSpec(target_speed=55.0),
+            },
+        ]
+
+        collated = aircraft_collate_fn(batch)
+
+        self.assertEqual(collated["latent"].shape, (2, 16))
+        self.assertEqual(collated["geometry"].shape, (2, 8, 8, 8))
+        self.assertEqual(collated["condition_vector"].shape, (2, 4))
+        self.assertEqual(len(collated["design_spec"]), 2)
+        self.assertIsInstance(collated["design_spec"][0], DesignSpec)
+        self.assertEqual(collated["design_spec"][1].target_speed, 55.0)
 
 if __name__ == '__main__':
     unittest.main()

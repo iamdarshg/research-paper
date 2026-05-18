@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data._utils.collate import default_collate
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -299,6 +300,25 @@ DEFAULT_CONDITIONING_PAYLOAD = {
     **CONDITIONING_SCALAR_DEFAULTS,
     **CONDITIONING_CATEGORICAL_DEFAULTS,
 }
+CONDITIONING_SCALAR_NORMALIZATION = {
+    "target_speed_mps": 100.0,
+    "wingspan_limit_m": 10.0,
+    "thrust_to_weight_min": 2.0,
+    "turn_rate_min_deg_s": 90.0,
+    "required_static_thrust_n": 1000.0,
+    "engine_diameter_mm": 500.0,
+    "engine_length_mm": 1000.0,
+    "engine_count_min": 8.0,
+    "engine_count_max": 8.0,
+    "payload_mass_min_g": 10000.0,
+    "payload_mass_max_g": 10000.0,
+    "takeoff_distance_min_m": 1000.0,
+    "takeoff_distance_max_m": 1000.0,
+    "wall_thickness_min_mm": 10.0,
+    "wall_thickness_max_mm": 10.0,
+    "part_count_min": 32.0,
+    "part_count_max": 32.0,
+}
 MANUFACTURING_METHOD_VOCAB = CONDITIONING_CATEGORICAL_FEATURES["manufacturing_method"]
 
 
@@ -417,6 +437,72 @@ def build_condition_vector(design_spec: Optional[DesignSpec] = None) -> torch.Te
     return torch.tensor(values, dtype=CONDITIONING_TENSOR_DTYPE)
 
 
+def normalize_condition_vector_tensor(condition: torch.Tensor) -> torch.Tensor:
+    """Normalize scalar condition slots while leaving categorical one-hot slots untouched."""
+    normalized = condition.clone()
+    for idx, feature_name in enumerate(CONDITIONING_SCALAR_FEATURES):
+        scale = CONDITIONING_SCALAR_NORMALIZATION.get(feature_name, 1.0)
+        normalized[..., idx] = normalized[..., idx] / scale
+    return normalized
+
+
+def _project_condition_signature(condition_vector: torch.Tensor, target_dim: int) -> torch.Tensor:
+    if target_dim <= 0:
+        return condition_vector.new_zeros(0)
+    normalized = normalize_condition_vector_tensor(condition_vector).to(torch.float32)
+    cols = normalized.shape[-1]
+    row_idx = torch.arange(target_dim, dtype=torch.float32, device=normalized.device).unsqueeze(1)
+    col_idx = torch.arange(cols, dtype=torch.float32, device=normalized.device).unsqueeze(0)
+    projection = torch.sin((row_idx + 1.0) * (col_idx + 1.0) * 0.173)
+    return (projection @ normalized) / max(1.0, float(cols) ** 0.5)
+
+
+def build_structured_latent_code(
+    design_spec: DesignSpec,
+    geometry: torch.Tensor,
+    condition_vector: torch.Tensor,
+    latent_dim: int,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Create a deterministic latent target tied to both conditions and geometry."""
+    geometry = geometry.to(torch.float32)
+    occupied = (geometry > 0.5).to(torch.float32)
+    coords = torch.nonzero(occupied, as_tuple=False)
+
+    if coords.numel() == 0:
+        geom_stats = torch.zeros(8, dtype=torch.float32)
+    else:
+        mins = coords.min(dim=0).values.to(torch.float32)
+        maxs = coords.max(dim=0).values.to(torch.float32)
+        dims = (maxs - mins + 1.0) / max(1.0, float(geometry.shape[-1]))
+        center = coords.to(torch.float32).mean(dim=0) / max(1.0, float(geometry.shape[-1] - 1))
+        occupancy_ratio = occupied.mean()
+        engine_density = 0.5 * (
+            float(design_spec.engine_count_min) + float(design_spec.engine_count_max)
+        ) / 8.0
+        geom_stats = torch.tensor(
+            [
+                float(occupancy_ratio),
+                float(dims[0]),
+                float(dims[1]),
+                float(dims[2]),
+                float(center[0]),
+                float(center[1]),
+                float(center[2]),
+                float(engine_density),
+            ],
+            dtype=torch.float32,
+        )
+
+    signature_dim = max(4, latent_dim - geom_stats.numel())
+    condition_signature = _project_condition_signature(condition_vector, signature_dim)
+    base = torch.cat([condition_signature, geom_stats], dim=0)
+    if base.numel() < latent_dim:
+        noise = 0.02 * torch.randn(latent_dim - base.numel(), generator=generator)
+        base = torch.cat([base, noise.to(torch.float32)], dim=0)
+    return base[:latent_dim].to(torch.float32)
+
+
 def sample_design_spec(rng: Optional[random.Random] = None) -> DesignSpec:
     rng = rng or random.Random()
     return DesignSpec(
@@ -498,6 +584,7 @@ def _procedural_aircraft_geometry(
 ) -> torch.Tensor:
     geom = torch.zeros((grid_size, grid_size, grid_size), dtype=torch.float32)
     cx, cy, cz = grid_size // 2, grid_size // 2, grid_size // 2
+    margin = 2 if grid_size >= 12 else 1
 
     avg_payload_g = 0.5 * (
         float(design_spec.payload_mass_min_g) + float(design_spec.payload_mass_max_g)
@@ -550,25 +637,30 @@ def _procedural_aircraft_geometry(
         grid_size // 3,
         int(round(grid_size * (0.42 + 0.16 * speed_scale + 0.08 * engine_length_scale - 0.05 * maneuver_scale))),
     )
-    y0 = max(1, cy - fuselage_length // 2)
-    y1 = min(grid_size - 1, y0 + fuselage_length)
+    fuselage_length = min(fuselage_length, max(4, grid_size - 2 * margin))
+    y0 = max(margin, cy - fuselage_length // 2)
+    y1 = min(grid_size - margin, y0 + fuselage_length)
 
     wall_thickness = _manufacturing_wall_thickness(design_spec)
     wing_half_span = max(
         2,
         int(round(grid_size * (0.18 + 0.16 * span_scale + 0.08 * (1.0 - runway_scale) + 0.05 * maneuver_scale))),
     )
+    wing_half_span = min(wing_half_span, max(2, cx - margin - 1))
     wing_half_chord = max(
         1,
         int(round(grid_size * (0.05 + 0.03 * (1.0 - speed_scale) + 0.02 * payload_scale + 0.03 * maneuver_scale))),
     )
+    wing_half_chord = min(wing_half_chord, max(1, cy - margin - 1, grid_size - margin - cy - 1))
     wing_z_thickness = max(1, wall_thickness)
     wing_y = int(round(cy + grid_size * (0.05 - 0.08 * speed_scale - 0.03 * maneuver_scale)))
-    tail_y = min(grid_size - 2, y1 - max(2, grid_size // 8))
+    wing_y = int(np.clip(wing_y, margin + wing_half_chord, grid_size - margin - wing_half_chord - 1))
+    tail_y = min(grid_size - margin - 1, y1 - max(2, grid_size // 8))
     vertical_tail_height = max(
         2,
         int(round(1 + wall_thickness + thrust_scale + 0.5 * maneuver_scale)),
     )
+    vertical_tail_height = min(vertical_tail_height, max(2, grid_size - margin - cz))
 
     for y in range(y0, y1):
         taper = 1.0 - abs(y - cy) / max(1, fuselage_length)
@@ -633,8 +725,14 @@ def _procedural_aircraft_geometry(
                 max(0, cz - pod_half_height):min(grid_size, cz + pod_half_height + 1),
             ] = 1.0
 
+    support_mask = F.max_pool3d(
+        geom.unsqueeze(0).unsqueeze(0),
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    ).squeeze(0).squeeze(0) > 0
     noise = torch.rand((grid_size, grid_size, grid_size), generator=generator)
-    geom = torch.where(noise > 0.995, torch.ones_like(geom), geom)
+    geom = torch.where((noise > 0.992) & support_mask, torch.ones_like(geom), geom)
     return geom.clamp(0.0, 1.0)
 
 # ============================================================================
@@ -1122,7 +1220,7 @@ class LatentDiffusionUNet(nn.Module):
         t_emb = self.time_embedding(timestep.to(self.time_embedding[0].weight.dtype).unsqueeze(1) / self.diffusion_config.timesteps)
         condition_embedding = None
         if condition is not None and self.conditioning_dim > 0 and condition.ndim == 2:
-            condition = condition.to(self.time_embedding[0].weight.dtype)
+            condition = normalize_condition_vector_tensor(condition.to(self.time_embedding[0].weight.dtype))
             t_emb = t_emb + self.condition_time_projection(condition)
             condition_embedding = self.condition_projection(condition)
         
@@ -1434,16 +1532,27 @@ class AircraftDesignDataset(Dataset):
             return
 
         self.num_samples = num_samples
-        self.latent_codes = torch.randn(
-            num_samples,
-            latent_dim,
-            generator=self.torch_generator,
-        )
         self.design_specs = [sample_design_spec(self.rng) for _ in range(num_samples)]
         self.condition_vectors = torch.stack(
             [build_condition_vector(spec) for spec in self.design_specs]
         )
         self.geometries = self._generate_geometries()
+        self.latent_codes = torch.stack(
+            [
+                build_structured_latent_code(
+                    design_spec,
+                    geometry,
+                    condition_vector,
+                    latent_dim,
+                    generator=self.torch_generator,
+                )
+                for design_spec, geometry, condition_vector in zip(
+                    self.design_specs,
+                    self.geometries,
+                    self.condition_vectors,
+                )
+            ]
+        )
 
     def _generate_geometries(self) -> List[torch.Tensor]:
         """Generate procedural aircraft geometries tied to design metadata."""
@@ -1468,6 +1577,21 @@ class AircraftDesignDataset(Dataset):
             'condition_vector': self.condition_vectors[idx],
             'design_spec': design_spec,
         }
+
+
+def aircraft_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate tensors normally while preserving structured metadata objects."""
+    if not batch:
+        return {}
+
+    collated: Dict[str, Any] = {}
+    for key in batch[0].keys():
+        values = [item[key] for item in batch]
+        if key in {"design_spec", "reward_record"}:
+            collated[key] = values
+        else:
+            collated[key] = default_collate(values)
+    return collated
 
 # ============================================================================
 # LOSS FUNCTIONS
@@ -2033,7 +2157,9 @@ class OptimizedAircraftGenerator:
     
     def _write_stl(self, path: str, vertices: np.ndarray, faces: np.ndarray):
         """Write mesh to binary STL file with optimizations"""
-        with open(path, 'wb') as f:
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'wb') as f:
             # Header
             f.write(b'\0' * 80)
             # Number of triangles
@@ -2465,7 +2591,13 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         latent_dim=model_config.latent_dim,
         artifact_path=dataset_artifact,
     )
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    train_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=aircraft_collate_fn,
+    )
 
     # Optimized trainer
     trainer = OptimizedDiffusionTrainer(
@@ -2557,6 +2689,8 @@ def generate(
     
     # Export to optimized STL
     print(f"Converting to optimized STL mesh with adaptive refinement...")
+    output_parent = Path(output).parent
+    output_parent.mkdir(parents=True, exist_ok=True)
     generator.voxels_to_stl(voxel_grid, output, use_marching_cubes=use_marching_cubes)
 
     # Add final CFD analysis
@@ -2604,6 +2738,109 @@ def batch_generate(checkpoint, output_dir, num_designs):
         
         output_path = os.path.join(output_dir, f'aircraft_optimized_{i+1:03d}.stl')
         generator.voxels_to_stl(voxel_grid, output_path, use_marching_cubes=True)
+
+@cli.command("densify-dataset")
+@click.option('--output-artifact', required=True, help='Output artifact path (.pt)')
+@click.option('--checkpoint', default=None, help='Optional conditioned checkpoint to sample from')
+@click.option('--report-dir', default=None, help='Optional directory for manifest/npz/jsonl sidecars')
+@click.option('--num-samples', default=32, help='Number of procedural candidates when no checkpoint is provided')
+@click.option('--num-conditions', default=4, help='Number of condition seeds when sampling from a checkpoint')
+@click.option('--num-candidates-per-condition', default=6, help='Candidates to sample per condition when using a checkpoint')
+@click.option('--grid-size', default=16, help='Voxel grid size for procedural bootstrap mode')
+@click.option('--latent-dim', default=16, help='Latent dimension for procedural bootstrap mode')
+@click.option('--seed', default=0, help='Random seed for procedural bootstrap mode')
+@click.option('--min-total-reward', default=0.15, help='Minimum acceptance reward')
+@click.option('--min-connected-fraction', default=0.90, help='Minimum largest-component fraction')
+@click.option('--min-occupancy-ratio', default=0.01, help='Minimum occupancy ratio')
+@click.option('--max-occupancy-ratio', default=0.35, help='Maximum occupancy ratio')
+@click.option('--enable-cfd/--no-cfd', default=False, help='Enable bounded CFD reranking in the offline verifier')
+@click.option('--cfd-steps', default=24, help='Bounded CFD steps for verifier mode')
+@click.option('--cfd-top-k', default=1, help='Number of top heuristic survivors to rerank with CFD')
+def densify_dataset(
+    output_artifact,
+    checkpoint,
+    report_dir,
+    num_samples,
+    num_conditions,
+    num_candidates_per_condition,
+    grid_size,
+    latent_dim,
+    seed,
+    min_total_reward,
+    min_connected_fraction,
+    min_occupancy_ratio,
+    max_occupancy_ratio,
+    enable_cfd,
+    cfd_steps,
+    cfd_top_k,
+):
+    """Build an offline verified dataset artifact for conditioned training."""
+    import offline_densify as densify_module
+
+    config = densify_module.RLVRBootstrapConfig(
+        min_total_reward=min_total_reward,
+        min_connected_fraction=min_connected_fraction,
+        min_occupancy_ratio=min_occupancy_ratio,
+        max_occupancy_ratio=max_occupancy_ratio,
+        cfd_steps=cfd_steps,
+        cfd_top_k=cfd_top_k,
+        enable_cfd=enable_cfd,
+        base_grid_resolution=grid_size,
+        num_candidates_per_condition=num_candidates_per_condition,
+    )
+
+    if checkpoint:
+        summary = densify_module.densify_from_checkpoint(
+            checkpoint_path=checkpoint,
+            output_path=output_artifact,
+            num_conditions=num_conditions,
+            config=config,
+        )
+    else:
+        summary = densify_module.bootstrap_dataset(
+            output_path=output_artifact,
+            config=config,
+            num_samples=num_samples,
+            grid_size=grid_size,
+            latent_dim=latent_dim,
+            seed=seed,
+        )
+
+    print(
+        "Offline densification complete: "
+        f"candidates={summary['num_candidates']} "
+        f"accepted={summary['num_accepted']} "
+        f"artifact={summary['output_path']}"
+    )
+
+    if report_dir:
+        payload = torch.load(output_artifact, map_location='cpu')
+        design_specs = payload.get('design_specs', [])
+        reward_records = payload.get('reward_records', [])
+        accepted_records = []
+        for idx in range(int(payload['geometries'].shape[0])):
+            design_spec_payload = design_specs[idx] if idx < len(design_specs) else {}
+            accepted_records.append(
+                {
+                    'geometry': payload['geometries'][idx],
+                    'condition_vector': payload['condition_vectors'][idx],
+                    'design_spec': DesignSpec(**design_spec_payload) if design_spec_payload else DesignSpec(),
+                    'reward': reward_records[idx] if idx < len(reward_records) else {
+                        'total_reward': 0.0,
+                        'reward_components': {},
+                    },
+                }
+            )
+        report_paths = densify_module.write_dataset_artifact(
+            output_dir=report_dir,
+            accepted_records=accepted_records,
+            config=config,
+            checkpoint_path=checkpoint,
+        )
+        print(f"Report bundle written to {report_dir}")
+        print(f"  manifest={report_paths['manifest']}")
+        print(f"  npz={report_paths['npz']}")
+        print(f"  jsonl={report_paths['jsonl']}")
 
 @cli.command()
 def performance_benchmark():

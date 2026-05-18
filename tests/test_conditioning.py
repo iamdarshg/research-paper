@@ -238,6 +238,41 @@ class TestLiveConditioningPath(unittest.TestCase):
             1.0,
         )
 
+    def test_normalize_condition_vector_scales_scalar_slots_only(self):
+        schema = _load_conditioning_schema()
+        design_spec = cli_module.DesignSpec(
+            target_speed=42.0,
+            wingspan_limit_m=1.8,
+            thrust_to_weight_min=0.45,
+            turn_rate_min_deg_s=18.0,
+            required_static_thrust_n=180.0,
+            engine_diameter_mm=140,
+            engine_length_mm=260,
+            engine_count_min=1,
+            engine_count_max=2,
+            payload_mass_min_g=500,
+            payload_mass_max_g=2000,
+            takeoff_distance_min_m=120,
+            takeoff_distance_max_m=250,
+            wall_thickness_min_mm=1,
+            wall_thickness_max_mm=2,
+            part_count_min=1,
+            part_count_max=8,
+            manufacturing_method="fdm_pla_0p6mm",
+        )
+
+        vector = cli_module.build_condition_vector(design_spec)
+        normalized = cli_module.normalize_condition_vector_tensor(vector.unsqueeze(0)).squeeze(0)
+        layout = schema["vector_layout"]
+
+        self.assertAlmostEqual(normalized[layout.index("target_speed_mps")].item(), 0.42, places=6)
+        self.assertAlmostEqual(normalized[layout.index("payload_mass_max_g")].item(), 0.2, places=6)
+        self.assertAlmostEqual(normalized[layout.index("required_static_thrust_n")].item(), 0.18, places=6)
+        self.assertEqual(
+            normalized[layout.index("manufacturing_method__fdm_pla_0p6mm")].item(),
+            1.0,
+        )
+
     def test_dataset_emits_condition_vector_and_design_spec(self):
         schema = _load_conditioning_schema()
         dataset = cli_module.AircraftDesignDataset(

@@ -51,6 +51,19 @@ def _largest_component_fraction(binary: np.ndarray) -> float:
     return float(largest) / float(occupied)
 
 
+def _trim_boundary_voxels(geometry: torch.Tensor) -> torch.Tensor:
+    trimmed = geometry.detach().clone()
+    if trimmed.ndim != 3 or min(trimmed.shape) < 3:
+        return trimmed
+    trimmed[0, :, :] = 0
+    trimmed[-1, :, :] = 0
+    trimmed[:, 0, :] = 0
+    trimmed[:, -1, :] = 0
+    trimmed[:, :, 0] = 0
+    trimmed[:, :, -1] = 0
+    return trimmed
+
+
 def _bbox_dimensions(binary: np.ndarray) -> Dict[str, int]:
     coords = np.argwhere(binary)
     if coords.size == 0:
@@ -413,7 +426,9 @@ def densify_from_checkpoint(
                 num_steps=4,
                 condition=condition_vector.unsqueeze(0).to(generator.device),
             )
-            voxel_grid = torch.sigmoid(generator.converter(latent)).squeeze(0).detach().cpu().float()
+            voxel_grid = torch.sigmoid(generator.converter(latent)).squeeze(0)
+            voxel_grid = generator._postprocess_voxels(voxel_grid).detach().cpu().float()
+            voxel_grid = _trim_boundary_voxels(voxel_grid)
             candidate_records.append(
                 {
                     "latent": latent.squeeze(0).detach().cpu().float(),

@@ -12,5 +12,6 @@ CLI/checkpoints_sanity/final_optimized_model.pt
 *.pt
 build/
 smoke_outputs/
+smoke_outputs*/
 deprecated/
 *.log

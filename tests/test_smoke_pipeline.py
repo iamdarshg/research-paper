@@ -13,6 +13,7 @@ if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
 import aircraft_diffusion_cfd as cli_module
+import offline_densify as densify_module
 from aircraft_diffusion_cfd import CFDConfig, DiffusionConfig, LBMPhysicsConfig, ModelConfig, TrainingConfig
 
 
@@ -50,8 +51,15 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("train", result.output)
         self.assertIn("generate", result.output)
         self.assertIn("batch-generate", result.output)
+        self.assertIn("densify-dataset", result.output)
         self.assertIn("performance-benchmark", result.output)
         self.assertIn("info", result.output)
+
+    def test_train_help_lists_dataset_artifact_option(self):
+        result = self.runner.invoke(cli_module.cli, ["train", "--help"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("--dataset-artifact", result.output)
 
     def test_generate_help_lists_current_options(self):
         result = self.runner.invoke(cli_module.cli, ["generate", "--help"])
@@ -68,6 +76,17 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("--num-steps", result.output)
         self.assertIn("--use-marching-cubes", result.output)
         self.assertIn("--solver", result.output)
+
+    def test_densify_help_lists_current_options(self):
+        result = self.runner.invoke(cli_module.cli, ["densify-dataset", "--help"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("--output-artifact", result.output)
+        self.assertIn("--checkpoint", result.output)
+        self.assertIn("--report-dir", result.output)
+        self.assertIn("--num-samples", result.output)
+        self.assertIn("--num-conditions", result.output)
+        self.assertIn("--num-candidates-per-condition", result.output)
 
     def test_save_checkpoint_includes_cfd_config_payload(self):
         trainer = object.__new__(cli_module.OptimizedDiffusionTrainer)
@@ -176,6 +195,98 @@ class TestCLISmokePipeline(unittest.TestCase):
             "design.stl",
             use_marching_cubes=True,
         )
+
+    def test_generate_creates_parent_output_directory(self):
+        fake_generator = mock.Mock()
+        fake_generator.generate.return_value = torch.ones((12, 12, 12))
+        fake_generator.voxels_to_stl.return_value = None
+
+        fake_simulator = mock.Mock()
+        fake_simulator.simulate_aerodynamics.return_value = {
+            "drag_coefficient": 0.1,
+            "lift_coefficient": 0.2,
+        }
+
+        nested_dir_created = False
+        with self.runner.isolated_filesystem():
+            with mock.patch.object(cli_module.os.path, "exists", return_value=True), \
+                 mock.patch.object(cli_module, "OptimizedAircraftGenerator", return_value=fake_generator), \
+                 mock.patch.object(cli_module, "AdvancedCFDSimulator", return_value=fake_simulator), \
+                 mock.patch.object(cli_module.torch.cuda, "is_available", return_value=False):
+                result = self.runner.invoke(
+                    cli_module.cli,
+                    [
+                        "generate",
+                        "--checkpoint",
+                        "fake-checkpoint.pt",
+                        "--output",
+                        os.path.join("nested", "design.stl"),
+                    ],
+                )
+            nested_dir_created = os.path.isdir("nested")
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertTrue(nested_dir_created)
+
+    def test_train_passes_dataset_artifact_and_enables_conditioning_for_fresh_model(self):
+        fake_dataset = mock.Mock()
+        fake_loader = mock.Mock()
+        fake_trainer = mock.Mock()
+
+        with mock.patch.object(cli_module.torch._logging, "set_logs"), \
+             mock.patch.object(cli_module.torch.cuda, "is_available", return_value=False), \
+             mock.patch.object(cli_module, "AircraftDesignDataset", return_value=fake_dataset) as mock_dataset_cls, \
+             mock.patch.object(cli_module, "DataLoader", return_value=fake_loader) as mock_loader_cls, \
+             mock.patch.object(cli_module, "OptimizedDiffusionTrainer", return_value=fake_trainer) as mock_trainer_cls:
+            result = self.runner.invoke(
+                cli_module.cli,
+                [
+                    "train",
+                    "--num-epochs",
+                    "1",
+                    "--num-samples",
+                    "2",
+                    "--dataset-artifact",
+                    "artifact.pt",
+                    "--save-dir",
+                    "tmp-checkpoints",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(mock_dataset_cls.call_args.kwargs["artifact_path"], "artifact.pt")
+        self.assertEqual(
+            mock_loader_cls.call_args.kwargs["collate_fn"].__name__,
+            "aircraft_collate_fn",
+        )
+        model_config = mock_trainer_cls.call_args.args[0]
+        self.assertEqual(model_config.conditioning_dim, cli_module.infer_conditioning_dim())
+        fake_trainer.train.assert_called_once_with(fake_loader)
+
+    def test_densify_dataset_cli_delegates_to_checkpoint_densifier(self):
+        with mock.patch.object(densify_module, "densify_from_checkpoint", return_value={"num_candidates": 6, "num_accepted": 2, "output_path": "artifact.pt"}) as mock_densify, \
+             mock.patch.object(densify_module, "bootstrap_dataset") as mock_bootstrap:
+            result = self.runner.invoke(
+                cli_module.cli,
+                [
+                    "densify-dataset",
+                    "--checkpoint",
+                    "fake-checkpoint.pt",
+                    "--output-artifact",
+                    "artifact.pt",
+                    "--num-conditions",
+                    "2",
+                    "--num-candidates-per-condition",
+                    "3",
+                    "--min-total-reward",
+                    "0.2",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        mock_densify.assert_called_once()
+        mock_bootstrap.assert_not_called()
+        self.assertIn("accepted=2", result.output)
 
 
 if __name__ == "__main__":
