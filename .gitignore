@@ -7,7 +7,7 @@ checkpoint*
 test_checkpoints
 __pycache__/
 GUI/__pycache__
-*/__pycache__/*
+*/__pycache__/
 CLI/checkpoints_sanity/final_optimized_model.pt
 *.pt
 build/

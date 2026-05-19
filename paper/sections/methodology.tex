@@ -1,6 +1,6 @@
 \section{Methodology}
 \label{sec:methodology}
-The current repository implements a proof-of-concept generative workflow built from four components: a noise scheduler, a latent diffusion-style denoiser, a latent-to-3D converter, and an internal CFD-oriented evaluator. The codebase operates on synthetic voxel training data and uses a progressive training schedule together with connectivity heuristics and aerodynamic score terms. Figure \ref{fig:architecture} should therefore be read as an implementation diagram for the present repository rather than as evidence of a fully validated aircraft-design system.
+The current repository implements a proof-of-concept generative workflow built from four components: a noise scheduler, a latent diffusion-style denoiser, a latent-to-3D converter, and an internal CFD-oriented evaluator. The codebase operates on synthetic voxel training data and uses bounded smoke runs together with connectivity heuristics and aerodynamic score terms. In this revision, the same path also carries a documented structured condition vector through dataset generation, latent construction, and checkpointed inference. Figure \ref{fig:architecture} should therefore be read as an implementation diagram for the present repository rather than as evidence of a fully validated aircraft-design system.
 
 \begin{figure*}[!t]
 \centering

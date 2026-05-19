@@ -5,14 +5,15 @@ This README exists because the current repository does **not** yet implement a f
 ## What The Repo Can Do Today
 
 - Train a proof-of-concept latent generator on a synthetic voxel dataset.
+- Carry a structured condition vector through the current dataset, model, and generator code paths.
 - Export generated voxel grids to STL.
 - Score shapes with the internal CFD path and benchmark selected meshes with OpenFOAM.
 - Reproduce a small sanity run on limited hardware.
 
 ## What The Repo Cannot Honestly Claim Today
 
-- Conditioned generation from a full flight profile.
-- Conditioning on manufacturing method, material, or production constraints.
+- Scientifically validated conditioned generation from a full flight profile.
+- Scientifically validated conditioning on manufacturing method, material, or production constraints.
 - Real aircraft design synthesis from a curated aircraft dataset.
 - Structural viability beyond connectivity heuristics.
 - Publication-grade aerodynamic optimization on an 8 GB laptop GPU.
@@ -72,7 +73,7 @@ The repo now documents a minimal condition-vector seam in `CLI/conditioning_sche
 
 That ordering matters. Dataset preprocessing, any future condition encoder, and checkpoint metadata should all emit the same flat vector layout.
 
-The public CLI still only wires `target_speed`, and `batch-generate` still uses a fixed `DesignSpec(target_speed=50.0)`. So this seam is best described as the smallest stable interface for future conditioned work, not as finished end-user conditioning.
+The repository now has a partial structured conditioning path: the dataset, latent/model path, and generator all consume the documented condition vector. The public CLI currently exposes only a subset of that schema. The direct `generate` and `batch-generate` paths now expose speed, thrust-to-weight, turn-rate, static thrust, engine geometry, engine count, wingspan, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and manufacturing method. Remaining work is still real: payload, takeoff, wingspan, wall-thickness, part-count, and manufacturing controls need condition-response benchmarks against grounded aircraft-like data before they can support scientific claims, and config-driven evaluation workflows still need to be hardened around the full schema.
 
 ### 3. Replace the synthetic dataset
 
@@ -84,12 +85,12 @@ The current synthetic voxel generator is not enough. The minimum viable dataset 
 
 Even a noisy, partly procedural dataset is better than the current hand-drawn synthetic fuselage-and-wing voxel prior.
 
-### 4. Make the model explicitly conditional
+### 4. Upgrade partial plumbing into validated conditioning
 
-The current code only uses `target_speed` plus simple loss weights. The cheapest workable upgrade is:
-- encode the structured condition vector with an MLP,
-- inject it into the latent denoiser and decoder,
-- train a conditional model first without expensive CFD in every step,
+The current code already carries a structured condition vector into the dataset, latent construction, denoiser, and generation path. The missing work is not "add conditioning from scratch"; it is to make that path scientifically meaningful:
+- expose the remaining condition fields cleanly in public CLI/config surfaces,
+- train and evaluate against a grounded aircraft-like corpus rather than only procedural data,
+- measure whether changing each condition changes outputs in the intended direction,
 - run CFD as reranking or periodic auxiliary supervision rather than full tight-loop optimization.
 
 ### 5. Respect the 8 GB GPU boundary

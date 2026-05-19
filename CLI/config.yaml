@@ -45,9 +45,9 @@ conditioning:
   schema_path: conditioning_schema.yaml
   vector_dim: 22
   notes:
-    - public CLI still only wires `target_speed` on the direct `generate` path
-    - offline densification and synthetic dataset generation should use the full schema
-    - scalar constraints now include thrust-to-weight, turn-rate, and explicit min/max bounds
+    - the repo now has a partial structured conditioning path spanning dataset, model, generator, and offline densification
+    - public CLI surfaces only a subset of the full schema and still needs condition-response benchmarks before claims can be strengthened
+    - scalar constraints include thrust-to-weight, turn-rate, explicit thrust and engine geometry, and numeric min/max bounds
 
 design:
   target_speed: 50.0

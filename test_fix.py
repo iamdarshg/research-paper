@@ -8,7 +8,10 @@ import sys
 
 import torch
 
-sys.path.append('.')
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+CLI_DIR = os.path.join(REPO_ROOT, "CLI")
+if CLI_DIR not in sys.path:
+    sys.path.append(CLI_DIR)
 
 from aircraft_diffusion_cfd import AdvancedCFDSimulator, CFDConfig, LatentTo3DConverter, ModelConfig
 

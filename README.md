@@ -1,6 +1,6 @@
 # Aircraft Diffusion CFD - Research Repo
 
-> Current status: a proof-of-concept research codebase for synthetic voxel generation, CFD-informed scoring, and reproducible benchmarking. It is not yet a validated aircraft-design system or a mission/manufacturing-conditioned airplane generator.
+> Current status: a proof-of-concept research codebase for synthetic voxel generation, CFD-informed scoring, reproducible smoke checks, and partial structured conditioning plumbing. It is not yet a validated aircraft-design system or a scientifically supported mission/manufacturing-conditioned airplane generator.
 
 ## Overview
 
@@ -9,26 +9,27 @@ This repository combines a latent generative model, voxel decoding, internal lat
 ## Current Scope
 
 - Proof-of-concept latent generation of freeform or aircraft-like voxel geometries
+- Partial structured conditioning path: dataset, model, and generator consume a documented condition vector
 - Internal D3Q27/OpenFOAM benchmark path for solver cross-checks
 - STL export and reproducible local validation tooling
 - Small-scale training smoke runs on commodity hardware
 
 ## Not Yet Implemented At Claimable Quality
 
-- Flight-profile-conditioned generation
-- Manufacturing-method-conditioned generation
+- Full public CLI/config exposure for mission and manufacturing conditioning
+- Condition-response benchmarks for payload, takeoff, wingspan, wall-thickness, part-count, and manufacturing controls
 - Real aircraft dataset training
 - Structural validation beyond connectivity heuristics
 - Publication-grade aerodynamic optimization claims
 
 ### Key Features
 
-- 🚀 **Fast Training**: Progressive grid refinement (16³ → 24³ → 32³) with only 4-6 hours on A100
-- 💾 **Memory Efficient**: Optimized for 8-13GB VRAM using gradient checkpointing & sparse grids
-- ✈️ **Aerodynamic Optimization**: Built-in CFD simulator evaluates drag, lift, and structural constraints
-- 🎯 **Connectivity Constraints**: Ensures generated designs are structurally viable
+- 🚀 **Prototype Training Path**: Includes smoke-run and final-run guardrails for the current research workflow
+- 💾 **Memory-Aware Implementation**: Uses gradient checkpointing and sparse-grid-oriented code paths
+- ✈️ **CFD-Informed Scoring**: Built-in solver paths can score generated shapes for research experiments
+- 🎯 **Connectivity Heuristics**: Applies connectedness-oriented penalties rather than validated structural analysis
 - 📊 **Real-time Monitoring**: TensorBoard integration for training visualization
-- 📦 **STL Export**: Convert volumetric designs to production-ready meshes
+- 📦 **STL Export**: Convert volumetric designs to STL mesh artifacts for inspection and downstream experiments
 
 ## Quick Start
 
@@ -94,13 +95,13 @@ python aircraft_diffusion_cfd.py batch-generate \
   --num-designs 5
 ```
 
-### 6. Run the Validation Benchmark
+### 6. Run the Internal Benchmark
 
 ```bash
 python3 run_internal_benchmark.py
 ```
 
-This runs the internal D3Q27 solver and, when OpenFOAM is available, a local sonicFoam case for `20mm_cube.stl` plus any other root-level `*.stl` files, then prints a JSON summary with the force comparison. On Linux or Windows/WSL, pass `--install-openfoam` to let the benchmark bootstrap OpenFOAM if it is missing.
+This runs the internal D3Q27 solver and, when OpenFOAM is available, a local sonicFoam case for `20mm_cube.stl` plus any other root-level `*.stl` files, then prints a JSON summary with the force comparison. Treat it as a solver cross-check and implementation smoke benchmark, not as a publication-grade aerodynamic benchmark. On Linux or Windows/WSL, pass `--install-openfoam` to let the benchmark bootstrap OpenFOAM if it is missing.
 
 ## Commands Reference
 
@@ -128,14 +129,19 @@ python aircraft_diffusion_cfd.py train \
 ```
 
 ### `generate`
-Generate new aircraft designs using a trained model.
+Generate new voxel designs using a trained model.
 
 **Key Arguments:**
 - `--checkpoint` (str): Path to trained model checkpoint (required)
 - `--output` (str): Output STL path (default: `aircraft_optimized.stl`)
-- `--target-speed` (float): Scalar design target carried through the current CLI (default: `7.0`)
+- `--target-speed` (float): One scalar in the current public conditioning subset (default: `7.0`)
+- `--thrust-to-weight-min`, `--turn-rate-min-deg-s`, `--required-static-thrust-n`
+- `--engine-diameter-mm`, `--engine-length-mm`, `--engine-count-min`, `--engine-count-max`
+- `--wingspan-limit-m`, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and `--manufacturing-method`
 - `--num-steps` (int): Number of consistency-model sampling steps (default: `4`)
 - `--use-marching-cubes` (bool flag): Export via marching cubes when possible
+
+Under the hood, the repository now has a partial structured conditioning path: the dataset, diffusion model, and generator all consume a condition vector documented in `CLI/conditioning_schema.yaml`. Public CLI exposure is still incomplete relative to the full scientific goal. The public commands now surface a meaningful subset of payload, takeoff, wingspan, wall-thickness, part-count, propulsion, maneuverability, and manufacturing controls, but those controls still need grounded condition-response benchmarks before they support scientific claims.
 
 **Example:**
 ```bash
@@ -153,6 +159,8 @@ Generate multiple STL artifacts from a trained checkpoint.
 - `--checkpoint` (str): Path to trained model checkpoint (required)
 - `--output-dir` (str): Output directory for generated STL files
 - `--num-designs` (int): Number of STL files to emit
+- `--seed` (int): Seed for deterministic condition variation and manifest metadata
+- `--vary-conditions` (flag): Sample deterministic `DesignSpec` variation and record each payload in `batch_manifest.json`
 
 **Example:**
 ```bash
@@ -181,7 +189,7 @@ python aircraft_diffusion_cfd.py info
 ### Hardware
 - **GPU**: NVIDIA CUDA-capable GPU with 8GB+ VRAM
   - 8GB: 16³ training only
-  - 10-13GB: Full 16³ → 32³ progressive training
+  - Larger GPUs: better suited for final-eval workflows with grounded dataset artifacts and baselines
 - **CPU**: Multi-core processor (6+ cores recommended)
 - **RAM**: 16GB+ system RAM
 
@@ -199,9 +207,9 @@ See `requirements.txt`. Key packages:
 - TensorBoard ≥ 2.13.0
 - TrimMesh ≥ 3.20.0
 
-## Training Performance
+## Historical Schedule Notes
 
-### Progressive Training Schedule
+### Legacy Progressive Schedule Reference
 
 | Grid Size | Epochs | Memory | Time (RTX 3090) |
 |-----------|--------|--------|-----------------|
@@ -211,6 +219,8 @@ See `requirements.txt`. Key packages:
 | **Total** | 200    | Peak 10GB | ~14-18 hrs  |
 
 *Note: A100 GPUs are ~2-3x faster than RTX 3090*
+
+This table is retained as historical context from earlier experiments. The current CLI now distinguishes smoke runs from guarded final runs, and the current trainer executes one configured grid size rather than an automatic 16 -> 24 -> 32 schedule.
 
 ## Configuration
 

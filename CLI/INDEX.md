@@ -19,6 +19,8 @@ The current commands are:
 - `train`
 - `generate`
 - `batch-generate`
+- `condition-response-smoke`
+- `densify-dataset`
 - `performance-benchmark`
 - `info`
 

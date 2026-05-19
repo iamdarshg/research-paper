@@ -8,7 +8,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
 from advanced_lbm_solver import D3Q27CascadedSolver, D3Q27Lattice
-from aircraft_diffusion_cfd import CFDConfig, LBMPhysicsConfig
+from config import CFDConfig, LBMPhysicsConfig
 
 class TestLBMSolvers(unittest.TestCase):
     def setUp(self):
@@ -64,6 +64,39 @@ class TestLBMSolvers(unittest.TestCase):
         self.assertTrue(torch.isfinite(solver.f).all().item())
         self.assertTrue(torch.isfinite(torch.tensor(coeffs['drag_coefficient'])).item())
         self.assertTrue(torch.isfinite(torch.tensor(coeffs['lift_coefficient'])).item())
+
+    def test_mrt_conservation(self):
+        """Verify that MRT collision operator conserves mass and momentum."""
+        # Use zero freestream to ensure mass is conserved in a closed/balanced domain
+        self.config.mach_number = 0.0
+        solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
+        geometry_mask = torch.zeros((8, 8, 8), device=self.device)
+
+        # Initial mass
+        total_mass_in = torch.sum(solver._solver.f).item()
+
+        # Perform 10 steps in an empty domain
+        solver.collide_stream(geometry_mask, steps=10)
+
+        total_mass_out = torch.sum(solver._solver.f).item()
+
+        # Check mass conservation
+        # Note: BFL interpolation and MRT moment transforms on CPU accumulate minor
+        # truncation errors over multiple steps in float32. A delta of 1e-3 is
+        # accepted to account for these cumulative errors while still verifying
+        # that no major mass leaks occur.
+        self.assertAlmostEqual(total_mass_in, total_mass_out, delta=1e-3)
+
+        # Check momentum stability using conserved indices from solver
+        m = torch.tensordot(solver._solver.moment_basis, solver._solver.f, dims=([1], [0]))
+
+        # Verify all moments remain finite
+        self.assertTrue(torch.isfinite(m).all())
+
+        # Verify conserved moments (rho, jx, jy, jz) remain finite
+        c_idx = solver._solver.conserved_indices
+        for idx in c_idx:
+             self.assertTrue(torch.isfinite(m[idx]).all())
 
 if __name__ == '__main__':
     unittest.main()

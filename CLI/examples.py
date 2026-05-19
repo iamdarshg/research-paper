@@ -156,7 +156,7 @@ EXAMPLES: dict[str, Example] = {
         command_builder=build_generate,
         notes=(
             "Requires a checkpoint file.",
-            "The public CLI only exposes target-speed conditioning here.",
+            "The public CLI exposes a partial structured conditioning subset here, not the full scientific workflow.",
         ),
     ),
     "batch-generate": Example(
@@ -166,7 +166,7 @@ EXAMPLES: dict[str, Example] = {
         command_builder=build_batch_generate,
         notes=(
             "Requires a checkpoint file.",
-            "The current CLI uses fixed target_speed=50.0 and num_steps=4 internally.",
+            "The current CLI records a condition manifest per STL and still uses fixed num_steps=4.",
         ),
     ),
     "resume-train": Example(
@@ -185,7 +185,7 @@ EXAMPLES: dict[str, Example] = {
         summary="Sketch of direct Python usage for custom DesignSpec weights.",
         notes=(
             "This is intentionally labeled pseudocode.",
-            "The public CLI does not expose full DesignSpec control for generation.",
+            "The public CLI still does not expose the full schema or claim-bearing evaluation workflow.",
             "Internal Python classes are not treated as a stable API.",
         ),
         pseudocode="""from aircraft_diffusion_cfd import DesignSpec, OptimizedAircraftGenerator

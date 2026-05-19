@@ -27,7 +27,7 @@ import random
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import asyncio
 
@@ -265,6 +265,9 @@ class DesignSpec:
     bounding_box: Tuple[int, int, int] = (64, 64, 64)
     vital_components: np.ndarray = None
 
+    def __post_init__(self):
+        validate_design_spec(self)
+
 
 CONDITIONING_SCHEMA_PATH = Path(__file__).with_name("conditioning_schema.yaml")
 
@@ -276,6 +279,7 @@ def load_conditioning_schema(schema_path: Optional[Path] = None) -> Dict[str, An
 
 
 CONDITIONING_SCHEMA = load_conditioning_schema()
+CONDITIONING_SCHEMA_VERSION = int(CONDITIONING_SCHEMA.get("schema_version", 1))
 CONDITIONING_TENSOR_DTYPE = getattr(
     torch,
     CONDITIONING_SCHEMA.get("tensor_dtype", "float32"),
@@ -320,6 +324,155 @@ CONDITIONING_SCALAR_NORMALIZATION = {
     "part_count_max": 32.0,
 }
 MANUFACTURING_METHOD_VOCAB = CONDITIONING_CATEGORICAL_FEATURES["manufacturing_method"]
+DATASET_ARTIFACT_SCHEMA_VERSION = 2
+RUN_CLASS_SMOKE = "smoke"
+RUN_CLASS_FINAL = "final"
+
+
+def _coerce_positive_float(name: str, value: Any) -> float:
+    numeric = float(value)
+    if numeric <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {numeric}")
+    return numeric
+
+
+def _coerce_non_negative_float(name: str, value: Any) -> float:
+    numeric = float(value)
+    if numeric < 0.0:
+        raise ValueError(f"{name} must be >= 0, got {numeric}")
+    return numeric
+
+
+def _coerce_positive_int(name: str, value: Any) -> int:
+    numeric = int(value)
+    if numeric <= 0:
+        raise ValueError(f"{name} must be > 0, got {numeric}")
+    return numeric
+
+
+def validate_design_spec(design_spec: DesignSpec, compatibility_mode: bool = False) -> DesignSpec:
+    _coerce_positive_float("target_speed", design_spec.target_speed)
+    _coerce_positive_float("wingspan_limit_m", design_spec.wingspan_limit_m)
+    _coerce_positive_float("thrust_to_weight_min", design_spec.thrust_to_weight_min)
+    _coerce_positive_float("turn_rate_min_deg_s", design_spec.turn_rate_min_deg_s)
+    _coerce_positive_float("required_static_thrust_n", design_spec.required_static_thrust_n)
+    _coerce_positive_int("engine_diameter_mm", design_spec.engine_diameter_mm)
+    _coerce_positive_int("engine_length_mm", design_spec.engine_length_mm)
+    _coerce_positive_float("takeoff_distance_min_m", design_spec.takeoff_distance_min_m)
+    _coerce_positive_float("takeoff_distance_max_m", design_spec.takeoff_distance_max_m)
+    _coerce_positive_float("wall_thickness_min_mm", design_spec.wall_thickness_min_mm)
+    _coerce_positive_float("wall_thickness_max_mm", design_spec.wall_thickness_max_mm)
+    _coerce_non_negative_float("payload_mass_min_g", design_spec.payload_mass_min_g)
+    _coerce_non_negative_float("payload_mass_max_g", design_spec.payload_mass_max_g)
+
+    design_spec.engine_count_min = _coerce_positive_int("engine_count_min", design_spec.engine_count_min)
+    design_spec.engine_count_max = _coerce_positive_int("engine_count_max", design_spec.engine_count_max)
+    design_spec.part_count_min = _coerce_positive_int("part_count_min", design_spec.part_count_min)
+    design_spec.part_count_max = _coerce_positive_int("part_count_max", design_spec.part_count_max)
+
+    bounded_pairs = [
+        ("engine_count_min", design_spec.engine_count_min, "engine_count_max", design_spec.engine_count_max),
+        ("payload_mass_min_g", float(design_spec.payload_mass_min_g), "payload_mass_max_g", float(design_spec.payload_mass_max_g)),
+        ("takeoff_distance_min_m", float(design_spec.takeoff_distance_min_m), "takeoff_distance_max_m", float(design_spec.takeoff_distance_max_m)),
+        ("wall_thickness_min_mm", float(design_spec.wall_thickness_min_mm), "wall_thickness_max_mm", float(design_spec.wall_thickness_max_mm)),
+        ("part_count_min", design_spec.part_count_min, "part_count_max", design_spec.part_count_max),
+    ]
+    for min_name, min_value, max_name, max_value in bounded_pairs:
+        if float(min_value) > float(max_value):
+            raise ValueError(f"{min_name} must be <= {max_name}, got {min_value} > {max_value}")
+
+    _resolve_category(
+        "manufacturing_method",
+        design_spec.manufacturing_method,
+        compatibility_mode=compatibility_mode,
+    )
+    return design_spec
+
+
+def _legacy_dataset_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    num_samples = int(payload.get("geometries", torch.zeros((0, 1, 1, 1))).shape[0])
+    return {
+        "artifact_schema_version": 1,
+        "condition_schema_version": CONDITIONING_SCHEMA_VERSION,
+        "condition_vector_layout": condition_vector_layout(),
+        "data_source": "legacy_unknown",
+        "legacy_compatibility_mode": True,
+        "num_samples": num_samples,
+        "split_assignments": deterministic_split_assignments(num_samples, seed=0),
+    }
+
+
+def deterministic_split_assignments(num_samples: int, seed: int = 0) -> List[str]:
+    if num_samples <= 0:
+        return []
+    indices = list(range(num_samples))
+    shuffled = indices[:]
+    random.Random(seed).shuffle(shuffled)
+    train_cut = int(round(num_samples * 0.7))
+    val_cut = train_cut + int(round(num_samples * 0.15))
+    assignments = ["holdout"] * num_samples
+    for idx in shuffled[:train_cut]:
+        assignments[idx] = "train"
+    for idx in shuffled[train_cut:val_cut]:
+        assignments[idx] = "val"
+    return assignments
+
+
+def build_dataset_artifact_metadata(
+    *,
+    num_samples: int,
+    grid_size: int,
+    latent_dim: int,
+    data_source: str,
+    seed: int,
+    checkpoint_path: Optional[str] = None,
+    split_seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    split_seed = seed if split_seed is None else split_seed
+    return {
+        "artifact_schema_version": DATASET_ARTIFACT_SCHEMA_VERSION,
+        "condition_schema_version": CONDITIONING_SCHEMA_VERSION,
+        "condition_schema_path": CONDITIONING_SCHEMA_PATH.name,
+        "condition_vector_layout": condition_vector_layout(),
+        "num_samples": int(num_samples),
+        "grid_size": int(grid_size),
+        "latent_dim": int(latent_dim),
+        "data_source": data_source,
+        "seed": int(seed),
+        "split_seed": int(split_seed),
+        "split_assignments": deterministic_split_assignments(int(num_samples), seed=int(split_seed)),
+        "checkpoint_path": checkpoint_path,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def validate_dataset_artifact_payload(
+    payload: Dict[str, Any],
+    *,
+    artifact_path: Optional[str] = None,
+    require_non_empty: bool = False,
+) -> Dict[str, Any]:
+    required_keys = {"latents", "geometries", "condition_vectors", "design_specs", "reward_records"}
+    missing = sorted(required_keys - set(payload.keys()))
+    if missing:
+        location = artifact_path or "<in-memory artifact>"
+        raise ValueError(f"Dataset artifact {location} is missing required keys: {missing}")
+
+    metadata = payload.get("metadata") or _legacy_dataset_metadata(payload)
+    payload["metadata"] = metadata
+
+    if metadata.get("condition_vector_layout") != condition_vector_layout():
+        raise ValueError("Dataset artifact condition_vector_layout does not match current conditioning schema")
+
+    if int(payload["condition_vectors"].shape[-1]) != infer_conditioning_dim():
+        raise ValueError("Dataset artifact condition_vectors width does not match conditioning dimension")
+
+    if require_non_empty and int(payload["geometries"].shape[0]) == 0:
+        location = artifact_path or "<in-memory artifact>"
+        raise ValueError(
+            f"Dataset artifact {location} contains zero accepted samples; regenerate it before training"
+        )
+    return metadata
 
 
 def condition_vector_layout() -> List[str]:
@@ -335,15 +488,24 @@ def _safe_spec_value(value: Optional[float], default: float = 0.0) -> float:
     return float(value)
 
 
-def _resolve_category(feature_name: str, value: Optional[str]) -> str:
+def _resolve_category(
+    feature_name: str,
+    value: Optional[str],
+    compatibility_mode: bool = False,
+) -> str:
     categories = CONDITIONING_CATEGORICAL_FEATURES[feature_name]
     if value in categories:
         return value
-    return DEFAULT_CONDITIONING_PAYLOAD[feature_name]
+    if compatibility_mode:
+        return DEFAULT_CONDITIONING_PAYLOAD[feature_name]
+    raise ValueError(
+        f"{feature_name} must be one of {list(categories)!r}; got {value!r}"
+    )
 
 
 def design_spec_to_condition_payload(design_spec: Optional[DesignSpec] = None) -> Dict[str, Any]:
     spec = design_spec or DesignSpec()
+    validate_design_spec(spec)
     wingspan_limit = spec.wingspan_limit_m
     if wingspan_limit is None:
         wingspan_limit = spec.wingspan_limit_bucket
@@ -505,6 +667,16 @@ def build_structured_latent_code(
 
 def sample_design_spec(rng: Optional[random.Random] = None) -> DesignSpec:
     rng = rng or random.Random()
+    engine_count_min = rng.randint(1, 2)
+    engine_count_max = rng.randint(engine_count_min, 4)
+    payload_mass_min_g = rng.randint(250, 1500)
+    payload_mass_max_g = rng.randint(payload_mass_min_g, 6000)
+    takeoff_distance_min_m = rng.randint(80, 200)
+    takeoff_distance_max_m = rng.randint(takeoff_distance_min_m, 700)
+    wall_thickness_min_mm = rng.randint(1, 2)
+    wall_thickness_max_mm = rng.randint(wall_thickness_min_mm, 4)
+    part_count_min = rng.randint(1, 3)
+    part_count_max = rng.randint(part_count_min, 20)
     return DesignSpec(
         target_speed=rng.uniform(30.0, 90.0),
         thrust_to_weight_min=rng.uniform(0.28, 0.85),
@@ -512,16 +684,16 @@ def sample_design_spec(rng: Optional[random.Random] = None) -> DesignSpec:
         required_static_thrust_n=rng.uniform(90.0, 320.0),
         engine_diameter_mm=rng.randint(90, 220),
         engine_length_mm=rng.randint(180, 420),
-        engine_count_min=rng.randint(1, 2),
-        engine_count_max=rng.randint(2, 4),
-        payload_mass_min_g=rng.randint(250, 1500),
-        payload_mass_max_g=rng.randint(1500, 6000),
-        takeoff_distance_min_m=rng.randint(80, 200),
-        takeoff_distance_max_m=rng.randint(180, 700),
-        wall_thickness_min_mm=rng.randint(1, 2),
-        wall_thickness_max_mm=rng.randint(2, 4),
-        part_count_min=rng.randint(1, 3),
-        part_count_max=rng.randint(4, 20),
+        engine_count_min=engine_count_min,
+        engine_count_max=engine_count_max,
+        payload_mass_min_g=payload_mass_min_g,
+        payload_mass_max_g=payload_mass_max_g,
+        takeoff_distance_min_m=takeoff_distance_min_m,
+        takeoff_distance_max_m=takeoff_distance_max_m,
+        wall_thickness_min_mm=wall_thickness_min_mm,
+        wall_thickness_max_mm=wall_thickness_max_mm,
+        part_count_min=part_count_min,
+        part_count_max=part_count_max,
         wingspan_limit_m=rng.uniform(1.2, 2.4),
         manufacturing_method=rng.choice(MANUFACTURING_METHOD_VOCAB),
     )
@@ -734,6 +906,139 @@ def _procedural_aircraft_geometry(
     noise = torch.rand((grid_size, grid_size, grid_size), generator=generator)
     geom = torch.where((noise > 0.992) & support_mask, torch.ones_like(geom), geom)
     return geom.clamp(0.0, 1.0)
+
+
+def _condition_response_metrics(geometry: torch.Tensor, design_spec: DesignSpec) -> Dict[str, float]:
+    binary = (geometry.detach().cpu().numpy() > 0.5).astype(np.uint8)
+    occupancy_ratio = float(binary.mean())
+    coords = np.argwhere(binary)
+    if coords.size == 0:
+        span_x = span_y = span_z = 0.0
+    else:
+        mins = coords.min(axis=0)
+        maxs = coords.max(axis=0)
+        dims = (maxs - mins + 1).astype(np.float32)
+        span_x = float(dims[0]) / max(1.0, float(binary.shape[0]))
+        span_y = float(dims[1]) / max(1.0, float(binary.shape[1]))
+        span_z = float(dims[2]) / max(1.0, float(binary.shape[2]))
+    shell_fraction = 1.0
+    if occupancy_ratio > 0.0:
+        eroded = binary_dilation(binary.astype(bool)) & (~binary.astype(bool))
+        shell_fraction = float(eroded.sum()) / max(1.0, float(binary.sum()))
+    engine_proxy = 0.5 * (float(design_spec.engine_count_min) + float(design_spec.engine_count_max))
+    part_proxy = 0.5 * (float(design_spec.part_count_min) + float(design_spec.part_count_max))
+    return {
+        "occupancy_ratio": occupancy_ratio,
+        "span_x_fraction": span_x,
+        "span_y_fraction": span_y,
+        "span_z_fraction": span_z,
+        "shell_fraction": shell_fraction,
+        "engine_proxy": engine_proxy,
+        "part_count_proxy": part_proxy,
+    }
+
+
+def _smoke_condition_cases() -> List[DesignSpec]:
+    return [
+        DesignSpec(
+            target_speed=38.0,
+            wingspan_limit_m=1.35,
+            thrust_to_weight_min=0.35,
+            turn_rate_min_deg_s=12.0,
+            required_static_thrust_n=110.0,
+            engine_diameter_mm=95,
+            engine_length_mm=210,
+            engine_count_min=1,
+            engine_count_max=1,
+            payload_mass_min_g=250,
+            payload_mass_max_g=650,
+            takeoff_distance_min_m=70,
+            takeoff_distance_max_m=120,
+            wall_thickness_min_mm=1,
+            wall_thickness_max_mm=1,
+            part_count_min=1,
+            part_count_max=4,
+            manufacturing_method="sheet_balsa_tabbed",
+        ),
+        DesignSpec(
+            target_speed=82.0,
+            wingspan_limit_m=2.35,
+            thrust_to_weight_min=0.78,
+            turn_rate_min_deg_s=26.0,
+            required_static_thrust_n=310.0,
+            engine_diameter_mm=210,
+            engine_length_mm=410,
+            engine_count_min=2,
+            engine_count_max=4,
+            payload_mass_min_g=1800,
+            payload_mass_max_g=4800,
+            takeoff_distance_min_m=180,
+            takeoff_distance_max_m=520,
+            wall_thickness_min_mm=2,
+            wall_thickness_max_mm=4,
+            part_count_min=6,
+            part_count_max=18,
+            manufacturing_method="composite_wet_layup",
+        ),
+    ]
+
+
+def generate_condition_response_smoke_summary(
+    output_path: str,
+    grid_size: int = 16,
+    latent_dim: int = 16,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    specs = _smoke_condition_cases()
+    cases: List[Dict[str, Any]] = []
+    torch_generator = torch.Generator().manual_seed(seed)
+
+    for idx, spec in enumerate(specs):
+        condition_vector = build_condition_vector(spec)
+        geometry = _procedural_aircraft_geometry(spec, grid_size=grid_size, generator=torch_generator)
+        latent = build_structured_latent_code(
+            spec,
+            geometry,
+            condition_vector,
+            latent_dim=latent_dim,
+            generator=torch_generator,
+        )
+        cases.append(
+            {
+                "name": f"case_{idx}",
+                "design_spec": asdict(spec),
+                "condition_vector": condition_vector.tolist(),
+                "latent_summary": {
+                    "mean": float(latent.mean().item()),
+                    "std": float(latent.std().item()),
+                },
+                "metrics": _condition_response_metrics(geometry, spec),
+            }
+        )
+
+    deltas = {}
+    for metric_name in cases[0]["metrics"].keys():
+        values = [case["metrics"][metric_name] for case in cases]
+        deltas[metric_name] = float(max(values) - min(values))
+
+    summary = {
+        "mode": "condition-response smoke only",
+        "seed": int(seed),
+        "grid_size": int(grid_size),
+        "latent_dim": int(latent_dim),
+        "cases": cases,
+        "deltas": deltas,
+        "notes": [
+            "Smoke benchmark only; not scientific validation.",
+            "Use this to confirm directional response of the procedural path.",
+        ],
+    }
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    return summary
 
 # ============================================================================
 # GROUPED-QUERY ATTENTION (50% KV-CACHE REDUCTION)
@@ -1517,6 +1822,11 @@ class AircraftDesignDataset(Dataset):
 
         if artifact_path:
             payload = torch.load(artifact_path, map_location="cpu")
+            self.metadata = validate_dataset_artifact_payload(
+                payload,
+                artifact_path=artifact_path,
+                require_non_empty=True,
+            )
             self.latent_codes = payload["latents"].float()
             self.geometries = [geometry.float() for geometry in payload["geometries"]]
             self.condition_vectors = payload["condition_vectors"].float()
@@ -1532,6 +1842,13 @@ class AircraftDesignDataset(Dataset):
             return
 
         self.num_samples = num_samples
+        self.metadata = build_dataset_artifact_metadata(
+            num_samples=num_samples,
+            grid_size=grid_size,
+            latent_dim=latent_dim,
+            data_source="procedural_synthetic",
+            seed=seed,
+        )
         self.design_specs = [sample_design_spec(self.rng) for _ in range(num_samples)]
         self.condition_vectors = torch.stack(
             [build_condition_vector(spec) for spec in self.design_specs]
@@ -1960,9 +2277,9 @@ class OptimizedDiffusionTrainer:
         for grid_size in grid_sizes:
             print(f"\n{'='*60}")
             print(f"Training with grid size: {grid_size}x{grid_size}x{grid_size}")
-            print(f"Features: 4-step consistency, grouped-query attention, gradient checkpointing")
-            print(f"Memory: 60% VRAM savings, 50% KV-cache reduction")
-            print(f"CFD: Adaptive mesh (~5k cells), GPU LBM solver")
+            print("Configured features: consistency path, grouped attention, checkpointing")
+            print("Memory note: efficiency features are enabled, but no benchmark claim is implied here")
+            print("CFD note: this run uses the configured internal solver path for smoke evidence")
             print(f"{'='*60}\n")
 
             torch.cuda.empty_cache()
@@ -2070,13 +2387,12 @@ class OptimizedAircraftGenerator:
     @torch.no_grad()
     def generate(self, design_spec: DesignSpec, num_steps: int = 4, guidance_scale: float = 7.5) -> torch.Tensor:
         """
-        Generate aircraft design via 4-step consistency model.
-        250x faster than original 1000-step diffusion!
+        Generate an aircraft-like voxel artifact through the configured consistency path.
         """
         latent_shape = (1, self.model_config.latent_dim)
         condition = build_condition_vector(design_spec).unsqueeze(0).to(self.device)
         
-        print(f"Generating with 4-step consistency model (vs 1000-step diffusion)")
+        print(f"Generating with configured {num_steps}-step consistency path")
         
         # Use fast 4-step consistency model
         latent = self.consistency_model.fast_inference(
@@ -2475,6 +2791,138 @@ simulationType laminar;
 
 import click
 
+
+def _build_design_spec_from_cli_options(
+    *,
+    target_speed: float,
+    thrust_to_weight_min: float,
+    turn_rate_min_deg_s: float,
+    required_static_thrust_n: float,
+    engine_diameter_mm: int,
+    engine_length_mm: int,
+    engine_count_min: int,
+    engine_count_max: int,
+    wingspan_limit_m: float,
+    payload_mass_min_g: int,
+    payload_mass_max_g: int,
+    takeoff_distance_min_m: int,
+    takeoff_distance_max_m: int,
+    wall_thickness_min_mm: int,
+    wall_thickness_max_mm: int,
+    part_count_min: int,
+    part_count_max: int,
+    manufacturing_method: str,
+) -> DesignSpec:
+    return DesignSpec(
+        target_speed=target_speed,
+        thrust_to_weight_min=thrust_to_weight_min,
+        turn_rate_min_deg_s=turn_rate_min_deg_s,
+        required_static_thrust_n=required_static_thrust_n,
+        engine_diameter_mm=engine_diameter_mm,
+        engine_length_mm=engine_length_mm,
+        engine_count_min=engine_count_min,
+        engine_count_max=engine_count_max,
+        wingspan_limit_m=wingspan_limit_m,
+        payload_mass_min_g=payload_mass_min_g,
+        payload_mass_max_g=payload_mass_max_g,
+        takeoff_distance_min_m=takeoff_distance_min_m,
+        takeoff_distance_max_m=takeoff_distance_max_m,
+        wall_thickness_min_mm=wall_thickness_min_mm,
+        wall_thickness_max_mm=wall_thickness_max_mm,
+        part_count_min=part_count_min,
+        part_count_max=part_count_max,
+        manufacturing_method=manufacturing_method,
+        space_weight=0.33,
+        drag_weight=0.33,
+        lift_weight=0.34,
+    )
+
+
+def _cli_output_path(path: str) -> str:
+    return str(Path(path).resolve())
+
+
+def _batch_design_specs(base_spec: DesignSpec, num_designs: int, seed: int, vary_conditions: bool) -> List[DesignSpec]:
+    if not vary_conditions:
+        return [DesignSpec(**asdict(base_spec)) for _ in range(num_designs)]
+
+    specs: List[DesignSpec] = []
+    seeded_rng = random.Random(seed)
+    for _ in range(num_designs):
+        spec = sample_design_spec(seeded_rng)
+        spec.space_weight = base_spec.space_weight
+        spec.drag_weight = base_spec.drag_weight
+        spec.lift_weight = base_spec.lift_weight
+        specs.append(spec)
+    return specs
+
+
+def _write_batch_manifest(
+    output_dir: str,
+    design_specs: List[DesignSpec],
+    output_paths: List[str],
+    seed: int,
+    vary_conditions: bool,
+) -> str:
+    manifest_path = Path(output_dir) / "batch_manifest.json"
+    payload = {
+        "mode": "smoke-run batch generation",
+        "seed": int(seed),
+        "vary_conditions": bool(vary_conditions),
+        "designs": [
+            {
+                "output_path": path,
+                "design_spec": asdict(spec),
+                "condition_vector": build_condition_vector(spec).tolist(),
+            }
+            for spec, path in zip(design_specs, output_paths)
+        ],
+        "notes": [
+            "Generated artifacts are smoke outputs only.",
+            "This manifest is for reproducibility and does not validate aircraft quality.",
+        ],
+    }
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return str(manifest_path)
+
+
+def _validate_run_class_inputs(
+    run_class: str,
+    dataset_artifact: Optional[str],
+    baseline_config: Optional[str],
+    claim_gates: Optional[str],
+) -> None:
+    if run_class != RUN_CLASS_FINAL:
+        return
+
+    missing = []
+    if not dataset_artifact:
+        missing.append("dataset artifact")
+    if not baseline_config:
+        missing.append("baseline config")
+    if not claim_gates:
+        missing.append("claim gates")
+    if missing:
+        raise click.UsageError(
+            "Final run class requires " + ", ".join(missing) + "."
+        )
+
+    for label, path in (
+        ("dataset artifact", dataset_artifact),
+        ("baseline config", baseline_config),
+        ("claim gates", claim_gates),
+    ):
+        if not path or not Path(path).exists():
+            raise click.UsageError(f"Final run class requires an existing {label}: {path}")
+
+    payload = torch.load(dataset_artifact, map_location="cpu")
+    validate_dataset_artifact_payload(
+        payload,
+        artifact_path=dataset_artifact,
+        require_non_empty=True,
+    )
+
 @click.group()
 def cli():
     """Aircraft structural design proof-of-concept CLI."""
@@ -2495,15 +2943,18 @@ def cli():
 @click.option('--dataset-artifact', default=None, help='Optional densified dataset artifact (.pt)')
 @click.option('--resume-from', default=None, help='Resume from checkpoint')
 @click.option('--save-dir', default='./checkpoints', help='Directory to save checkpoints')
+@click.option('--run-class', type=click.Choice([RUN_CLASS_SMOKE, RUN_CLASS_FINAL]), default=RUN_CLASS_SMOKE, help='Run profile: local smoke or claim-bearing final evaluation')
+@click.option('--baseline-config', default=None, help='Required for final runs: baseline comparison config path')
+@click.option('--claim-gates', default=None, help='Required for final runs: path to FINAL_RUN_GATES.md')
 @click.option('--enable-consistency', is_flag=True, default=True, help='Enable 4-step consistency model')
 @click.option('--enable-pipeline', is_flag=True, default=True, help='Enable pipeline parallelism')
 @click.option('--enable-checkpointing', is_flag=True, default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
-          num_samples, dataset_artifact, resume_from, save_dir, enable_consistency, enable_pipeline, 
+          num_samples, dataset_artifact, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline, 
           enable_checkpointing, enable_compile, solver):
-    """Train the optimized diffusion model with all TRM/HRM features"""
+    """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
 
@@ -2528,11 +2979,12 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    _validate_run_class_inputs(run_class, dataset_artifact, baseline_config, claim_gates)
     print(f"Using device: {device}")
     
     if torch.cuda.is_available():
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        print(f"Memory Optimization: 60% VRAM savings enabled")
+        print("Configured memory optimizations are enabled for the selected run class.")
     
     # Load checkpoint if resuming
     model_config_override = None
@@ -2608,16 +3060,19 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         trainer.load_checkpoint(resume_from)
         print(f"Resumed from {resume_from}")
     
-    print("\n" + "="*60)
-    print("🚀 STARTING OPTIMIZED TRAINING")
-    print("="*60)
-    print(f"✨ 4-step consistency model: {enable_consistency}")
-    print(f"🔄 Pipeline parallelism: {enable_pipeline}")
-    print(f"💾 Gradient checkpointing: {enable_checkpointing}")
-    print(f"⚡ torch.compile optimization: {enable_compile}")
-    print(f"🎯 Adaptive mesh refinement: ~5k cells (vs 32³ = 32k)")
-    print(f"🧠 Grouped-query attention: 50% KV-cache reduction")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print("STARTING TRAINING RUN")
+    print("=" * 60)
+    print(f"Run class: {run_class}")
+    print(f"4-step consistency path enabled: {enable_consistency}")
+    print(f"Pipeline parallelism enabled: {enable_pipeline}")
+    print(f"Gradient checkpointing enabled: {enable_checkpointing}")
+    print(f"torch.compile enabled: {enable_compile}")
+    if run_class == RUN_CLASS_SMOKE:
+        print("Smoke-run mode: local sanity evidence only, not a final evaluation.")
+    else:
+        print("Final-eval mode: baselines, claim gates, and dataset artifact were provided.")
+    print("=" * 60)
     
     # Train with optimizations
     trainer.train(train_loader)
@@ -2625,18 +3080,31 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
     # Save final model
     final_checkpoint = os.path.join(save_dir, 'final_optimized_model.pt')
     trainer.save_checkpoint(final_checkpoint)
-    print(f"\n🎉 Training complete! Final optimized model saved to {final_checkpoint}")
-    print(f"📊 Achieved: 250x speedup (4-step vs 1000-step), 60% VRAM savings, 50% memory reduction")
+    print(f"\nTraining complete. Final checkpoint saved to {final_checkpoint}")
+    if run_class == RUN_CLASS_SMOKE:
+        print("This checkpoint comes from a smoke run and is not claim-bearing evidence.")
 
 @cli.command()
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')
 @click.option('--output', default='aircraft_optimized.stl', help='Output STL file path')
 @click.option('--target-speed', default=7.0, help='Target aircraft speed (m/s)')
+@click.option('--thrust-to-weight-min', default=0.45, help='Minimum thrust-to-weight ratio constraint')
+@click.option('--turn-rate-min-deg-s', default=18.0, help='Minimum maneuverability target in deg/s')
 @click.option('--required-static-thrust-n', default=180.0, help='Required static thrust (N)')
 @click.option('--engine-diameter-mm', default=140, help='Nominal engine diameter (mm)')
 @click.option('--engine-length-mm', default=260, help='Nominal engine length (mm)')
 @click.option('--engine-count-min', default=1, help='Minimum engine count')
 @click.option('--engine-count-max', default=2, help='Maximum engine count')
+@click.option('--wingspan-limit-m', default=1.8, help='Maximum allowable wingspan (m)')
+@click.option('--payload-mass-min-g', default=500, help='Minimum payload mass bound (g)')
+@click.option('--payload-mass-max-g', default=2000, help='Maximum payload mass bound (g)')
+@click.option('--takeoff-distance-min-m', default=120, help='Minimum takeoff distance bound (m)')
+@click.option('--takeoff-distance-max-m', default=250, help='Maximum takeoff distance bound (m)')
+@click.option('--wall-thickness-min-mm', default=1, help='Minimum wall-thickness bound (mm)')
+@click.option('--wall-thickness-max-mm', default=2, help='Maximum wall-thickness bound (mm)')
+@click.option('--part-count-min', default=1, help='Minimum part-count bound')
+@click.option('--part-count-max', default=8, help='Maximum part-count bound')
+@click.option('--manufacturing-method', default='fdm_pla_0p4mm', type=click.Choice(list(MANUFACTURING_METHOD_VOCAB)), help='Manufacturing route for the smoke conditioning path')
 @click.option('--num-steps', default=4, help='Number of diffusion steps for generation (4 for consistency)')
 @click.option('--use-marching-cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
@@ -2644,16 +3112,28 @@ def generate(
     checkpoint,
     output,
     target_speed,
+    thrust_to_weight_min,
+    turn_rate_min_deg_s,
     required_static_thrust_n,
     engine_diameter_mm,
     engine_length_mm,
     engine_count_min,
     engine_count_max,
+    wingspan_limit_m,
+    payload_mass_min_g,
+    payload_mass_max_g,
+    takeoff_distance_min_m,
+    takeoff_distance_max_m,
+    wall_thickness_min_mm,
+    wall_thickness_max_mm,
+    part_count_min,
+    part_count_max,
+    manufacturing_method,
     num_steps,
     use_marching_cubes,
     solver,
 ):
-    """Generate aircraft design using optimized 4-step consistency model"""
+    """Generate a smoke-run aircraft artifact from the conditioned checkpoint path."""
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -2666,22 +3146,28 @@ def generate(
     print(f"Loading optimized checkpoint from {checkpoint}...")
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
     
-    # Design specification
-    design_spec = DesignSpec(
+    design_spec = _build_design_spec_from_cli_options(
         target_speed=target_speed,
+        thrust_to_weight_min=thrust_to_weight_min,
+        turn_rate_min_deg_s=turn_rate_min_deg_s,
         required_static_thrust_n=required_static_thrust_n,
         engine_diameter_mm=engine_diameter_mm,
         engine_length_mm=engine_length_mm,
         engine_count_min=engine_count_min,
         engine_count_max=engine_count_max,
-        space_weight=0.33,
-        drag_weight=0.33,
-        lift_weight=0.34
+        wingspan_limit_m=wingspan_limit_m,
+        payload_mass_min_g=payload_mass_min_g,
+        payload_mass_max_g=payload_mass_max_g,
+        takeoff_distance_min_m=takeoff_distance_min_m,
+        takeoff_distance_max_m=takeoff_distance_max_m,
+        wall_thickness_min_mm=wall_thickness_min_mm,
+        wall_thickness_max_mm=wall_thickness_max_mm,
+        part_count_min=part_count_min,
+        part_count_max=part_count_max,
+        manufacturing_method=manufacturing_method,
     )
     
-    # Generate with 4-step consistency model
-    print(f"🚀 Generating aircraft design with 4-step consistency model...")
-    print(f"⚡ Speedup: 250x faster than 1000-step diffusion!")
+    print("Generating aircraft design with the configured 4-step consistency path...")
     voxel_grid = generator.generate(design_spec, num_steps=num_steps)
     
     print(f"Generated voxel grid shape: {voxel_grid.shape}")
@@ -2693,8 +3179,7 @@ def generate(
     output_parent.mkdir(parents=True, exist_ok=True)
     generator.voxels_to_stl(voxel_grid, output, use_marching_cubes=use_marching_cubes)
 
-    # Add final CFD analysis
-    print(f"🚀 Running final CFD analysis with {solver} solver...")
+    print(f"Running quick CFD smoke analysis with {solver} solver...")
     cfd_config = CFDConfig(
         solver_type=solver,
         base_grid_resolution=int(voxel_grid.shape[-1]),
@@ -2713,12 +3198,54 @@ def generate(
         print("  Warning: CFD analysis became non-finite")
         print("  Treat this export as a smoke artifact, not a validated aerodynamic result")
 
+
+@cli.command("condition-response-smoke")
+@click.option('--output', default='./build/condition_response_smoke.json', help='Output JSON summary path')
+@click.option('--grid-size', default=16, help='Procedural grid size used by the smoke summary')
+@click.option('--latent-dim', default=16, help='Latent dimension used by the smoke summary')
+@click.option('--seed', default=0, help='Deterministic seed for the smoke summary')
+def condition_response_smoke(output, grid_size, latent_dim, seed):
+    """Write a smoke-only condition-response summary for the procedural conditioning path."""
+
+    summary = generate_condition_response_smoke_summary(
+        output_path=output,
+        grid_size=grid_size,
+        latent_dim=latent_dim,
+        seed=seed,
+    )
+    print(
+        "Condition-response smoke summary complete: "
+        f"cases={len(summary['cases'])} "
+        f"output={_cli_output_path(output)}"
+    )
+    print("This report is for directional smoke evidence only, not scientific validation.")
+
 @cli.command()
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')
 @click.option('--output-dir', default='./generations_optimized', help='Output directory for generated designs')
 @click.option('--num-designs', default=5, help='Number of designs to generate')
-def batch_generate(checkpoint, output_dir, num_designs):
-    """Generate multiple aircraft designs using optimized pipeline"""
+@click.option('--seed', default=0, help='Seed used for deterministic condition variation and manifest metadata')
+@click.option('--vary-conditions/--fixed-conditions', default=False, help='Sample deterministic varied DesignSpec values instead of reusing the same one')
+@click.option('--target-speed', default=7.0, help='Target aircraft speed (m/s)')
+@click.option('--thrust-to-weight-min', default=0.45, help='Minimum thrust-to-weight ratio constraint')
+@click.option('--turn-rate-min-deg-s', default=18.0, help='Minimum maneuverability target in deg/s')
+@click.option('--required-static-thrust-n', default=180.0, help='Required static thrust (N)')
+@click.option('--engine-diameter-mm', default=140, help='Nominal engine diameter (mm)')
+@click.option('--engine-length-mm', default=260, help='Nominal engine length (mm)')
+@click.option('--engine-count-min', default=1, help='Minimum engine count')
+@click.option('--engine-count-max', default=2, help='Maximum engine count')
+@click.option('--wingspan-limit-m', default=1.8, help='Maximum allowable wingspan (m)')
+@click.option('--payload-mass-min-g', default=500, help='Minimum payload mass bound (g)')
+@click.option('--payload-mass-max-g', default=2000, help='Maximum payload mass bound (g)')
+@click.option('--takeoff-distance-min-m', default=120, help='Minimum takeoff distance bound (m)')
+@click.option('--takeoff-distance-max-m', default=250, help='Maximum takeoff distance bound (m)')
+@click.option('--wall-thickness-min-mm', default=1, help='Minimum wall-thickness bound (mm)')
+@click.option('--wall-thickness-max-mm', default=2, help='Maximum wall-thickness bound (mm)')
+@click.option('--part-count-min', default=1, help='Minimum part-count bound')
+@click.option('--part-count-max', default=8, help='Maximum part-count bound')
+@click.option('--manufacturing-method', default='fdm_pla_0p4mm', type=click.Choice(list(MANUFACTURING_METHOD_VOCAB)), help='Manufacturing route for the smoke conditioning path')
+def batch_generate(checkpoint, output_dir, num_designs, seed, vary_conditions, target_speed, thrust_to_weight_min, turn_rate_min_deg_s, required_static_thrust_n, engine_diameter_mm, engine_length_mm, engine_count_min, engine_count_max, wingspan_limit_m, payload_mass_min_g, payload_mass_max_g, takeoff_distance_min_m, takeoff_distance_max_m, wall_thickness_min_mm, wall_thickness_max_mm, part_count_min, part_count_max, manufacturing_method):
+    """Generate multiple smoke-run aircraft artifacts and record their conditioning payloads."""
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -2727,17 +3254,48 @@ def batch_generate(checkpoint, output_dir, num_designs):
     print(f"Loading optimized checkpoint from {checkpoint}...")
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
     
-    design_spec = DesignSpec(target_speed=50.0)
+    base_spec = _build_design_spec_from_cli_options(
+        target_speed=target_speed,
+        thrust_to_weight_min=thrust_to_weight_min,
+        turn_rate_min_deg_s=turn_rate_min_deg_s,
+        required_static_thrust_n=required_static_thrust_n,
+        engine_diameter_mm=engine_diameter_mm,
+        engine_length_mm=engine_length_mm,
+        engine_count_min=engine_count_min,
+        engine_count_max=engine_count_max,
+        wingspan_limit_m=wingspan_limit_m,
+        payload_mass_min_g=payload_mass_min_g,
+        payload_mass_max_g=payload_mass_max_g,
+        takeoff_distance_min_m=takeoff_distance_min_m,
+        takeoff_distance_max_m=takeoff_distance_max_m,
+        wall_thickness_min_mm=wall_thickness_min_mm,
+        wall_thickness_max_mm=wall_thickness_max_mm,
+        part_count_min=part_count_min,
+        part_count_max=part_count_max,
+        manufacturing_method=manufacturing_method,
+    )
+    design_specs = _batch_design_specs(base_spec, num_designs, seed=seed, vary_conditions=vary_conditions)
+    output_paths: List[str] = []
     
-    print(f"\n🚀 Generating {num_designs} optimized aircraft designs...")
-    print(f"⚡ Using 4-step consistency model with pipeline parallelism")
+    print(f"\nGenerating {num_designs} smoke-run aircraft designs...")
+    print(f"Condition variation enabled: {vary_conditions}")
     
-    for i in range(num_designs):
-        print(f"\n🎨 Generating optimized design {i+1}/{num_designs}...")
+    for i, design_spec in enumerate(design_specs):
+        print(f"\nGenerating design {i+1}/{num_designs}...")
         voxel_grid = generator.generate(design_spec, num_steps=4)
         
         output_path = os.path.join(output_dir, f'aircraft_optimized_{i+1:03d}.stl')
         generator.voxels_to_stl(voxel_grid, output_path, use_marching_cubes=True)
+        output_paths.append(output_path)
+
+    manifest_path = _write_batch_manifest(
+        output_dir,
+        design_specs=design_specs,
+        output_paths=output_paths,
+        seed=seed,
+        vary_conditions=vary_conditions,
+    )
+    print(f"Batch manifest written to {manifest_path}")
 
 @cli.command("densify-dataset")
 @click.option('--output-artifact', required=True, help='Output artifact path (.pt)')
@@ -2795,6 +3353,7 @@ def densify_dataset(
             output_path=output_artifact,
             num_conditions=num_conditions,
             config=config,
+            seed=seed,
         )
     else:
         summary = densify_module.bootstrap_dataset(
@@ -2836,6 +3395,7 @@ def densify_dataset(
             accepted_records=accepted_records,
             config=config,
             checkpoint_path=checkpoint,
+            seed=seed,
         )
         print(f"Report bundle written to {report_dir}")
         print(f"  manifest={report_paths['manifest']}")
@@ -2858,20 +3418,20 @@ def performance_benchmark():
         print(f"Compute Capability: {props.major}.{props.minor}")
     
     print("\n✨ OPTIMIZATION FEATURES:")
-    print("• 4-step consistency model: 250x speedup vs 1000-step diffusion")
-    print("• Grouped-query attention: 50% KV-cache reduction")
-    print("• Gradient checkpointing: 60% VRAM savings")
+    print("• 4-step consistency model path is compiled into this build")
+    print("• Grouped-query attention path is compiled into this build")
+    print("• Gradient checkpointing path is compiled into this build")
     print("• torch.compile: Kernel fusion optimization")
     print("• Adaptive mesh refinement: ~5k cells vs 32³ (85% reduction)")
     print("• GPU LBM solver: SoA layout with 256-thread blocks")
     print("• Pipeline parallelism: CFD + diffusion overlap")
     
     print("\n🎯 EXPECTED PERFORMANCE GAINS:")
-    print("• Inference Speed: 250x faster (4 steps vs 1000 steps)")
-    print("• Memory Usage: 60% VRAM reduction")
-    print("• Attention Memory: 50% KV-cache reduction")
-    print("• CFD Grid Size: 85% fewer cells")
-    print("• Training Throughput: 2-3x improvement")
+    print("• Inference Path: configured consistency sampling")
+    print("• Memory Path: efficiency hooks available")
+    print("• Attention Path: grouped-query implementation available")
+    print("• CFD Path: bounded internal solver configuration available")
+    print("• Throughput Claims: require explicit benchmark artifacts")
     
     print("\n📊 BENCHMARK COMPLETE")
     print("All TRM/HRM optimizations successfully implemented! 🎉")
@@ -2900,6 +3460,62 @@ def info():
     print(f"• GPU LBM solver: ✅ ENABLED (SoA layout, 256-thread blocks)")
     print(f"• Pipeline parallelism: ✅ ENABLED")
     print(f"• FluidX3D integration: ✅ ENABLED")
+
+
+@cli.command(name="performance-benchmark")
+def performance_benchmark_status():
+    """Print the current smoke-run status summary for major runtime paths."""
+    print("\nSMOKE-RUN STATUS SUMMARY")
+    print("=" * 60)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        print(f"GPU: {props.name}")
+        print(f"Total Memory: {props.total_memory / 1e9:.2f} GB")
+        print(f"Compute Capability: {props.major}.{props.minor}")
+
+    print("\nConfigured runtime features:")
+    print("- Consistency sampling path with a default 4-step smoke configuration")
+    print("- Grouped attention modules in the latent model")
+    print("- Gradient checkpointing hooks")
+    print("- Optional torch.compile path")
+    print("- Internal CFD and OpenFOAM export hooks")
+    print("- Pipeline-parallel and mixed-precision code paths where enabled")
+
+    print("\nInterpretation:")
+    print("- This command reports compiled-in status, not a measured benchmark")
+    print("- Use explicit benchmark artifacts before quoting speed, memory, or accuracy claims")
+
+    print("\nSTATUS SUMMARY COMPLETE")
+
+
+@cli.command(name="info")
+def info_status():
+    """Print system information and smoke-run feature status."""
+    _configure_console_output()
+    print("\nAircraft structural design proof-of-concept")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA capability: {torch.cuda.get_device_capability(0)}")
+        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        print(f"Allocated GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+        print(f"Reserved GPU memory: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
+
+    print("\nConfigured feature status:")
+    print("- Consistency model path: enabled in the current CLI")
+    print("- Grouped-query attention: enabled in the current model config")
+    print("- Gradient checkpointing: enabled in the current model config")
+    print("- torch.compile path: available when requested")
+    print("- Adaptive mesh refinement path: available in the internal CFD hook")
+    print("- GPU LBM solver path: available when CUDA is present")
+    print("- Pipeline parallelism hook: available in training config")
+    print("- This output is a smoke status check, not a claim-bearing benchmark")
 
 if __name__ == '__main__':
     cli()

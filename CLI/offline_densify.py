@@ -19,12 +19,15 @@ import torch
 from scipy.ndimage import binary_dilation, binary_erosion, label
 
 from aircraft_diffusion_cfd import (
+    AdvancedCFDSimulator,
     AircraftDesignDataset,
     CFDConfig,
     DesignSpec,
     OptimizedAircraftGenerator,
+    build_dataset_artifact_metadata,
     build_condition_vector,
     sample_design_spec,
+    validate_dataset_artifact_payload,
 )
 
 
@@ -220,6 +223,43 @@ def score_candidate(
     }
 
 
+def _cfd_rank_score(results: Dict[str, Any]) -> float:
+    drag = float(results.get("drag_coefficient", float("nan")))
+    lift = float(results.get("lift_coefficient", float("nan")))
+    if not (np.isfinite(drag) and np.isfinite(lift)):
+        return float("-inf")
+    return float(lift / max(abs(drag), 1e-6))
+
+
+def _rerank_top_candidates_with_cfd(
+    scored_records: List[Dict[str, Any]],
+    config: RLVRBootstrapConfig,
+) -> None:
+    if not config.enable_cfd or not scored_records:
+        return
+
+    top_k = max(1, min(int(config.cfd_top_k), len(scored_records)))
+    simulator = AdvancedCFDSimulator(
+        CFDConfig(base_grid_resolution=int(config.base_grid_resolution)),
+        torch.device("cpu"),
+    )
+    for record in scored_records[:top_k]:
+        results = simulator.simulate_aerodynamics(record["geometry"], steps=int(config.cfd_steps))
+        record["reward"]["cfd_results"] = results
+        record["reward"]["cfd_rank_score"] = _cfd_rank_score(results)
+        if not np.isfinite(record["reward"]["cfd_rank_score"]):
+            record["reward"]["accepted"] = False
+            record["reward"]["rejection_reason"] = "cfd_non_finite"
+
+    scored_records.sort(
+        key=lambda record: (
+            record["reward"].get("cfd_rank_score", float("-inf")),
+            record["reward"]["total_reward"],
+        ),
+        reverse=True,
+    )
+
+
 def generate_candidate_pool(
     num_samples: int,
     grid_size: int,
@@ -235,13 +275,19 @@ def generate_candidate_pool(
     return [dataset[i] for i in range(len(dataset))]
 
 
-def _empty_artifact(latent_dim: int, grid_size: int, condition_dim: int) -> Dict[str, Any]:
+def _empty_artifact(
+    latent_dim: int,
+    grid_size: int,
+    condition_dim: int,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
     return {
         "latents": torch.zeros((0, latent_dim), dtype=torch.float32),
         "geometries": torch.zeros((0, grid_size, grid_size, grid_size), dtype=torch.float32),
         "condition_vectors": torch.zeros((0, condition_dim), dtype=torch.float32),
         "design_specs": [],
         "reward_records": [],
+        "metadata": metadata,
     }
 
 
@@ -253,6 +299,8 @@ def bootstrap_dataset(
     grid_size: int = 16,
     latent_dim: int = 16,
     seed: int = 0,
+    checkpoint_path: Optional[str] = None,
+    data_source: str = "procedural_synthetic",
 ) -> Dict[str, Any]:
     config = config or RLVRBootstrapConfig(base_grid_resolution=grid_size)
     records = list(candidates) if candidates is not None else generate_candidate_pool(
@@ -262,11 +310,30 @@ def bootstrap_dataset(
         seed=seed,
     )
 
-    accepted_records: List[Dict[str, Any]] = []
+    metadata = build_dataset_artifact_metadata(
+        num_samples=0,
+        grid_size=grid_size,
+        latent_dim=latent_dim,
+        data_source=data_source,
+        seed=seed,
+        checkpoint_path=checkpoint_path,
+    )
+    scored_records: List[Dict[str, Any]] = []
     for record in records:
         reward = score_candidate(record["geometry"], record["design_spec"], config=config)
-        if reward["accepted"]:
-            accepted_records.append({**record, "reward": reward})
+        scored_records.append({**record, "reward": reward})
+
+    scored_records.sort(key=lambda record: record["reward"]["total_reward"], reverse=True)
+    _rerank_top_candidates_with_cfd(scored_records, config)
+    accepted_records = [record for record in scored_records if record["reward"]["accepted"]]
+    metadata = build_dataset_artifact_metadata(
+        num_samples=len(accepted_records),
+        grid_size=grid_size,
+        latent_dim=latent_dim,
+        data_source=data_source,
+        seed=seed,
+        checkpoint_path=checkpoint_path,
+    )
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -283,16 +350,19 @@ def bootstrap_dataset(
             "condition_vectors": condition_vectors,
             "design_specs": [asdict(record["design_spec"]) for record in accepted_records],
             "reward_records": [record["reward"] for record in accepted_records],
+            "metadata": metadata,
         }
     else:
         condition_dim = records[0]["condition_vector"].numel() if records else 0
-        payload = _empty_artifact(latent_dim, grid_size, condition_dim)
+        payload = _empty_artifact(latent_dim, grid_size, condition_dim, metadata)
 
+    validate_dataset_artifact_payload(payload, require_non_empty=False)
     torch.save(payload, output)
     return {
         "output_path": str(output),
         "num_candidates": len(records),
         "num_accepted": len(accepted_records),
+        "artifact_is_empty": len(accepted_records) == 0,
     }
 
 
@@ -315,6 +385,7 @@ def write_dataset_artifact(
     accepted_records: List[Dict[str, Any]],
     config: RLVRBootstrapConfig,
     checkpoint_path: Optional[str] = None,
+    seed: int = 0,
 ) -> Dict[str, str]:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +396,15 @@ def write_dataset_artifact(
         "commit_sha": _git_commit_sha(Path(__file__).resolve().parent.parent),
         "num_accepted": len(accepted_records),
         "config": asdict(config),
+        "artifact_schema_version": 2,
+        "condition_vector_layout": build_dataset_artifact_metadata(
+            num_samples=len(accepted_records),
+            grid_size=config.base_grid_resolution,
+            latent_dim=accepted_records[0]["latent"].numel() if accepted_records else 0,
+            data_source="procedural_synthetic" if checkpoint_path is None else "checkpoint_conditioned_sampling",
+            seed=seed,
+            checkpoint_path=checkpoint_path,
+        )["condition_vector_layout"],
     }
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2),
@@ -377,6 +457,11 @@ class OfflineAcceptedDataset(torch.utils.data.Dataset):
 
     def __init__(self, artifact_path: str):
         payload = torch.load(artifact_path, map_location="cpu")
+        self.metadata = validate_dataset_artifact_payload(
+            payload,
+            artifact_path=artifact_path,
+            require_non_empty=True,
+        )
         self.latents = payload["latents"].float()
         self.geometries = payload["geometries"].float()
         self.condition_vectors = payload["condition_vectors"].float()
@@ -411,21 +496,26 @@ def densify_from_checkpoint(
     num_conditions: int = 4,
     config: Optional[RLVRBootstrapConfig] = None,
     device: Optional[torch.device] = None,
+    seed: int = 0,
 ) -> Dict[str, Any]:
     config = config or RLVRBootstrapConfig()
     generator = OptimizedAircraftGenerator(checkpoint_path, device=device)
     candidate_records: List[Dict[str, Any]] = []
+    rng = np.random.default_rng(seed)
     for condition_seed in range(num_conditions):
-        rng = np.random.default_rng(condition_seed)
         for _ in range(config.num_candidates_per_condition):
-            design_spec = sample_design_spec()
+            spec_seed = int(rng.integers(0, 2**31 - 1))
+            spec_rng = __import__("random").Random(spec_seed)
+            design_spec = sample_design_spec(spec_rng)
             design_spec.target_speed = float(rng.uniform(35.0, 85.0))
             condition_vector = build_condition_vector(design_spec)
-            latent = generator.consistency_model.fast_inference(
-                (1, generator.model_config.latent_dim),
-                num_steps=4,
-                condition=condition_vector.unsqueeze(0).to(generator.device),
-            )
+            with torch.random.fork_rng():
+                torch.manual_seed(spec_seed)
+                latent = generator.consistency_model.fast_inference(
+                    (1, generator.model_config.latent_dim),
+                    num_steps=4,
+                    condition=condition_vector.unsqueeze(0).to(generator.device),
+                )
             voxel_grid = torch.sigmoid(generator.converter(latent)).squeeze(0)
             voxel_grid = generator._postprocess_voxels(voxel_grid).detach().cpu().float()
             voxel_grid = _trim_boundary_voxels(voxel_grid)
@@ -437,4 +527,15 @@ def densify_from_checkpoint(
                     "design_spec": design_spec,
                 }
             )
-    return bootstrap_dataset(output_path, candidates=candidate_records, config=config)
+    latent_dim = int(generator.model_config.latent_dim)
+    grid_size = int(candidate_records[0]["geometry"].shape[-1]) if candidate_records else int(config.base_grid_resolution)
+    return bootstrap_dataset(
+        output_path,
+        candidates=candidate_records,
+        config=config,
+        latent_dim=latent_dim,
+        grid_size=grid_size,
+        seed=seed,
+        checkpoint_path=checkpoint_path,
+        data_source="checkpoint_conditioned_sampling",
+    )

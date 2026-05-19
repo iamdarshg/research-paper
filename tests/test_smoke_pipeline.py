@@ -51,6 +51,7 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("train", result.output)
         self.assertIn("generate", result.output)
         self.assertIn("batch-generate", result.output)
+        self.assertIn("condition-response-smoke", result.output)
         self.assertIn("densify-dataset", result.output)
         self.assertIn("performance-benchmark", result.output)
         self.assertIn("info", result.output)
@@ -60,6 +61,9 @@ class TestCLISmokePipeline(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertIn("--dataset-artifact", result.output)
+        self.assertIn("--run-class", result.output)
+        self.assertIn("--baseline-config", result.output)
+        self.assertIn("--claim-gates", result.output)
 
     def test_generate_help_lists_current_options(self):
         result = self.runner.invoke(cli_module.cli, ["generate", "--help"])
@@ -68,11 +72,23 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("--checkpoint", result.output)
         self.assertIn("--output", result.output)
         self.assertIn("--target-speed", result.output)
+        self.assertIn("--thrust-to-weight-min", result.output)
+        self.assertIn("--turn-rate-min-deg-s", result.output)
         self.assertIn("--required-static-thrust-n", result.output)
         self.assertIn("--engine-diameter-mm", result.output)
         self.assertIn("--engine-length-mm", result.output)
         self.assertIn("--engine-count-min", result.output)
         self.assertIn("--engine-count-max", result.output)
+        self.assertIn("--wingspan-limit-m", result.output)
+        self.assertIn("--payload-mass-min-g", result.output)
+        self.assertIn("--payload-mass-max-g", result.output)
+        self.assertIn("--takeoff-distance-min-m", result.output)
+        self.assertIn("--takeoff-distance-max-m", result.output)
+        self.assertIn("--wall-thickness-min-mm", result.output)
+        self.assertIn("--wall-thickness-max-mm", result.output)
+        self.assertIn("--part-count-min", result.output)
+        self.assertIn("--part-count-max", result.output)
+        self.assertIn("--manufacturing-method", result.output)
         self.assertIn("--num-steps", result.output)
         self.assertIn("--use-marching-cubes", result.output)
         self.assertIn("--solver", result.output)
@@ -263,6 +279,25 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertEqual(model_config.conditioning_dim, cli_module.infer_conditioning_dim())
         fake_trainer.train.assert_called_once_with(fake_loader)
 
+    def test_final_run_class_requires_artifact_baselines_and_claim_gates(self):
+        result = self.runner.invoke(
+            cli_module.cli,
+            [
+                "train",
+                "--run-class",
+                "final",
+                "--num-epochs",
+                "1",
+                "--num-samples",
+                "2",
+            ],
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("dataset artifact", result.output.lower())
+        self.assertIn("baseline", result.output.lower())
+        self.assertIn("claim", result.output.lower())
+
     def test_densify_dataset_cli_delegates_to_checkpoint_densifier(self):
         with mock.patch.object(densify_module, "densify_from_checkpoint", return_value={"num_candidates": 6, "num_accepted": 2, "output_path": "artifact.pt"}) as mock_densify, \
              mock.patch.object(densify_module, "bootstrap_dataset") as mock_bootstrap:
@@ -287,6 +322,47 @@ class TestCLISmokePipeline(unittest.TestCase):
         mock_densify.assert_called_once()
         mock_bootstrap.assert_not_called()
         self.assertIn("accepted=2", result.output)
+
+    def test_batch_generate_writes_condition_manifest(self):
+        fake_generator = mock.Mock()
+        fake_generator.generate.return_value = torch.ones((12, 12, 12))
+
+        def _write_stl(_voxel_grid, output_path, use_marching_cubes=True):
+            with open(output_path, "w", encoding="utf-8") as handle:
+                handle.write("solid mock\nendsolid mock\n")
+
+        fake_generator.voxels_to_stl.side_effect = _write_stl
+
+        with self.runner.isolated_filesystem(), \
+             mock.patch.object(cli_module, "OptimizedAircraftGenerator", return_value=fake_generator), \
+             mock.patch.object(cli_module.os.path, "exists", return_value=True), \
+             mock.patch.object(cli_module.torch.cuda, "is_available", return_value=False):
+            result = self.runner.invoke(
+                cli_module.cli,
+                [
+                    "batch-generate",
+                    "--checkpoint",
+                    "fake-checkpoint.pt",
+                    "--output-dir",
+                    "batch-out",
+                    "--num-designs",
+                    "2",
+                    "--seed",
+                    "7",
+                ],
+            )
+
+            manifest_path = os.path.join("batch-out", "batch_manifest.json")
+            self.assertTrue(os.path.exists(manifest_path))
+            import json
+
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(len(manifest["designs"]), 2)
+        self.assertIn("design_spec", manifest["designs"][0])
+        self.assertIn("condition_vector", manifest["designs"][0])
 
 
 if __name__ == "__main__":

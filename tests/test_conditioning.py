@@ -172,7 +172,8 @@ class TestConditioningSchema(unittest.TestCase):
             readme = handle.read()
 
         self.assertIn(f"[batch, {schema['vector_dim']}]", readme)
-        self.assertIn("public CLI still only wires `target_speed`", readme)
+        self.assertIn("partial structured conditioning path", readme)
+        self.assertIn("public CLI currently exposes only a subset", readme)
         with open(TRAINING_CONFIG_PATH, "r", encoding="utf-8") as handle:
             training_config = yaml.safe_load(handle)
         self.assertEqual(
@@ -188,6 +189,28 @@ class TestConditioningSchema(unittest.TestCase):
 
 
 class TestLiveConditioningPath(unittest.TestCase):
+    def test_invalid_design_spec_combinations_raise_clear_errors(self):
+        with self.assertRaisesRegex(ValueError, "engine_count_min"):
+            cli_module.DesignSpec(engine_count_min=3, engine_count_max=1)
+
+        with self.assertRaisesRegex(ValueError, "payload_mass_min_g"):
+            cli_module.DesignSpec(payload_mass_min_g=2500, payload_mass_max_g=500)
+
+        with self.assertRaisesRegex(ValueError, "takeoff_distance_min_m"):
+            cli_module.DesignSpec(takeoff_distance_min_m=300, takeoff_distance_max_m=150)
+
+        with self.assertRaisesRegex(ValueError, "wall_thickness_min_mm"):
+            cli_module.DesignSpec(wall_thickness_min_mm=3, wall_thickness_max_mm=1)
+
+        with self.assertRaisesRegex(ValueError, "part_count_min"):
+            cli_module.DesignSpec(part_count_min=9, part_count_max=4)
+
+        with self.assertRaisesRegex(ValueError, "required_static_thrust_n"):
+            cli_module.DesignSpec(required_static_thrust_n=0.0)
+
+        with self.assertRaisesRegex(ValueError, "manufacturing_method"):
+            cli_module.DesignSpec(manufacturing_method="mystery_process")
+
     def test_build_condition_vector_matches_documented_schema(self):
         schema = _load_conditioning_schema()
         design_spec = cli_module.DesignSpec(
@@ -288,6 +311,16 @@ class TestLiveConditioningPath(unittest.TestCase):
         self.assertEqual(sample["condition_vector"].shape, (schema["vector_dim"],))
         self.assertIsInstance(sample["design_spec"], cli_module.DesignSpec)
 
+    def test_sample_design_spec_respects_numeric_bounds(self):
+        rng = __import__("random").Random(7)
+        for _ in range(32):
+            sample = cli_module.sample_design_spec(rng)
+            self.assertLessEqual(sample.engine_count_min, sample.engine_count_max)
+            self.assertLessEqual(sample.payload_mass_min_g, sample.payload_mass_max_g)
+            self.assertLessEqual(sample.takeoff_distance_min_m, sample.takeoff_distance_max_m)
+            self.assertLessEqual(sample.wall_thickness_min_mm, sample.wall_thickness_max_mm)
+            self.assertLessEqual(sample.part_count_min, sample.part_count_max)
+
     def test_generator_passes_condition_vector_to_consistency_model(self):
         schema = _load_conditioning_schema()
         generator = object.__new__(cli_module.OptimizedAircraftGenerator)
@@ -325,6 +358,24 @@ class TestLiveConditioningPath(unittest.TestCase):
             fast_inference_kwargs["condition"].shape[-1],
             schema["vector_dim"],
         )
+
+    def test_condition_response_smoke_summary_reports_meaningful_deltas(self):
+        with mock.patch.object(cli_module.Path, "mkdir"), \
+             mock.patch.object(cli_module.Path, "open", mock.mock_open()) as mock_file:
+            summary = cli_module.generate_condition_response_smoke_summary(
+                output_path=os.path.join(REPO_ROOT, "build", "condition_response_smoke.json"),
+                grid_size=16,
+                latent_dim=16,
+                seed=0,
+            )
+
+        self.assertEqual(summary["mode"], "condition-response smoke only")
+        self.assertEqual(len(summary["cases"]), 2)
+        self.assertGreater(summary["deltas"]["occupancy_ratio"], 0.0)
+        self.assertGreater(summary["deltas"]["span_y_fraction"], 0.0)
+        self.assertGreater(summary["deltas"]["engine_proxy"], 0.0)
+        handle = mock_file()
+        handle.write.assert_called()
 
 
 if __name__ == "__main__":

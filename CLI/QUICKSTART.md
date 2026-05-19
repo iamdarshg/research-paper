@@ -58,7 +58,7 @@ What this command does today:
 - Exports an STL
 - Runs a final CFD analysis pass and prints drag/lift coefficients
 
-The public CLI only lets you change `--target-speed` here. The other design weights are fixed inside the command.
+The public CLI now exposes a partial structured conditioning subset here, including speed, thrust-to-weight, turn-rate, static thrust, engine geometry, engine count, wingspan, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and manufacturing method. It still does not make the workflow scientifically validated conditioned generation.
 
 ## 6. Generate a Small Batch
 
@@ -71,11 +71,21 @@ python aircraft_diffusion_cfd.py batch-generate \
 
 Current behavior to know up front:
 
-- `batch-generate` uses a fixed `target_speed=50.0`
 - `batch-generate` uses a fixed `num_steps=4`
+- `batch-generate` can reuse one condition payload or deterministically vary conditions with `--vary-conditions`
+- `batch-generate` writes `batch_manifest.json` with the exact condition payload for every STL
 - Output files are named like `aircraft_optimized_001.stl`
 
-## 7. Useful Option Reference
+## 7. Optional Condition-Response Smoke Check
+
+```bash
+python aircraft_diffusion_cfd.py condition-response-smoke \
+  --output ./build/condition_response_smoke.json
+```
+
+This writes a small JSON summary for the procedural conditioning path. It is useful for smoke-level directional checks only.
+
+## 8. Useful Option Reference
 
 `train`
 
@@ -96,6 +106,9 @@ Current behavior to know up front:
 - `--checkpoint` required
 - `--output` default `aircraft_optimized.stl`
 - `--target-speed` default `7.0`
+- `--thrust-to-weight-min` default `0.45`
+- `--turn-rate-min-deg-s` default `18.0`
+- propulsion, payload, takeoff, wall-thickness, part-count, and manufacturing options are also exposed
 - `--num-steps` default `4`
 - `--solver` default `D3Q27`
 
@@ -104,15 +117,18 @@ Current behavior to know up front:
 - `--checkpoint` required
 - `--output-dir` default `./generations_optimized`
 - `--num-designs` default `5`
+- `--seed` default `0`
+- `--vary-conditions` optional deterministic variation
 
-## 8. Current Caveats
+## 9. Current Caveats
 
 - This is a synthetic-data research workflow.
 - The docs intentionally do not promise production readiness.
 - The current trainer runs one configured grid size; it does not run the older staged `16 -> 24 -> 32` schedule.
 - The CLI exposes `--enable-consistency`, `--enable-pipeline`, `--enable-checkpointing`, and `--use-marching-cubes` as on-switches only in the present code.
+- Smoke outputs and smoke condition-response summaries are not claim-bearing evaluation artifacts.
 
-## 9. If Something Fails
+## 10. If Something Fails
 
 Check the public help text again:
 

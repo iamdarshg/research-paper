@@ -6,10 +6,11 @@ This directory contains a proof-of-concept CLI for synthetic aircraft-like voxel
 
 - The training dataset is synthetic.
 - The workflow is not validated for real aircraft design, certification, or manufacturing decisions.
-- The CLI exposes only lightweight conditioning. `generate` accepts `--target-speed`, but the other `DesignSpec` weights are fixed inside the command.
-- `batch-generate` uses a fixed `DesignSpec(target_speed=50.0)` and fixed `num_steps=4`.
+- The repo now has partial structured conditioning plumbing: dataset generation, the diffusion model, and the generator consume a documented 22-slot condition vector.
+- The public CLI exposes only a subset of that path today. `generate` and `batch-generate` surface speed, maneuverability, propulsion, wingspan, payload, takeoff, wall-thickness, part-count, and manufacturing options, but the full schema still needs config-driven evaluation flows plus condition-response benchmarks on grounded aircraft-like data.
+- `batch-generate` now records a manifest with the exact `DesignSpec` payload and condition vector for each STL. It still uses a fixed `num_steps=4`.
 - Several flags are exposed as on-switches only in the current implementation: `--enable-consistency`, `--enable-pipeline`, `--enable-checkpointing`, and `--use-marching-cubes`.
-- `info` and `performance-benchmark` report compiled-in feature/status messages; they are not full runtime validation of every optimization path.
+- `info` and `performance-benchmark` report compiled-in feature/status messages; they are smoke-oriented status checks, not full runtime validation of every optimization path.
 
 ## Install
 
@@ -30,6 +31,8 @@ Commands exposed by the current file:
 - `train`
 - `generate`
 - `batch-generate`
+- `condition-response-smoke`
+- `densify-dataset`
 - `performance-benchmark`
 - `info`
 
@@ -54,8 +57,12 @@ Current training options:
 - `--precision` default `float32`
 - `--disconnection-penalty` default `30.0`
 - `--num-samples` default `500`
+- `--dataset-artifact` optional densified dataset artifact
 - `--resume-from` optional checkpoint path
 - `--save-dir` default `./checkpoints`
+- `--run-class` `smoke` or `final`
+- `--baseline-config` required for final runs
+- `--claim-gates` required for final runs
 - `--enable-consistency` exposed, currently defaults on
 - `--enable-pipeline` exposed, currently defaults on
 - `--enable-checkpointing` exposed, currently defaults on
@@ -91,6 +98,17 @@ Current generation options:
 - `--checkpoint` required
 - `--output` default `aircraft_optimized.stl`
 - `--target-speed` default `7.0`
+- `--thrust-to-weight-min` default `0.45`
+- `--turn-rate-min-deg-s` default `18.0`
+- `--required-static-thrust-n` default `180.0`
+- `--engine-diameter-mm` / `--engine-length-mm`
+- `--engine-count-min` / `--engine-count-max`
+- `--wingspan-limit-m`
+- `--payload-mass-min-g` / `--payload-mass-max-g`
+- `--takeoff-distance-min-m` / `--takeoff-distance-max-m`
+- `--wall-thickness-min-mm` / `--wall-thickness-max-mm`
+- `--part-count-min` / `--part-count-max`
+- `--manufacturing-method`
 - `--num-steps` default `4`
 - `--use-marching-cubes` exposed, currently defaults on
 - `--solver` default `D3Q27`
@@ -98,10 +116,17 @@ Current generation options:
 What the command does today:
 
 - Loads `OptimizedAircraftGenerator`
-- Builds a `DesignSpec` with fixed weights `0.33 / 0.33 / 0.34`
+- Builds a `DesignSpec`, converts it into the internal condition-vector format, and passes that vector into the generator path
 - Generates a voxel grid
 - Writes an STL
 - Runs a final CFD analysis pass and prints drag/lift coefficients
+
+Important nuance:
+
+- The condition-vector seam is real code plumbing, not just a TODO. See `conditioning_schema.yaml` and `config.yaml`.
+- Public CLI exposure is still partial. The repo is not yet validated as a mission-conditioned or manufacturing-conditioned aircraft generator.
+- `condition-response-smoke` writes a JSON report for directional smoke evidence only; it is not a scientific benchmark.
+- No grounded condition-response benchmark currently demonstrates that changing payload, takeoff, wingspan, wall-thickness, part-count, or manufacturing inputs reliably changes generated outputs in the intended direction.
 
 ## Batch Generation
 
@@ -117,12 +142,24 @@ Current batch options:
 - `--checkpoint` required
 - `--output-dir` default `./generations_optimized`
 - `--num-designs` default `5`
+- `--seed` default `0`
+- `--vary-conditions` to sample deterministic `DesignSpec` variation
+- the same public conditioning subset exposed by `generate`
 
 Current limitations:
 
-- Uses fixed `target_speed=50.0`
 - Uses fixed `num_steps=4`
-- Always writes filenames shaped like `aircraft_optimized_001.stl`
+- Writes filenames shaped like `aircraft_optimized_001.stl`
+- Needs claim-bearing evaluation before batch outputs can be used as scientific evidence
+
+## Condition-Response Smoke Benchmark
+
+```bash
+python aircraft_diffusion_cfd.py condition-response-smoke \
+  --output ./build/condition_response_smoke.json
+```
+
+This command writes a small JSON report from the procedural conditioning path. Use it to confirm that materially different condition payloads produce measurable directional deltas in the smoke geometry proxies. Do not treat it as aircraft-level conditional validation.
 
 ## Inspection Commands
 
@@ -139,6 +176,7 @@ python aircraft_diffusion_cfd.py performance-benchmark
 ```
 
 These commands are useful as smoke checks because they are fast and do not require a checkpoint.
+They should not be cited as claim-bearing evidence for aerodynamic quality, production readiness, or conditioned generation performance.
 
 ## Python API Note
 
@@ -164,4 +202,4 @@ python aircraft_diffusion_cfd.py --help
 
 ## Status
 
-This is a research proof of concept with runnable CLI entry points, not a production aircraft-design tool.
+This is a research proof of concept with runnable CLI entry points, not a production aircraft-design tool or a claim-bearing benchmark harness.
