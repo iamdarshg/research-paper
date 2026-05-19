@@ -27,6 +27,26 @@ A claim-bearing corpus needs examples that are recognizably aircraft-like and tr
 - Explicit mission and manufacturing metadata attached to every example
 - Train, validation, and holdout splits that prevent near-duplicate leakage
 
+## Checked-In Minimal Manifest
+
+The repo now includes a minimal runnable manifest at `docs/dataset/minimal_grounded_manifest.jsonl`.
+
+Its purpose is limited:
+
+- exercise the grounded-manifest code path end to end,
+- make final-run guardrails point at a real non-empty dataset input,
+- provide a versioned template for richer manifests.
+
+It is **not** a scientifically adequate aircraft corpus. It contains only the repository's bundled STL examples and should be treated as wiring validation, not dataset completion.
+
+Each record may include:
+
+- `geometry_path` or `stl_path`
+- `design_spec`
+- `condition_vector`
+- `latent_path`
+- `split`
+
 ## Required Metadata Fields
 
 Every example in a grounded corpus should include, at minimum, the fields already represented in the documented condition schema:

@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import json
 from dataclasses import asdict
 from unittest import mock
 
@@ -61,9 +62,63 @@ class TestCLISmokePipeline(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertIn("--dataset-artifact", result.output)
+        self.assertIn("--dataset-manifest", result.output)
         self.assertIn("--run-class", result.output)
         self.assertIn("--baseline-config", result.output)
         self.assertIn("--claim-gates", result.output)
+
+    def test_manifest_dataset_loads_grounded_samples(self):
+        with self.runner.isolated_filesystem():
+            geometry = torch.zeros((16, 16, 16), dtype=torch.float32)
+            geometry[4:12, 4:12, 4:12] = 1.0
+            os.makedirs("dataset", exist_ok=True)
+            geometry_path = os.path.join("dataset", "sample.npy")
+            manifest_path = os.path.join("dataset", "manifest.jsonl")
+
+            import numpy as np
+
+            np.save(geometry_path, geometry.numpy())
+            record = {
+                "geometry_path": "sample.npy",
+                "design_spec": {
+                    "target_speed": 44.0,
+                    "wingspan_limit_m": 1.7,
+                    "thrust_to_weight_min": 0.4,
+                    "turn_rate_min_deg_s": 15.0,
+                    "required_static_thrust_n": 150.0,
+                    "engine_diameter_mm": 120,
+                    "engine_length_mm": 240,
+                    "engine_count_min": 1,
+                    "engine_count_max": 1,
+                    "payload_mass_min_g": 300,
+                    "payload_mass_max_g": 900,
+                    "takeoff_distance_min_m": 80,
+                    "takeoff_distance_max_m": 150,
+                    "wall_thickness_min_mm": 1,
+                    "wall_thickness_max_mm": 2,
+                    "part_count_min": 1,
+                    "part_count_max": 5,
+                    "manufacturing_method": "fdm_pla_0p4mm",
+                },
+                "split": "train",
+            }
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+
+            dataset = cli_module.AircraftDesignDataset(
+                manifest_path=manifest_path,
+                grid_size=16,
+                latent_dim=16,
+                seed=7,
+            )
+
+            self.assertEqual(len(dataset), 1)
+            self.assertEqual(dataset.metadata["data_source"], "grounded_manifest")
+            self.assertEqual(dataset.metadata["split_assignments"], ["train"])
+            sample = dataset[0]
+            self.assertEqual(sample["geometry"].shape, (16, 16, 16))
+            self.assertEqual(sample["design_spec"].target_speed, 44.0)
+            self.assertEqual(sample["condition_vector"].numel(), cli_module.infer_conditioning_dim())
 
     def test_generate_help_lists_current_options(self):
         result = self.runner.invoke(cli_module.cli, ["generate", "--help"])

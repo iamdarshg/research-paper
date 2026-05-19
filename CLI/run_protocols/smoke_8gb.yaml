@@ -1,0 +1,35 @@
+train:
+  enabled: true
+  num_epochs: 1
+  batch_size: 1
+  learning_rate: 0.0002
+  latent_dim: 16
+  precision: float32
+  disconnection_penalty: 30.0
+  num_samples: 8
+  save_dir: ../../checkpoints_protocol_smoke
+  run_class: smoke
+  solver: D3Q27
+  enable_consistency: true
+  enable_pipeline: true
+  enable_checkpointing: true
+  enable_compile: false
+
+evaluate_baselines:
+  enabled: true
+  solver: D3Q27
+  grid_size: 32
+  steps: 200
+  output: ../../build/protocol_smoke/baseline_report.json
+
+validate_conditions:
+  enabled: true
+  num_seeds: 4
+  grid_size: 32
+  output: ../../build/protocol_smoke/condition_validation.json
+
+multi_seed_eval:
+  enabled: true
+  num_seeds: 4
+  grid_size: 32
+  output_dir: ../../build/protocol_smoke/multi_seed_eval

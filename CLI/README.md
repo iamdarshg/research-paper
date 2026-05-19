@@ -38,6 +38,13 @@ Commands exposed by the current file:
 - `performance-benchmark`
 - `info`
 
+Standalone helpers:
+
+- `run_protocol.py`
+- `run_protocols/smoke_8gb.yaml`
+- `run_protocols/final_cloud.yaml`
+- `baseline_config.yaml`
+
 ## Training
 
 Basic run:
@@ -60,6 +67,7 @@ Current training options:
 - `--disconnection-penalty` default `30.0`
 - `--num-samples` default `500`
 - `--dataset-artifact` optional densified dataset artifact
+- `--dataset-manifest` optional grounded dataset manifest (`.json`, `.jsonl`, `.yaml`)
 - `--resume-from` optional checkpoint path
 - `--save-dir` default `./checkpoints`
 - `--run-class` `smoke` or `final`
@@ -81,6 +89,14 @@ Resolution behavior in the current code:
 - `D3Q27` training uses a base grid resolution of `16`.
 - Any other solver string falls back to `32`.
 - The current trainer runs one configured grid size; it does not execute the older staged `16 -> 24 -> 32` schedule described in stale docs.
+
+Grounded-manifest behavior:
+
+- `--dataset-manifest` lets training ingest a checked-in or external grounded corpus manifest.
+- Each manifest record may provide `geometry_path` or `stl_path`.
+- Each manifest record may optionally provide `design_spec`, `condition_vector`, `latent_path`, and `split`.
+- Relative paths are resolved from the manifest file's directory.
+- The checked-in minimal example is [`docs/dataset/minimal_grounded_manifest.jsonl`](../docs/dataset/minimal_grounded_manifest.jsonl).
 
 ## Generation
 
@@ -186,6 +202,22 @@ python multi_seed_eval.py \
   --num-seeds 10 \
   --output-dir ./eval_results
 ```
+
+## Protocol Runner
+
+Run the checked-in 8 GB smoke protocol:
+
+```bash
+python run_protocol.py --config run_protocols/smoke_8gb.yaml
+```
+
+Preview the guarded final-eval protocol without executing it:
+
+```bash
+python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
+```
+
+The final protocol is intentionally conservative: it references `baseline_config.yaml`, `paper/FINAL_RUN_GATES.md`, and the minimal grounded manifest so claim-bearing runs must name their baselines and dataset inputs explicitly.
 
 ## Condition-Response Smoke Benchmark
 

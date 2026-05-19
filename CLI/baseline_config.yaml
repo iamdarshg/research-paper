@@ -1,0 +1,14 @@
+baseline_name: minimal_grounded_aircraft
+description: >
+  Minimal grounded baseline set using the repository's bundled aircraft-like STL files.
+  This config exists to make final-run guardrails executable rather than purely documentary.
+stl_paths:
+  - ../biplane.stl
+  - ../F-18_Hornet.stl
+evaluation:
+  solver: D3Q27
+  grid_size: 32
+  steps: 200
+notes:
+  - Replace or extend these paths with a larger grounded corpus before making paper-level claims.
+  - The current config is suitable for smoke/final guardrail plumbing, not publication-grade benchmarking.

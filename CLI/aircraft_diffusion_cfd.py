@@ -466,6 +466,47 @@ def build_dataset_artifact_metadata(
     }
 
 
+def _load_structured_records(path: Path) -> List[Dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix in {".jsonl", ".ndjson"}:
+        records: List[Dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise ValueError(f"{path}:{line_number} must be a JSON object")
+                records.append(payload)
+        return records
+
+    if suffix in {".yaml", ".yml"}:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+    if isinstance(payload, dict):
+        payload = payload.get("samples", payload.get("records", payload))
+
+    if not isinstance(payload, list):
+        raise ValueError(f"{path} must contain a list of sample records")
+
+    records = []
+    for idx, record in enumerate(payload):
+        if not isinstance(record, dict):
+            raise ValueError(f"{path} record {idx} must be an object")
+        records.append(record)
+    return records
+
+
+def load_grounded_manifest_records(manifest_path: str) -> List[Dict[str, Any]]:
+    path = Path(manifest_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset manifest not found: {manifest_path}")
+    return _load_structured_records(path)
+
+
 def validate_dataset_artifact_payload(
     payload: Dict[str, Any],
     *,
@@ -1833,12 +1874,16 @@ class AircraftDesignDataset(Dataset):
         seed: int = random.randint(0, 100),
         latent_dim: int = 128,
         artifact_path: Optional[str] = None,
+        manifest_path: Optional[str] = None,
     ):
         self.grid_size = grid_size
         self.latent_dim = latent_dim
         self.seed = seed
         self.rng = random.Random(seed)
         self.torch_generator = torch.Generator().manual_seed(seed)
+
+        if artifact_path and manifest_path:
+            raise ValueError("Provide only one of artifact_path or manifest_path.")
 
         if artifact_path:
             payload = torch.load(artifact_path, map_location="cpu")
@@ -1859,6 +1904,10 @@ class AircraftDesignDataset(Dataset):
             self.num_samples = len(self.geometries)
             if self.geometries:
                 self.grid_size = int(self.geometries[0].shape[-1])
+            return
+
+        if manifest_path:
+            self._load_manifest_dataset(Path(manifest_path))
             return
 
         self.num_samples = num_samples
@@ -1896,6 +1945,120 @@ class AircraftDesignDataset(Dataset):
             )
         else:
             self.latent_codes = torch.zeros((0, latent_dim))
+
+    def _load_manifest_dataset(self, manifest_path: Path) -> None:
+        records = load_grounded_manifest_records(str(manifest_path))
+        if not records:
+            raise ValueError(f"Dataset manifest {manifest_path} contains no samples")
+
+        base_dir = manifest_path.parent
+        geometries: List[torch.Tensor] = []
+        design_specs: List[DesignSpec] = []
+        condition_vectors: List[torch.Tensor] = []
+        latent_codes: List[torch.Tensor] = []
+        explicit_splits: List[str] = []
+
+        for idx, record in enumerate(records):
+            if "design_spec" in record and isinstance(record["design_spec"], dict):
+                design_spec = DesignSpec(**record["design_spec"])
+            else:
+                design_spec = sample_design_spec(self.rng)
+
+            geometry = self._load_manifest_geometry(record, base_dir)
+            resolved_grid_size = int(geometry.shape[-1])
+            if idx == 0:
+                self.grid_size = resolved_grid_size
+            elif resolved_grid_size != self.grid_size:
+                raise ValueError(
+                    f"Dataset manifest {manifest_path} mixes grid sizes {self.grid_size} and {resolved_grid_size}"
+                )
+
+            if "condition_vector" in record:
+                condition_vector = torch.as_tensor(
+                    record["condition_vector"],
+                    dtype=CONDITIONING_TENSOR_DTYPE,
+                ).flatten()
+                if int(condition_vector.numel()) != infer_conditioning_dim():
+                    raise ValueError(
+                        f"Dataset manifest {manifest_path} record {idx} has condition_vector width "
+                        f"{condition_vector.numel()}, expected {infer_conditioning_dim()}"
+                    )
+            else:
+                condition_vector = build_condition_vector(design_spec)
+
+            latent_codes.append(
+                self._load_or_build_manifest_latent(
+                    record,
+                    base_dir,
+                    design_spec,
+                    geometry,
+                    condition_vector,
+                )
+            )
+            geometries.append(geometry)
+            design_specs.append(design_spec)
+            condition_vectors.append(condition_vector.float())
+            if "split" in record:
+                explicit_splits.append(str(record["split"]))
+
+        self.num_samples = len(geometries)
+        self.geometries = geometries
+        self.design_specs = design_specs
+        self.condition_vectors = torch.stack(condition_vectors)
+        self.latent_codes = torch.stack(latent_codes)
+        self.metadata = build_dataset_artifact_metadata(
+            num_samples=self.num_samples,
+            grid_size=self.grid_size,
+            latent_dim=self.latent_dim,
+            data_source="grounded_manifest",
+            seed=self.seed,
+        )
+        self.metadata["manifest_path"] = str(manifest_path)
+        if len(explicit_splits) == self.num_samples:
+            self.metadata["split_assignments"] = explicit_splits
+
+    def _load_manifest_geometry(self, record: Dict[str, Any], base_dir: Path) -> torch.Tensor:
+        geometry_path = record.get("geometry_path")
+        stl_path = record.get("stl_path")
+        if geometry_path:
+            path = (base_dir / str(geometry_path)).resolve()
+            geometry_np = np.load(path)
+            geometry = torch.from_numpy(geometry_np).float()
+            if geometry.ndim > 3:
+                geometry = geometry.squeeze()
+            if geometry.ndim != 3:
+                raise ValueError(f"geometry_path must resolve to a 3D array, got shape {tuple(geometry.shape)}")
+            return geometry
+        if stl_path:
+            path = (base_dir / str(stl_path)).resolve()
+            return self._voxelize_stl(str(path), self.grid_size)
+        raise ValueError("Each manifest record must provide geometry_path or stl_path")
+
+    def _load_or_build_manifest_latent(
+        self,
+        record: Dict[str, Any],
+        base_dir: Path,
+        design_spec: DesignSpec,
+        geometry: torch.Tensor,
+        condition_vector: torch.Tensor,
+    ) -> torch.Tensor:
+        latent_path = record.get("latent_path")
+        if latent_path:
+            path = (base_dir / str(latent_path)).resolve()
+            latent_np = np.load(path)
+            latent = torch.as_tensor(latent_np, dtype=torch.float32).flatten()
+            if int(latent.numel()) != int(self.latent_dim):
+                raise ValueError(
+                    f"latent_path must contain {self.latent_dim} values, got {latent.numel()}"
+                )
+            return latent
+        return build_structured_latent_code(
+            design_spec,
+            geometry,
+            condition_vector,
+            self.latent_dim,
+            generator=self.torch_generator,
+        )
 
     def _voxelize_stl(self, stl_path: str, grid_size: int) -> torch.Tensor:
         """Voxelize a grounded STL file preserving aspect ratio (Issue #30)."""
@@ -2959,15 +3122,19 @@ def _write_batch_manifest(
 def _validate_run_class_inputs(
     run_class: str,
     dataset_artifact: Optional[str],
+    dataset_manifest: Optional[str],
     baseline_config: Optional[str],
     claim_gates: Optional[str],
 ) -> None:
+    if dataset_artifact and dataset_manifest:
+        raise click.UsageError("Provide only one of --dataset-artifact or --dataset-manifest.")
+
     if run_class != RUN_CLASS_FINAL:
         return
 
     missing = []
-    if not dataset_artifact:
-        missing.append("dataset artifact")
+    if not dataset_artifact and not dataset_manifest:
+        missing.append("dataset artifact or dataset manifest")
     if not baseline_config:
         missing.append("baseline config")
     if not claim_gates:
@@ -2979,18 +3146,27 @@ def _validate_run_class_inputs(
 
     for label, path in (
         ("dataset artifact", dataset_artifact),
+        ("dataset manifest", dataset_manifest),
         ("baseline config", baseline_config),
         ("claim gates", claim_gates),
     ):
         if not path or not Path(path).exists():
             raise click.UsageError(f"Final run class requires an existing {label}: {path}")
 
-    payload = torch.load(dataset_artifact, map_location="cpu")
-    validate_dataset_artifact_payload(
-        payload,
-        artifact_path=dataset_artifact,
-        require_non_empty=True,
-    )
+    if dataset_artifact:
+        payload = torch.load(dataset_artifact, map_location="cpu")
+        validate_dataset_artifact_payload(
+            payload,
+            artifact_path=dataset_artifact,
+            require_non_empty=True,
+        )
+
+    if dataset_manifest:
+        records = load_grounded_manifest_records(dataset_manifest)
+        if not records:
+            raise click.UsageError(
+                f"Final run class requires a non-empty dataset manifest: {dataset_manifest}"
+            )
 
 @click.group()
 def cli():
@@ -3010,6 +3186,7 @@ def cli():
 @click.option('--disconnection-penalty', default=30.0, help='Penalty for disconnected voxels')
 @click.option('--num-samples', default=500, help='Number of training samples')
 @click.option('--dataset-artifact', default=None, help='Optional densified dataset artifact (.pt)')
+@click.option('--dataset-manifest', default=None, help='Optional grounded dataset manifest (.json, .jsonl, .yaml)')
 @click.option('--resume-from', default=None, help='Resume from checkpoint')
 @click.option('--save-dir', default='./checkpoints', help='Directory to save checkpoints')
 @click.option('--run-class', type=click.Choice([RUN_CLASS_SMOKE, RUN_CLASS_FINAL]), default=RUN_CLASS_SMOKE, help='Run profile: local smoke or claim-bearing final evaluation')
@@ -3021,7 +3198,7 @@ def cli():
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
-          num_samples, dataset_artifact, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline, 
+          num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline, 
           enable_checkpointing, enable_compile, solver):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
@@ -3048,7 +3225,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    _validate_run_class_inputs(run_class, dataset_artifact, baseline_config, claim_gates)
+    _validate_run_class_inputs(run_class, dataset_artifact, dataset_manifest, baseline_config, claim_gates)
     print(f"Using device: {device}")
     
     if torch.cuda.is_available():
@@ -3111,6 +3288,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
         grid_size=base_resolution,
         latent_dim=model_config.latent_dim,
         artifact_path=dataset_artifact,
+        manifest_path=dataset_manifest,
     )
     train_loader = DataLoader(
         dataset,

@@ -124,6 +124,22 @@ If you need the script to create an isolated Windows venv first:
 .\run_tests.ps1 -BootstrapVenv -q
 ```
 
+### 8. Run A Checked-In Protocol
+
+For the explicit 8 GB smoke workflow:
+
+```bash
+cd CLI
+python run_protocol.py --config run_protocols/smoke_8gb.yaml
+```
+
+To inspect the guarded final-eval path without running it:
+
+```bash
+cd CLI
+python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
+```
+
 ## Commands Reference
 
 ### `train`
@@ -244,6 +260,15 @@ See `requirements.txt`. Key packages:
 This table is retained as historical context from earlier experiments. The current CLI now distinguishes smoke runs from guarded final runs, and the current trainer executes one configured grid size rather than an automatic 16 -> 24 -> 32 schedule.
 
 ## Configuration
+
+The repo now includes executable protocol/config scaffolding for the remaining evaluation work:
+
+- `CLI/baseline_config.yaml`
+- `CLI/run_protocols/smoke_8gb.yaml`
+- `CLI/run_protocols/final_cloud.yaml`
+- `docs/dataset/minimal_grounded_manifest.jsonl`
+
+These do not make the repo publication-ready by themselves, but they turn the smoke/final workflow and minimal grounded-data path into concrete, versioned inputs instead of informal notes.
 
 ### Config File (`config.yaml`)
 
