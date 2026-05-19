@@ -4,6 +4,8 @@ import torch
 import os
 import json
 import shutil
+import gc
+import time
 from pathlib import Path
 import sys
 from unittest.mock import MagicMock, patch
@@ -16,8 +18,26 @@ from generator import OptimizedAircraftGenerator
 from data_utils import GroundTruthExporter, CFDLabelDataset
 from models import AeroSurrogate, MissionEncoder, LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel
 
+
+def _cleanup_ground_truth():
+    ground_truth_dir = Path("./ground_truth")
+    if not ground_truth_dir.exists():
+        return
+
+    gc.collect()
+    for _ in range(10):
+        try:
+            shutil.rmtree(ground_truth_dir)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(0.1)
+
+    shutil.rmtree(ground_truth_dir, ignore_errors=True)
+
 class TestIssue15Integration(unittest.TestCase):
     def setUp(self):
+        _cleanup_ground_truth()
         self.test_dir = Path("./test_issue_15_integration")
         self.test_dir.mkdir(exist_ok=True, parents=True)
         self.device = torch.device('cpu')
@@ -57,8 +77,7 @@ class TestIssue15Integration(unittest.TestCase):
     def tearDown(self):
         if self.test_dir.exists():
             shutil.rmtree(self.test_dir)
-        if Path("./ground_truth").exists():
-            shutil.rmtree("./ground_truth")
+        _cleanup_ground_truth()
 
     def test_full_multi_fidelity_loop(self):
         """Verify the full label -> train -> load -> rank -> promote loop."""

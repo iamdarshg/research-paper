@@ -7,7 +7,6 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 from datetime import datetime
 from typing import Dict, Any, List
@@ -17,6 +16,26 @@ from config import ModelConfig, DiffusionConfig, TrainingConfig, CFDConfig, Desi
 from models import LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel, NoiseSchedule, MissionEncoder, AeroSurrogate
 from data_utils import ConnectivityLoss, AerodynamicLoss, GroundTruthExporter
 from cfd_simulator import AdvancedCFDSimulator
+
+
+def _make_grad_scaler(device_type: str):
+    """Use the modern AMP GradScaler API when available without breaking older torch versions."""
+    enabled = device_type == "cuda"
+    amp_namespace = getattr(torch, "amp", None)
+    grad_scaler_cls = getattr(amp_namespace, "GradScaler", None) if amp_namespace else None
+    if grad_scaler_cls is not None:
+        for args, kwargs in (
+            ((), {"device": device_type, "enabled": enabled}),
+            (((device_type,), {"enabled": enabled})),
+            ((), {"enabled": enabled}),
+        ):
+            try:
+                return grad_scaler_cls(*args, **kwargs)
+            except TypeError:
+                continue
+
+    from torch.cuda.amp import GradScaler as CudaGradScaler
+    return CudaGradScaler(enabled=enabled)
 
 class OptimizedDiffusionTrainer:
     """Main training orchestrator with all TRM/HRM optimizations"""
@@ -46,7 +65,7 @@ class OptimizedDiffusionTrainer:
                   list(self.surrogate.parameters()))
         self.optimizer = AdamW(params, lr=training_config.learning_rate, weight_decay=training_config.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
-        self.scaler = GradScaler()
+        self.scaler = _make_grad_scaler(self.device.type)
 
         self.mse_loss = nn.MSELoss()
         self.connectivity_loss = ConnectivityLoss(penalty=training_config.disconnection_penalty)

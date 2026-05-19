@@ -2,6 +2,7 @@
 import unittest
 import torch
 import torch.nn as nn
+import warnings
 from pathlib import Path
 import sys
 import os
@@ -159,6 +160,21 @@ class TestMissionConditioning(unittest.TestCase):
         res4 = trainer._normalize_mission_batch(batch4, 2)
         self.assertEqual(res4[0].cruise_speed_mps, 80.0)
         self.assertEqual(res4[1].aircraft_class, 'fighter')
+
+    def test_trainer_init_emits_no_grad_scaler_futurewarning(self):
+        """Verify trainer initialization uses a non-deprecated GradScaler path."""
+        from trainer import OptimizedDiffusionTrainer
+        from config import CFDConfig, TrainingConfig
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            OptimizedDiffusionTrainer(self.model_config, self.diffusion_config, TrainingConfig(), CFDConfig())
+
+        grad_scaler_warnings = [
+            warning for warning in caught
+            if issubclass(warning.category, FutureWarning) and "GradScaler" in str(warning.message)
+        ]
+        self.assertEqual(grad_scaler_warnings, [])
 
     def test_generator_propagation(self):
         """Verify generator correctly encodes mission and propagates to inference"""

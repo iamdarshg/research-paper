@@ -1,4 +1,5 @@
 .vscode/
+.venv-win/
 data/
 runs/
 checkpoints/

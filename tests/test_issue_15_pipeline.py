@@ -4,6 +4,8 @@ import torch
 import os
 import json
 import shutil
+import gc
+import time
 from pathlib import Path
 import sys
 
@@ -16,8 +18,26 @@ from cfd_simulator import AdvancedCFDSimulator
 from data_utils import GroundTruthExporter
 from models import AeroSurrogate, MissionEncoder, LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel
 
+
+def _cleanup_ground_truth():
+    ground_truth_dir = Path("./ground_truth")
+    if not ground_truth_dir.exists():
+        return
+
+    gc.collect()
+    for _ in range(10):
+        try:
+            shutil.rmtree(ground_truth_dir)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(0.1)
+
+    shutil.rmtree(ground_truth_dir, ignore_errors=True)
+
 class TestIssue15Pipeline(unittest.TestCase):
     def setUp(self):
+        _cleanup_ground_truth()
         self.test_dir = Path("./test_issue_15_pipeline")
         self.test_dir.mkdir(exist_ok=True)
         self.device = torch.device('cpu')
@@ -57,8 +77,7 @@ class TestIssue15Pipeline(unittest.TestCase):
     def tearDown(self):
         if self.test_dir.exists():
             shutil.rmtree(self.test_dir)
-        if Path("./ground_truth").exists():
-            shutil.rmtree("./ground_truth")
+        _cleanup_ground_truth()
 
     def test_label_tier_serialization(self):
         """Verify label tiers survive export/load."""

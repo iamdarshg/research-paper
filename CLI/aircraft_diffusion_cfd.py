@@ -40,7 +40,6 @@ from torch.utils.data._utils.collate import default_collate
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
 
 from tqdm import tqdm
 import yaml
@@ -51,6 +50,26 @@ import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
 
 warnings.filterwarnings('ignore')
+
+
+def _make_grad_scaler(device_type: str):
+    """Use the modern AMP GradScaler API when available without breaking older torch versions."""
+    enabled = device_type == "cuda"
+    amp_namespace = getattr(torch, "amp", None)
+    grad_scaler_cls = getattr(amp_namespace, "GradScaler", None) if amp_namespace else None
+    if grad_scaler_cls is not None:
+        for args, kwargs in (
+            ((), {"device": device_type, "enabled": enabled}),
+            (((device_type,), {"enabled": enabled})),
+            ((), {"enabled": enabled}),
+        ):
+            try:
+                return grad_scaler_cls(*args, **kwargs)
+            except TypeError:
+                continue
+
+    from torch.cuda.amp import GradScaler as CudaGradScaler
+    return CudaGradScaler(enabled=enabled)
 
 
 def _configure_console_output() -> None:
@@ -2090,7 +2109,7 @@ class OptimizedDiffusionTrainer:
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
         
         # Gradient scaler for mixed precision
-        self.scaler = GradScaler()
+        self.scaler = _make_grad_scaler(self.device.type)
         
         # Losses
         self.mse_loss = nn.MSELoss()

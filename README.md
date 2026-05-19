@@ -103,6 +103,27 @@ python3 run_internal_benchmark.py
 
 This runs the internal D3Q27 solver and, when OpenFOAM is available, a local sonicFoam case for `20mm_cube.stl` plus any other root-level `*.stl` files, then prints a JSON summary with the force comparison. Treat it as a solver cross-check and implementation smoke benchmark, not as a publication-grade aerodynamic benchmark. On Linux or Windows/WSL, pass `--install-openfoam` to let the benchmark bootstrap OpenFOAM if it is missing.
 
+### 7. Run Tests
+
+For a normal Python environment:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+For this repo specifically on Windows, a common failure mode is having a Unix-style `.venv` checked out from WSL or Linux. In that case, use the repo runner instead:
+
+```powershell
+.\run_tests.ps1 -q
+```
+
+If you need the script to create an isolated Windows venv first:
+
+```powershell
+.\run_tests.ps1 -BootstrapVenv -q
+```
+
 ## Commands Reference
 
 ### `train`
