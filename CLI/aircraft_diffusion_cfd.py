@@ -1879,32 +1879,33 @@ class AircraftDesignDataset(Dataset):
             self.latent_codes = torch.zeros((0, latent_dim))
 
     def _voxelize_stl(self, stl_path: str, grid_size: int) -> torch.Tensor:
-        """Voxelize a grounded STL file (Issue #30)."""
+        """Voxelize a grounded STL file preserving aspect ratio (Issue #30)."""
         try:
             mesh = trimesh.load(stl_path)
-            # Center and scale to unit domain
+            # Center and scale such that the largest extent fits in 0.8 of the grid
             mesh.apply_translation(-mesh.centroid)
-            extents = mesh.extents
-            scale = 0.8 / max(extents)
+            max_extent = max(mesh.extents)
+            scale = 0.8 / max_extent
             mesh.apply_scale(scale)
 
-            # Voxelize
+            # Voxelize with pitch matched to grid resolution
             voxels = mesh.voxelized(pitch=1.0/grid_size).matrix
 
-            # Use zoom for exact resolution matching
-            zoom_factors = [grid_size / s for s in voxels.shape]
-            voxels_resized = zoom(voxels.astype(float), zoom_factors, order=0)
+            # Create the final cubic grid and center the voxel matrix
+            final_voxels = np.zeros((grid_size, grid_size, grid_size), dtype=float)
+            v_shape = voxels.shape
 
-            # Ensure correct shape [grid_size, grid_size, grid_size]
-            if voxels_resized.shape != (grid_size, grid_size, grid_size):
-                final_voxels = np.zeros((grid_size, grid_size, grid_size))
-                s0 = min(grid_size, voxels_resized.shape[0])
-                s1 = min(grid_size, voxels_resized.shape[1])
-                s2 = min(grid_size, voxels_resized.shape[2])
-                final_voxels[:s0, :s1, :s2] = voxels_resized[:s0, :s1, :s2]
-                voxels_resized = final_voxels
+            # Calculate centering offsets
+            start = [(grid_size - s) // 2 for s in v_shape]
 
-            return torch.from_numpy(voxels_resized).float()
+            # Safety clipping and bounds checking
+            st0, st1, st2 = max(0, start[0]), max(0, start[1]), max(0, start[2])
+            s0 = min(v_shape[0], grid_size - st0)
+            s1 = min(v_shape[1], grid_size - st1)
+            s2 = min(v_shape[2], grid_size - st2)
+
+            final_voxels[st0:st0+s0, st1:st1+s1, st2:st2+s2] = voxels[:s0, :s1, :s2]
+            return torch.from_numpy(final_voxels).float()
         except Exception as e:
             print(f"Warning: Failed to voxelize {stl_path}: {e}")
             return torch.zeros((grid_size, grid_size, grid_size))
@@ -3305,6 +3306,9 @@ def validate_conditions(checkpoint, num_seeds, grid_size, output):
         "occupancy": []
     }
 
+    cfd_config = CFDConfig(base_grid_resolution=grid_size)
+    simulator = AdvancedCFDSimulator(cfd_config, device)
+
     print(f"Starting scientific condition-response study with {num_seeds} seeds...")
     for s in range(num_seeds):
         rng = random.Random(s)
@@ -3317,8 +3321,6 @@ def validate_conditions(checkpoint, num_seeds, grid_size, output):
         spec.wingspan_limit_m = span
 
         voxel_grid = generator.generate(spec, num_steps=4)
-        cfd_config = CFDConfig(base_grid_resolution=grid_size)
-        simulator = AdvancedCFDSimulator(cfd_config, device)
         res = simulator.simulate_aerodynamics(voxel_grid, steps=100)
 
         study_data["target_speed"].append(speed)
