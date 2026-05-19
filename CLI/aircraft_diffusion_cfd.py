@@ -44,7 +44,8 @@ from torch.cuda.amp import GradScaler, autocast
 
 from tqdm import tqdm
 import yaml
-from scipy.ndimage import label, binary_dilation
+from scipy.ndimage import label, binary_dilation, zoom
+from scipy.stats import pearsonr
 from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
@@ -1850,37 +1851,85 @@ class AircraftDesignDataset(Dataset):
             seed=seed,
         )
         self.design_specs = [sample_design_spec(self.rng) for _ in range(num_samples)]
-        self.condition_vectors = torch.stack(
-            [build_condition_vector(spec) for spec in self.design_specs]
-        )
+        if self.design_specs:
+            self.condition_vectors = torch.stack(
+                [build_condition_vector(spec) for spec in self.design_specs]
+            )
+        else:
+            self.condition_vectors = torch.zeros((0, infer_conditioning_dim()))
         self.geometries = self._generate_geometries()
-        self.latent_codes = torch.stack(
-            [
-                build_structured_latent_code(
-                    design_spec,
-                    geometry,
-                    condition_vector,
-                    latent_dim,
-                    generator=self.torch_generator,
-                )
-                for design_spec, geometry, condition_vector in zip(
-                    self.design_specs,
-                    self.geometries,
-                    self.condition_vectors,
-                )
-            ]
-        )
+        if self.design_specs:
+            self.latent_codes = torch.stack(
+                [
+                    build_structured_latent_code(
+                        design_spec,
+                        geometry,
+                        condition_vector,
+                        latent_dim,
+                        generator=self.torch_generator,
+                    )
+                    for design_spec, geometry, condition_vector in zip(
+                        self.design_specs,
+                        self.geometries,
+                        self.condition_vectors,
+                    )
+                ]
+            )
+        else:
+            self.latent_codes = torch.zeros((0, latent_dim))
+
+    def _voxelize_stl(self, stl_path: str, grid_size: int) -> torch.Tensor:
+        """Voxelize a grounded STL file (Issue #30)."""
+        try:
+            mesh = trimesh.load(stl_path)
+            # Center and scale to unit domain
+            mesh.apply_translation(-mesh.centroid)
+            extents = mesh.extents
+            scale = 0.8 / max(extents)
+            mesh.apply_scale(scale)
+
+            # Voxelize
+            voxels = mesh.voxelized(pitch=1.0/grid_size).matrix
+
+            # Use zoom for exact resolution matching
+            zoom_factors = [grid_size / s for s in voxels.shape]
+            voxels_resized = zoom(voxels.astype(float), zoom_factors, order=0)
+
+            # Ensure correct shape [grid_size, grid_size, grid_size]
+            if voxels_resized.shape != (grid_size, grid_size, grid_size):
+                final_voxels = np.zeros((grid_size, grid_size, grid_size))
+                s0 = min(grid_size, voxels_resized.shape[0])
+                s1 = min(grid_size, voxels_resized.shape[1])
+                s2 = min(grid_size, voxels_resized.shape[2])
+                final_voxels[:s0, :s1, :s2] = voxels_resized[:s0, :s1, :s2]
+                voxels_resized = final_voxels
+
+            return torch.from_numpy(voxels_resized).float()
+        except Exception as e:
+            print(f"Warning: Failed to voxelize {stl_path}: {e}")
+            return torch.zeros((grid_size, grid_size, grid_size))
 
     def _generate_geometries(self) -> List[torch.Tensor]:
-        """Generate procedural aircraft geometries tied to design metadata."""
-        return [
-            _procedural_aircraft_geometry(
-                design_spec,
-                self.grid_size,
-                generator=self.torch_generator,
-            )
-            for design_spec in self.design_specs
-        ]
+        """Generate aircraft geometries, mixing grounded STLs with procedural ones (Issue #30)."""
+        repo_root = Path(__file__).resolve().parent.parent
+        stl_files = list(repo_root.glob("*.stl"))
+        grounded_stls = [str(f) for f in stl_files if f.name in ("F-18_Hornet.stl", "biplane.stl")]
+
+        geometries = []
+        for i, design_spec in enumerate(self.design_specs):
+            # Mix grounded STLs if available (approx 20% of dataset if enough samples)
+            if grounded_stls and i < len(grounded_stls) * 5 and i % 5 == 0:
+                stl_path = grounded_stls[i // 5 % len(grounded_stls)]
+                geometries.append(self._voxelize_stl(stl_path, self.grid_size))
+            else:
+                geometries.append(
+                    _procedural_aircraft_geometry(
+                        design_spec,
+                        self.grid_size,
+                        generator=self.torch_generator,
+                    )
+                )
+        return geometries
     
     def __len__(self) -> int:
         return self.num_samples
@@ -3197,6 +3246,107 @@ def generate(
     else:
         print("  Warning: CFD analysis became non-finite")
         print("  Treat this export as a smoke artifact, not a validated aerodynamic result")
+
+
+@cli.command("evaluate-baselines")
+@click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
+@click.option('--grid-size', default=32, help='Voxel resolution for baseline evaluation')
+@click.option('--steps', default=200, help='Simulation steps')
+@click.option('--output', default='./baseline_report.json', help='Output report path')
+def evaluate_baselines(solver, grid_size, steps, output):
+    """Voxelize and evaluate grounded aircraft STLs to establish performance baselines (Issue #31)."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    repo_root = Path(__file__).resolve().parent.parent
+    grounded_stls = [repo_root / f for f in ("F-18_Hornet.stl", "biplane.stl") if (repo_root / f).exists()]
+
+    if not grounded_stls:
+        print("No grounded STLs found in repo root.")
+        return
+
+    # Use AircraftDesignDataset's internal voxelizer
+    dataset = AircraftDesignDataset(num_samples=0, grid_size=grid_size)
+    cfd_config = CFDConfig(solver_type=solver, base_grid_resolution=grid_size)
+    simulator = AdvancedCFDSimulator(cfd_config, device)
+
+    results = {}
+    for stl_path in grounded_stls:
+        print(f"Evaluating baseline: {stl_path.name} at {grid_size}^3...")
+        voxel_grid = dataset._voxelize_stl(str(stl_path), grid_size)
+        res = simulator.simulate_aerodynamics(voxel_grid, steps=steps)
+
+        results[stl_path.name] = {
+            "drag_coefficient": float(res.get("drag_coefficient", 0.0)),
+            "lift_coefficient": float(res.get("lift_coefficient", 0.0)),
+            "lift_to_drag": float(res.get("lift_coefficient", 0.0) / max(res.get("drag_coefficient", 1e-6), 1e-6)),
+            "volume_fraction": float((voxel_grid > 0.5).float().mean())
+        }
+        print(f"  Cd: {results[stl_path.name]['drag_coefficient']:.4f}, Cl: {results[stl_path.name]['lift_coefficient']:.4f}")
+
+    with open(output, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"Baseline report written to {output}")
+
+
+@cli.command("validate-conditions")
+@click.option('--checkpoint', required=True, help='Path to model checkpoint')
+@click.option('--num-seeds', default=10, help='Number of random seeds for the scientific study')
+@click.option('--grid-size', default=32, help='Voxel resolution for validation')
+@click.option('--output', default='./condition_validation.json', help='Output validation report')
+def validate_conditions(checkpoint, num_seeds, grid_size, output):
+    """Perform scientific condition-response validation and compute Pearson correlations (Issue #32)."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    generator = OptimizedAircraftGenerator(checkpoint, device=device)
+
+    study_data = {
+        "target_speed": [],
+        "wingspan_limit": [],
+        "measured_drag": [],
+        "measured_lift": [],
+        "occupancy": []
+    }
+
+    print(f"Starting scientific condition-response study with {num_seeds} seeds...")
+    for s in range(num_seeds):
+        rng = random.Random(s)
+        # Sample varied mission profiles
+        speed = rng.uniform(30.0, 90.0)
+        span = rng.uniform(1.2, 2.4)
+
+        spec = sample_design_spec(rng)
+        spec.target_speed = speed
+        spec.wingspan_limit_m = span
+
+        voxel_grid = generator.generate(spec, num_steps=4)
+        cfd_config = CFDConfig(base_grid_resolution=grid_size)
+        simulator = AdvancedCFDSimulator(cfd_config, device)
+        res = simulator.simulate_aerodynamics(voxel_grid, steps=100)
+
+        study_data["target_speed"].append(speed)
+        study_data["wingspan_limit"].append(span)
+        study_data["measured_drag"].append(float(res.get("drag_coefficient", 0.0)))
+        study_data["measured_lift"].append(float(res.get("lift_coefficient", 0.0)))
+        study_data["occupancy"].append(float((voxel_grid > 0.5).float().mean()))
+
+    # Compute correlations
+    correlations = {}
+    for input_key in ["target_speed", "wingspan_limit"]:
+        for output_key in ["measured_drag", "measured_lift", "occupancy"]:
+            r, p = pearsonr(study_data[input_key], study_data[output_key])
+            correlations[f"{input_key}_vs_{output_key}"] = {"r": float(r), "p": float(p)}
+
+    report = {
+        "metadata": {
+            "checkpoint": checkpoint,
+            "num_seeds": num_seeds,
+            "grid_size": grid_size
+        },
+        "correlations": correlations,
+        "raw_data": study_data
+    }
+
+    with open(output, 'w') as f:
+        json.dump(report, f, indent=2)
+    print(f"Condition validation report written to {output}")
 
 
 @cli.command("condition-response-smoke")
