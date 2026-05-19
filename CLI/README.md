@@ -31,6 +31,8 @@ Commands exposed by the current file:
 - `train`
 - `generate`
 - `batch-generate`
+- `evaluate-baselines`
+- `validate-conditions`
 - `condition-response-smoke`
 - `densify-dataset`
 - `performance-benchmark`
@@ -151,6 +153,39 @@ Current limitations:
 - Uses fixed `num_steps=4`
 - Writes filenames shaped like `aircraft_optimized_001.stl`
 - Needs claim-bearing evaluation before batch outputs can be used as scientific evidence
+
+## Baseline Evaluation
+
+Establish performance baselines using grounded aircraft STLs:
+
+```bash
+python aircraft_diffusion_cfd.py evaluate-baselines \
+  --grid-size 32 \
+  --steps 500 \
+  --output ./baseline_report.json
+```
+
+## Condition-Response Validation
+
+Perform scientific condition-response validation and compute Pearson correlations:
+
+```bash
+python aircraft_diffusion_cfd.py validate-conditions \
+  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --num-seeds 20 \
+  --output ./condition_validation.json
+```
+
+## Multi-Seed Evaluation Study
+
+Automate aggregated performance studies across multiple seeds using the standalone script:
+
+```bash
+python multi_seed_eval.py \
+  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --num-seeds 10 \
+  --output-dir ./eval_results
+```
 
 ## Condition-Response Smoke Benchmark
 
