@@ -3192,9 +3192,9 @@ def cli():
 @click.option('--run-class', type=click.Choice([RUN_CLASS_SMOKE, RUN_CLASS_FINAL]), default=RUN_CLASS_SMOKE, help='Run profile: local smoke or claim-bearing final evaluation')
 @click.option('--baseline-config', default=None, help='Required for final runs: baseline comparison config path')
 @click.option('--claim-gates', default=None, help='Required for final runs: path to FINAL_RUN_GATES.md')
-@click.option('--enable-consistency', is_flag=True, default=True, help='Enable 4-step consistency model')
-@click.option('--enable-pipeline', is_flag=True, default=True, help='Enable pipeline parallelism')
-@click.option('--enable-checkpointing', is_flag=True, default=True, help='Enable gradient checkpointing')
+@click.option('--enable-consistency/--disable-consistency', default=True, help='Enable 4-step consistency model')
+@click.option('--enable-pipeline/--disable-pipeline', default=True, help='Enable pipeline parallelism')
+@click.option('--enable-checkpointing/--disable-checkpointing', default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconnection_penalty, 
@@ -3353,7 +3353,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, precision, disconne
 @click.option('--part-count-max', default=8, help='Maximum part-count bound')
 @click.option('--manufacturing-method', default='fdm_pla_0p4mm', type=click.Choice(list(MANUFACTURING_METHOD_VOCAB)), help='Manufacturing route for the smoke conditioning path')
 @click.option('--num-steps', default=4, help='Number of diffusion steps for generation (4 for consistency)')
-@click.option('--use-marching-cubes', is_flag=True, default=True, help='Use marching cubes for STL conversion')
+@click.option('--use-marching-cubes/--no-marching-cubes', default=True, help='Use marching cubes for STL conversion')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 def generate(
     checkpoint,
@@ -3750,66 +3750,6 @@ def densify_dataset(
         print(f"  manifest={report_paths['manifest']}")
         print(f"  npz={report_paths['npz']}")
         print(f"  jsonl={report_paths['jsonl']}")
-
-@cli.command()
-def performance_benchmark():
-    """Benchmark all optimizations"""
-    print("\n🚀 TRM/HRM RECURSIVE STYLE PERFORMANCE BENCHMARK")
-    print("="*60)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        print(f"GPU: {props.name}")
-        print(f"Total Memory: {props.total_memory / 1e9:.2f} GB")
-        print(f"Compute Capability: {props.major}.{props.minor}")
-    
-    print("\n✨ OPTIMIZATION FEATURES:")
-    print("• 4-step consistency model path is compiled into this build")
-    print("• Grouped-query attention path is compiled into this build")
-    print("• Gradient checkpointing path is compiled into this build")
-    print("• torch.compile: Kernel fusion optimization")
-    print("• Adaptive mesh refinement: ~5k cells vs 32³ (85% reduction)")
-    print("• GPU LBM solver: SoA layout with 256-thread blocks")
-    print("• Pipeline parallelism: CFD + diffusion overlap")
-    
-    print("\n🎯 EXPECTED PERFORMANCE GAINS:")
-    print("• Inference Path: configured consistency sampling")
-    print("• Memory Path: efficiency hooks available")
-    print("• Attention Path: grouped-query implementation available")
-    print("• CFD Path: bounded internal solver configuration available")
-    print("• Throughput Claims: require explicit benchmark artifacts")
-    
-    print("\n📊 BENCHMARK COMPLETE")
-    print("All TRM/HRM optimizations successfully implemented! 🎉")
-
-@cli.command()
-def info():
-    """Print system and optimization information"""
-    _configure_console_output()
-    print(f"\nAircraft structural design proof-of-concept")
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA capability: {torch.cuda.get_device_capability(0)}")
-        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        print(f"Allocated GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
-        print(f"Reserved GPU memory: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
-    
-    print(f"\n✨ OPTIMIZATION STATUS:")
-    print(f"• 4-step consistency model: ✅ ENABLED")
-    print(f"• Grouped-query attention: ✅ ENABLED (4 groups)")
-    print(f"• Gradient checkpointing: ✅ ENABLED")
-    print(f"• torch.compile optimization: ✅ ENABLED")
-    print(f"• Adaptive mesh refinement: ✅ ENABLED (~5k cells)")
-    print(f"• GPU LBM solver: ✅ ENABLED (SoA layout, 256-thread blocks)")
-    print(f"• Pipeline parallelism: ✅ ENABLED")
-    print(f"• FluidX3D integration: ✅ ENABLED")
-
 
 @cli.command(name="performance-benchmark")
 def performance_benchmark_status():

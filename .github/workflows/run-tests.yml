@@ -23,9 +23,9 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libegl1 libgles2 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xinput0 libxcb-xfixes0 xvfb
         python -m pip install --upgrade pip
-        pip install torch numpy scipy scikit-image click pyyaml tqdm tensorboard pydantic PyQt5 pyqtgraph matplotlib trimesh
+        pip install -r requirements-dev.txt
 
     - name: Run tests
       run: |
         export PYTHONPATH=$PYTHONPATH:$(pwd)/CLI:$(pwd)/GUI
-        xvfb-run python -m unittest discover tests
+        xvfb-run python -m pytest -q

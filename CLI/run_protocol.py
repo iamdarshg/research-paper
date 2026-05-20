@@ -41,6 +41,12 @@ def _add_option(command: List[str], flag: str, value: Any) -> None:
     command.extend([flag, str(value)])
 
 
+def _add_dual_flag(command: List[str], enable_flag: str, disable_flag: str, value: Any) -> None:
+    if value is None:
+        return
+    command.append(enable_flag if value else disable_flag)
+
+
 def _default_checkpoint(config: Dict[str, Any], train_cfg: Dict[str, Any]) -> str:
     save_dir = _resolve_path(config, train_cfg.get("save_dir", "./checkpoints"))
     return str((Path(save_dir) / "final_optimized_model.pt").resolve())
@@ -81,14 +87,15 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
             if key in {"dataset_artifact", "dataset_manifest", "resume_from", "save_dir", "baseline_config", "claim_gates"}:
                 value = _resolve_path(config, value)
             _add_option(train_cmd, flag, value)
-        for flag, key in (
-            ("--enable-consistency", "enable_consistency"),
-            ("--enable-pipeline", "enable_pipeline"),
-            ("--enable-checkpointing", "enable_checkpointing"),
-            ("--enable-compile", "enable_compile"),
+        for enable_flag, disable_flag, key in (
+            ("--enable-consistency", "--disable-consistency", "enable_consistency"),
+            ("--enable-pipeline", "--disable-pipeline", "enable_pipeline"),
+            ("--enable-checkpointing", "--disable-checkpointing", "enable_checkpointing"),
         ):
             if key in train_cfg:
-                _add_option(train_cmd, flag, bool(train_cfg[key]))
+                _add_dual_flag(train_cmd, enable_flag, disable_flag, bool(train_cfg[key]))
+        if "enable_compile" in train_cfg:
+            _add_option(train_cmd, "--enable-compile", bool(train_cfg["enable_compile"]))
         commands.append(train_cmd)
 
     checkpoint = _resolve_path(config, config.get("checkpoint")) or _resolve_path(config, train_cfg.get("checkpoint"))

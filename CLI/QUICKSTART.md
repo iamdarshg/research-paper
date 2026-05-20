@@ -27,6 +27,8 @@ This prints the proof-of-concept benchmark/status summary. It does not train a m
 
 ## 4. Run a Small Training Smoke Test
 
+For repeatable smoke/final workflows, prefer the protocol runner (`run_protocol.py`) with the checked-in YAML configs. The manual steps below are for quick experimentation only.
+
 ```bash
 python aircraft_diffusion_cfd.py train \
   --num-epochs 1 \
@@ -125,7 +127,7 @@ This writes a small JSON summary for the procedural conditioning path. It is use
 - This is a synthetic-data research workflow.
 - The docs intentionally do not promise production readiness.
 - The current trainer runs one configured grid size; it does not run the older staged `16 -> 24 -> 32` schedule.
-- The CLI exposes `--enable-consistency`, `--enable-pipeline`, `--enable-checkpointing`, and `--use-marching-cubes` as on-switches only in the present code.
+- The CLI exposes paired flags: `--enable-consistency/--disable-consistency`, `--enable-pipeline/--disable-pipeline`, `--enable-checkpointing/--disable-checkpointing`, and `--use-marching-cubes/--no-marching-cubes`.
 - Smoke outputs and smoke condition-response summaries are not claim-bearing evaluation artifacts.
 
 ## 10. If Something Fails

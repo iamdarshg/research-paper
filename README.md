@@ -63,7 +63,7 @@ python aircraft_diffusion_cfd.py train \
   --num-epochs 100 \
   --batch-size 4 \
   --num-samples 100 \
-  --save-dir ./checkpoints
+  --save-dir ./checkpoints_smoke
 ```
 
 For an honest local smoke run on 8 GB hardware, use much smaller settings first:
@@ -80,7 +80,7 @@ python aircraft_diffusion_cfd.py train \
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
+  --checkpoint checkpoints_smoke/final_optimized_model.pt \
   --output ./designs\design_0.stl \
   --target-speed 50.0 \
   --num-steps 4
@@ -90,7 +90,7 @@ python aircraft_diffusion_cfd.py generate \
 
 ```bash
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
+  --checkpoint checkpoints_smoke/final_optimized_model.pt \
   --output-dir ./designs \
   --num-designs 5
 ```
@@ -140,6 +140,8 @@ cd CLI
 python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
 ```
 
+The checked-in protocol configs are the canonical, repeatable entry points for smoke and final runs. They keep smoke artifacts (`checkpoints_protocol_smoke`, `build/protocol_smoke`) and final-eval artifacts (`checkpoints_protocol_final`, `build/protocol_final`) in separate paths.
+
 ## Commands Reference
 
 ### `train`
@@ -153,7 +155,7 @@ Train the diffusion model from scratch or resume from checkpoint.
 - `--disconnection-penalty` (float): Penalty for disconnected structures (default: 10.0)
 - `--num-samples` (int): Synthetic training data samples (default: 100)
 - `--resume-from` (str): Path to checkpoint to resume training
-- `--save-dir` (str): Directory for saving checkpoints (default: ./checkpoints)
+- `--save-dir` (str): Directory for saving checkpoints (default: ./checkpoints). Use a smoke/final-specific path to keep artifacts separated.
 
 **Example:**
 ```bash
@@ -176,14 +178,14 @@ Generate new voxel designs using a trained model.
 - `--engine-diameter-mm`, `--engine-length-mm`, `--engine-count-min`, `--engine-count-max`
 - `--wingspan-limit-m`, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and `--manufacturing-method`
 - `--num-steps` (int): Number of consistency-model sampling steps (default: `4`)
-- `--use-marching-cubes` (bool flag): Export via marching cubes when possible
+- `--use-marching-cubes` / `--no-marching-cubes`: Export via marching cubes when possible
 
 Under the hood, the repository now has a partial structured conditioning path: the dataset, diffusion model, and generator all consume a condition vector documented in `CLI/conditioning_schema.yaml`. Public CLI exposure is still incomplete relative to the full scientific goal. The public commands now surface a meaningful subset of payload, takeoff, wingspan, wall-thickness, part-count, propulsion, maneuverability, and manufacturing controls, but those controls still need grounded condition-response benchmarks before they support scientific claims.
 
 **Example:**
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
+  --checkpoint checkpoints_smoke/final_optimized_model.pt \
   --output ./generated_designs\design_0.stl \
   --target-speed 50.0 \
   --num-steps 4
@@ -202,7 +204,7 @@ Generate multiple STL artifacts from a trained checkpoint.
 **Example:**
 ```bash
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
+  --checkpoint checkpoints_smoke/final_optimized_model.pt \
   --output-dir ./generated_designs \
   --num-designs 5
 ```
@@ -214,11 +216,11 @@ Print the runtime environment and optimization status.
 python aircraft_diffusion_cfd.py info
 ```
 
-### `info`
-Display system information and GPU/CUDA status.
+### `performance-benchmark`
+Print the smoke-run feature status summary.
 
 ```bash
-python aircraft_diffusion_cfd.py info
+python aircraft_diffusion_cfd.py performance-benchmark
 ```
 
 ## System Requirements
@@ -308,7 +310,7 @@ CLI/
 ├── QUICKSTART.md                 # 5-minute setup guide
 ├── ARCHITECTURE.md               # Technical deep dive
 ├── README.md                     # Original detailed README
-├── checkpoints/                  # Trained model checkpoints
+├── checkpoints_smoke/            # Smoke-run checkpoints (local outputs)
 ├── runs/                         # TensorBoard logs
 └── reference/                    # Reference implementations
     └── complete_amr_d3q27_cascaded_guide.py
@@ -321,13 +323,14 @@ CLI/
 python aircraft_diffusion_cfd.py train \
   --num-epochs 100 \
   --batch-size 4 \
-  --num-samples 100
+  --num-samples 100 \
+  --save-dir ./checkpoints_smoke
 ```
 
 ### Example 2: Generate 100 Designs
 ```bash
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
+  --checkpoint checkpoints_smoke/final_optimized_model.pt \
   --output-dir ./generated_designs \
   --num-designs 100
 ```
@@ -335,18 +338,18 @@ python aircraft_diffusion_cfd.py batch-generate \
 ### Example 3: Full Pipeline
 ```bash
 # Train
-python aircraft_diffusion_cfd.py train --num-epochs 100
+python aircraft_diffusion_cfd.py train --num-epochs 100 --save-dir ./checkpoints_smoke
 
 # Generate
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
+  --checkpoint checkpoints_smoke/final_optimized_model.pt \
   --output best_aircraft.stl \
   --target-speed 50.0 \
   --num-steps 4
 
 # Optional batch generation
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
+  --checkpoint checkpoints_smoke/final_optimized_model.pt \
   --output-dir ./designs \
   --num-designs 20
 ```

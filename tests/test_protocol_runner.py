@@ -63,3 +63,34 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertEqual(commands[1][2], "evaluate-baselines")
             self.assertEqual(commands[2][2], "validate-conditions")
             self.assertEqual(commands[3][1], str((cli_dir / "multi_seed_eval.py").resolve()))
+
+    def test_build_protocol_commands_supports_disable_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cli_dir = repo_root / "CLI"
+            protocol_dir = cli_dir / "run_protocols"
+            protocol_dir.mkdir(parents=True)
+
+            config_path = protocol_dir / "smoke.yaml"
+            payload = {
+                "train": {
+                    "enabled": True,
+                    "num_epochs": 1,
+                    "batch_size": 1,
+                    "num_samples": 2,
+                    "save_dir": "../../checkpoints_test",
+                    "enable_consistency": False,
+                    "enable_pipeline": False,
+                    "enable_checkpointing": False,
+                    "enable_compile": False,
+                },
+            }
+            config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+            config = run_protocol.load_protocol_config(str(config_path))
+            commands = run_protocol.build_protocol_commands(config)
+
+            train_cmd = commands[0]
+            self.assertIn("--disable-consistency", train_cmd)
+            self.assertIn("--disable-pipeline", train_cmd)
+            self.assertIn("--disable-checkpointing", train_cmd)
