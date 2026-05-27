@@ -4,8 +4,8 @@ Aircraft Structural Design via Diffusion Models + FluidX3D CFD
 Combines TRM/HRM principles with diffusion-based 3D voxel generation,
 GPU-accelerated CFD simulation, and marching cubes STL export.
 
-Fully optimized for 8-13GB VRAM with pipelined training and inference.
-TRM/HRM Recursive Style Implementation with:
+Proof-of-concept implementation with memory-aware training and inference paths.
+Current implementation details include:
 - FluidX3D integration with adaptive mesh refinement
 - 4-step consistency model distillation
 - Grouped-query attention (4 groups, 50% KV-cache reduction)
@@ -3487,11 +3487,11 @@ def evaluate_baselines(solver, grid_size, steps, output):
 
 @cli.command("validate-conditions")
 @click.option('--checkpoint', required=True, help='Path to model checkpoint')
-@click.option('--num-seeds', default=10, help='Number of random seeds for the scientific study')
+@click.option('--num-seeds', default=10, help='Number of random seeds for the condition-response sweep')
 @click.option('--grid-size', default=32, help='Voxel resolution for validation')
 @click.option('--output', default='./condition_validation.json', help='Output validation report')
 def validate_conditions(checkpoint, num_seeds, grid_size, output):
-    """Perform scientific condition-response validation and compute Pearson correlations (Issue #32)."""
+    """Run a multi-seed condition-response sweep and compute Pearson correlations (Issue #32)."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
 
@@ -3506,7 +3506,7 @@ def validate_conditions(checkpoint, num_seeds, grid_size, output):
     cfd_config = CFDConfig(base_grid_resolution=grid_size)
     simulator = AdvancedCFDSimulator(cfd_config, device)
 
-    print(f"Starting scientific condition-response study with {num_seeds} seeds...")
+    print(f"Starting multi-seed condition-response sweep with {num_seeds} seeds...")
     for s in range(num_seeds):
         rng = random.Random(s)
         # Sample varied mission profiles
@@ -3546,6 +3546,7 @@ def validate_conditions(checkpoint, num_seeds, grid_size, output):
     with open(output, 'w') as f:
         json.dump(report, f, indent=2)
     print(f"Condition validation report written to {output}")
+    print("Treat this report as current-checkpoint evidence only, not grounded aircraft validation.")
 
 
 @cli.command("condition-response-smoke")

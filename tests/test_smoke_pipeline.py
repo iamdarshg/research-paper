@@ -120,6 +120,27 @@ class TestCLISmokePipeline(unittest.TestCase):
             self.assertEqual(sample["design_spec"].target_speed, 44.0)
             self.assertEqual(sample["condition_vector"].numel(), cli_module.infer_conditioning_dim())
 
+    def test_checked_in_minimal_manifest_loads_through_repo_dataset_path(self):
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        manifest_path = os.path.join(repo_root, "docs", "dataset", "minimal_grounded_manifest.jsonl")
+
+        dataset = cli_module.AircraftDesignDataset(
+            manifest_path=manifest_path,
+            grid_size=32,
+            latent_dim=16,
+            seed=11,
+        )
+
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(dataset.metadata["data_source"], "grounded_manifest")
+        self.assertEqual(
+            dataset.metadata["split_assignments"],
+            ["train", "holdout"],
+        )
+        sample = dataset[0]
+        self.assertEqual(sample["geometry"].shape, (32, 32, 32))
+        self.assertEqual(sample["condition_vector"].numel(), cli_module.infer_conditioning_dim())
+
     def test_generate_help_lists_current_options(self):
         result = self.runner.invoke(cli_module.cli, ["generate", "--help"])
 
@@ -158,6 +179,14 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("--num-samples", result.output)
         self.assertIn("--num-conditions", result.output)
         self.assertIn("--num-candidates-per-condition", result.output)
+
+    def test_validate_conditions_help_avoids_scientific_validation_claim(self):
+        result = self.runner.invoke(cli_module.cli, ["validate-conditions", "--help"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("condition-response", result.output)
+        self.assertNotIn("scientific study", result.output.lower())
+        self.assertNotIn("scientific condition-response validation", result.output.lower())
 
     def test_save_checkpoint_includes_cfd_config_payload(self):
         trainer = object.__new__(cli_module.OptimizedDiffusionTrainer)

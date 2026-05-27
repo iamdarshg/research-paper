@@ -63,3 +63,27 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertEqual(commands[1][2], "evaluate-baselines")
             self.assertEqual(commands[2][2], "validate-conditions")
             self.assertEqual(commands[3][1], str((cli_dir / "multi_seed_eval.py").resolve()))
+
+    def test_checked_in_protocols_resolve_repo_assets(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        protocol_paths = [
+            repo_root / "CLI" / "run_protocols" / "smoke_8gb.yaml",
+            repo_root / "CLI" / "run_protocols" / "final_cloud.yaml",
+        ]
+
+        for path in protocol_paths:
+            config = run_protocol.load_protocol_config(str(path))
+            commands = run_protocol.build_protocol_commands(config)
+            self.assertTrue(commands, f"{path} should produce runnable commands")
+            self.assertTrue(Path(commands[0][1]).exists())
+
+        final_config = run_protocol.load_protocol_config(str(protocol_paths[1]))
+        final_commands = run_protocol.build_protocol_commands(final_config)
+        train_command = final_commands[0]
+
+        self.assertIn(
+            str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()),
+            train_command,
+        )
+        self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), train_command)
+        self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), train_command)

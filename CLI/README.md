@@ -6,8 +6,8 @@ This directory contains a proof-of-concept CLI for synthetic aircraft-like voxel
 
 - The training dataset is synthetic.
 - The workflow is not validated for real aircraft design, certification, or manufacturing decisions.
-- The repo now has partial structured conditioning plumbing: dataset generation, the diffusion model, and the generator consume a documented 22-slot condition vector.
-- The public CLI exposes only a subset of that path today. `generate` and `batch-generate` surface speed, maneuverability, propulsion, wingspan, payload, takeoff, wall-thickness, part-count, and manufacturing options, but the full schema still needs config-driven evaluation flows plus condition-response benchmarks on grounded aircraft-like data.
+- The repo now has structured conditioning plumbing: dataset generation, the diffusion model, and the generator consume a documented 22-slot condition vector.
+- The public CLI/config surface exposes the current documented conditioning fields. What is still missing is grounded condition-response evidence on aircraft-like data.
 - `batch-generate` now records a manifest with the exact `DesignSpec` payload and condition vector for each STL. It still uses a fixed `num_steps=4`.
 - Several flags are exposed as on-switches only in the current implementation: `--enable-consistency`, `--enable-pipeline`, `--enable-checkpointing`, and `--use-marching-cubes`.
 - `info` and `performance-benchmark` report compiled-in feature/status messages; they are smoke-oriented status checks, not full runtime validation of every optimization path.
@@ -97,6 +97,7 @@ Grounded-manifest behavior:
 - Each manifest record may optionally provide `design_spec`, `condition_vector`, `latent_path`, and `split`.
 - Relative paths are resolved from the manifest file's directory.
 - The checked-in minimal example is [`docs/dataset/minimal_grounded_manifest.jsonl`](../docs/dataset/minimal_grounded_manifest.jsonl).
+- That checked-in manifest is wiring validation only, not a publication-grade aircraft corpus.
 
 ## Generation
 
@@ -142,7 +143,7 @@ What the command does today:
 Important nuance:
 
 - The condition-vector seam is real code plumbing, not just a TODO. See `conditioning_schema.yaml` and `config.yaml`.
-- Public CLI exposure is still partial. The repo is not yet validated as a mission-conditioned or manufacturing-conditioned aircraft generator.
+- The CLI/config surface exposes the documented condition fields, but the repo is not yet validated as a mission-conditioned or manufacturing-conditioned aircraft generator.
 - `condition-response-smoke` writes a JSON report for directional smoke evidence only; it is not a scientific benchmark.
 - No grounded condition-response benchmark currently demonstrates that changing payload, takeoff, wingspan, wall-thickness, part-count, or manufacturing inputs reliably changes generated outputs in the intended direction.
 
@@ -162,7 +163,7 @@ Current batch options:
 - `--num-designs` default `5`
 - `--seed` default `0`
 - `--vary-conditions` to sample deterministic `DesignSpec` variation
-- the same public conditioning subset exposed by `generate`
+- the same documented public conditioning fields exposed by `generate`
 
 Current limitations:
 
@@ -183,7 +184,7 @@ python aircraft_diffusion_cfd.py evaluate-baselines \
 
 ## Condition-Response Validation
 
-Perform scientific condition-response validation and compute Pearson correlations:
+Run a multi-seed condition-response sweep and compute Pearson correlations:
 
 ```bash
 python aircraft_diffusion_cfd.py validate-conditions \

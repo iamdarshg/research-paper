@@ -58,7 +58,7 @@ What this command does today:
 - Exports an STL
 - Runs a final CFD analysis pass and prints drag/lift coefficients
 
-The public CLI now exposes a partial structured conditioning subset here, including speed, thrust-to-weight, turn-rate, static thrust, engine geometry, engine count, wingspan, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and manufacturing method. It still does not make the workflow scientifically validated conditioned generation.
+The public CLI/config surface now exposes the documented conditioning fields here, including speed, thrust-to-weight, turn-rate, static thrust, engine geometry, engine count, wingspan, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and manufacturing method. It still does not make the workflow scientifically validated conditioned generation on grounded aircraft-like data.
 
 ## 6. Generate a Small Batch
 
