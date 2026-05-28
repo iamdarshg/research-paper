@@ -1,3 +1,9 @@
+validate_manifest:
+  enabled: true
+  manifest: ../../docs/dataset/minimal_grounded_manifest.jsonl
+  level: claim-bearing
+  output: ../../build/protocol_final/manifest_validation.json
+
 train:
   enabled: true
   num_epochs: 5

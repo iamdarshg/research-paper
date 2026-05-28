@@ -24,6 +24,12 @@ class TestProtocolRunner(unittest.TestCase):
 
             config_path = protocol_dir / "smoke.yaml"
             payload = {
+                "validate_manifest": {
+                    "enabled": True,
+                    "manifest": "../../docs/dataset/minimal_grounded_manifest.jsonl",
+                    "level": "claim-bearing",
+                    "output": "../../build/manifest_validation.json",
+                },
                 "train": {
                     "enabled": True,
                     "num_epochs": 1,
@@ -55,14 +61,17 @@ class TestProtocolRunner(unittest.TestCase):
             config = run_protocol.load_protocol_config(str(config_path))
             commands = run_protocol.build_protocol_commands(config)
 
-            self.assertEqual(commands[0][1], str((cli_dir / "aircraft_diffusion_cfd.py").resolve()))
+            self.assertEqual(commands[0][1], str((cli_dir / "validate_manifest.py").resolve()))
             self.assertIn(str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()), commands[0])
-            self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), commands[0])
-            self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), commands[0])
-            self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[2])
-            self.assertEqual(commands[1][2], "evaluate-baselines")
-            self.assertEqual(commands[2][2], "validate-conditions")
-            self.assertEqual(commands[3][1], str((cli_dir / "multi_seed_eval.py").resolve()))
+            self.assertEqual(commands[0][2], "--manifest")
+            self.assertEqual(commands[1][1], str((cli_dir / "aircraft_diffusion_cfd.py").resolve()))
+            self.assertIn(str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()), commands[1])
+            self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), commands[1])
+            self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), commands[1])
+            self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[3])
+            self.assertEqual(commands[2][2], "evaluate-baselines")
+            self.assertEqual(commands[3][2], "validate-conditions")
+            self.assertEqual(commands[4][1], str((cli_dir / "multi_seed_eval.py").resolve()))
 
     def test_checked_in_protocols_resolve_repo_assets(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -79,7 +88,8 @@ class TestProtocolRunner(unittest.TestCase):
 
         final_config = run_protocol.load_protocol_config(str(protocol_paths[1]))
         final_commands = run_protocol.build_protocol_commands(final_config)
-        train_command = final_commands[0]
+        self.assertEqual(final_commands[0][1], str((repo_root / "CLI" / "validate_manifest.py").resolve()))
+        train_command = final_commands[1]
 
         self.assertIn(
             str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()),

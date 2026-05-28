@@ -41,6 +41,7 @@ Commands exposed by the current file:
 Standalone helpers:
 
 - `run_protocol.py`
+- `validate_manifest.py`
 - `run_protocols/smoke_8gb.yaml`
 - `run_protocols/final_cloud.yaml`
 - `baseline_config.yaml`
@@ -218,7 +219,14 @@ Preview the guarded final-eval protocol without executing it:
 python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
 ```
 
-The final protocol is intentionally conservative: it references `baseline_config.yaml`, `paper/FINAL_RUN_GATES.md`, and the minimal grounded manifest so claim-bearing runs must name their baselines and dataset inputs explicitly.
+The final protocol is intentionally conservative: it now starts with grounded-manifest validation and references `baseline_config.yaml`, `paper/FINAL_RUN_GATES.md`, and the minimal grounded manifest so claim-bearing runs must name their baselines and dataset inputs explicitly.
+
+Validate a manifest directly:
+
+```bash
+python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level basic
+python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
+```
 
 ## Condition-Response Smoke Benchmark
 

@@ -52,9 +52,23 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     python_exe = sys.executable
     cli_script = str((cli_dir / "aircraft_diffusion_cfd.py").resolve())
     multi_seed_script = str((cli_dir / "multi_seed_eval.py").resolve())
+    manifest_validator_script = str((cli_dir / "validate_manifest.py").resolve())
 
     commands: List[List[str]] = []
     train_cfg = dict(config.get("train", {}))
+    manifest_cfg = dict(config.get("validate_manifest", {}))
+    if manifest_cfg.get("enabled"):
+        manifest_path = manifest_cfg.get("manifest") or train_cfg.get("dataset_manifest")
+        manifest_path = _resolve_path(config, manifest_path)
+        if not manifest_path:
+            raise ValueError("validate_manifest.enabled requires a manifest path or train.dataset_manifest")
+
+        manifest_cmd = [python_exe, manifest_validator_script, "--manifest", manifest_path]
+        _add_option(manifest_cmd, "--level", manifest_cfg.get("level", "basic"))
+        output_path = _resolve_path(config, manifest_cfg.get("output"))
+        _add_option(manifest_cmd, "--output", output_path)
+        commands.append(manifest_cmd)
+
     if train_cfg.get("enabled", True):
         train_cmd = [python_exe, cli_script, "train"]
         for flag, key in (
