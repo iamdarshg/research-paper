@@ -53,6 +53,10 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     cli_script = str((cli_dir / "aircraft_diffusion_cfd.py").resolve())
     multi_seed_script = str((cli_dir / "multi_seed_eval.py").resolve())
     manifest_validator_script = str((cli_dir / "validate_manifest.py").resolve())
+    condition_benchmark_script = str((cli_dir / "run_condition_benchmark.py").resolve())
+    aircraft_validity_script = str((cli_dir / "aircraft_validity.py").resolve())
+    manufacturing_constraints_script = str((cli_dir / "condition_feasibility.py").resolve())
+    final_evidence_script = str((cli_dir / "final_evidence.py").resolve())
 
     commands: List[List[str]] = []
     train_cfg = dict(config.get("train", {}))
@@ -138,6 +142,52 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
             _add_option(condition_cmd, flag, value)
         commands.append(condition_cmd)
 
+    condition_benchmark_cfg = dict(config.get("condition_benchmark", {}))
+    if condition_benchmark_cfg.get("enabled"):
+        manifest_path = condition_benchmark_cfg.get("manifest") or train_cfg.get("dataset_manifest")
+        manifest_path = _resolve_path(config, manifest_path)
+        if not manifest_path:
+            raise ValueError("condition_benchmark.enabled requires a manifest path or train.dataset_manifest")
+
+        benchmark_cmd = [
+            python_exe,
+            condition_benchmark_script,
+            "--checkpoint",
+            checkpoint,
+            "--manifest",
+            manifest_path,
+        ]
+        output_path = _resolve_path(config, condition_benchmark_cfg.get("output"))
+        _add_option(benchmark_cmd, "--output", output_path)
+        if condition_benchmark_cfg.get("seeds"):
+            _add_option(benchmark_cmd, "--seeds", condition_benchmark_cfg.get("seeds"))
+        elif condition_benchmark_cfg.get("num_seeds"):
+            num_seeds = int(condition_benchmark_cfg["num_seeds"])
+            _add_option(benchmark_cmd, "--seeds", f"0-{max(0, num_seeds - 1)}")
+        _add_option(benchmark_cmd, "--min-grounded-records", condition_benchmark_cfg.get("min_grounded_records"))
+        _add_option(benchmark_cmd, "--min-effect", condition_benchmark_cfg.get("min_effect"))
+        commands.append(benchmark_cmd)
+
+    manufacturing_cfg = dict(config.get("manufacturing_constraints", {}))
+    if manufacturing_cfg.get("enabled"):
+        manifest_path = manufacturing_cfg.get("manifest") or train_cfg.get("dataset_manifest")
+        manifest_path = _resolve_path(config, manifest_path)
+        manufacturing_cmd = [python_exe, manufacturing_constraints_script]
+        _add_option(manufacturing_cmd, "--manifest", manifest_path)
+        _add_option(manufacturing_cmd, "--payload-json", manufacturing_cfg.get("payload_json"))
+        output_path = _resolve_path(config, manufacturing_cfg.get("output"))
+        _add_option(manufacturing_cmd, "--output", output_path)
+        commands.append(manufacturing_cmd)
+
+    aircraft_validity_cfg = dict(config.get("aircraft_validity", {}))
+    if aircraft_validity_cfg.get("enabled"):
+        validity_cmd = [python_exe, aircraft_validity_script]
+        for input_path in aircraft_validity_cfg.get("inputs", []) or []:
+            _add_option(validity_cmd, "--input", _resolve_path(config, input_path))
+        _add_option(validity_cmd, "--input-dir", _resolve_path(config, aircraft_validity_cfg.get("input_dir")))
+        _add_option(validity_cmd, "--output", _resolve_path(config, aircraft_validity_cfg.get("output")))
+        commands.append(validity_cmd)
+
     multi_seed_cfg = dict(config.get("multi_seed_eval", {}))
     if multi_seed_cfg.get("enabled"):
         multi_cmd = [python_exe, multi_seed_script, "--checkpoint", checkpoint]
@@ -151,6 +201,23 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
                 value = _resolve_path(config, value)
             _add_option(multi_cmd, flag, value)
         commands.append(multi_cmd)
+
+    final_evidence_cfg = dict(config.get("final_evidence", {}))
+    if final_evidence_cfg.get("enabled"):
+        evidence_cmd = [python_exe, final_evidence_script]
+        report_paths = {
+            "manifest_validation": manifest_cfg.get("output"),
+            "aircraft_validity": aircraft_validity_cfg.get("output"),
+            "condition_benchmark": condition_benchmark_cfg.get("output"),
+            "manufacturing_constraints": manufacturing_cfg.get("output"),
+            "baseline_statistics": final_evidence_cfg.get("baseline_statistics"),
+        }
+        for gate_id, report_path in report_paths.items():
+            _add_option(evidence_cmd, f"--{gate_id.replace('_', '-')}", _resolve_path(config, report_path))
+        if final_evidence_cfg.get("require_run_consistency"):
+            _add_option(evidence_cmd, "--require-run-consistency", True)
+        _add_option(evidence_cmd, "--output", _resolve_path(config, final_evidence_cfg.get("output")))
+        commands.append(evidence_cmd)
 
     return commands
 

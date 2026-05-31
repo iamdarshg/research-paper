@@ -1,4 +1,6 @@
 baseline_name: minimal_grounded_aircraft
+baseline_set:
+  - bundled_grounded_stl
 description: >
   Minimal grounded baseline set using the repository's bundled aircraft-like STL files.
   This config exists to make final-run guardrails executable rather than purely documentary.

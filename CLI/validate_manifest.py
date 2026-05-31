@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Validate grounded dataset manifests for smoke wiring or claim-bearing workflows."""
+"""Validate grounded dataset manifests for smoke wiring or claim-bearing workflows.
+
+The claim-bearing level follows dataset-documentation expectations from
+Datasheets for Datasets: motivation, composition, collection/preprocessing, and
+recommended uses must be explicit before downstream claims are credible.
+https://doi.org/10.48550/arXiv.1803.09010
+"""
 
 from __future__ import annotations
 

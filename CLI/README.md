@@ -42,6 +42,9 @@ Standalone helpers:
 
 - `run_protocol.py`
 - `validate_manifest.py`
+- `run_condition_benchmark.py`
+- `aircraft_validity.py`
+- `final_evidence.py`
 - `run_protocols/smoke_8gb.yaml`
 - `run_protocols/final_cloud.yaml`
 - `baseline_config.yaml`
@@ -227,6 +230,28 @@ Validate a manifest directly:
 python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level basic
 python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
 ```
+
+Run the grounded condition-response gate directly:
+
+```bash
+python run_condition_benchmark.py \
+  --checkpoint ../checkpoints_protocol_final/final_optimized_model.pt \
+  --manifest ../docs/dataset/minimal_grounded_manifest.jsonl \
+  --output ../build/protocol_final/condition_benchmark.json
+```
+
+Evaluate the final evidence package:
+
+```bash
+python final_evidence.py \
+  --manifest-validation ../build/protocol_final/manifest_validation.json \
+  --aircraft-validity ../build/protocol_final/aircraft_validity.json \
+  --condition-benchmark ../build/protocol_final/condition_benchmark.json \
+  --manufacturing-constraints ../build/protocol_final/manufacturing_constraints.json \
+  --baseline-statistics ../build/protocol_final/baseline_statistics.json
+```
+
+Missing, failed, or blocked reports keep claim-bearing wording blocked.
 
 ## Condition-Response Smoke Benchmark
 

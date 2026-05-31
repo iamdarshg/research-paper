@@ -36,8 +36,31 @@ validate_conditions:
   grid_size: 32
   output: ../../build/protocol_final/condition_validation.json
 
+condition_benchmark:
+  enabled: true
+  manifest: ../../docs/dataset/minimal_grounded_manifest.jsonl
+  num_seeds: 8
+  min_grounded_records: 20
+  output: ../../build/protocol_final/condition_benchmark.json
+
+manufacturing_constraints:
+  enabled: true
+  manifest: ../../docs/dataset/minimal_grounded_manifest.jsonl
+  output: ../../build/protocol_final/manufacturing_constraints.json
+
+aircraft_validity:
+  enabled: true
+  input_dir: ../../build/protocol_final/generated_voxels
+  output: ../../build/protocol_final/aircraft_validity.json
+
 multi_seed_eval:
   enabled: true
   num_seeds: 8
   grid_size: 32
   output_dir: ../../build/protocol_final/multi_seed_eval
+
+final_evidence:
+  enabled: true
+  baseline_statistics: ../../build/protocol_final/baseline_statistics.json
+  require_run_consistency: true
+  output: ../../build/protocol_final/final_evidence_package.json

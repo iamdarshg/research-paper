@@ -10,7 +10,7 @@ This repository combines a latent generative model, voxel decoding, internal lat
 
 - The model consumes structured conditions end to end through the dataset, model, and generator paths.
 - The public CLI/config surface exposes the documented conditioning fields for propulsion, maneuverability, payload, takeoff, manufacturing, and geometry bounds.
-- Condition-response tooling exists through `validate-conditions`, `condition-response-smoke`, `multi_seed_eval.py`, and the checked-in protocol runner.
+- Condition-response and claim-gate tooling exists through `validate-conditions`, `condition-response-smoke`, `run_condition_benchmark.py`, `aircraft_validity.py`, `final_evidence.py`, `multi_seed_eval.py`, and the checked-in protocol runner.
 - The repo does not yet provide scientific validation of conditioned aircraft generation on grounded aircraft-like data.
 
 ## Current Scope
@@ -24,6 +24,7 @@ This repository combines a latent generative model, voxel decoding, internal lat
 ## Not Yet Implemented At Claimable Quality
 
 - Grounded condition-response evidence on an aircraft-like corpus
+- A passing final evidence package that combines manifest, validity, condition-response, manufacturing, and baseline-statistics reports
 - Real aircraft dataset training
 - Structural validation beyond connectivity heuristics
 - Publication-grade aerodynamic optimization claims
@@ -110,6 +111,12 @@ Guarded final path preview:
 ```bash
 cd CLI
 python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
+```
+
+Final claim-bearing wording remains blocked until the final evidence package passes:
+
+```bash
+python CLI/final_evidence.py
 ```
 
 ## Commands Reference

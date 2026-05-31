@@ -26,7 +26,7 @@ import multiprocessing as mp
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import asyncio
@@ -48,6 +48,7 @@ from scipy.stats import pearsonr
 from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
+from condition_feasibility import validate_condition_feasibility
 
 warnings.filterwarnings('ignore')
 
@@ -289,6 +290,17 @@ class DesignSpec:
         validate_design_spec(self)
 
 
+def _normalize_manifest_design_spec(raw_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Bridge the public manifest schema to the internal DesignSpec field names."""
+    if not isinstance(raw_spec, dict):
+        raise ValueError("manifest design_spec must be an object")
+    normalized = dict(raw_spec)
+    if "target_speed" not in normalized and "target_speed_mps" in normalized:
+        normalized["target_speed"] = normalized["target_speed_mps"]
+    allowed_fields = {field.name for field in fields(DesignSpec)}
+    return {key: value for key, value in normalized.items() if key in allowed_fields}
+
+
 CONDITIONING_SCHEMA_PATH = Path(__file__).with_name("conditioning_schema.yaml")
 
 
@@ -406,6 +418,24 @@ def validate_design_spec(design_spec: DesignSpec, compatibility_mode: bool = Fal
         design_spec.manufacturing_method,
         compatibility_mode=compatibility_mode,
     )
+    feasibility_payload = {
+        "target_speed_mps": design_spec.target_speed,
+        "thrust_to_weight_min": design_spec.thrust_to_weight_min,
+        "turn_rate_min_deg_s": design_spec.turn_rate_min_deg_s,
+        "required_static_thrust_n": design_spec.required_static_thrust_n,
+        "engine_count_min": design_spec.engine_count_min,
+        "engine_count_max": design_spec.engine_count_max,
+        "payload_mass_min_g": design_spec.payload_mass_min_g,
+        "payload_mass_max_g": design_spec.payload_mass_max_g,
+        "wall_thickness_min_mm": design_spec.wall_thickness_min_mm,
+        "wall_thickness_max_mm": design_spec.wall_thickness_max_mm,
+        "part_count_min": design_spec.part_count_min,
+        "part_count_max": design_spec.part_count_max,
+        "manufacturing_method": design_spec.manufacturing_method,
+    }
+    feasibility_report = validate_condition_feasibility(feasibility_payload)
+    if feasibility_report["status"] != "pass":
+        raise ValueError("; ".join(feasibility_report["errors"]))
     return design_spec
 
 
@@ -1960,7 +1990,7 @@ class AircraftDesignDataset(Dataset):
 
         for idx, record in enumerate(records):
             if "design_spec" in record and isinstance(record["design_spec"], dict):
-                design_spec = DesignSpec(**record["design_spec"])
+                design_spec = DesignSpec(**_normalize_manifest_design_spec(record["design_spec"]))
             else:
                 design_spec = sample_design_spec(self.rng)
 

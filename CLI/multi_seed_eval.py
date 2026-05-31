@@ -2,6 +2,10 @@
 """
 Multi-Seed Evaluation Script for Aircraft Diffusion CFD.
 Automates aggregated performance studies across multiple seeds (Issue #32).
+
+Mean/std summaries are uncertainty descriptors, not proof of superiority.
+NIST guidance treats standard uncertainty as a standard-deviation expression of
+incomplete knowledge: https://www.nist.gov/itl/sed/topic-areas/measurement-uncertainty
 """
 
 import os
@@ -11,6 +15,59 @@ import argparse
 import subprocess
 import numpy as np
 from pathlib import Path
+
+
+def build_statistical_summary(records, metric_keys, min_seeds=3):
+    # Do not collapse claim-bearing comparisons to a single lucky seed. This
+    # helper reports sample mean/std and blocks when the seed count is too low.
+    seeds = sorted({int(record["seed"]) for record in records if "seed" in record})
+    blockers = []
+    if len(seeds) < min_seeds:
+        blockers.append(f"insufficient seeds: found {len(seeds)}, require at least {min_seeds}")
+
+    metrics = {}
+    for key in metric_keys:
+        values = [float(record[key]) for record in records if key in record]
+        if len(values) < min_seeds:
+            blockers.append(f"metric {key} has insufficient values: found {len(values)}, require at least {min_seeds}")
+            continue
+        metrics[key] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
+            "count": len(values),
+        }
+
+    return {
+        "status": "pass" if not blockers else "blocked",
+        "seed_count": len(seeds),
+        "seeds": seeds,
+        "metrics": metrics,
+        "blockers": blockers,
+    }
+
+
+def validate_baseline_policy(config, required_baselines=None):
+    required_baselines = required_baselines or [
+        "retrieval",
+        "unconditional_checkpoint",
+        "bundled_grounded_stl",
+    ]
+    blockers = []
+    baseline_set = config.get("baseline_set")
+    if not isinstance(baseline_set, list):
+        blockers.append("missing baseline_set")
+        baseline_set = []
+    missing = [name for name in required_baselines if name not in baseline_set]
+    if missing:
+        blockers.append("missing required baselines: " + ", ".join(missing))
+    if not config.get("baseline_name"):
+        blockers.append("missing baseline_name")
+    return {
+        "status": "pass" if not blockers else "blocked",
+        "required_baselines": required_baselines,
+        "baseline_set": baseline_set,
+        "blockers": blockers,
+    }
 
 def run_eval(checkpoint, num_seeds, grid_size, output_dir):
     output_dir = Path(output_dir)

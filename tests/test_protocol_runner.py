@@ -50,10 +50,33 @@ class TestProtocolRunner(unittest.TestCase):
                     "num_seeds": 3,
                     "output": "../../build/condition_validation.json",
                 },
+                "condition_benchmark": {
+                    "enabled": True,
+                    "manifest": "../../docs/dataset/minimal_grounded_manifest.jsonl",
+                    "num_seeds": 3,
+                    "output": "../../build/condition_benchmark.json",
+                    "min_grounded_records": 4,
+                },
+                "manufacturing_constraints": {
+                    "enabled": True,
+                    "manifest": "../../docs/dataset/minimal_grounded_manifest.jsonl",
+                    "output": "../../build/manufacturing_constraints.json",
+                },
+                "aircraft_validity": {
+                    "enabled": True,
+                    "input_dir": "../../build/generated_voxels",
+                    "output": "../../build/aircraft_validity.json",
+                },
                 "multi_seed_eval": {
                     "enabled": True,
                     "num_seeds": 3,
                     "output_dir": "../../build/multi_seed_eval",
+                },
+                "final_evidence": {
+                    "enabled": True,
+                    "baseline_statistics": "../../build/baseline_statistics.json",
+                    "require_run_consistency": True,
+                    "output": "../../build/final_evidence_package.json",
                 },
             }
             config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
@@ -71,7 +94,14 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[3])
             self.assertEqual(commands[2][2], "evaluate-baselines")
             self.assertEqual(commands[3][2], "validate-conditions")
-            self.assertEqual(commands[4][1], str((cli_dir / "multi_seed_eval.py").resolve()))
+            self.assertEqual(commands[4][1], str((cli_dir / "run_condition_benchmark.py").resolve()))
+            self.assertIn(str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()), commands[4])
+            self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[4])
+            self.assertEqual(commands[5][1], str((cli_dir / "condition_feasibility.py").resolve()))
+            self.assertEqual(commands[6][1], str((cli_dir / "aircraft_validity.py").resolve()))
+            self.assertEqual(commands[7][1], str((cli_dir / "multi_seed_eval.py").resolve()))
+            self.assertEqual(commands[8][1], str((cli_dir / "final_evidence.py").resolve()))
+            self.assertIn("--require-run-consistency", commands[8])
 
     def test_checked_in_protocols_resolve_repo_assets(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -97,3 +127,15 @@ class TestProtocolRunner(unittest.TestCase):
         )
         self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), train_command)
         self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), train_command)
+        self.assertTrue(
+            any(command[1] == str((repo_root / "CLI" / "run_condition_benchmark.py").resolve()) for command in final_commands)
+        )
+        self.assertTrue(
+            any(command[1] == str((repo_root / "CLI" / "condition_feasibility.py").resolve()) for command in final_commands)
+        )
+        self.assertTrue(
+            any(command[1] == str((repo_root / "CLI" / "aircraft_validity.py").resolve()) for command in final_commands)
+        )
+        self.assertTrue(
+            any(command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve()) for command in final_commands)
+        )

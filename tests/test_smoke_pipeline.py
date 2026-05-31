@@ -120,6 +120,53 @@ class TestCLISmokePipeline(unittest.TestCase):
             self.assertEqual(sample["design_spec"].target_speed, 44.0)
             self.assertEqual(sample["condition_vector"].numel(), cli_module.infer_conditioning_dim())
 
+    def test_manifest_dataset_accepts_schema_target_speed_mps(self):
+        with self.runner.isolated_filesystem():
+            geometry = torch.zeros((8, 8, 8), dtype=torch.float32)
+            geometry[2:6, 2:6, 2:6] = 1.0
+            os.makedirs("dataset", exist_ok=True)
+            geometry_path = os.path.join("dataset", "sample.npy")
+            manifest_path = os.path.join("dataset", "manifest.jsonl")
+
+            import numpy as np
+
+            np.save(geometry_path, geometry.numpy())
+            record = {
+                "geometry_path": "sample.npy",
+                "design_spec": {
+                    "target_speed_mps": 51.0,
+                    "wingspan_limit_m": 1.7,
+                    "thrust_to_weight_min": 0.4,
+                    "turn_rate_min_deg_s": 15.0,
+                    "required_static_thrust_n": 150.0,
+                    "engine_diameter_mm": 120,
+                    "engine_length_mm": 240,
+                    "engine_count_min": 1,
+                    "engine_count_max": 1,
+                    "payload_mass_min_g": 300,
+                    "payload_mass_max_g": 900,
+                    "takeoff_distance_min_m": 80,
+                    "takeoff_distance_max_m": 150,
+                    "wall_thickness_min_mm": 1,
+                    "wall_thickness_max_mm": 2,
+                    "part_count_min": 1,
+                    "part_count_max": 5,
+                    "manufacturing_method": "fdm_pla_0p4mm",
+                },
+                "split": "train",
+            }
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+
+            dataset = cli_module.AircraftDesignDataset(
+                manifest_path=manifest_path,
+                grid_size=8,
+                latent_dim=8,
+                seed=7,
+            )
+
+            self.assertEqual(dataset[0]["design_spec"].target_speed, 51.0)
+
     def test_checked_in_minimal_manifest_loads_through_repo_dataset_path(self):
         repo_root = os.path.dirname(os.path.dirname(__file__))
         manifest_path = os.path.join(repo_root, "docs", "dataset", "minimal_grounded_manifest.jsonl")

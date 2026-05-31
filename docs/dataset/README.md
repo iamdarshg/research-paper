@@ -51,7 +51,8 @@ Current expected behavior:
 - `basic` should pass for the checked-in minimal manifest.
 - `claim-bearing` should return `blocked`, because the file is intentionally a wiring artifact and not a publication-grade corpus.
 
-See `docs/dataset/GROUNDED_CORPUS_SPEC.md` for the stricter claim-bearing contract.
+See `docs/dataset/GROUNDED_CORPUS_SPEC.md` for the stricter claim-bearing contract and
+`docs/dataset/manifest_schema.example.json` for a machine-readable example record shape.
 
 Each record may include:
 
