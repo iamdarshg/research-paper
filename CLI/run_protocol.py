@@ -57,6 +57,7 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     aircraft_validity_script = str((cli_dir / "aircraft_validity.py").resolve())
     manufacturing_constraints_script = str((cli_dir / "condition_feasibility.py").resolve())
     final_evidence_script = str((cli_dir / "final_evidence.py").resolve())
+    gate_readiness_script = str((cli_dir / "gate_readiness.py").resolve())
 
     commands: List[List[str]] = []
     train_cfg = dict(config.get("train", {}))
@@ -202,6 +203,17 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
             _add_option(multi_cmd, flag, value)
         commands.append(multi_cmd)
 
+    baseline_statistics_cfg = dict(config.get("baseline_statistics", {}))
+    if baseline_statistics_cfg.get("enabled"):
+        stats_cmd = [python_exe, multi_seed_script]
+        _add_option(stats_cmd, "--baseline-config", _resolve_path(config, baseline_statistics_cfg.get("baseline_config")))
+        _add_option(stats_cmd, "--records-json", _resolve_path(config, baseline_statistics_cfg.get("records_json")))
+        for metric_key in baseline_statistics_cfg.get("metric_keys", []) or []:
+            _add_option(stats_cmd, "--metric-key", metric_key)
+        _add_option(stats_cmd, "--baseline-statistics-output", _resolve_path(config, baseline_statistics_cfg.get("output")))
+        _add_option(stats_cmd, "--min-seeds", baseline_statistics_cfg.get("min_seeds"))
+        commands.append(stats_cmd)
+
     final_evidence_cfg = dict(config.get("final_evidence", {}))
     if final_evidence_cfg.get("enabled"):
         evidence_cmd = [python_exe, final_evidence_script]
@@ -218,6 +230,12 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
             _add_option(evidence_cmd, "--require-run-consistency", True)
         _add_option(evidence_cmd, "--output", _resolve_path(config, final_evidence_cfg.get("output")))
         commands.append(evidence_cmd)
+
+    gate_readiness_cfg = dict(config.get("gate_readiness", {}))
+    if gate_readiness_cfg.get("enabled"):
+        readiness_cmd = [python_exe, gate_readiness_script]
+        _add_option(readiness_cmd, "--output", _resolve_path(config, gate_readiness_cfg.get("output")))
+        commands.append(readiness_cmd)
 
     return commands
 

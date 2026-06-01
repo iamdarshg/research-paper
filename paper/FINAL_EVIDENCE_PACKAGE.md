@@ -6,6 +6,10 @@ before the paper, README, or CLI docs can strengthen their wording.
 The current per-gate implementation/evidence status lives in
 `paper/SCIENTIFIC_GATE_STATUS.md`.
 
+Current gate readiness is 90%+ only in the mapped/implemented/scaffolded
+sense. Claim-bearing scientific evidence remains 0/13 until the reports below
+exist and return evidence-level outcomes.
+
 ## Required Reports
 
 | Gate | Required report | Current executable source | Claim unlocked only if |
@@ -39,8 +43,8 @@ python CLI/final_evidence.py \
 ## Decision Rule
 
 If any required report is missing, blocked, or failed, claim-bearing wording must
-stay blocked. Passing smoke or wiring checks is not enough.
+stay blocked. Successful smoke or wiring checks are not enough.
 
 The current repository still lacks a publication-grade grounded corpus and
 claim-bearing result reports, so paper-level aircraft-generation claims remain
-blocked until those artifacts exist.
+blocked at 0/13 until those artifacts exist.

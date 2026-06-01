@@ -72,11 +72,23 @@ class TestProtocolRunner(unittest.TestCase):
                     "num_seeds": 3,
                     "output_dir": "../../build/multi_seed_eval",
                 },
+                "baseline_statistics": {
+                    "enabled": True,
+                    "baseline_config": "../baseline_config.yaml",
+                    "records_json": "../../build/baseline_records.json",
+                    "metric_keys": ["lift_to_drag"],
+                    "output": "../../build/baseline_statistics.json",
+                    "min_seeds": 3,
+                },
                 "final_evidence": {
                     "enabled": True,
                     "baseline_statistics": "../../build/baseline_statistics.json",
                     "require_run_consistency": True,
                     "output": "../../build/final_evidence_package.json",
+                },
+                "gate_readiness": {
+                    "enabled": True,
+                    "output": "../../build/gate_readiness.json",
                 },
             }
             config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
@@ -100,8 +112,11 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertEqual(commands[5][1], str((cli_dir / "condition_feasibility.py").resolve()))
             self.assertEqual(commands[6][1], str((cli_dir / "aircraft_validity.py").resolve()))
             self.assertEqual(commands[7][1], str((cli_dir / "multi_seed_eval.py").resolve()))
-            self.assertEqual(commands[8][1], str((cli_dir / "final_evidence.py").resolve()))
-            self.assertIn("--require-run-consistency", commands[8])
+            self.assertEqual(commands[8][1], str((cli_dir / "multi_seed_eval.py").resolve()))
+            self.assertIn("--baseline-statistics-output", commands[8])
+            self.assertEqual(commands[9][1], str((cli_dir / "final_evidence.py").resolve()))
+            self.assertIn("--require-run-consistency", commands[9])
+            self.assertEqual(commands[10][1], str((cli_dir / "gate_readiness.py").resolve()))
 
     def test_checked_in_protocols_resolve_repo_assets(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -139,3 +154,16 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve()) for command in final_commands)
         )
+        self.assertTrue(
+            any(command[1] == str((repo_root / "CLI" / "gate_readiness.py").resolve()) for command in final_commands)
+        )
+        baseline_stats_index = next(
+            idx for idx, command in enumerate(final_commands)
+            if command[1] == str((repo_root / "CLI" / "multi_seed_eval.py").resolve())
+            and "--baseline-statistics-output" in command
+        )
+        final_evidence_index = next(
+            idx for idx, command in enumerate(final_commands)
+            if command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve())
+        )
+        self.assertLess(baseline_stats_index, final_evidence_index)

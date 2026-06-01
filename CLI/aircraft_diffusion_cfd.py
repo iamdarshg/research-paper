@@ -1797,7 +1797,21 @@ class AdvancedCFDSimulator:
         if self.amr_solver:
             self.amr_solver._initialize_equilibrium()
     
-    def simulate_aerodynamics(self, geometry: torch.Tensor, steps: int = 100) -> Dict[str, float]:
+    def _reference_area_from_geometry(self, geometry_mask: torch.Tensor) -> float:
+        h = float(getattr(self.config.lbm_config, "grid_spacing", 1.0 / max(self.resolution, 1)))
+        projected_cells = float(torch.sum(torch.any(geometry_mask > 0.5, dim=0).float()).item())
+        return max(projected_cells * h * h, h * h)
+
+    def _solver_provenance(self, *, steps: int, amr_enabled: bool, external_validation: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "primary_solver": self.config.solver_type,
+            "steps": int(steps),
+            "base_grid_resolution": int(self.config.base_grid_resolution),
+            "amr_enabled": bool(amr_enabled),
+            "external_validation_status": external_validation.get("status", "not_run"),
+        }
+
+    def simulate_aerodynamics(self, geometry: torch.Tensor, steps: int = 100) -> Dict[str, Any]:
         """
         Simulate flow around geometry with adaptive mesh refinement.
         geometry: [D, H, W] binary voxel grid (1 = solid, 0 = fluid)
@@ -1809,8 +1823,11 @@ class AdvancedCFDSimulator:
         print(f"Running {self.config.solver_type} GPU LBM solver at base resolution...")
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
         results = self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask)
+        results.setdefault("reference_area", self._reference_area_from_geometry(geometry_mask))
+        results.setdefault("reference_area_source", "projected_frontal_voxel_area_yz")
 
         # Step 2: If AMR is enabled, run the high-resolution solver
+        amr_results = None
         if self.amr_solver:
             print("Applying adaptive mesh refinement by running a higher-resolution simulation...")
 
@@ -1831,10 +1848,36 @@ class AdvancedCFDSimulator:
 
         # Step 3: Run FluidX3D for validation (if available)
         fluidx3d_results = self._run_fluidx3d_validation(geometry)
+        external_validation = {"status": "not_available", "claim_bearing": False}
         if fluidx3d_results:
-            # Blend results for accuracy
-            results['drag_coefficient'] = 0.7 * results['drag_coefficient'] + 0.3 * fluidx3d_results['drag_coefficient']
-            results['lift_coefficient'] = 0.7 * results['lift_coefficient'] + 0.3 * fluidx3d_results['lift_coefficient']
+            if fluidx3d_results.get("claim_bearing") is True and fluidx3d_results.get("label_tier") == "external_pde":
+                results['drag_coefficient'] = 0.7 * results['drag_coefficient'] + 0.3 * fluidx3d_results['drag_coefficient']
+                results['lift_coefficient'] = 0.7 * results['lift_coefficient'] + 0.3 * fluidx3d_results['lift_coefficient']
+                external_validation = {
+                    "status": "blended_claim_bearing_external",
+                    "claim_bearing": True,
+                    "result": fluidx3d_results,
+                }
+            else:
+                external_validation = {
+                    "status": "heuristic_proxy_not_blended",
+                    "claim_bearing": False,
+                    "result": fluidx3d_results,
+                }
+
+        results["external_validation"] = external_validation
+        results["solver_provenance"] = self._solver_provenance(
+            steps=steps,
+            amr_enabled=amr_results is not None,
+            external_validation=external_validation,
+        )
+        results["claim_bearing_cfd"] = bool(
+            results.get("lbm_converged") is True and external_validation.get("claim_bearing") is True
+        )
+        results["claim_boundary"] = (
+            "Internal D3Q27 coefficients include provenance and reference-area metadata. "
+            "Heuristic external proxies are reported but not blended into primary claim-bearing coefficients."
+        )
 
         return results
     
@@ -1885,7 +1928,11 @@ class AdvancedCFDSimulator:
         volume = 0.1  # Approximate volume fraction
         return {
             'drag_coefficient': 0.02 + volume * 0.1,
-            'lift_coefficient': volume * 0.4
+            'lift_coefficient': volume * 0.4,
+            'label_tier': 'heuristic_proxy',
+            'claim_bearing': False,
+            'claim_boundary': 'FluidX3D fast fallback is a heuristic proxy, not claim-bearing external validation.',
+            'source': 'fluidx3d_fast_placeholder',
         }
 
 # ============================================================================

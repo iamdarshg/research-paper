@@ -879,10 +879,23 @@ class D3Q27CascadedSolver:
             'max_vorticity': float(vorticity_mag.max().item()),
             'vortex_core_volume': float(vortex_cells * h**3),
             'reference_area': ref_area,
+            'reference_area_source': 'projected_frontal_voxel_area_yz',
+            'reference_area_lattice': projected_area_lattice,
             'reference_length': h * self.resolution,
+            'reference_length_source': 'grid_spacing_times_resolution',
             'freestream_speed': v_inf,
             'density': coeffs['density'],
-            'reynolds_number_turbulent': reynolds_turbulent
+            'reynolds_number_turbulent': reynolds_turbulent,
+            'empty_geometry': bool(torch.sum(solid.float()).item() <= 0.0),
+            'claim_bearing_cfd': False,
+            'solver_provenance': {
+                'primary_solver': 'D3Q27',
+                'label_tier': 'lbm_raw',
+                'lbm_converged': lbm_converged,
+                'grid_resolution': int(self.resolution),
+                'force_samples': int(self._solver.force_samples),
+                'reference_area_source': 'projected_frontal_voxel_area_yz',
+            },
         } | shape_drag_metrics
 
 

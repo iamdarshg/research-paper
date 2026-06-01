@@ -42,6 +42,11 @@ class TestLBMSolvers(unittest.TestCase):
         coeffs = solver.compute_aerodynamic_coefficients(geometry_mask)
         self.assertIn('drag_coefficient', coeffs)
         self.assertIn('lift_coefficient', coeffs)
+        self.assertIn('reference_area_source', coeffs)
+        self.assertIn('claim_bearing_cfd', coeffs)
+        self.assertEqual(coeffs['reference_area_source'], 'projected_frontal_voxel_area_yz')
+        self.assertFalse(coeffs['claim_bearing_cfd'])
+        self.assertGreater(coeffs['reference_area'], 0.0)
         self.assertIsInstance(coeffs['drag_coefficient'], float)
 
     def test_d3q27_benchmark_like_run_is_finite(self):

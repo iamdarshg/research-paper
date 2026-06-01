@@ -59,8 +59,21 @@ multi_seed_eval:
   grid_size: 32
   output_dir: ../../build/protocol_final/multi_seed_eval
 
+baseline_statistics:
+  enabled: true
+  baseline_config: ../baseline_config.yaml
+  records_json: ../../build/protocol_final/baseline_records.json
+  metric_keys:
+    - lift_to_drag
+  min_seeds: 3
+  output: ../../build/protocol_final/baseline_statistics.json
+
 final_evidence:
   enabled: true
   baseline_statistics: ../../build/protocol_final/baseline_statistics.json
   require_run_consistency: true
   output: ../../build/protocol_final/final_evidence_package.json
+
+gate_readiness:
+  enabled: true
+  output: ../../build/protocol_final/gate_readiness.json
