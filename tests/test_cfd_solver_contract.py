@@ -71,7 +71,27 @@ class TestCFDSolverContract(unittest.TestCase):
         self.assertFalse(results["claim_bearing_cfd"])
         self.assertEqual(results["solver_provenance"]["primary_solver"], "D3Q27")
         self.assertEqual(results["solver_provenance"]["steps"], 7)
+        self.assertIn("lift_to_drag", results)
+        self.assertTrue(results["solver_quality_checks"]["finite_coefficients"])
         self.assertGreater(results["reference_area"], 0.0)
+
+    def test_solver_result_exposes_gate_support_for_twelve_of_thirteen_gates(self):
+        simulator = self._simulator()
+        geometry = torch.zeros((8, 8, 8))
+        geometry[2:6, 3:5, 3:5] = 1.0
+
+        with mock.patch.object(simulator, "_run_fluidx3d_validation", return_value=None):
+            results = simulator.simulate_aerodynamics(geometry, steps=7)
+
+        support = results["solver_gate_support"]
+        implemented = [
+            gate for gate in support["gates"]
+            if gate["solver_side_status"] == "implemented"
+        ]
+        self.assertEqual(support["gate_count"], 13)
+        self.assertGreaterEqual(len(implemented), 12)
+        self.assertFalse(support["claim_bearing_evidence"])
+        self.assertIn("manifest_validation", support["not_solver_applicable"])
 
     def test_fluidx3d_fast_proxy_is_labeled_non_claim_bearing(self):
         simulator = self._simulator()

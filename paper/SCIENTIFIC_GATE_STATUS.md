@@ -11,6 +11,7 @@ mistaken for experimental validation.
 | Gate mapped | 13 / 13 | The gate is named, scoped, and mapped to evidence requirements. |
 | Implementation/readiness mapped or scaffolded | 13 / 13 | The repo has documented readiness coverage across all gates; this is the 90%+ gate-readiness result, not scientific evidence. |
 | Runnable executable/reporting entrypoint implemented | 13 / 13 | The repo has runnable code, protocol hooks, or dedicated fail-closed scaffold reports for every gate. |
+| Solver-side support implemented | 12 / 13 | CFD results now expose normalized metrics, provenance, quality checks, and solver-gate support for all solver-relevant gates; manifest validation is not solver-applicable. |
 | Claim-bearing scientific evidence | 0 / 13 | No publication-grade corpus/checkpoint/report bundle exists yet. |
 
 The current branch is therefore strong on documented, fail-closed gate coverage,
@@ -27,12 +28,34 @@ but still blocked for scientific aircraft-generation claims.
 | 5 | Baseline statistics | mapped | implemented: `CLI/multi_seed_eval.py` policy/stat summary helpers | blocked: required baselines and final metric tables missing |
 | 6 | Final evidence package | mapped | implemented: `CLI/final_evidence.py` consistency-aware aggregator | blocked: required report bundle missing |
 | 7 | Generates aircraft structures | mapped | scaffolded: validity gate and corpus contract exist | blocked: no claim-bearing generated sample package |
-| 8 | Aerodynamically optimized | mapped | implemented: CFD outputs include solver provenance/reference area and heuristic external proxies are not blended | blocked: no converged CFD comparison against baselines |
+| 8 | Aerodynamically optimized | mapped | implemented: CFD outputs include solver provenance/reference area, L/D, quality checks, and heuristic external proxies are not blended | blocked: no converged CFD comparison against baselines |
 | 9 | Structurally viable | mapped | scaffolded: feasibility guards exist | blocked: no structural analysis or load-case evidence |
 | 10 | CFD-guided training | mapped | implemented: fail-closed matched-ablation scaffold plus solver label/provenance guards | blocked: no matched ablation with and without CFD term |
 | 11 | Outperforms prior approaches | mapped | implemented: baseline-statistics writer plus prior-method comparison scaffold | blocked: no prior-method or superiority comparison package |
 | 12 | Publication-quality validation | mapped | implemented: validation-study scaffold plus solver provenance/reference-area fields | blocked: no convergence/sensitivity/external-validation study |
 | 13 | Conditioned on flight profile and manufacturing method | mapped | implemented: condition schema/vector/protocol harnesses exist | blocked: no grounded generated-output response evidence |
+
+## Solver-Side Gate Support
+
+`AdvancedCFDSimulator.simulate_aerodynamics()` now emits a
+`solver_gate_support` object. That object marks 12 of 13 gates as having
+solver-side support implemented and marks `manifest_validation` as
+`not_solver_applicable`.
+
+The solver-side support payload includes:
+
+- normalized aerodynamic metrics: `drag_coefficient`, `lift_coefficient`, and
+  `lift_to_drag`;
+- reference-area provenance: `reference_area`,
+  `reference_area_source`, and D3Q27 reference-area metadata;
+- `solver_provenance` with primary solver, grid, step, AMR, and external
+  validation status;
+- `solver_quality_checks` for finite coefficients, non-empty geometry, and
+  positive reference area;
+- `external_validation` metadata that reports heuristic FluidX3D fallback
+  outputs without blending them into primary coefficients;
+- `claim_bearing_cfd: false` until convergence and external validation evidence
+  are present.
 
 ## Verification Snapshot
 
