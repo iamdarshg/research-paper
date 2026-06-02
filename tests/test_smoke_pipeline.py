@@ -2,7 +2,9 @@ import os
 import sys
 import unittest
 import json
+import tempfile
 from dataclasses import asdict
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -428,6 +430,24 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("dataset artifact", result.output.lower())
         self.assertIn("baseline", result.output.lower())
         self.assertIn("claim", result.output.lower())
+
+    def test_final_run_class_accepts_manifest_without_dataset_artifact(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = root / "manifest.jsonl"
+            baseline_config = root / "baseline_config.json"
+            claim_gates = root / "FINAL_RUN_GATES.md"
+            manifest.write_text('{"sample_id":"fixture","geometry_path":"fixture.npy","split":"train"}\n', encoding="utf-8")
+            baseline_config.write_text('{"baseline_name":"fixture","baseline_set":["retrieval"]}\n', encoding="utf-8")
+            claim_gates.write_text("# gates\n", encoding="utf-8")
+
+            cli_module._validate_run_class_inputs(
+                cli_module.RUN_CLASS_FINAL,
+                dataset_artifact=None,
+                dataset_manifest=str(manifest),
+                baseline_config=str(baseline_config),
+                claim_gates=str(claim_gates),
+            )
 
     def test_densify_dataset_cli_delegates_to_checkpoint_densifier(self):
         with mock.patch.object(densify_module, "densify_from_checkpoint", return_value={"num_candidates": 6, "num_accepted": 2, "output_path": "artifact.pt"}) as mock_densify, \

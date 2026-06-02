@@ -123,6 +123,7 @@ class TestProtocolRunner(unittest.TestCase):
         protocol_paths = [
             repo_root / "CLI" / "run_protocols" / "smoke_8gb.yaml",
             repo_root / "CLI" / "run_protocols" / "final_cloud.yaml",
+            repo_root / "CLI" / "run_protocols" / "first_training.yaml",
         ]
 
         for path in protocol_paths:
@@ -174,3 +175,25 @@ class TestProtocolRunner(unittest.TestCase):
             if command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve())
         )
         self.assertLess(baseline_stats_index, final_evidence_index)
+
+        first_training_config = run_protocol.load_protocol_config(str(protocol_paths[2]))
+        first_training_commands = run_protocol.build_protocol_commands(first_training_config)
+        train_index = next(
+            idx for idx, command in enumerate(first_training_commands)
+            if command[1] == str((repo_root / "CLI" / "aircraft_diffusion_cfd.py").resolve())
+            and command[2] == "train"
+        )
+        metadata_index = next(
+            idx for idx, command in enumerate(first_training_commands)
+            if command[1] == str((repo_root / "CLI" / "write_run_metadata.py").resolve())
+        )
+        final_evidence_index = next(
+            idx for idx, command in enumerate(first_training_commands)
+            if command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve())
+        )
+        self.assertLess(train_index, metadata_index)
+        self.assertLess(metadata_index, final_evidence_index)
+        self.assertIn(
+            str((repo_root / "checkpoints_first_training" / "final_optimized_model.pt").resolve()),
+            first_training_commands[metadata_index],
+        )

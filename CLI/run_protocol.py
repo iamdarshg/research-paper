@@ -52,6 +52,7 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     python_exe = sys.executable
     cli_script = str((cli_dir / "aircraft_diffusion_cfd.py").resolve())
     reference_evidence_script = str((cli_dir / "build_reference_evidence.py").resolve())
+    run_metadata_script = str((cli_dir / "write_run_metadata.py").resolve())
     multi_seed_script = str((cli_dir / "multi_seed_eval.py").resolve())
     manifest_validator_script = str((cli_dir / "validate_manifest.py").resolve())
     condition_benchmark_script = str((cli_dir / "run_condition_benchmark.py").resolve())
@@ -123,6 +124,19 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     checkpoint = _resolve_path(config, config.get("checkpoint")) or _resolve_path(config, train_cfg.get("checkpoint"))
     if not checkpoint:
         checkpoint = _default_checkpoint(config, train_cfg)
+
+    run_metadata_cfg = dict(config.get("run_metadata", {}))
+    if run_metadata_cfg.get("enabled"):
+        metadata_manifest = run_metadata_cfg.get("manifest") or manifest_cfg.get("manifest") or train_cfg.get("dataset_manifest")
+        metadata_checkpoint = run_metadata_cfg.get("checkpoint")
+        metadata_checkpoint = _resolve_path(config, metadata_checkpoint) if metadata_checkpoint else checkpoint
+        metadata_cmd = [python_exe, run_metadata_script]
+        _add_option(metadata_cmd, "--checkpoint", metadata_checkpoint)
+        _add_option(metadata_cmd, "--manifest", _resolve_path(config, metadata_manifest))
+        _add_option(metadata_cmd, "--protocol", _resolve_path(config, run_metadata_cfg.get("protocol")) or str(config_path))
+        _add_option(metadata_cmd, "--output", _resolve_path(config, run_metadata_cfg.get("output")))
+        _add_option(metadata_cmd, "--run-id-prefix", run_metadata_cfg.get("run_id_prefix"))
+        commands.append(metadata_cmd)
 
     baseline_cfg = dict(config.get("evaluate_baselines", {}))
     if baseline_cfg.get("enabled"):

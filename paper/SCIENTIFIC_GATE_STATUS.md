@@ -59,6 +59,28 @@ The reference basis is cited in the generated checkpoint card and bundle report:
 NASA/TMR NACA 0012 validation, NASA/TMR ONERA M6 validation, NASA Glenn four
 forces, NASA Glenn CFD verification/validation guidance, and NASA-STD-7009B.
 
+## First Training Protocol
+
+`CLI/run_protocols/first_training.yaml` performs the first real training run
+against the deterministic reference corpus:
+
+1. build the 20-record grounded reference corpus;
+2. validate the generated manifest at claim-bearing level;
+3. train a small one-epoch D3Q27 final-run checkpoint at
+   `checkpoints_first_training/final_optimized_model.pt`;
+4. write `build/first_training/run_metadata.json` after training so the
+   `checkpoint_hash` refers to the `.pt` checkpoint, not the reference
+   checkpoint card;
+5. rerun the manifest, condition response, manufacturing feasibility, aircraft
+   validity, baseline statistics, final evidence, and readiness reports under
+   `build/first_training/`.
+
+This is a smoke-scale training run. It proves that the train -> checkpoint ->
+report path works with a real checkpoint, but it does not satisfy the remaining
+publication-scale gates for CFD-guided ablation, converged CFD validation,
+structural load-path validation, prior-method superiority, or uncertainty/
+sensitivity studies.
+
 ## Solver-Side Gate Support
 
 `AdvancedCFDSimulator.simulate_aerodynamics()` now emits a
@@ -88,6 +110,7 @@ Fresh local verification for this branch should include:
 ```bash
 python -m pytest tests -q
 python CLI/run_protocol.py --config CLI/run_protocols/final_cloud.yaml
+python CLI/run_protocol.py --config CLI/run_protocols/first_training.yaml
 python CLI/validate_manifest.py --manifest build/protocol_final/grounded_corpus/manifest.jsonl --level claim-bearing
 python CLI/final_evidence.py --manifest-validation build/protocol_final/manifest_validation.json --aircraft-validity build/protocol_final/aircraft_validity.json --condition-benchmark build/protocol_final/condition_benchmark.json --manufacturing-constraints build/protocol_final/manufacturing_constraints.json --baseline-statistics build/protocol_final/baseline_statistics.json --require-run-consistency --run-metadata build/protocol_final/run_metadata.json
 ```
@@ -97,6 +120,9 @@ Expected outcomes:
 - the test suite passes;
 - the checked-in final protocol generates the reference bundle and required
   reports;
+- the first-training protocol creates
+  `checkpoints_first_training/final_optimized_model.pt` and hashes it in
+  `build/first_training/run_metadata.json`;
 - the generated reference manifest passes claim-bearing manifest validation;
 - the final evidence package passes for the deterministic reference-bundle scope;
 - larger trained-model claims remain blocked until the missing ablation,

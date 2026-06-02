@@ -3289,12 +3289,16 @@ def _validate_run_class_inputs(
             "Final run class requires " + ", ".join(missing) + "."
         )
 
-    for label, path in (
-        ("dataset artifact", dataset_artifact),
-        ("dataset manifest", dataset_manifest),
+    required_paths = [
         ("baseline config", baseline_config),
         ("claim gates", claim_gates),
-    ):
+    ]
+    if dataset_artifact:
+        required_paths.append(("dataset artifact", dataset_artifact))
+    if dataset_manifest:
+        required_paths.append(("dataset manifest", dataset_manifest))
+
+    for label, path in required_paths:
         if not path or not Path(path).exists():
             raise click.UsageError(f"Final run class requires an existing {label}: {path}")
 
