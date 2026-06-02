@@ -1588,19 +1588,19 @@ class LatentDiffusionUNet(nn.Module):
                             triton_config.cudagraphs = False
                         # autotune doesn't exist in this PyTorch version, skip it
                     else:
-                        print("⚠️ Triton config not available, using default inductor settings")
+                        print("[warn] Triton config not available, using default inductor settings")
 
                 # Try to compile
                 self.forward = torch.compile(self.forward, backend=backend, mode=mode)
-                print(f"✅ Successfully applied torch.compile() with backend='{backend}', mode='{mode}'")
+                print(f"[ok] Successfully applied torch.compile() with backend='{backend}', mode='{mode}'")
                 return
 
             except Exception as e:
-                print(f"❌ torch.compile() failed with backend='{backend}': {str(e)}")
+                print(f"[error] torch.compile() failed with backend='{backend}': {str(e)}")
                 traceback.print_exc()
                 continue
 
-        print("⚠️  All torch.compile() backends failed, using original forward function")
+        print("[warn] All torch.compile() backends failed, using original forward function")
         # Keep original forward function - no functionality lost
         pass
     
@@ -3913,20 +3913,20 @@ def performance_benchmark():
         print(f"Compute Capability: {props.major}.{props.minor}")
     
     print("\n✨ OPTIMIZATION FEATURES:")
-    print("• 4-step consistency model path is compiled into this build")
-    print("• Grouped-query attention path is compiled into this build")
-    print("• Gradient checkpointing path is compiled into this build")
-    print("• torch.compile: Kernel fusion optimization")
-    print("• Adaptive mesh refinement: ~5k cells vs 32³ (85% reduction)")
-    print("• GPU LBM solver: SoA layout with 256-thread blocks")
-    print("• Pipeline parallelism: CFD + diffusion overlap")
+    print("- 4-step consistency model path is compiled into this build")
+    print("- Grouped-query attention path is compiled into this build")
+    print("- Gradient checkpointing path is compiled into this build")
+    print("- torch.compile: Kernel fusion optimization")
+    print("- Adaptive mesh refinement: ~5k cells vs 32^3 (85% reduction)")
+    print("- GPU LBM solver: SoA layout with 256-thread blocks")
+    print("- Pipeline parallelism: CFD + diffusion overlap")
     
     print("\n🎯 EXPECTED PERFORMANCE GAINS:")
-    print("• Inference Path: configured consistency sampling")
-    print("• Memory Path: efficiency hooks available")
-    print("• Attention Path: grouped-query implementation available")
-    print("• CFD Path: bounded internal solver configuration available")
-    print("• Throughput Claims: require explicit benchmark artifacts")
+    print("- Inference Path: configured consistency sampling")
+    print("- Memory Path: efficiency hooks available")
+    print("- Attention Path: grouped-query implementation available")
+    print("- CFD Path: bounded internal solver configuration available")
+    print("- Throughput Claims: require explicit benchmark artifacts")
     
     print("\n📊 BENCHMARK COMPLETE")
     print("All TRM/HRM optimizations successfully implemented! 🎉")
@@ -3947,14 +3947,14 @@ def info():
         print(f"Reserved GPU memory: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
     
     print(f"\n✨ OPTIMIZATION STATUS:")
-    print(f"• 4-step consistency model: ✅ ENABLED")
-    print(f"• Grouped-query attention: ✅ ENABLED (4 groups)")
-    print(f"• Gradient checkpointing: ✅ ENABLED")
-    print(f"• torch.compile optimization: ✅ ENABLED")
-    print(f"• Adaptive mesh refinement: ✅ ENABLED (~5k cells)")
-    print(f"• GPU LBM solver: ✅ ENABLED (SoA layout, 256-thread blocks)")
-    print(f"• Pipeline parallelism: ✅ ENABLED")
-    print(f"• FluidX3D integration: ✅ ENABLED")
+    print("- 4-step consistency model: ENABLED")
+    print("- Grouped-query attention: ENABLED (4 groups)")
+    print("- Gradient checkpointing: ENABLED")
+    print("- torch.compile optimization: ENABLED")
+    print("- Adaptive mesh refinement: ENABLED (~5k cells)")
+    print("- GPU LBM solver: ENABLED (SoA layout, 256-thread blocks)")
+    print("- Pipeline parallelism: ENABLED")
+    print("- FluidX3D integration: ENABLED")
 
 
 @cli.command(name="performance-benchmark")

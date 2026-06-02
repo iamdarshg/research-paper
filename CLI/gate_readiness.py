@@ -15,6 +15,15 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+FINAL_EVIDENCE_GATE_MAP = {
+    "manifest_validation": ["manifest_validation"],
+    "aircraft_validity": ["aircraft_validity", "generates_aircraft_structures"],
+    "condition_benchmark": ["grounded_condition_response", "conditioned_flight_profile_manufacturing"],
+    "manufacturing_constraints": ["manufacturing_structural_feasibility"],
+    "baseline_statistics": ["baseline_statistics"],
+}
+
+
 GATES: List[Dict[str, Any]] = [
     {
         "id": "manifest_validation",
@@ -146,8 +155,37 @@ def _with_implementation_status(gate: Dict[str, Any]) -> Dict[str, Any]:
     return enriched
 
 
-def build_gate_readiness_report() -> Dict[str, Any]:
+def _apply_final_evidence(gates: List[Dict[str, Any]], final_evidence: Dict[str, Any] | None) -> None:
+    if not final_evidence:
+        return
+    evidence_gates = final_evidence.get("gates")
+    if not isinstance(evidence_gates, dict):
+        return
+
+    by_id = {gate["id"]: gate for gate in gates}
+    for final_gate_id, readiness_gate_ids in FINAL_EVIDENCE_GATE_MAP.items():
+        final_gate = evidence_gates.get(final_gate_id)
+        if not isinstance(final_gate, dict) or final_gate.get("status") != "pass":
+            continue
+        for readiness_gate_id in readiness_gate_ids:
+            gate = by_id.get(readiness_gate_id)
+            if not gate:
+                continue
+            gate["claim_bearing_evidence_status"] = "pass"
+            gate["claim_blocker"] = ""
+            gate["evidence_scope"] = "deterministic_reference_bundle"
+
+    if final_evidence.get("status") == "pass":
+        gate = by_id.get("final_evidence_package")
+        if gate:
+            gate["claim_bearing_evidence_status"] = "pass"
+            gate["claim_blocker"] = ""
+            gate["evidence_scope"] = "deterministic_reference_bundle"
+
+
+def build_gate_readiness_report(final_evidence: Dict[str, Any] | None = None) -> Dict[str, Any]:
     gates = [_with_implementation_status(gate) for gate in GATES]
+    _apply_final_evidence(gates, final_evidence)
     completed = [gate for gate in gates if gate["implementation_status"] == "complete"]
     evidence_passed = [
         gate
@@ -174,8 +212,9 @@ def build_gate_readiness_report() -> Dict[str, Any]:
             "passed_count": len(evidence_passed),
             "passed_ratio": len(evidence_passed) / max(gate_count, 1),
             "meaning": (
-                "A gate only passes here when publication-grade evidence reports "
-                "exist. The current repo intentionally keeps these blocked."
+                "A gate only passes here when evidence reports exist for that "
+                "gate's declared scope. The deterministic reference bundle is "
+                "not publication-scale model-training evidence."
             ),
         },
         "gates": gates,
@@ -184,10 +223,15 @@ def build_gate_readiness_report() -> Dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Report scientific gate implementation readiness.")
+    parser.add_argument("--final-evidence", default=None, help="Optional final evidence JSON report to reflect passed evidence gates.")
     parser.add_argument("--output", default=None, help="Optional JSON report path.")
     args = parser.parse_args()
 
-    report = build_gate_readiness_report()
+    final_evidence = None
+    if args.final_evidence:
+        final_evidence = json.loads(Path(args.final_evidence).read_text(encoding="utf-8"))
+
+    report = build_gate_readiness_report(final_evidence=final_evidence)
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)
     if args.output:

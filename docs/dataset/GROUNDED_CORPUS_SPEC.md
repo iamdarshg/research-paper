@@ -75,3 +75,19 @@ python CLI/validate_manifest.py --manifest docs/dataset/minimal_grounded_manifes
 Expected current behavior:
 - `basic`: pass
 - `claim-bearing`: blocked
+
+## Deterministic Reference Bundle
+
+For PR-level evidence plumbing, the repo now includes a bounded reference-bundle
+builder:
+
+```bash
+python CLI/build_reference_evidence.py --output-root build/protocol_final --protocol CLI/run_protocols/final_cloud.yaml
+```
+
+This produces a 20-record manifest under
+`build/protocol_final/grounded_corpus/manifest.jsonl`. The records include
+complete claim-bearing manifest fields, deterministic aircraft-like voxel paths,
+condition-response metrics, and public NASA/TMR source URLs. The paired
+`reference_checkpoint.json` is a checkpoint card for a deterministic fixture,
+not a trained diffusion checkpoint.

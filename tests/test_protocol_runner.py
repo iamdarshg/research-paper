@@ -133,15 +133,12 @@ class TestProtocolRunner(unittest.TestCase):
 
         final_config = run_protocol.load_protocol_config(str(protocol_paths[1]))
         final_commands = run_protocol.build_protocol_commands(final_config)
-        self.assertEqual(final_commands[0][1], str((repo_root / "CLI" / "validate_manifest.py").resolve()))
-        train_command = final_commands[1]
-
+        self.assertEqual(final_commands[0][1], str((repo_root / "CLI" / "build_reference_evidence.py").resolve()))
+        self.assertEqual(final_commands[1][1], str((repo_root / "CLI" / "validate_manifest.py").resolve()))
         self.assertIn(
-            str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()),
-            train_command,
+            str((repo_root / "build" / "protocol_final" / "grounded_corpus" / "manifest.jsonl").resolve()),
+            final_commands[1],
         )
-        self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), train_command)
-        self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), train_command)
         self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "run_condition_benchmark.py").resolve()) for command in final_commands)
         )
@@ -154,6 +151,16 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve()) for command in final_commands)
         )
+        final_evidence_command = next(
+            command for command in final_commands
+            if command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve())
+        )
+        self.assertIn("--run-metadata", final_evidence_command)
+        gate_readiness_command = next(
+            command for command in final_commands
+            if command[1] == str((repo_root / "CLI" / "gate_readiness.py").resolve())
+        )
+        self.assertIn("--final-evidence", gate_readiness_command)
         self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "gate_readiness.py").resolve()) for command in final_commands)
         )

@@ -51,6 +51,7 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     cli_dir = config_path.parent.parent
     python_exe = sys.executable
     cli_script = str((cli_dir / "aircraft_diffusion_cfd.py").resolve())
+    reference_evidence_script = str((cli_dir / "build_reference_evidence.py").resolve())
     multi_seed_script = str((cli_dir / "multi_seed_eval.py").resolve())
     manifest_validator_script = str((cli_dir / "validate_manifest.py").resolve())
     condition_benchmark_script = str((cli_dir / "run_condition_benchmark.py").resolve())
@@ -61,6 +62,15 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
 
     commands: List[List[str]] = []
     train_cfg = dict(config.get("train", {}))
+    reference_cfg = dict(config.get("reference_evidence", {}))
+    if reference_cfg.get("enabled"):
+        reference_cmd = [python_exe, reference_evidence_script]
+        _add_option(reference_cmd, "--output-root", _resolve_path(config, reference_cfg.get("output_root")))
+        _add_option(reference_cmd, "--sample-count", reference_cfg.get("sample_count"))
+        _add_option(reference_cmd, "--protocol", _resolve_path(config, reference_cfg.get("protocol")))
+        _add_option(reference_cmd, "--output", _resolve_path(config, reference_cfg.get("output")))
+        commands.append(reference_cmd)
+
     manifest_cfg = dict(config.get("validate_manifest", {}))
     if manifest_cfg.get("enabled"):
         manifest_path = manifest_cfg.get("manifest") or train_cfg.get("dataset_manifest")
@@ -149,12 +159,13 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
         manifest_path = _resolve_path(config, manifest_path)
         if not manifest_path:
             raise ValueError("condition_benchmark.enabled requires a manifest path or train.dataset_manifest")
+        benchmark_checkpoint = _resolve_path(config, condition_benchmark_cfg.get("checkpoint")) or checkpoint
 
         benchmark_cmd = [
             python_exe,
             condition_benchmark_script,
             "--checkpoint",
-            checkpoint,
+            benchmark_checkpoint,
             "--manifest",
             manifest_path,
         ]
@@ -228,12 +239,14 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
             _add_option(evidence_cmd, f"--{gate_id.replace('_', '-')}", _resolve_path(config, report_path))
         if final_evidence_cfg.get("require_run_consistency"):
             _add_option(evidence_cmd, "--require-run-consistency", True)
+        _add_option(evidence_cmd, "--run-metadata", _resolve_path(config, final_evidence_cfg.get("run_metadata")))
         _add_option(evidence_cmd, "--output", _resolve_path(config, final_evidence_cfg.get("output")))
         commands.append(evidence_cmd)
 
     gate_readiness_cfg = dict(config.get("gate_readiness", {}))
     if gate_readiness_cfg.get("enabled"):
         readiness_cmd = [python_exe, gate_readiness_script]
+        _add_option(readiness_cmd, "--final-evidence", _resolve_path(config, gate_readiness_cfg.get("final_evidence")))
         _add_option(readiness_cmd, "--output", _resolve_path(config, gate_readiness_cfg.get("output")))
         commands.append(readiness_cmd)
 

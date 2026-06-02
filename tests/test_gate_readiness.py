@@ -31,6 +31,32 @@ class TestGateReadiness(unittest.TestCase):
         }
         self.assertEqual(len(blocked_gate_ids), 13)
 
+    def test_reference_final_evidence_marks_only_supported_gate_scopes(self):
+        final_evidence = {
+            "status": "pass",
+            "gates": {
+                "manifest_validation": {"status": "pass"},
+                "aircraft_validity": {"status": "pass"},
+                "condition_benchmark": {"status": "pass"},
+                "manufacturing_constraints": {"status": "pass"},
+                "baseline_statistics": {"status": "pass"},
+            },
+        }
+
+        report = build_gate_readiness_report(final_evidence=final_evidence)
+        passed_gate_ids = {
+            gate["id"]
+            for gate in report["gates"]
+            if gate["claim_bearing_evidence_status"] == "pass"
+        }
+
+        self.assertEqual(report["claim_bearing_evidence"]["passed_count"], 8)
+        self.assertIn("manifest_validation", passed_gate_ids)
+        self.assertIn("generates_aircraft_structures", passed_gate_ids)
+        self.assertIn("conditioned_flight_profile_manufacturing", passed_gate_ids)
+        self.assertNotIn("aerodynamically_optimized", passed_gate_ids)
+        self.assertNotIn("cfd_guided_training", passed_gate_ids)
+
     def test_each_completed_gate_has_documentation_and_machine_readable_artifact(self):
         report = build_gate_readiness_report()
 

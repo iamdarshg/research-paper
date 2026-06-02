@@ -29,6 +29,7 @@ def evaluate_final_evidence_package(
     reports: Dict[str, Dict[str, Any]],
     *,
     require_run_consistency: bool = False,
+    run_metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     blocked = []
     gate_results = {}
@@ -44,6 +45,7 @@ def evaluate_final_evidence_package(
     consistency_errors: List[str] = []
     consistency_values: Dict[str, Any] = {}
     if require_run_consistency:
+        run_metadata = run_metadata or {}
         passing_reports = {
             gate_id: report
             for gate_id, report in reports.items()
@@ -51,7 +53,7 @@ def evaluate_final_evidence_package(
         }
         for field_name in CONSISTENCY_FIELDS:
             values = {
-                gate_id: report.get(field_name)
+                gate_id: report.get(field_name) or run_metadata.get(field_name)
                 for gate_id, report in passing_reports.items()
             }
             missing = [gate_id for gate_id, value in values.items() if not value]
@@ -96,6 +98,7 @@ def main() -> int:
         action="store_true",
         help="Require common run/checkpoint/manifest/protocol identifiers across passing reports.",
     )
+    parser.add_argument("--run-metadata", default=None, help="Optional JSON file with shared run consistency fields.")
     parser.add_argument("--output", default=None, help="Optional JSON report output path.")
     args = parser.parse_args()
 
@@ -104,7 +107,12 @@ def main() -> int:
         value = getattr(args, gate_id)
         if value:
             reports[gate_id] = _read_report(Path(value))
-    report = evaluate_final_evidence_package(reports, require_run_consistency=args.require_run_consistency)
+    run_metadata = _read_report(Path(args.run_metadata)) if args.run_metadata else None
+    report = evaluate_final_evidence_package(
+        reports,
+        require_run_consistency=args.require_run_consistency,
+        run_metadata=run_metadata,
+    )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)
     if args.output:

@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 
 CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
@@ -14,6 +15,7 @@ from multi_seed_eval import (
     build_baseline_statistics_report,
     build_statistical_summary,
     validate_baseline_policy,
+    write_baseline_statistics_report,
 )
 
 
@@ -154,6 +156,42 @@ class TestBaselinePolicy(unittest.TestCase):
             with open(output_path, "r", encoding="utf-8") as output_file:
                 report = json.load(output_file)
             self.assertEqual(report["status"], "pass")
+
+    def test_report_writer_accepts_checked_in_yaml_baseline_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "baseline_config.yaml"
+            records_path = root / "records.json"
+            output_path = root / "baseline_statistics.json"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "baseline_name: fixture",
+                        "baseline_set:",
+                        "  - retrieval",
+                        "  - unconditional_checkpoint",
+                        "  - bundled_grounded_stl",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            records = []
+            for baseline in ["retrieval", "unconditional_checkpoint", "bundled_grounded_stl"]:
+                for seed in [0, 1, 2]:
+                    records.append({"baseline": baseline, "seed": seed, "lift_to_drag": 5.0 + seed})
+            records_path.write_text(json.dumps({"records": records}), encoding="utf-8")
+
+            report = write_baseline_statistics_report(
+                baseline_config_path=config_path,
+                records_json_path=records_path,
+                metric_keys=["lift_to_drag"],
+                output_path=output_path,
+                min_seeds=3,
+            )
+
+            self.assertEqual(report["status"], "pass")
+            self.assertTrue(output_path.exists())
 
     def test_report_only_cli_fails_closed_and_writes_blocked_report(self):
         script_path = os.path.join(CLI_DIR, "multi_seed_eval.py")

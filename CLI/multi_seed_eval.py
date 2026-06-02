@@ -16,6 +16,8 @@ import subprocess
 import numpy as np
 from pathlib import Path
 
+import yaml
+
 
 def build_statistical_summary(records, metric_keys, min_seeds=3):
     # Do not collapse claim-bearing comparisons to a single lucky seed. This
@@ -137,7 +139,10 @@ def write_baseline_statistics_report(
     min_seeds=3,
 ):
     with open(baseline_config_path, "r", encoding="utf-8") as config_file:
-        baseline_config = json.load(config_file)
+        if str(baseline_config_path).lower().endswith((".yaml", ".yml")):
+            baseline_config = yaml.safe_load(config_file)
+        else:
+            baseline_config = json.load(config_file)
     with open(records_json_path, "r", encoding="utf-8") as records_file:
         records = json.load(records_file)
     if isinstance(records, dict) and "records" in records:
