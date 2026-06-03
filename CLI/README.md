@@ -1,299 +1,315 @@
-# Aircraft Structural Design via Diffusion Models + FluidX3D CFD
+# Aircraft Structural Design CLI
 
-A sophisticated PyTorch-based system that combines **Transformer-based Radiance Mapping (TRM)** and **Hierarchical Representation Mapping (HRM)** principles with **diffusion models** to generate viable aircraft structures. Features GPU-accelerated CFD simulation (FluidX3D-inspired), connectivity constraints, and marching cubes STL export—all optimized for **8–13GB VRAM**.
+This directory contains a proof-of-concept CLI for synthetic aircraft-like voxel generation plus CFD-informed scoring. The public surface today is the Click CLI in `aircraft_diffusion_cfd.py`; internal classes are still evolving and should not be treated as a stable SDK.
 
-## Features
+## Scope and Limits
 
-✅ **Diffusion-based 3D Generation**: Latent diffusion model with n-dimensional latent space compressed to 3D geometry  
-✅ **TRM/HRM Principles**: Hierarchical structural representation with importance weighting  
-✅ **GPU-Accelerated CFD**: FluidX3D-like compressible flow simulation on GPU  
-✅ **Connectivity Constraints**: Penalizes disconnected voxel groups (critical for structural integrity)  
-✅ **Marching Cubes Export**: Convert volumetric output to production-ready STL meshes  
-✅ **Progressive Training**: Start on 16³, scale to 32³ to prevent overfitting and reduce VRAM  
-✅ **Pipelined Execution**: Sparse voxel grids and batch processing for memory efficiency  
-✅ **Aerodynamic Loss**: Multi-objective balancing space, drag, and lift  
-✅ **TensorBoard Logging**: Real-time training visualization  
-✅ **CLI Interface**: Easy-to-use command-line tools for training and inference  
+- The training dataset is synthetic.
+- The workflow is not validated for real aircraft design, certification, or manufacturing decisions.
+- The repo now has structured conditioning plumbing: dataset generation, the diffusion model, and the generator consume a documented 22-slot condition vector.
+- The public CLI/config surface exposes the current documented conditioning fields. What is still missing is grounded condition-response evidence on aircraft-like data.
+- `batch-generate` now records a manifest with the exact `DesignSpec` payload and condition vector for each STL. It still uses a fixed `num_steps=4`.
+- Several flags are exposed as on-switches only in the current implementation: `--enable-consistency`, `--enable-pipeline`, `--enable-checkpointing`, and `--use-marching-cubes`.
+- `info` and `performance-benchmark` report compiled-in feature/status messages; they are smoke-oriented status checks, not full runtime validation of every optimization path.
 
-## Architecture Overview
+## Install
 
-### Core Components
-
-**1. Latent Diffusion UNet (LatentDiffusionUNet)**
-- Operates on n-dimensional latent codes (default: 128D)
-- Uses time-aware residual blocks with spatial attention
-- Predicts noise in latent space for reverse diffusion
-
-**2. Latent-to-3D Converter (LatentTo3DConverter)**
-- Maps 128D latent codes to 3D voxel grids (32×32×32)
-- Uses multi-layer perceptron with ReLU activations
-- Sigmoid output for probability per voxel
-
-**3. CFD Simulator (SimplifiedCFDSimulator)**
-- Lattice-Boltzmann-inspired GPU acceleration
-- Computes drag and lift coefficients
-- Runs at low resolution (16³) during training for speed
-
-**4. Connectivity Loss (ConnectivityLoss)**
-- Uses scipy.ndimage.label() for connected component analysis
-- Penalizes disconnected voxel groups heavily (default: 10× multiplier)
-- Critical for ensuring structural viability
-
-**5. Aerodynamic Loss (AerodynamicLoss)**
-- Balances three objectives:
-  - **Space weight** (volume minimization)
-  - **Drag weight** (aerodynamic efficiency)
-  - **Lift weight** (aerodynamic performance)
-- Weighted by design specification
-
-## Installation
-
-### Requirements
 ```bash
 pip install -r requirements.txt
 ```
 
-### GPU Requirements
-- **Minimum**: 8GB VRAM (16³ training)
-- **Recommended**: 10–13GB VRAM (full 32³ training)
-- NVIDIA CUDA 11.8+ or 12.x
-- cuDNN 8.7+
+Python 3.9+ is expected. CUDA is optional, but practical training and generation are much slower on CPU.
 
-### Python
-Python 3.9+ (3.10 or 3.11 recommended for PyTorch compatibility)
+## Current CLI Surface
 
-## Usage
+```bash
+python aircraft_diffusion_cfd.py --help
+```
 
-### 1. Training
+Commands exposed by the current file:
 
-Start training with progressive grid refinement:
+- `train`
+- `generate`
+- `batch-generate`
+- `evaluate-baselines`
+- `validate-conditions`
+- `condition-response-smoke`
+- `densify-dataset`
+- `performance-benchmark`
+- `info`
+
+Standalone helpers:
+
+- `run_protocol.py`
+- `validate_manifest.py`
+- `run_condition_benchmark.py`
+- `aircraft_validity.py`
+- `final_evidence.py`
+- `run_protocols/smoke_8gb.yaml`
+- `run_protocols/final_cloud.yaml`
+- `baseline_config.yaml`
+
+## Training
+
+Basic run:
 
 ```bash
 python aircraft_diffusion_cfd.py train \
-  --num-epochs 100 \
-  --batch-size 4 \
-  --learning-rate 2e-4 \
-  --latent-dim 128 \
-  --disconnection-penalty 10.0 \
-  --num-samples 100 \
-  --save-dir ./checkpoints
+  --num-epochs 1 \
+  --batch-size 1 \
+  --num-samples 8 \
+  --save-dir ./checkpoints_smoke
 ```
 
-**Parameters:**
-- `--num-epochs`: Total epochs at full resolution (default: 100)
-- `--batch-size`: Batch size (4 recommended for 10GB VRAM; reduce to 2 for 8GB)
-- `--learning-rate`: Adam learning rate (default: 2e-4)
-- `--latent-dim`: Dimensionality of latent space (default: 128)
-- `--disconnection-penalty`: Penalty multiplier for disconnected cells (default: 10.0)
-- `--num-samples`: Synthetic training samples (default: 100)
-- `--resume-from`: Resume from checkpoint (optional)
-- `--save-dir`: Directory for checkpoints (default: ./checkpoints)
+Current training options:
 
-**Training Schedule (Progressive):**
-1. **16³ grid**: 50 epochs (memory: ~3GB)
-2. **24³ grid**: 50 epochs (memory: ~6GB)
-3. **32³ grid**: 100 epochs (memory: ~10–12GB)
+- `--num-epochs` default `100`
+- `--batch-size` default `4`
+- `--learning-rate` default `2e-4`
+- `--latent-dim` default `16`
+- `--grid-size` optional explicit training/CFD voxel resolution override
+- `--precision` default `float32`
+- `--disconnection-penalty` default `30.0`
+- `--num-samples` default `500`
+- `--dataset-artifact` optional densified dataset artifact
+- `--dataset-manifest` optional grounded dataset manifest (`.json`, `.jsonl`, `.yaml`)
+- `--resume-from` optional checkpoint path
+- `--save-dir` default `./checkpoints`
+- `--run-class` `smoke` or `final`
+- `--baseline-config` required for final runs
+- `--claim-gates` required for final runs
+- `--enable-consistency` exposed, currently defaults on
+- `--enable-pipeline` exposed, currently defaults on
+- `--enable-checkpointing` exposed, currently defaults on
+- `--enable-compile` defaults off
+- `--solver` default `D3Q27`
 
-Total training time: ~4–6 hours on A100, ~12–18 hours on RTX 3090.
+Checkpoint behavior in the current code:
 
-### 2. Generate Aircraft Design
+- The final checkpoint is saved to `<save-dir>/final_optimized_model.pt`.
+- Periodic checkpoints are currently written by the trainer as `checkpoint_optimized_grid<grid>_ep<epoch>.pt` relative to the working directory, not under `--save-dir`.
 
-Generate a single aircraft design:
+Resolution behavior in the current code:
+
+- If `--grid-size` is provided, training uses that explicit resolution.
+- Otherwise `D3Q27` training uses a base grid resolution of `16`.
+- Any other solver string falls back to `32`.
+- The current trainer runs one configured grid size; it does not execute the older staged `16 -> 24 -> 32` schedule described in stale docs.
+
+Grounded-manifest behavior:
+
+- `--dataset-manifest` lets training ingest a checked-in or external grounded corpus manifest.
+- Each manifest record may provide `geometry_path` or `stl_path`.
+- Each manifest record may optionally provide `design_spec`, `condition_vector`, `latent_path`, and `split`.
+- Relative paths are resolved from the manifest file's directory.
+- The checked-in minimal example is [`docs/dataset/minimal_grounded_manifest.jsonl`](../docs/dataset/minimal_grounded_manifest.jsonl).
+- That checked-in manifest is wiring validation only, not a publication-grade aircraft corpus.
+
+## Generation
+
+Generate one STL artifact from a checkpoint:
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint ./checkpoints/final_model.pt \
-  --output aircraft_design.stl \
-  --target-speed 50.0 \
-  --num-steps 250 \
-  --use-marching-cubes
+  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --output aircraft_optimized.stl \
+  --target-speed 7.0 \
+  --num-steps 4 \
+  --solver D3Q27
 ```
 
-**Parameters:**
-- `--checkpoint`: Path to trained model (required)
-- `--output`: Output STL filename (default: aircraft.stl)
-- `--target-speed`: Target speed in m/s (default: 50.0)
-- `--num-steps`: Number of diffusion steps (default: 250; higher = more iterations, slower)
-- `--use-marching-cubes`: Enable marching cubes refinement (default: True)
+Current generation options:
 
-### 3. Batch Generation
+- `--checkpoint` required
+- `--output` default `aircraft_optimized.stl`
+- `--target-speed` default `7.0`
+- `--thrust-to-weight-min` default `0.45`
+- `--turn-rate-min-deg-s` default `18.0`
+- `--required-static-thrust-n` default `180.0`
+- `--engine-diameter-mm` / `--engine-length-mm`
+- `--engine-count-min` / `--engine-count-max`
+- `--wingspan-limit-m`
+- `--payload-mass-min-g` / `--payload-mass-max-g`
+- `--takeoff-distance-min-m` / `--takeoff-distance-max-m`
+- `--wall-thickness-min-mm` / `--wall-thickness-max-mm`
+- `--part-count-min` / `--part-count-max`
+- `--manufacturing-method`
+- `--num-steps` default `4`
+- `--use-marching-cubes` exposed, currently defaults on
+- `--solver` default `D3Q27`
 
-Generate multiple aircraft designs:
+What the command does today:
+
+- Loads `OptimizedAircraftGenerator`
+- Builds a `DesignSpec`, converts it into the internal condition-vector format, and passes that vector into the generator path
+- Generates a voxel grid
+- Writes an STL
+- Runs a final CFD analysis pass and prints drag/lift coefficients
+
+Important nuance:
+
+- The condition-vector seam is real code plumbing, not just a TODO. See `conditioning_schema.yaml` and `config.yaml`.
+- The CLI/config surface exposes the documented condition fields, but the repo is not yet validated as a mission-conditioned or manufacturing-conditioned aircraft generator.
+- `condition-response-smoke` writes a JSON report for directional smoke evidence only; it is not a scientific benchmark.
+- No grounded condition-response benchmark currently demonstrates that changing payload, takeoff, wingspan, wall-thickness, part-count, or manufacturing inputs reliably changes generated outputs in the intended direction.
+
+## Batch Generation
 
 ```bash
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint ./checkpoints/final_model.pt \
-  --output-dir ./generated_aircraft \
-  --num-designs 5
+  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --output-dir ./generations_optimized \
+  --num-designs 3
 ```
 
-### 4. System Information
+Current batch options:
 
-Check GPU status and PyTorch info:
+- `--checkpoint` required
+- `--output-dir` default `./generations_optimized`
+- `--num-designs` default `5`
+- `--seed` default `0`
+- `--vary-conditions` to sample deterministic `DesignSpec` variation
+- the same documented public conditioning fields exposed by `generate`
+
+Current limitations:
+
+- Uses fixed `num_steps=4`
+- Writes filenames shaped like `aircraft_optimized_001.stl`
+- Needs claim-bearing evaluation before batch outputs can be used as scientific evidence
+
+## Baseline Evaluation
+
+Establish performance baselines using grounded aircraft STLs:
+
+```bash
+python aircraft_diffusion_cfd.py evaluate-baselines \
+  --grid-size 32 \
+  --steps 500 \
+  --output ./baseline_report.json
+```
+
+## Condition-Response Validation
+
+Run a multi-seed condition-response sweep and compute Pearson correlations:
+
+```bash
+python aircraft_diffusion_cfd.py validate-conditions \
+  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --num-seeds 20 \
+  --output ./condition_validation.json
+```
+
+## Multi-Seed Evaluation Study
+
+Automate aggregated performance studies across multiple seeds using the standalone script:
+
+```bash
+python multi_seed_eval.py \
+  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --num-seeds 10 \
+  --baseline-config ./baseline_config.yaml \
+  --baseline-report ./baseline_report.json \
+  --validation-report ./condition_validation.json \
+  --output-dir ./eval_results \
+  --output-report ./baseline_statistics.json
+```
+
+The script now emits the claim-gate statistics bundle consumed by `final_evidence.py`.
+
+## Protocol Runner
+
+Run the checked-in 8 GB smoke protocol:
+
+```bash
+python run_protocol.py --config run_protocols/smoke_8gb.yaml
+```
+
+Preview the guarded final-eval protocol without executing it:
+
+```bash
+python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
+```
+
+The final protocol is intentionally conservative: it starts with grounded-manifest validation, trains against explicitly named dataset/baseline inputs, emits `baseline_statistics.json`, and then re-validates the manifest before assembling the final evidence package so report lineage fields can agree on one checkpoint.
+
+Validate a manifest directly:
+
+```bash
+python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level basic
+python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
+python validate_manifest.py --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl --level claim-bearing
+```
+
+Run the grounded condition-response gate directly:
+
+```bash
+python run_condition_benchmark.py \
+  --checkpoint ../checkpoints_protocol_final/final_optimized_model.pt \
+  --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl \
+  --output ../build/protocol_final/condition_benchmark.json
+```
+
+Evaluate the final evidence package:
+
+```bash
+python final_evidence.py \
+  --manifest-validation ../build/protocol_final/manifest_validation.json \
+  --aircraft-validity ../build/protocol_final/aircraft_validity.json \
+  --condition-benchmark ../build/protocol_final/condition_benchmark.json \
+  --manufacturing-constraints ../build/protocol_final/manufacturing_constraints.json \
+  --baseline-statistics ../build/protocol_final/baseline_statistics.json
+```
+
+Missing, failed, or blocked reports keep claim-bearing wording blocked.
+
+## Condition-Response Smoke Benchmark
+
+```bash
+python aircraft_diffusion_cfd.py condition-response-smoke \
+  --output ./build/condition_response_smoke.json
+```
+
+This command writes a small JSON report from the procedural conditioning path. Use it to confirm that materially different condition payloads produce measurable directional deltas in the smoke geometry proxies. Do not treat it as aircraft-level conditional validation.
+
+## Inspection Commands
+
+Print environment and status information:
 
 ```bash
 python aircraft_diffusion_cfd.py info
 ```
 
-## Design Specifications (DesignSpec)
+Print the benchmark/status summary:
 
-Customize design objectives via the `DesignSpec` class:
-
-```python
-from aircraft_diffusion_cfd import DesignSpec
-
-design_spec = DesignSpec(
-    target_speed=50.0,        # m/s
-    space_weight=0.33,        # Volume minimization (0–1)
-    drag_weight=0.33,         # Aerodynamic efficiency (0–1)
-    lift_weight=0.34,         # Aerodynamic performance (0–1)
-    bounding_box=(64, 64, 64) # Maximum structure size
-)
+```bash
+python aircraft_diffusion_cfd.py performance-benchmark
 ```
 
-## Training Details
+These commands are useful as smoke checks because they are fast and do not require a checkpoint.
+They should not be cited as claim-bearing evidence for aerodynamic quality, production readiness, or conditioned generation performance.
 
-### Loss Function Components
+## Python API Note
 
-```
-Total Loss = λ₁ * MSE_Diffusion + λ₂ * Connectivity_Loss + λ₃ * Aerodynamic_Loss
-
-Where:
-  MSE_Diffusion      = Diffusion model noise prediction error
-  Connectivity_Loss  = Penalty for disconnected voxel groups (10× multiplier)
-  Aerodynamic_Loss   = Multi-objective balance of space/drag/lift
-```
-
-### Memory Optimization
-
-1. **Progressive Training**: Start small (16³), scale up (32³)
-2. **Sparse Voxel Grids**: Only track occupied voxels
-3. **Batch Processing**: Configurable batch size (default: 4)
-4. **Selective CFD**: Compute aerodynamics every 5 batches only
-5. **EMA Model**: Uses separate EMA for better convergence
-
-### Gradient Clipping
-- Max norm: 1.0 (prevents gradient explosion)
-- Applied to both diffusion model and converter
-
-## Output
-
-### STL Mesh Export
-
-Two methods:
-
-**1. Marching Cubes (Recommended)**
-- Generates smooth surfaces from volumetric data
-- Produces vertex/face representation
-- Binary STL format (80-byte header + triangle data)
-
-**2. Voxel Cubes (Fallback)**
-- Each occupied voxel → 12 triangles (cube)
-- Produces blocky but guaranteed-valid mesh
-- Useful if marching cubes fails
-
-### Export Format
-
-All STL files are **binary format**:
-- Compatible with CAD software (Fusion 360, FreeCAD, Solidworks)
-- 50MB typical for 32×32×32 grid with ~50% occupancy
-- Can be imported into CFD solvers (ANSYS, OpenFOAM) for detailed analysis
-
-## Performance Benchmarks
-
-| Resolution | Grid Size | Memory (GB) | Train Time/Epoch | Inference Time |
-|-----------|-----------|------------|-----------------|----------------|
-| 16³ (256K) | 16×16×16 | ~3 | ~30s | ~5s |
-| 24³ (13.8K) | 24×24×24 | ~6 | ~60s | ~8s |
-| 32³ (32.7K) | 32×32×32 | ~10–12 | ~90s | ~12s |
-
-On RTX 3090 (24GB available):
-- Batch size 4 at 32³ = ~12GB memory
-- Batch size 2 at 32³ = ~7GB memory (8GB VRAM safe)
-
-## Customization
-
-### Modify Latent Dimension
-
-```python
-model_config = ModelConfig(latent_dim=256)  # Increase expressiveness
-```
-
-### Adjust Connectivity Penalty
-
-```python
-training_config = TrainingConfig(disconnection_penalty=20.0)  # Stricter connectivity
-```
-
-### Change CFD Parameters
-
-```python
-cfd_config = CFDConfig(
-    resolution=32,
-    mach_number=0.5,  # Higher speed
-    reynolds_number=5e6
-)
-```
+The file still defines internal classes such as `DesignSpec`, `OptimizedDiffusionTrainer`, and `OptimizedAircraftGenerator`. They can be useful for local experiments, but the stable, documented interface for this directory is the CLI. If you want guided command recipes instead of direct imports, see `examples.py`.
 
 ## Troubleshooting
 
-### Out of Memory (OOM)
+Checkpoint path missing:
+
 ```bash
-# Reduce batch size
-python aircraft_diffusion_cfd.py train --batch-size 2
-
-# Or reduce latent dimension
-python aircraft_diffusion_cfd.py train --latent-dim 64
+python aircraft_diffusion_cfd.py generate \
+  --checkpoint ./checkpoints/final_optimized_model.pt
 ```
 
-### Marching Cubes Fails
-The system falls back to voxel cube export automatically. Check voxel grid connectivity with:
+If that path does not exist yet, train first or point `--checkpoint` at a real file.
 
-```python
-from scipy.ndimage import label
-labeled, num_components = label(voxel_grid > 0.5)
-print(f"Connected components: {num_components}")
-```
+Quick environment check:
 
-### OpenFOAM Force Coefficients Fail
-If `forceCoeffs` is unreliable on your OpenFOAM install, use the exported `system/forces` dictionary and normalize the reported force vector into coefficients manually. The repository now prefers this lower-level fallback because it is more tolerant of stripped-down OpenFOAM builds.
-
-### Checkpoint Not Found
-Ensure path is correct:
 ```bash
-ls -la ./checkpoints/
-python aircraft_diffusion_cfd.py generate --checkpoint ./checkpoints/final_model.pt
+python aircraft_diffusion_cfd.py info
+python aircraft_diffusion_cfd.py --help
 ```
 
-## References
+## Status
 
-**Papers:**
-- Transformers for 3D Generation: *Transformers are All You Need* (et al.)
-- Diffusion Models: *Denoising Diffusion Probabilistic Models* (Ho et al., 2020)
-- Marching Cubes: *Marching Cubes: A High Resolution 3D Surface Construction Algorithm* (Lorensen & Cline, 1987)
-- FluidX3D: GPU lattice Boltzmann method framework
-
-**Citation:**
-If you use this system, please cite:
-
-```bibtex
-@software{aircraft_diffusion_2025,
-  title={Aircraft Structural Design via Diffusion Models and GPU-Accelerated CFD},
-  author={Your Name},
-  year={2025},
-  url={https://github.com/yourusername/aircraft-diffusion-cfd}
-}
-```
-
-## License
-
-MIT License - See LICENSE file for details.
-
-## Contact
-
-For issues or questions, create an issue on GitHub or contact the maintainers.
-
----
-
-**Last Updated**: December 2025  
-**Status**: Production-Ready (v1.0)
+This is a research proof of concept with runnable CLI entry points, not a production aircraft-design tool or a claim-bearing benchmark harness.

@@ -1,0 +1,133 @@
+# Dataset Status And Requirements
+
+This repository does not yet ship a grounded aircraft-like training corpus. The current data path is procedural and synthetic: generated voxel geometries, synthetic `DesignSpec` samples, and offline densification artifacts used to exercise the conditioning seam and training pipeline.
+
+## What The Current Data Supports
+
+- Smoke-testing the dataset, model, and generator conditioning interfaces
+- Verifying that condition vectors can be serialized, loaded, normalized, and consumed end to end
+- Running bounded synthetic/freeform experiments for implementation debugging
+
+## What The Current Data Does Not Support
+
+- Claims about real aircraft geometry distributions
+- Claims about mission-conditioned aircraft generation
+- Claims about manufacturing-conditioned aircraft generation
+- Claims about aerodynamic or structural realism beyond synthetic heuristics
+- Condition-response benchmarks that would support paper-level conclusions
+
+## What A Grounded Aircraft-Like Corpus Must Contain
+
+A claim-bearing corpus needs examples that are recognizably aircraft-like and traceable to a consistent data source. At minimum:
+
+- Aircraft-like geometry assets with documented provenance
+- One canonical preprocessing path from mesh or CAD to voxel grid
+- Stable orientation, scale, and unit conventions
+- Enough variation to cover the intended design family rather than a single template
+- Explicit mission and manufacturing metadata attached to every example
+- Train, validation, and holdout splits that prevent near-duplicate leakage
+
+## Checked-In Minimal Manifest
+
+The repo now includes a minimal runnable manifest at `docs/dataset/minimal_grounded_manifest.jsonl`.
+
+Its purpose is limited:
+
+- exercise the grounded-manifest code path end to end,
+- make final-run guardrails point at a real non-empty dataset input,
+- provide a versioned template for richer manifests.
+
+It is **not** a scientifically adequate aircraft corpus. It contains only the repository's bundled STL examples and should be treated as wiring validation, not dataset completion.
+
+The repo now also includes an executable validator:
+
+```bash
+python CLI/validate_manifest.py --manifest docs/dataset/minimal_grounded_manifest.jsonl --level basic
+python CLI/validate_manifest.py --manifest docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
+```
+
+Current expected behavior:
+
+- `basic` should pass for the checked-in minimal manifest.
+- `claim-bearing` should return `blocked`, because the file is intentionally a wiring artifact and not a publication-grade corpus.
+
+See `docs/dataset/GROUNDED_CORPUS_SPEC.md` for the stricter claim-bearing contract and
+`docs/dataset/manifest_schema.example.json` for a machine-readable example record shape.
+
+## Claim-Bearing Corpus Artifacts
+
+The repository now also contains a claim-bearing grounded corpus package built
+from public NACA source geometry code plus local preprocessing and analysis:
+
+- `docs/dataset/grounded_aircraft_manifest.jsonl`
+- `docs/dataset/grounded_aircraft_provenance.json`
+- `docs/dataset/GROUNDED_AIRCRAFT_CORPUS_REPORT.md`
+- `docs/dataset/grounded_aircraft/`
+
+This package is intentionally narrower than a full-aircraft dataset. It is
+airfoil-section-heavy, uses explicit local response-metric proxies, and should
+be treated as grounded manifest evidence for the current protocol contracts, not
+as whole-aircraft flight-validation evidence.
+
+Each record may include:
+
+- `geometry_path` or `stl_path`
+- `design_spec`
+- `condition_vector`
+- `latent_path`
+- `split`
+
+## Required Metadata Fields
+
+Every example in a grounded corpus should include, at minimum, the fields already represented in the documented condition schema:
+
+- `target_speed_mps`
+- `wingspan_limit_m`
+- `thrust_to_weight_min`
+- `turn_rate_min_deg_s`
+- `required_static_thrust_n`
+- `engine_diameter_mm`
+- `engine_length_mm`
+- `engine_count_min`
+- `engine_count_max`
+- `payload_mass_min_g`
+- `payload_mass_max_g`
+- `takeoff_distance_min_m`
+- `takeoff_distance_max_m`
+- `wall_thickness_min_mm`
+- `wall_thickness_max_mm`
+- `part_count_min`
+- `part_count_max`
+- `manufacturing_method`
+
+Recommended additional metadata:
+
+- Geometry provenance or source identifier
+- Aircraft family or configuration tag
+- Units and preprocessing version
+- Voxelization resolution and occupancy threshold
+- Any CFD or structural annotations used for evaluation
+
+## Split Rules
+
+To support honest evaluation, a grounded dataset should follow these split rules:
+
+- Split by source design or aircraft family before augmentation so near-duplicates cannot land in multiple splits.
+- Keep the holdout split untouched until final evaluation.
+- Preserve coverage across manufacturing categories and mission envelopes in train and validation.
+- If procedural augmentation is used, record the parent example so leakage can be audited.
+- Freeze the split manifest before reporting any benchmark numbers.
+
+## Claims Blocked Until This Exists
+
+The following claims remain blocked until a grounded corpus and evaluation protocol exist:
+
+- Mission-conditioned aircraft generation
+- Manufacturing-conditioned aircraft generation
+- Aircraft-level geometric validity at useful rates
+- Condition-response claims for payload, takeoff, wingspan, wall-thickness, part-count, or manufacturing inputs
+- Publication-grade aerodynamic comparison claims tied to conditioned generation
+
+## Practical Reading Of The Current Repo State
+
+The current repo has partial conditioning plumbing, not dataset-backed conditioned validation. The condition vector is real and used by the code path, but the present procedural/synthetic data cannot justify scientific claims about aircraft-like conditioned generation.

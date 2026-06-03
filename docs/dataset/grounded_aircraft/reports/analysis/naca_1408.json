@@ -1,0 +1,75 @@
+{
+  "claim_boundary": "Local geometry-plus-CFD proxy report for manifest grounding. Not a whole-aircraft or publication-grade aerodynamic validation artifact.",
+  "design_family": "airfoil_section_4digit",
+  "geometry_paths": {
+    "profile_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\grounded_aircraft\\profiles\\naca_1408.npy",
+    "stl_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\grounded_aircraft\\stl\\naca_1408.stl",
+    "voxel_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\grounded_aircraft\\voxels\\naca_1408.npy"
+  },
+  "hashes": {
+    "geometry_sha256": "d395566863b88bb3270464f4c2ea6a30e5a795185bac9ac1ab2bd78f53119ff8",
+    "profile_sha256": "34d8a8bbaf41b5ed4ff654de2b16bbe7f5781bdae729884342f358859a984f80",
+    "voxel_sha256": "de0da70202504483a8853217ec32a9e8cb8f6f5fd59e2c628b6dd9728dfea0ad"
+  },
+  "local_cfd": {
+    "density": 1.225,
+    "drag_coefficient": 75.66228029227,
+    "drag_link_metric_exponent": 1.68,
+    "drag_reference_speed": 80.0,
+    "drag_speed_normalization": 9.32944606413994,
+    "drag_speed_normalization_exponent": 1.0,
+    "force_stability": 1.0,
+    "force_x": 242.4232635498047,
+    "force_z": -0.0069728451780974865,
+    "freestream_speed": 8.575000000000001,
+    "lbm_converged": 0.0,
+    "lift_coefficient": 0.009823976944420453,
+    "max_turbulent_viscosity": 9.525937457510736e-06,
+    "max_vorticity": 0.3381975591182709,
+    "mean_smagorinsky_constant": 0.17,
+    "net_momentum_exchange_force_x": 242.4232635498047,
+    "physical_force_source": 242.4232635498047,
+    "pressure_only_fallback": 2.506680226363155,
+    "pressure_sum": 10923.3017578125,
+    "projected_area_lattice": 51.0,
+    "raw_force_x": 56.9933967590332,
+    "raw_force_z": -4.954338146490045e-05,
+    "raw_net_momentum_exchange_force_x": 1.7224630117416382,
+    "raw_projected_drag_coefficient": 1.117517583510455,
+    "reference_area": 0.0498046875,
+    "reference_length": 1.0,
+    "reynolds_number_turbulent": 6129531.941023628,
+    "shape_drag_blockage": 0.0498046875,
+    "shape_drag_fullness": 0.6296296296296297,
+    "shape_drag_projected_side": 7.14142842854285,
+    "shape_drag_scale": 0.1,
+    "shape_drag_surface_to_volume": 1.9907727797001153,
+    "surrogate_proxy_force": 2.338593797190115,
+    "vortex_core_volume": 0.1348876953125
+  },
+  "mesh_metrics": {
+    "camber_ratio": 0.01,
+    "chord_m": 1.0,
+    "mesh_area_m2": 1.3617847764051143,
+    "mesh_volume_m3": 0.0337785836434072,
+    "occupancy_ratio": 0.026458740234375,
+    "span_m": 0.62,
+    "thickness_ratio": 0.08000941385862705
+  },
+  "naca_code": "1408",
+  "response_metric_inputs": {
+    "maneuverability_proxy": 1.62,
+    "payload_proxy": 537.54,
+    "structural_proxy": 0.04960583659234877,
+    "thrust_proxy": 0.013216625194709663
+  },
+  "sample_id": "naca_1408",
+  "solver_config": {
+    "device": "cpu",
+    "grid_size": 32,
+    "solver_type": "D3Q27",
+    "steps": 20
+  },
+  "source_id": "naca_1408",
+  "split": "val"
+}
