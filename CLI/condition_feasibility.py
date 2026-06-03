@@ -14,6 +14,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from report_metadata import apply_report_metadata
+
 
 MIN_WALL_BY_METHOD_MM = {
     "foam_core_hotwire": 1.0,
@@ -159,6 +161,9 @@ def main() -> int:
     parser.add_argument("--manifest", default=None, help="JSONL manifest with design_spec objects.")
     parser.add_argument("--payload-json", default=None, help="Single condition payload JSON string.")
     parser.add_argument("--output", default=None, help="Optional JSON report path.")
+    parser.add_argument("--run-id", default=None, help="Optional run identifier shared across report artifacts.")
+    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path for evidence lineage metadata.")
+    parser.add_argument("--protocol-config", default=None, help="Optional protocol config path for evidence lineage metadata.")
     args = parser.parse_args()
 
     payloads: List[Dict[str, Any]] = []
@@ -177,6 +182,13 @@ def main() -> int:
         payloads.append(_condition_payload_from_design_spec(payload))
 
     report = build_manufacturing_constraints_report(payloads, manifest_path=args.manifest)
+    apply_report_metadata(
+        report,
+        run_id=args.run_id,
+        checkpoint_path=args.checkpoint,
+        manifest_path=args.manifest,
+        protocol_path=args.protocol_config,
+    )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)
     if args.output:

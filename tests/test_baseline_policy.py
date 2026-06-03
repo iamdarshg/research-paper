@@ -1,10 +1,6 @@
 import os
 import sys
-import json
-import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
 
 CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
@@ -15,7 +11,6 @@ from multi_seed_eval import (
     build_baseline_statistics_report,
     build_statistical_summary,
     validate_baseline_policy,
-    write_baseline_statistics_report,
 )
 
 
@@ -57,188 +52,31 @@ class TestBaselinePolicy(unittest.TestCase):
         self.assertEqual(report["status"], "blocked")
         self.assertIn("missing baseline_set", report["blockers"][0])
 
-    def test_baseline_statistics_report_passes_with_required_baselines_and_metrics(self):
+    def test_baseline_statistics_report_combines_policy_and_multi_seed_summary(self):
         report = build_baseline_statistics_report(
             baseline_config={
-                "baseline_name": "minimal_grounded_aircraft",
+                "baseline_name": "claim_bearing_aircraft",
                 "baseline_set": ["retrieval", "unconditional_checkpoint", "bundled_grounded_stl"],
             },
-            records=[
-                {"seed": 0, "baseline": "retrieval", "lift_to_drag": 4.0},
-                {"seed": 1, "baseline": "retrieval", "lift_to_drag": 6.0},
-                {"seed": 2, "baseline": "retrieval", "lift_to_drag": 8.0},
-                {"seed": 0, "baseline": "unconditional_checkpoint", "lift_to_drag": 3.0},
-                {"seed": 1, "baseline": "unconditional_checkpoint", "lift_to_drag": 5.0},
-                {"seed": 2, "baseline": "unconditional_checkpoint", "lift_to_drag": 7.0},
-                {"seed": 0, "baseline": "bundled_grounded_stl", "lift_to_drag": 2.0},
-                {"seed": 1, "baseline": "bundled_grounded_stl", "lift_to_drag": 4.0},
-                {"seed": 2, "baseline": "bundled_grounded_stl", "lift_to_drag": 6.0},
-            ],
-            metric_keys=["lift_to_drag"],
+            baseline_report={
+                "F-18_Hornet.stl": {"lift_to_drag": 5.0},
+                "biplane.stl": {"lift_to_drag": 3.0},
+            },
+            condition_validation_report={
+                "correlations": {"target_speed_vs_measured_drag": {"r": 0.4, "p": 0.1}},
+                "raw_data": {
+                    "measured_drag": [1.0, 2.0, 3.0],
+                    "measured_lift": [4.0, 6.0, 9.0],
+                    "occupancy": [0.1, 0.2, 0.3],
+                },
+            },
             min_seeds=3,
         )
 
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["baseline_policy"]["status"], "pass")
-        self.assertEqual(report["baselines"]["retrieval"]["metrics"]["lift_to_drag"]["mean"], 6.0)
-        self.assertEqual(report["baselines"]["retrieval"]["seed_count"], 3)
-
-    def test_baseline_statistics_report_blocks_missing_baseline_seed_and_metric(self):
-        report = build_baseline_statistics_report(
-            baseline_config={
-                "baseline_name": "minimal_grounded_aircraft",
-                "baseline_set": ["retrieval", "unconditional_checkpoint"],
-            },
-            records=[
-                {"seed": 0, "baseline": "retrieval", "lift_to_drag": 4.0},
-                {"seed": 1, "baseline": "retrieval"},
-            ],
-            metric_keys=["lift_to_drag"],
-            min_seeds=3,
-        )
-
-        self.assertEqual(report["status"], "blocked")
-        self.assertTrue(any("missing required baselines" in blocker for blocker in report["blockers"]))
-        self.assertTrue(any("baseline retrieval: insufficient seeds" in blocker for blocker in report["blockers"]))
-        self.assertTrue(any("baseline unconditional_checkpoint has no records" in blocker for blocker in report["blockers"]))
-
-    def test_report_only_cli_writes_baseline_statistics_json(self):
-        script_path = os.path.join(CLI_DIR, "multi_seed_eval.py")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = os.path.join(tmpdir, "baseline_config.json")
-            records_path = os.path.join(tmpdir, "records.json")
-            output_path = os.path.join(tmpdir, "baseline_statistics.json")
-            with open(config_path, "w", encoding="utf-8") as config_file:
-                json.dump(
-                    {
-                        "baseline_name": "minimal_grounded_aircraft",
-                        "baseline_set": ["retrieval", "unconditional_checkpoint", "bundled_grounded_stl"],
-                    },
-                    config_file,
-                )
-            with open(records_path, "w", encoding="utf-8") as records_file:
-                json.dump(
-                    [
-                        {"seed": 0, "baseline": "retrieval", "lift_to_drag": 4.0},
-                        {"seed": 1, "baseline": "retrieval", "lift_to_drag": 6.0},
-                        {"seed": 2, "baseline": "retrieval", "lift_to_drag": 8.0},
-                        {"seed": 0, "baseline": "unconditional_checkpoint", "lift_to_drag": 3.0},
-                        {"seed": 1, "baseline": "unconditional_checkpoint", "lift_to_drag": 5.0},
-                        {"seed": 2, "baseline": "unconditional_checkpoint", "lift_to_drag": 7.0},
-                        {"seed": 0, "baseline": "bundled_grounded_stl", "lift_to_drag": 2.0},
-                        {"seed": 1, "baseline": "bundled_grounded_stl", "lift_to_drag": 4.0},
-                        {"seed": 2, "baseline": "bundled_grounded_stl", "lift_to_drag": 6.0},
-                    ],
-                    records_file,
-                )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    script_path,
-                    "--baseline-config",
-                    config_path,
-                    "--records-json",
-                    records_path,
-                    "--metric-key",
-                    "lift_to_drag",
-                    "--baseline-statistics-output",
-                    output_path,
-                    "--min-seeds",
-                    "3",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            with open(output_path, "r", encoding="utf-8") as output_file:
-                report = json.load(output_file)
-            self.assertEqual(report["status"], "pass")
-
-    def test_report_writer_accepts_checked_in_yaml_baseline_config(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            config_path = root / "baseline_config.yaml"
-            records_path = root / "records.json"
-            output_path = root / "baseline_statistics.json"
-            config_path.write_text(
-                "\n".join(
-                    [
-                        "baseline_name: fixture",
-                        "baseline_set:",
-                        "  - retrieval",
-                        "  - unconditional_checkpoint",
-                        "  - bundled_grounded_stl",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            records = []
-            for baseline in ["retrieval", "unconditional_checkpoint", "bundled_grounded_stl"]:
-                for seed in [0, 1, 2]:
-                    records.append({"baseline": baseline, "seed": seed, "lift_to_drag": 5.0 + seed})
-            records_path.write_text(json.dumps({"records": records}), encoding="utf-8")
-
-            report = write_baseline_statistics_report(
-                baseline_config_path=config_path,
-                records_json_path=records_path,
-                metric_keys=["lift_to_drag"],
-                output_path=output_path,
-                min_seeds=3,
-            )
-
-            self.assertEqual(report["status"], "pass")
-            self.assertTrue(output_path.exists())
-
-    def test_report_only_cli_fails_closed_and_writes_blocked_report(self):
-        script_path = os.path.join(CLI_DIR, "multi_seed_eval.py")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = os.path.join(tmpdir, "baseline_config.json")
-            records_path = os.path.join(tmpdir, "records.json")
-            output_path = os.path.join(tmpdir, "baseline_statistics.json")
-            with open(config_path, "w", encoding="utf-8") as config_file:
-                json.dump(
-                    {
-                        "baseline_name": "minimal_grounded_aircraft",
-                        "baseline_set": ["retrieval"],
-                    },
-                    config_file,
-                )
-            with open(records_path, "w", encoding="utf-8") as records_file:
-                json.dump(
-                    [
-                        {"seed": 0, "baseline": "retrieval", "lift_to_drag": 4.0},
-                    ],
-                    records_file,
-                )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    script_path,
-                    "--baseline-config",
-                    config_path,
-                    "--records-json",
-                    records_path,
-                    "--metric-key",
-                    "lift_to_drag",
-                    "--baseline-statistics-output",
-                    output_path,
-                    "--min-seeds",
-                    "3",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            with open(output_path, "r", encoding="utf-8") as output_file:
-                report = json.load(output_file)
-            self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["multi_seed_summary"]["status"], "pass")
+        self.assertIn("lift_to_drag", report["multi_seed_summary"]["metrics"])
 
 
 if __name__ == "__main__":

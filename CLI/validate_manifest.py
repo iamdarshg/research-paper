@@ -16,6 +16,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+from report_metadata import apply_report_metadata
+
 
 ALLOWED_LEVELS = {"basic", "claim-bearing"}
 ALLOWED_SPLITS = {"train", "val", "validation", "holdout", "test"}
@@ -144,9 +146,19 @@ def main() -> int:
         help="Validation level: basic wiring checks or stricter claim-bearing checks.",
     )
     parser.add_argument("--output", default=None, help="Optional JSON report output path.")
+    parser.add_argument("--run-id", default=None, help="Optional run identifier shared across report artifacts.")
+    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path for evidence lineage metadata.")
+    parser.add_argument("--protocol-config", default=None, help="Optional protocol config path for evidence lineage metadata.")
     args = parser.parse_args()
 
     report = validate_manifest_file(args.manifest, level=args.level)
+    apply_report_metadata(
+        report,
+        run_id=args.run_id,
+        checkpoint_path=args.checkpoint,
+        manifest_path=args.manifest,
+        protocol_path=args.protocol_config,
+    )
     rendered = json.dumps(report, indent=2)
     print(rendered)
 

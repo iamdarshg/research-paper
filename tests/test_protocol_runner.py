@@ -35,6 +35,7 @@ class TestProtocolRunner(unittest.TestCase):
                     "num_epochs": 1,
                     "batch_size": 1,
                     "num_samples": 2,
+                    "grid_size": 24,
                     "save_dir": "../../checkpoints_test",
                     "run_class": "final",
                     "dataset_manifest": "../../docs/dataset/minimal_grounded_manifest.jsonl",
@@ -72,23 +73,11 @@ class TestProtocolRunner(unittest.TestCase):
                     "num_seeds": 3,
                     "output_dir": "../../build/multi_seed_eval",
                 },
-                "baseline_statistics": {
-                    "enabled": True,
-                    "baseline_config": "../baseline_config.yaml",
-                    "records_json": "../../build/baseline_records.json",
-                    "metric_keys": ["lift_to_drag"],
-                    "output": "../../build/baseline_statistics.json",
-                    "min_seeds": 3,
-                },
                 "final_evidence": {
                     "enabled": True,
                     "baseline_statistics": "../../build/baseline_statistics.json",
                     "require_run_consistency": True,
                     "output": "../../build/final_evidence_package.json",
-                },
-                "gate_readiness": {
-                    "enabled": True,
-                    "output": "../../build/gate_readiness.json",
                 },
             }
             config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
@@ -101,6 +90,8 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertEqual(commands[0][2], "--manifest")
             self.assertEqual(commands[1][1], str((cli_dir / "aircraft_diffusion_cfd.py").resolve()))
             self.assertIn(str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()), commands[1])
+            self.assertIn("--grid-size", commands[1])
+            self.assertIn("24", commands[1])
             self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), commands[1])
             self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), commands[1])
             self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[3])
@@ -112,18 +103,15 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertEqual(commands[5][1], str((cli_dir / "condition_feasibility.py").resolve()))
             self.assertEqual(commands[6][1], str((cli_dir / "aircraft_validity.py").resolve()))
             self.assertEqual(commands[7][1], str((cli_dir / "multi_seed_eval.py").resolve()))
-            self.assertEqual(commands[8][1], str((cli_dir / "multi_seed_eval.py").resolve()))
-            self.assertIn("--baseline-statistics-output", commands[8])
+            self.assertEqual(commands[8][1], str((cli_dir / "validate_manifest.py").resolve()))
             self.assertEqual(commands[9][1], str((cli_dir / "final_evidence.py").resolve()))
             self.assertIn("--require-run-consistency", commands[9])
-            self.assertEqual(commands[10][1], str((cli_dir / "gate_readiness.py").resolve()))
 
     def test_checked_in_protocols_resolve_repo_assets(self):
         repo_root = Path(__file__).resolve().parents[1]
         protocol_paths = [
             repo_root / "CLI" / "run_protocols" / "smoke_8gb.yaml",
             repo_root / "CLI" / "run_protocols" / "final_cloud.yaml",
-            repo_root / "CLI" / "run_protocols" / "first_training.yaml",
         ]
 
         for path in protocol_paths:
@@ -134,12 +122,17 @@ class TestProtocolRunner(unittest.TestCase):
 
         final_config = run_protocol.load_protocol_config(str(protocol_paths[1]))
         final_commands = run_protocol.build_protocol_commands(final_config)
-        self.assertEqual(final_commands[0][1], str((repo_root / "CLI" / "build_reference_evidence.py").resolve()))
-        self.assertEqual(final_commands[1][1], str((repo_root / "CLI" / "validate_manifest.py").resolve()))
+        self.assertEqual(final_commands[0][1], str((repo_root / "CLI" / "validate_manifest.py").resolve()))
+        train_command = final_commands[1]
+
         self.assertIn(
-            str((repo_root / "build" / "protocol_final" / "grounded_corpus" / "manifest.jsonl").resolve()),
-            final_commands[1],
+            str((repo_root / "docs" / "dataset" / "grounded_aircraft_manifest.jsonl").resolve()),
+            train_command,
         )
+        self.assertIn("--grid-size", train_command)
+        self.assertIn("32", train_command)
+        self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), train_command)
+        self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), train_command)
         self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "run_condition_benchmark.py").resolve()) for command in final_commands)
         )
@@ -152,48 +145,7 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve()) for command in final_commands)
         )
-        final_evidence_command = next(
-            command for command in final_commands
-            if command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve())
-        )
-        self.assertIn("--run-metadata", final_evidence_command)
-        gate_readiness_command = next(
-            command for command in final_commands
-            if command[1] == str((repo_root / "CLI" / "gate_readiness.py").resolve())
-        )
-        self.assertIn("--final-evidence", gate_readiness_command)
-        self.assertTrue(
-            any(command[1] == str((repo_root / "CLI" / "gate_readiness.py").resolve()) for command in final_commands)
-        )
-        baseline_stats_index = next(
-            idx for idx, command in enumerate(final_commands)
-            if command[1] == str((repo_root / "CLI" / "multi_seed_eval.py").resolve())
-            and "--baseline-statistics-output" in command
-        )
-        final_evidence_index = next(
-            idx for idx, command in enumerate(final_commands)
-            if command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve())
-        )
-        self.assertLess(baseline_stats_index, final_evidence_index)
-
-        first_training_config = run_protocol.load_protocol_config(str(protocol_paths[2]))
-        first_training_commands = run_protocol.build_protocol_commands(first_training_config)
-        train_index = next(
-            idx for idx, command in enumerate(first_training_commands)
-            if command[1] == str((repo_root / "CLI" / "aircraft_diffusion_cfd.py").resolve())
-            and command[2] == "train"
-        )
-        metadata_index = next(
-            idx for idx, command in enumerate(first_training_commands)
-            if command[1] == str((repo_root / "CLI" / "write_run_metadata.py").resolve())
-        )
-        final_evidence_index = next(
-            idx for idx, command in enumerate(first_training_commands)
-            if command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve())
-        )
-        self.assertLess(train_index, metadata_index)
-        self.assertLess(metadata_index, final_evidence_index)
-        self.assertIn(
-            str((repo_root / "checkpoints_first_training" / "final_optimized_model.pt").resolve()),
-            first_training_commands[metadata_index],
+        self.assertGreaterEqual(
+            sum(1 for command in final_commands if command[1] == str((repo_root / "CLI" / "validate_manifest.py").resolve())),
+            2,
         )

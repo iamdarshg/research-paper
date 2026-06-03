@@ -67,6 +67,7 @@ Current training options:
 - `--batch-size` default `4`
 - `--learning-rate` default `2e-4`
 - `--latent-dim` default `16`
+- `--grid-size` optional explicit training/CFD voxel resolution override
 - `--precision` default `float32`
 - `--disconnection-penalty` default `30.0`
 - `--num-samples` default `500`
@@ -90,7 +91,8 @@ Checkpoint behavior in the current code:
 
 Resolution behavior in the current code:
 
-- `D3Q27` training uses a base grid resolution of `16`.
+- If `--grid-size` is provided, training uses that explicit resolution.
+- Otherwise `D3Q27` training uses a base grid resolution of `16`.
 - Any other solver string falls back to `32`.
 - The current trainer runs one configured grid size; it does not execute the older staged `16 -> 24 -> 32` schedule described in stale docs.
 
@@ -205,8 +207,14 @@ Automate aggregated performance studies across multiple seeds using the standalo
 python multi_seed_eval.py \
   --checkpoint ./checkpoints/final_optimized_model.pt \
   --num-seeds 10 \
-  --output-dir ./eval_results
+  --baseline-config ./baseline_config.yaml \
+  --baseline-report ./baseline_report.json \
+  --validation-report ./condition_validation.json \
+  --output-dir ./eval_results \
+  --output-report ./baseline_statistics.json
 ```
+
+The script now emits the claim-gate statistics bundle consumed by `final_evidence.py`.
 
 ## Protocol Runner
 
@@ -222,13 +230,14 @@ Preview the guarded final-eval protocol without executing it:
 python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
 ```
 
-The final protocol is intentionally conservative: it now starts with grounded-manifest validation and references `baseline_config.yaml`, `paper/FINAL_RUN_GATES.md`, and the minimal grounded manifest so claim-bearing runs must name their baselines and dataset inputs explicitly.
+The final protocol is intentionally conservative: it starts with grounded-manifest validation, trains against explicitly named dataset/baseline inputs, emits `baseline_statistics.json`, and then re-validates the manifest before assembling the final evidence package so report lineage fields can agree on one checkpoint.
 
 Validate a manifest directly:
 
 ```bash
 python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level basic
 python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
+python validate_manifest.py --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl --level claim-bearing
 ```
 
 Run the grounded condition-response gate directly:
@@ -236,7 +245,7 @@ Run the grounded condition-response gate directly:
 ```bash
 python run_condition_benchmark.py \
   --checkpoint ../checkpoints_protocol_final/final_optimized_model.pt \
-  --manifest ../docs/dataset/minimal_grounded_manifest.jsonl \
+  --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl \
   --output ../build/protocol_final/condition_benchmark.json
 ```
 

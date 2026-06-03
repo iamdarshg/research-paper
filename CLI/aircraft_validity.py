@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterable, List
 import numpy as np
 import torch
 
+from report_metadata import apply_report_metadata
+
 
 def _as_tensor(voxels: Any) -> torch.Tensor:
     if isinstance(voxels, torch.Tensor):
@@ -138,6 +140,10 @@ def main() -> int:
     parser.add_argument("--input", action="append", default=[], help="Path to a .npy/.pt voxel artifact. May be repeated.")
     parser.add_argument("--input-dir", default=None, help="Directory containing .npy/.pt/.pth voxel artifacts.")
     parser.add_argument("--output", default=None, help="Optional JSON report path.")
+    parser.add_argument("--manifest", default=None, help="Optional manifest path for evidence lineage metadata.")
+    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path for evidence lineage metadata.")
+    parser.add_argument("--run-id", default=None, help="Optional run identifier shared across report artifacts.")
+    parser.add_argument("--protocol-config", default=None, help="Optional protocol config path for evidence lineage metadata.")
     args = parser.parse_args()
 
     paths = [Path(value) for value in args.input]
@@ -158,6 +164,13 @@ def main() -> int:
     if input_errors:
         report["status"] = "blocked"
         report["errors"] = input_errors
+    apply_report_metadata(
+        report,
+        run_id=args.run_id,
+        checkpoint_path=args.checkpoint,
+        manifest_path=args.manifest,
+        protocol_path=args.protocol_config,
+    )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)
     if args.output:
