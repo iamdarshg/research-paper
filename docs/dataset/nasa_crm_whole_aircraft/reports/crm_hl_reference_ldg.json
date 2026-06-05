@@ -1,0 +1,168 @@
+{
+  "analysis": {
+    "cfd": {
+      "density": 1.225,
+      "drag_coefficient": 36.49421747441606,
+      "drag_link_metric_exponent": 1.68,
+      "drag_reference_speed": 80.0,
+      "drag_speed_normalization": 9.32944606413994,
+      "drag_speed_normalization_exponent": 1.0,
+      "force_stability": 1.0,
+      "force_x": 126.08283996582031,
+      "force_z": -26.95477867126465,
+      "freestream_speed": 8.575000000000001,
+      "lbm_converged": 0.0,
+      "lift_coefficient": -7.788038150016649,
+      "max_turbulent_viscosity": 9.44619023357518e-06,
+      "max_vorticity": 0.3441334068775177,
+      "mean_smagorinsky_constant": 0.17,
+      "net_momentum_exchange_force_x": 126.08283996582031,
+      "physical_force_source": 126.08283996582031,
+      "pressure_only_fallback": 1.2172893636908413,
+      "pressure_sum": 10924.3486328125,
+      "projected_area_lattice": 55.0,
+      "raw_force_x": 27.677026748657227,
+      "raw_force_z": -0.19151878356933594,
+      "raw_net_momentum_exchange_force_x": 0.895842432975769,
+      "raw_projected_drag_coefficient": 0.5032186681574041,
+      "reference_area": 0.0537109375,
+      "reference_length": 1.0,
+      "reynolds_number_turbulent": 6613634.894002422,
+      "shape_drag_blockage": 0.0537109375,
+      "shape_drag_fullness": 0.28215488215488216,
+      "shape_drag_projected_side": 7.416198487095663,
+      "shape_drag_scale": 1.5501540229693014,
+      "shape_drag_surface_to_volume": 1.8186157517899761,
+      "surrogate_proxy_force": 17.60453415037293,
+      "vortex_core_volume": 0.083038330078125
+    },
+    "occupancy_ratio": 0.012786865234375,
+    "validity": {
+      "canonicalization": {
+        "metrics": {
+          "center_body_density": 0.0283203125,
+          "center_body_density_ratio": 3.1926606621929716,
+          "center_body_fraction": 0.3460620525059666,
+          "high_end_fraction": 0.0405727923627685,
+          "left_wing_density": 0.00630326708778739,
+          "left_wing_fraction": 0.16945107398568018,
+          "length_fraction_x": 0.78125,
+          "longitudinal_profile_cv": 1.365426256565473,
+          "low_end_fraction": 0.0405727923627685,
+          "occupancy_ratio": 0.012786865234375,
+          "right_wing_density": 0.008870442397892475,
+          "right_wing_fraction": 0.26014319809069214,
+          "span_fraction_y": 0.84375,
+          "symmetry_score": 0.766109785202864,
+          "tail_fraction": 0.0405727923627685,
+          "thickness_fraction_z": 0.25,
+          "voxel_symmetry_score": 0.2219570405727923
+        },
+        "permutation": [
+          2,
+          0,
+          1
+        ],
+        "score": 13.313350602545457
+      },
+      "checks": {
+        "body_centerline_dominance": true,
+        "longitudinal_profile_variation": true,
+        "nonempty_occupancy": true,
+        "span_sanity": true,
+        "symmetry": true,
+        "tail_body_plausibility": true,
+        "wing_body_balance": true
+      },
+      "claim_boundary": "First-pass aircraft-specific heuristic validity, not structural or aerodynamic proof.",
+      "failed_checks": [],
+      "metrics": {
+        "center_body_density": 0.0283203125,
+        "center_body_density_ratio": 3.1926606621929716,
+        "center_body_fraction": 0.3460620525059666,
+        "high_end_fraction": 0.0405727923627685,
+        "left_wing_density": 0.00630326708778739,
+        "left_wing_fraction": 0.16945107398568018,
+        "length_fraction_x": 0.78125,
+        "longitudinal_profile_cv": 1.365426256565473,
+        "low_end_fraction": 0.0405727923627685,
+        "occupancy_ratio": 0.012786865234375,
+        "right_wing_density": 0.008870442397892475,
+        "right_wing_fraction": 0.26014319809069214,
+        "span_fraction_y": 0.84375,
+        "symmetry_score": 0.766109785202864,
+        "tail_fraction": 0.0405727923627685,
+        "thickness_fraction_z": 0.25,
+        "voxel_symmetry_score": 0.2219570405727923
+      },
+      "status": "pass"
+    },
+    "voxel_sha256": "48fd76897f6aeb16c2c7804a29bddaabe338ce30f0c7a8bfdeef7d091e815441"
+  },
+  "claim_boundary": "Public whole-aircraft geometry context with local voxel validity and internal CFD checks. Not yet a final grounded manifest record.",
+  "configuration": "landing",
+  "data_use_policy_url": "https://www.earthdata.nasa.gov/engage/open-data-services-software/data-use-policy",
+  "date_accessed": "2026-06-04",
+  "geometry_provenance": "NASA CRM-HL assembled half-aircraft STEP exported to STL with CadQuery/OpenCascade, mirrored across detected symmetry plane, then voxelized locally.",
+  "hashes": {
+    "full_stl_sha256": "0baf6a853fca7c520e021443af41a5e0b76b1704d75f5d58547b93e63549643b",
+    "half_stl_sha256": "41c8ec5ef8d14118edd56af05300caca091af7448b410d66eb65bd29da78536b",
+    "step_sha256": "6ed94d2ffdd3310a166f90f61664917713ee51da0316397a806ebbb37c993813",
+    "voxel_sha256": "48fd76897f6aeb16c2c7804a29bddaabe338ce30f0c7a8bfdeef7d091e815441",
+    "zip_sha256": "416c6fab3a3ffecae490e158d4916347492a5506fa64216608a32a1cf7709fa2"
+  },
+  "mirror_info": {
+    "full_bounds": [
+      [
+        2349.5,
+        -29461.34765625,
+        481.141845703125
+      ],
+      [
+        66698.7578125,
+        29461.34765625,
+        18497.748046875
+      ]
+    ],
+    "full_faces": 7996,
+    "full_is_watertight": false,
+    "full_vertices": 4066,
+    "half_bounds": [
+      [
+        2349.5,
+        -0.000390176719520241,
+        481.141845703125
+      ],
+      [
+        66698.7578125,
+        29461.34765625,
+        18497.748046875
+      ]
+    ],
+    "half_extents": [
+      64349.2578125,
+      29461.34804642672,
+      18016.606201171875
+    ],
+    "half_faces": 3998,
+    "half_is_watertight": false,
+    "half_vertices": 2033,
+    "mirror_axis_index": 1,
+    "mirror_axis_label": "y"
+  },
+  "paths": {
+    "analysis_report_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\reports\\crm_hl_reference_ldg.json",
+    "full_stl_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\stl_full\\crm_hl_reference_ldg_full.stl",
+    "half_stl_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\stl_half\\crm_hl_reference_ldg.stl",
+    "step_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\step\\crm_hl_reference_ldg\\CRM-HL_Reference_LDG_20230224.stp",
+    "voxel_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\voxels\\crm_hl_reference_ldg_full.npy",
+    "zip_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\raw\\CRM-HL_Reference_LDG_20230224.stp.zip"
+  },
+  "preprocessing_version": "nasa-crm-whole-aircraft-context-v1",
+  "reference_page": "https://commonresearchmodel.larc.nasa.gov/high-lift-crm/high-lift-crm-geometry/reference-geometry/",
+  "source_id": "crm_hl_reference_ldg",
+  "source_page": "https://commonresearchmodel.larc.nasa.gov/high-lift-crm/high-lift-crm-geometry/assembled-geometry/",
+  "units": "mm_inferred_from_geometry_scale",
+  "usage_terms": "Publicly downloadable NASA CRM geometry. File-level license not stated on the CRM page; usage bounded to NASA public data-use policy context and research/reference validation.",
+  "zip_url": "https://commonresearchmodel.larc.nasa.gov/wp-content/uploads/sites/7/2023/02/CRM-HL_Reference_LDG_20230224.stp.zip"
+}

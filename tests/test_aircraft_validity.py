@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 import tempfile
+from pathlib import Path
 
 import torch
 import numpy as np
@@ -11,6 +12,7 @@ CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
 if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
+from aircraft_diffusion_cfd import AircraftDesignDataset
 from aircraft_validity import evaluate_aircraft_validity, evaluate_aircraft_validity_batch
 
 
@@ -40,7 +42,7 @@ class TestAircraftValidity(unittest.TestCase):
         report = evaluate_aircraft_validity(voxels)
 
         self.assertEqual(report["status"], "fail")
-        self.assertIn("symmetry", report["failed_checks"])
+        self.assertIn("nonempty_occupancy", report["failed_checks"])
         self.assertIn("span_sanity", report["failed_checks"])
         self.assertIn("wing_body_balance", report["failed_checks"])
 
@@ -59,6 +61,17 @@ class TestAircraftValidity(unittest.TestCase):
         self.assertEqual(report["sample_count"], 2)
         self.assertEqual(report["passed_sample_count"], 1)
         self.assertEqual(report["failed_sample_indices"], [1])
+
+    def test_bundled_aircraft_stls_pass_first_pass_checks(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        dataset = AircraftDesignDataset(num_samples=0, grid_size=32)
+
+        for stl_name in ("F-18_Hornet.stl", "biplane.stl"):
+            with self.subTest(stl_name=stl_name):
+                voxels = dataset._voxelize_stl(str(repo_root / stl_name), 32)
+                report = evaluate_aircraft_validity(voxels)
+                self.assertEqual(report["status"], "pass")
+                self.assertEqual(report["failed_checks"], [])
 
 
 if __name__ == "__main__":

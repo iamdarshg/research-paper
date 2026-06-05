@@ -1,0 +1,71 @@
+{
+  "cases": {
+    "crm_hl_reference_ldg": {
+      "configuration": "landing",
+      "grid_ladder": [
+        {
+          "drag_coefficient": 51.421294956045344,
+          "grid_size": 24,
+          "lift_coefficient": -8.061986706672112,
+          "occupancy_ratio": 0.018156828358769417,
+          "steps": 15,
+          "symmetry_score": 0.7370517928286853
+        },
+        {
+          "drag_coefficient": 36.49421747441606,
+          "grid_size": 32,
+          "lift_coefficient": -7.788038150016649,
+          "occupancy_ratio": 0.012786865234375,
+          "steps": 20,
+          "symmetry_score": 0.766109785202864
+        },
+        {
+          "drag_coefficient": 22.95042640944064,
+          "grid_size": 40,
+          "lift_coefficient": -7.976036596435334,
+          "occupancy_ratio": 0.010031250305473804,
+          "steps": 25,
+          "symmetry_score": 0.7320872274143302
+        }
+      ],
+      "source_page": "https://commonresearchmodel.larc.nasa.gov/high-lift-crm/high-lift-crm-geometry/assembled-geometry/"
+    },
+    "crm_hs_dpw6_cf": {
+      "configuration": "cruise_clean",
+      "grid_ladder": [
+        {
+          "drag_coefficient": 50.597485346596194,
+          "grid_size": 24,
+          "lift_coefficient": -12.979407304449635,
+          "occupancy_ratio": 0.016131365671753883,
+          "steps": 15,
+          "symmetry_score": 0.452914798206278
+        },
+        {
+          "drag_coefficient": 38.069910436520495,
+          "grid_size": 32,
+          "lift_coefficient": -6.6121498898357665,
+          "occupancy_ratio": 0.01068115234375,
+          "steps": 20,
+          "symmetry_score": 0.7371428571428571
+        },
+        {
+          "drag_coefficient": 27.313381756953397,
+          "grid_size": 40,
+          "lift_coefficient": -6.3081770988331805,
+          "occupancy_ratio": 0.008984374813735485,
+          "steps": 25,
+          "symmetry_score": 0.7669565217391304
+        }
+      ],
+      "source_page": "https://commonresearchmodel.larc.nasa.gov/geometry/dpw6-geometries/"
+    }
+  },
+  "claim_boundary": "Internal-solver consistency study only. It checks grid/step sensitivity for representative public whole-aircraft geometries and does not establish external coefficient agreement.",
+  "generated": "2026-06-05",
+  "source_context": {
+    "crm_hl_assembled_page": "https://commonresearchmodel.larc.nasa.gov/high-lift-crm/high-lift-crm-geometry/assembled-geometry/",
+    "crm_hs_dpw6_page": "https://commonresearchmodel.larc.nasa.gov/geometry/dpw6-geometries/"
+  },
+  "study": "nasa_crm_whole_aircraft_grid_refinement"
+}

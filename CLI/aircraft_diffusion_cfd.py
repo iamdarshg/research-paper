@@ -24,6 +24,7 @@ import tempfile
 import threading
 import multiprocessing as mp
 import random
+import math
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict, fields
@@ -83,6 +84,32 @@ def _configure_console_output() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def resolve_grounded_grid_size(
+    requested_grid_size: Optional[int],
+    *,
+    detected_grid_size: Optional[int] = None,
+    solver: Optional[str] = None,
+    source_label: Optional[str] = None,
+) -> int:
+    if requested_grid_size is not None:
+        requested = int(requested_grid_size)
+    elif solver == "D3Q27":
+        requested = 16
+    else:
+        requested = 32
+
+    if detected_grid_size is None:
+        return requested
+
+    detected = int(detected_grid_size)
+    if requested_grid_size is not None and requested != detected:
+        raise ValueError(
+            f"Requested grid size {requested} conflicts with {source_label or 'grounded dataset'} "
+            f"native grid size {detected}. Use the grounded grid size end to end."
+        )
+    return detected
 
 OPENFOAM_ROOT = Path(os.environ.get("OPENFOAM_ROOT", "/home/darsh/.openclaw/openfoam/usr/share/openfoam"))
 OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
@@ -152,6 +179,10 @@ class TrainingConfig:
     save_interval: int = 5
     val_interval: int = 2
     geometry_reconstruction_weight: float = 1.0
+    consistency_interval: int = 20
+    aerodynamic_interval: int = 10
+    min_consistency_evals_per_epoch: int = 2
+    min_aerodynamic_evals_per_epoch: int = 2
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
@@ -2340,6 +2371,7 @@ class OptimizedDiffusionTrainer:
 
     def validate_epoch(self, val_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Validate for one epoch with the high-fidelity D3Q27 solver"""
+        self._assert_runtime_grid_alignment(grid_size)
         self.diffusion_model.eval()
         self.converter.eval()
 
@@ -2381,6 +2413,7 @@ class OptimizedDiffusionTrainer:
 
     def train_epoch(self, train_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Train for one epoch with all optimizations"""
+        self._assert_runtime_grid_alignment(grid_size)
         self.diffusion_model.train()
         self.converter.train()
         self.consistency_model.student_model.train()
@@ -2391,6 +2424,19 @@ class OptimizedDiffusionTrainer:
         total_consistency = 0.0
         total_connectivity = 0.0
         total_aero = 0.0
+        num_batches = max(1, len(train_loader))
+        consistency_interval = self._resolve_epoch_interval(
+            num_batches,
+            desired_interval=self.training_config.consistency_interval,
+            min_evals=self.training_config.min_consistency_evals_per_epoch,
+        )
+        aerodynamic_interval = self._resolve_epoch_interval(
+            num_batches,
+            desired_interval=self.training_config.aerodynamic_interval,
+            min_evals=self.training_config.min_aerodynamic_evals_per_epoch,
+        )
+        consistency_evals = 0
+        aerodynamic_evals = 0
         
         pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
         
@@ -2414,8 +2460,9 @@ class OptimizedDiffusionTrainer:
 
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
-            if batch_idx % 20 == 0:  # Every 20 batches
+            if batch_idx % consistency_interval == 0:
                 consistency_loss = self._compute_consistency_loss(latent, condition=condition)
+                consistency_evals += 1
 
             # Random timestep for diffusion training
             t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device)
@@ -2442,8 +2489,9 @@ class OptimizedDiffusionTrainer:
 
             # CFD-based aerodynamic loss (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
-            if batch_idx % 10 == 0:
+            if batch_idx % aerodynamic_interval == 0:
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
+                aerodynamic_evals += 1
 
             # Combined loss
             total_loss_val = (
@@ -2489,7 +2537,7 @@ class OptimizedDiffusionTrainer:
             self.global_step += 1
             
             # Clear memory
-            if batch_idx % 10 == 0:
+            if batch_idx % aerodynamic_interval == 0:
                 torch.cuda.empty_cache()
         
         avg_loss = total_loss / len(train_loader)
@@ -2508,8 +2556,30 @@ class OptimizedDiffusionTrainer:
             'geometry_reconstruction': total_geometry / len(train_loader),
             'consistency': total_consistency / len(train_loader),
             'connectivity': total_connectivity / len(train_loader),
-            'aerodynamic': total_aero / len(train_loader)
+            'aerodynamic': total_aero / len(train_loader),
+            'consistency_batches': float(consistency_evals),
+            'aerodynamic_batches': float(aerodynamic_evals),
+            'effective_consistency_interval': float(consistency_interval),
+            'effective_aerodynamic_interval': float(aerodynamic_interval),
         }
+
+    @staticmethod
+    def _resolve_epoch_interval(num_batches: int, *, desired_interval: int, min_evals: int) -> int:
+        desired_interval = max(1, int(desired_interval))
+        min_evals = max(1, int(min_evals))
+        num_batches = max(1, int(num_batches))
+        coverage_interval = math.ceil(num_batches / min_evals)
+        return max(1, min(desired_interval, coverage_interval))
+
+    def _assert_runtime_grid_alignment(self, grid_size: int) -> None:
+        runtime_grid = int(grid_size)
+        configured_model_grid = int(self.model_config.grid_resolution)
+        configured_cfd_grid = int(self.cfd_config.base_grid_resolution)
+        if runtime_grid != configured_model_grid or runtime_grid != configured_cfd_grid:
+            raise ValueError(
+                "Runtime grid size must match both model and CFD resolutions for grounded training. "
+                f"Got runtime={runtime_grid}, model={configured_model_grid}, cfd={configured_cfd_grid}."
+            )
     
     def _compute_consistency_loss(
         self,
@@ -3273,6 +3343,29 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     # Create directories
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
+    requested_resolution = resolve_grounded_grid_size(
+        grid_size,
+        detected_grid_size=None,
+        solver=solver,
+    )
+
+    # Dataset
+    dataset = AircraftDesignDataset(
+        num_samples=num_samples,
+        grid_size=requested_resolution,
+        latent_dim=model_config_override.latent_dim if model_config_override else latent_dim,
+        artifact_path=dataset_artifact,
+        manifest_path=dataset_manifest,
+    )
+    base_resolution = resolve_grounded_grid_size(
+        grid_size,
+        detected_grid_size=dataset.grid_size if dataset_manifest else None,
+        solver=solver,
+        source_label=dataset_manifest,
+    )
+    if dataset_manifest:
+        print(f"Using grounded manifest lattice resolution: {base_resolution}^3")
+
     # Optimized configs
     model_config = model_config_override if model_config_override else ModelConfig(
         latent_dim=latent_dim,
@@ -3280,7 +3373,13 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         enable_gradient_checkpointing=enable_checkpointing,
         use_torch_compile=enable_compile  # Respect the enable-compile flag
     )
-    if model_config_override is None and model_config.conditioning_dim == 0:
+    if model_config_override is not None:
+        checkpoint_grid = int(model_config_override.grid_resolution)
+        if checkpoint_grid != base_resolution:
+            raise ValueError(
+                f"Checkpoint grid resolution {checkpoint_grid} conflicts with grounded training grid {base_resolution}."
+            )
+    if model_config.conditioning_dim == 0:
         model_config.conditioning_dim = infer_conditioning_dim()
     
     diffusion_config = DiffusionConfig(
@@ -3296,14 +3395,6 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         precision=precision,
         enable_pipeline_parallelism=enable_pipeline
     )
-    
-    # Determine correct grid resolution based on solver type
-    if grid_size is not None:
-        base_resolution = int(grid_size)
-    elif solver == "D3Q27":
-        base_resolution = 16  # Use smaller grid for D3Q27 due to memory
-    else:
-        base_resolution = 32  # Standard resolution
 
     cfd_config = CFDConfig(
         base_grid_resolution=base_resolution,  # Match the grid resolution used
@@ -3315,14 +3406,6 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     model_config.base_grid_resolution = base_resolution
     model_config.grid_resolution = base_resolution
 
-    # Dataset
-    dataset = AircraftDesignDataset(
-        num_samples=num_samples,
-        grid_size=base_resolution,
-        latent_dim=model_config.latent_dim,
-        artifact_path=dataset_artifact,
-        manifest_path=dataset_manifest,
-    )
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
