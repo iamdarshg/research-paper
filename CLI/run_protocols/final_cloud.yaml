@@ -49,6 +49,15 @@ manufacturing_constraints:
   manifest: ../../docs/dataset/grounded_aircraft_manifest.jsonl
   output: ../../build/protocol_final/manufacturing_constraints.json
 
+prepare_aircraft_validity_inputs:
+  enabled: true
+  output_dir: ../../build/protocol_final/generated_voxels
+  metadata: ../../build/protocol_final/generated_voxels_metadata.json
+  num_samples: 20
+  grid_size: 32
+  seed_start: 0
+  max_attempts: 64
+
 aircraft_validity:
   enabled: true
   input_dir: ../../build/protocol_final/generated_voxels

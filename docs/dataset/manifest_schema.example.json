@@ -1,0 +1,71 @@
+{
+  "schema_name": "grounded_aircraft_manifest_record",
+  "schema_version": 1,
+  "validation_levels": ["basic", "claim-bearing"],
+  "required_record_fields": [
+    "geometry_path_or_stl_path",
+    "split",
+    "source_id",
+    "geometry_provenance",
+    "preprocessing_version",
+    "units",
+    "design_family",
+    "design_spec"
+  ],
+  "allowed_splits": ["holdout", "test", "train", "val", "validation"],
+  "required_design_spec_fields": [
+    "target_speed_mps",
+    "wingspan_limit_m",
+    "thrust_to_weight_min",
+    "turn_rate_min_deg_s",
+    "required_static_thrust_n",
+    "engine_diameter_mm",
+    "engine_length_mm",
+    "engine_count_min",
+    "engine_count_max",
+    "payload_mass_min_g",
+    "payload_mass_max_g",
+    "takeoff_distance_min_m",
+    "takeoff_distance_max_m",
+    "wall_thickness_min_mm",
+    "wall_thickness_max_mm",
+    "part_count_min",
+    "part_count_max",
+    "manufacturing_method"
+  ],
+  "optional_response_metrics_for_condition_benchmark": [
+    "payload_response",
+    "thrust_response",
+    "maneuverability_response",
+    "structural_response"
+  ],
+  "example_record": {
+    "geometry_path": "relative/path/to/aircraft_voxels.npy",
+    "split": "train",
+    "source_id": "source-design-001",
+    "geometry_provenance": "curated-aircraft-like-corpus-v1",
+    "preprocessing_version": "voxelizer-v1",
+    "units": "m",
+    "design_family": "uav",
+    "design_spec": {
+      "target_speed_mps": 42.0,
+      "wingspan_limit_m": 1.8,
+      "thrust_to_weight_min": 0.42,
+      "turn_rate_min_deg_s": 16.0,
+      "required_static_thrust_n": 160.0,
+      "engine_diameter_mm": 120,
+      "engine_length_mm": 240,
+      "engine_count_min": 1,
+      "engine_count_max": 1,
+      "payload_mass_min_g": 400,
+      "payload_mass_max_g": 900,
+      "takeoff_distance_min_m": 90,
+      "takeoff_distance_max_m": 180,
+      "wall_thickness_min_mm": 1,
+      "wall_thickness_max_mm": 2,
+      "part_count_min": 1,
+      "part_count_max": 6,
+      "manufacturing_method": "sheet_balsa_tabbed"
+    }
+  }
+}

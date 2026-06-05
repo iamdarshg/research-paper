@@ -1,0 +1,104 @@
+tensor_dtype: float32
+scalar_features:
+  - name: target_speed_mps
+    default: 50.0
+    units: m/s
+    description: Cruise target carried through the current DesignSpec path.
+  - name: wingspan_limit_m
+    default: 1.8
+    units: m
+    description: Maximum allowable span for packaging and launch constraints.
+  - name: thrust_to_weight_min
+    default: 0.45
+    units: ratio
+    description: Minimum installed thrust-to-weight ratio required by the mission profile.
+  - name: turn_rate_min_deg_s
+    default: 18.0
+    units: deg/s
+    description: Minimum sustained turn-rate target used as a maneuverability proxy.
+  - name: required_static_thrust_n
+    default: 180.0
+    units: N
+    description: Required installed static thrust for the propulsion system.
+  - name: engine_diameter_mm
+    default: 140
+    units: mm
+    description: Nominal engine or nacelle diameter envelope.
+  - name: engine_length_mm
+    default: 260
+    units: mm
+    description: Nominal engine or nacelle length envelope.
+  - name: engine_count_min
+    default: 1
+    units: count
+    description: Minimum engine count allowed by the mission and packaging constraints.
+  - name: engine_count_max
+    default: 2
+    units: count
+    description: Maximum engine count allowed by the mission and packaging constraints.
+  - name: payload_mass_min_g
+    default: 500
+    units: g
+    description: Lower payload mass bound for the requested design envelope.
+  - name: payload_mass_max_g
+    default: 2000
+    units: g
+    description: Upper payload mass bound for the requested design envelope.
+  - name: takeoff_distance_min_m
+    default: 120
+    units: m
+    description: Lower takeoff distance bound for the operating envelope.
+  - name: takeoff_distance_max_m
+    default: 250
+    units: m
+    description: Upper takeoff distance bound for the operating envelope.
+  - name: wall_thickness_min_mm
+    default: 1
+    units: mm
+    description: Minimum manufacturable wall thickness for the requested process.
+  - name: wall_thickness_max_mm
+    default: 2
+    units: mm
+    description: Maximum wall thickness budget before mass penalties dominate.
+  - name: part_count_min
+    default: 1
+    units: count
+    description: Minimum allowed part count after decomposition.
+  - name: part_count_max
+    default: 8
+    units: count
+    description: Maximum allowed part count after decomposition.
+categorical_features:
+  manufacturing_method:
+    default: fdm_pla_0p4mm
+    description: Explicit manufacturing route rather than a coarse category.
+    categories:
+      - foam_core_hotwire
+      - fdm_pla_0p4mm
+      - fdm_pla_0p6mm
+      - sheet_balsa_tabbed
+      - composite_wet_layup
+vector_layout:
+  - target_speed_mps
+  - wingspan_limit_m
+  - thrust_to_weight_min
+  - turn_rate_min_deg_s
+  - required_static_thrust_n
+  - engine_diameter_mm
+  - engine_length_mm
+  - engine_count_min
+  - engine_count_max
+  - payload_mass_min_g
+  - payload_mass_max_g
+  - takeoff_distance_min_m
+  - takeoff_distance_max_m
+  - wall_thickness_min_mm
+  - wall_thickness_max_mm
+  - part_count_min
+  - part_count_max
+  - manufacturing_method__foam_core_hotwire
+  - manufacturing_method__fdm_pla_0p4mm
+  - manufacturing_method__fdm_pla_0p6mm
+  - manufacturing_method__sheet_balsa_tabbed
+  - manufacturing_method__composite_wet_layup
+vector_dim: 22
