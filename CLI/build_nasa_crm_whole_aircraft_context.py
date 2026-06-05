@@ -14,12 +14,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-import cadquery as cq
 import numpy as np
-import requests
 import torch
 import trimesh
-from cadquery import exporters
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +26,19 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from aircraft_diffusion_cfd import AircraftDesignDataset, CFDConfig, AdvancedCFDSimulator
 from aircraft_validity import evaluate_aircraft_validity
 from condition_feasibility import MIN_WALL_BY_METHOD_MM, validate_condition_feasibility
+
+
+def _requests_module():
+    import requests
+
+    return requests
+
+
+def _cadquery_modules():
+    import cadquery as cq
+    from cadquery import exporters
+
+    return cq, exporters
 
 
 ACCESS_DATE = str(date.today())
@@ -171,7 +181,7 @@ def load_existing_manifest_records(path: Path) -> Dict[str, Dict[str, Any]]:
 
 def download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    response = requests.get(url, timeout=(30, 300))
+    response = _requests_module().get(url, timeout=(30, 300))
     response.raise_for_status()
     destination.write_bytes(response.content)
 
@@ -197,6 +207,7 @@ def extract_step(zip_path: Path, destination_dir: Path, member: str | None) -> P
 
 
 def export_step_to_stl(step_path: Path, stl_path: Path) -> None:
+    cq, exporters = _cadquery_modules()
     shape = cq.importers.importStep(str(step_path))
     stl_path.parent.mkdir(parents=True, exist_ok=True)
     exporters.export(shape, str(stl_path), tolerance=0.5, angularTolerance=0.8)
@@ -877,7 +888,7 @@ def main() -> int:
             "torch": getattr(torch, "__version__", ""),
             "numpy": getattr(np, "__version__", ""),
             "trimesh": getattr(trimesh, "__version__", ""),
-            "cadquery": getattr(cq, "__version__", ""),
+            "cadquery": getattr(_cadquery_modules()[0], "__version__", ""),
         },
         "source_catalog": {
             "catalog_path": str(source_catalog_path),
