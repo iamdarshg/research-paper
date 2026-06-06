@@ -2317,6 +2317,19 @@ class AerodynamicLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
+    @staticmethod
+    def _select_loss_drag_coefficient(cfd_results: Dict[str, Any]) -> float:
+        candidate = cfd_results.get("training_drag_coefficient")
+        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
+            return float(candidate)
+        candidate = cfd_results.get("calibrated_drag_coefficient")
+        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
+            return float(candidate)
+        candidate = cfd_results.get("drag_coefficient", 0.1)
+        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
+            return float(candidate)
+        return 0.1
+
     def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec, cfd_simulator: "AdvancedCFDSimulator") -> torch.Tensor:
         """
         Compute aerodynamic loss balancing drag, lift, and volume using advanced CFD.
@@ -2336,8 +2349,9 @@ class AerodynamicLoss(nn.Module):
             volume = geometry.sum() / np.prod(geometry.shape)
             volume_loss = design_spec.space_weight * volume
 
-            # Drag coefficient penalty (drag weight)
-            cd = cfd_results.get('drag_coefficient', 0.1)
+            # Use the calibrated training coefficient on unstable coarse-grid runs,
+            # while preserving the raw coefficient separately for diagnostics.
+            cd = self._select_loss_drag_coefficient(cfd_results)
             drag_loss = design_spec.drag_weight * cd
 
             # Lift coefficient encouragement (lift weight)

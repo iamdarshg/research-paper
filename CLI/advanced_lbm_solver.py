@@ -847,6 +847,12 @@ class D3Q27CascadedSolver:
 
         drag_coefficient = float(coeffs['drag_coefficient'])
         lift_coefficient = float(coeffs['lift_coefficient'])
+        calibrated_drag_coefficient = float(drag_coefficient_surrogate)
+        training_drag_coefficient = calibrated_drag_coefficient
+        training_drag_source = 'lbm_calibrated'
+        if lbm_converged and np.isfinite(drag_coefficient) and drag_coefficient > 0.0:
+            training_drag_coefficient = drag_coefficient
+            training_drag_source = 'lbm_raw'
         lift_to_drag = float(lift_coefficient / max(abs(drag_coefficient), 1e-12))
         solver_quality_checks = {
             'finite_coefficients': bool(np.isfinite(drag_coefficient) and np.isfinite(lift_coefficient)),
@@ -875,6 +881,9 @@ class D3Q27CascadedSolver:
             'raw_force_x': float(projected_drag.item() if isinstance(projected_drag, torch.Tensor) else projected_drag),
             'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
             'drag_coefficient': drag_coefficient,
+            'calibrated_drag_coefficient': calibrated_drag_coefficient,
+            'training_drag_coefficient': training_drag_coefficient,
+            'training_drag_source': training_drag_source,
             'lift_coefficient': lift_coefficient,
             'lift_to_drag': lift_to_drag,
             'net_momentum_exchange_force_x': float(physical_net_drag_force.item() if isinstance(physical_net_drag_force, torch.Tensor) else physical_net_drag_force),
