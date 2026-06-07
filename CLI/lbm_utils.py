@@ -105,6 +105,15 @@ def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref
     }
 
 
+def d3q27_lattice_freestream_velocity_from_mach(mach_number: float) -> float:
+    """Return the lattice freestream velocity matching a physical Mach number.
+
+    For D3Q27, the lattice sound speed is c_s = 1/sqrt(3), so
+    u_lattice = Ma * c_s = Ma / sqrt(3).
+    """
+    return float(mach_number) / math.sqrt(3.0)
+
+
 class D3Q27Lattice:
     """D3Q27 velocity vectors and weights"""
 

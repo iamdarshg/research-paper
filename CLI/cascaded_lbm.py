@@ -5,7 +5,7 @@ from lbm_utils import (
     D3Q27Lattice,
     _compute_force_coefficients,
     build_lbm_compressibility_metadata,
-    mach_to_lattice_velocity,
+    d3q27_lattice_freestream_velocity_from_mach,
 )
 
 
@@ -16,14 +16,17 @@ def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: floa
     Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
     This results in force_scale = rho_phys * dx^2 * (343.0 * sqrt(3))^2.
 
-    The D3Q27 momentum exchange sum corresponds to Delta p / Delta t in lattice units.
-    We apply the c_s^2 = 1/3 factor to align with the physical dynamic pressure definition.
+    The extracted wall sum is treated as a perturbational lattice momentum flux
+    acting on the body. Multiplying by the lattice freestream speed restores
+    force ~ U^2 at fixed Reynolds number, and dt = dx / (343.0 * sqrt(3))
+    supplies the remaining physical-unit scale rho_phys * dx^2 * c^2.
     """
     dx = float(grid_spacing)
     # velocity_ratio = sound_speed_phys / sound_speed_lattice = 343.0 * sqrt(3)
     velocity_ratio = 343.0 * (3.0**0.5)
     force_scale = float(density) * (dx**2) * (velocity_ratio**2)
-    return (1.0 / 3.0) * force * force_scale
+    lattice_freestream_speed = abs(float(mach_number)) / (3.0**0.5)
+    return lattice_freestream_speed * force * force_scale
 
 
 class CascadedLBM:
@@ -172,7 +175,7 @@ class D3Q27CascadedSolver:
 
         # Use the lattice-consistent freestream speed for the Mach number.
         # For D3Q27, c_s = 1/sqrt(3), so u = Ma * c_s.
-        self.inlet_velocity_lu = mach_to_lattice_velocity(self.config.mach_number)
+        self.inlet_velocity_lu = d3q27_lattice_freestream_velocity_from_mach(self.config.mach_number)
         u_lattice = self.inlet_velocity_lu
         L_lattice = self.resolution
 
@@ -205,7 +208,11 @@ class D3Q27CascadedSolver:
     def _initialize_equilibrium(self):
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
-        u_lattice = getattr(self, "inlet_velocity_lu", mach_to_lattice_velocity(self.config.mach_number))
+        u_lattice = getattr(
+            self,
+            "inlet_velocity_lu",
+            d3q27_lattice_freestream_velocity_from_mach(self.config.mach_number),
+        )
         ux = u_lattice  # Lattice-consistent freestream speed.
         uy, uz = 0.0, 0.0
 
@@ -310,7 +317,11 @@ class D3Q27CascadedSolver:
             self.f = CascadedLBM.moments_to_populations(K_post, self.moment_matrix_inv)
 
             # === 4. Streaming ===
-            u_lattice = getattr(self, "inlet_velocity_lu", mach_to_lattice_velocity(self.config.mach_number))
+            u_lattice = getattr(
+                self,
+                "inlet_velocity_lu",
+                d3q27_lattice_freestream_velocity_from_mach(self.config.mach_number),
+            )
             u_sq = u_lattice * u_lattice
             for i in range(27):
                 dx = int(self.ex[i].item())
@@ -367,8 +378,12 @@ class D3Q27CascadedSolver:
                 boundary_link = (~mask) & neighbor_is_solid
                 if not torch.any(boundary_link):
                     continue
-                step_force_x += torch.sum(2.0 * self.ex[i] * self.f_pre_stream[i][boundary_link])
-                step_force_z += torch.sum(2.0 * self.ez[i] * self.f_pre_stream[i][boundary_link])
+                step_force_x += torch.sum(
+                    self.ex[i] * (self.f_pre_stream[i][boundary_link] + self.f_temp[opp_i][boundary_link])
+                )
+                step_force_z += torch.sum(
+                    self.ez[i] * (self.f_pre_stream[i][boundary_link] + self.f_temp[opp_i][boundary_link])
+                )
 
             self.force_x_last = step_force_x
             self.force_z_last = step_force_z
@@ -447,7 +462,11 @@ class D3Q27CascadedSolver:
         lbm_converged = bool(self.force_samples > 0 and not torch.isnan(self.f).any())
         compressibility_metadata = build_lbm_compressibility_metadata(
             mach_number=self.config.mach_number,
-            u_lattice=getattr(self, "inlet_velocity_lu", mach_to_lattice_velocity(self.config.mach_number)),
+            u_lattice=getattr(
+                self,
+                "inlet_velocity_lu",
+                d3q27_lattice_freestream_velocity_from_mach(self.config.mach_number),
+            ),
             lbm_converged=lbm_converged,
             force_stability=force_stability,
         )

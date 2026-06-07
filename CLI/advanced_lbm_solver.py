@@ -24,18 +24,22 @@ except Exception:  # pragma: no cover - optional acceleration path
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
     """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
 
-    Standard LBM force scaling: F_phys = rho_phys * (dx^4 / dt^2) * F_lattice.
-    Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
-    This results in force_scale = rho_phys * dx^2 * (343.0 * sqrt(3))^2.
+    The extracted wall sum is a perturbational lattice momentum flux acting on the
+    fluid. Converting it to the body-force convention used by the CFD outputs
+    requires:
 
-    The D3Q27 momentum exchange sum corresponds to Delta p / Delta t in lattice units.
-    We apply the c_s^2 = 1/3 factor to align with the physical dynamic pressure definition.
+    1. multiplying by the lattice freestream speed to recover the missing O(U)
+       factor needed for force ~ U^2 at fixed Reynolds number.
+
+    Using dt = dx / (343.0 * sqrt(3)) gives the remaining force scale
+    rho_phys * dx^2 * (343.0 * sqrt(3))^2.
     """
     dx = float(grid_spacing)
     # velocity_ratio = sound_speed_phys / sound_speed_lattice = 343.0 * sqrt(3)
     velocity_ratio = 343.0 * np.sqrt(3.0)
     force_scale = float(density) * (dx**2) * (velocity_ratio**2)
-    return (1.0 / 3.0) * force * force_scale
+    lattice_freestream_speed = abs(float(mach_number)) / np.sqrt(3.0)
+    return lattice_freestream_speed * force * force_scale
 
 
 class D3Q27Solver:
@@ -198,18 +202,11 @@ class D3Q27Solver:
             if not torch.any(active):
                 continue
 
-            qi = q[i][active]
-
-            # Momentum exchange for BFL:
-            # The simple BB exchange is 2 * fi_in.
-            # For BFL, we use the interpolated population that actually hits the wall.
-            # Weighting factor 4/(1+2q) ensures consistency with bounce-back (2*fi) at q=0.5.
-            # Simplified version: Use q to scale the momentum transfer.
-            bfl_factor = 4.0 / (1.0 + 2.0 * qi)
-
             f_in = self.f_pre_stream[i][active]
-            step_force_x += torch.sum(bfl_factor * self.ex[i] * f_in)
-            step_force_z += torch.sum(bfl_factor * self.ez[i] * f_in)
+            opp_i = self._opposite_list[i]
+            f_out = self.f_temp[opp_i][active]
+            step_force_x += torch.sum(self.ex[i] * (f_in + f_out))
+            step_force_z += torch.sum(self.ez[i] * (f_in + f_out))
 
         return step_force_x, step_force_z
 
