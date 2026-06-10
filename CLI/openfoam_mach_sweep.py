@@ -13,6 +13,7 @@ import json
 import math
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -345,7 +346,18 @@ def run_case(args: argparse.Namespace, mach: float, mesh, domain_min, domain_max
     failed = False
     for name, command, required in stages:
         started = time.perf_counter()
-        proc = run_openfoam_wsl(wsl_case, command, distro=args.distro, timeout=args.timeout)
+        try:
+            proc = run_openfoam_wsl(wsl_case, command, distro=args.distro, timeout=args.timeout)
+        except subprocess.TimeoutExpired as exc:
+            commands[name] = {
+                "returncode": "timeout",
+                "seconds": time.perf_counter() - started,
+                "stdout_tail": (exc.stdout or "")[-1000:] if isinstance(exc.stdout, str) else "",
+                "stderr_tail": (exc.stderr or "")[-1000:] if isinstance(exc.stderr, str) else "",
+                "timeout_seconds": args.timeout,
+            }
+            failed = True
+            break
         commands[name] = {
             "returncode": proc.returncode,
             "seconds": time.perf_counter() - started,
@@ -355,7 +367,10 @@ def run_case(args: argparse.Namespace, mach: float, mesh, domain_min, domain_max
         if proc.returncode != 0 and required:
             failed = True
             break
-    copy_wsl_dir_to_windows(wsl_case, case, distro=args.distro)
+    try:
+        copy_wsl_dir_to_windows(wsl_case, case, distro=args.distro)
+    except Exception as exc:
+        commands["copy_back"] = {"returncode": 1, "error": repr(exc)}
 
     force = None
     if not failed:
