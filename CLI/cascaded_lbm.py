@@ -1,15 +1,29 @@
 import torch
 from typing import Dict
 
-from lbm_utils import D3Q27Lattice, _compute_force_coefficients
+from lbm_utils import (
+    D3Q27Lattice,
+    _compute_force_coefficients,
+    build_lbm_compressibility_metadata,
+    mach_to_lattice_velocity,
+)
 
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
-    """Convert raw lattice momentum exchange into a physical force scale."""
-    freestream_speed = float(mach_number) * 343.0
-    # Use consistent analytic scaling with dynamic pressure factor 0.5
-    force_scale = 0.5 * float(density) * freestream_speed * freestream_speed * float(grid_spacing) * float(grid_spacing)
-    return force * force_scale
+    """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
+
+    Standard LBM force scaling: F_phys = rho_phys * (dx^4 / dt^2) * F_lattice.
+    Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
+    This results in force_scale = rho_phys * dx^2 * (343.0 * sqrt(3))^2.
+
+    The D3Q27 momentum exchange sum corresponds to Delta p / Delta t in lattice units.
+    We apply the c_s^2 = 1/3 factor to align with the physical dynamic pressure definition.
+    """
+    dx = float(grid_spacing)
+    # velocity_ratio = sound_speed_phys / sound_speed_lattice = 343.0 * sqrt(3)
+    velocity_ratio = 343.0 * (3.0**0.5)
+    force_scale = float(density) * (dx**2) * (velocity_ratio**2)
+    return (1.0 / 3.0) * force * force_scale
 
 
 class CascadedLBM:
@@ -157,8 +171,9 @@ class D3Q27CascadedSolver:
         self.cs2 = 1.0 / 3.0
 
         # Use the lattice-consistent freestream speed for the Mach number.
-        # For D3Q27, c_s = 1/3, so u = Ma * c_s.
-        u_lattice = self.config.mach_number / 3.0
+        # For D3Q27, c_s = 1/sqrt(3), so u = Ma * c_s.
+        self.inlet_velocity_lu = mach_to_lattice_velocity(self.config.mach_number)
+        u_lattice = self.inlet_velocity_lu
         L_lattice = self.resolution
 
         # Force reasonable Reynolds number for this grid
@@ -190,7 +205,7 @@ class D3Q27CascadedSolver:
     def _initialize_equilibrium(self):
         """Initialize with D3Q27 equilibrium"""
         rho = 1.0
-        u_lattice = self.config.mach_number / 3.0
+        u_lattice = getattr(self, "inlet_velocity_lu", mach_to_lattice_velocity(self.config.mach_number))
         ux = u_lattice  # Lattice-consistent freestream speed.
         uy, uz = 0.0, 0.0
 
@@ -295,7 +310,7 @@ class D3Q27CascadedSolver:
             self.f = CascadedLBM.moments_to_populations(K_post, self.moment_matrix_inv)
 
             # === 4. Streaming ===
-            u_lattice = self.config.mach_number * 0.10
+            u_lattice = getattr(self, "inlet_velocity_lu", mach_to_lattice_velocity(self.config.mach_number))
             u_sq = u_lattice * u_lattice
             for i in range(27):
                 dx = int(self.ex[i].item())
@@ -424,10 +439,25 @@ class D3Q27CascadedSolver:
         rho = torch.sum(self.f, dim=0)
         vorticity_mag = torch.sqrt(torch.sum(self.vorticity**2, dim=0)) if hasattr(self.vorticity, 'shape') else torch.zeros_like(rho)
         v_inf = coeffs['freestream_speed']
+        force_stability = None
+        if self.force_samples > 20:
+            avg_fx = float(self.force_x_accum.item()) / self.force_samples
+            last_fx = float(self.force_x_last.item())
+            force_stability = abs(last_fx - avg_fx) / (abs(avg_fx) + 1e-6)
+        lbm_converged = bool(self.force_samples > 0 and not torch.isnan(self.f).any())
+        compressibility_metadata = build_lbm_compressibility_metadata(
+            mach_number=self.config.mach_number,
+            u_lattice=getattr(self, "inlet_velocity_lu", mach_to_lattice_velocity(self.config.mach_number)),
+            lbm_converged=lbm_converged,
+            force_stability=force_stability,
+        )
 
         return {
             'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
             'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
+            'label_source': 'lbm_d3q27',
+            'label_tier': 'lbm_raw',
+            **compressibility_metadata,
             'raw_force_x': float(drag_force.item() if isinstance(drag_force, torch.Tensor) else drag_force),
             'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
             'drag_coefficient': coeffs['drag_coefficient'],

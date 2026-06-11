@@ -23,6 +23,11 @@ class TestLBMCompressibilityRegime(unittest.TestCase):
         self.assertIn("not validated compressible CFD", regime["high_mach_warning"])
         self.assertFalse(regime["claim_grade"].startswith("low_mach"))
 
+    def test_reverse_high_mach_uses_absolute_mach_for_regime(self):
+        regime = classify_lbm_regime(-0.8)
+        self.assertEqual(regime["validity_regime"], "experimental_high_mach_unvalidated")
+        self.assertEqual(regime["claim_grade"], "no_claim_experimental")
+
     def test_external_validation_can_be_recorded_without_upgrading_internal_physics(self):
         regime = classify_lbm_regime(0.8, external_validation="openfoam_compressible_converged")
         self.assertEqual(regime["validity_regime"], "external_compressible_reference_available")

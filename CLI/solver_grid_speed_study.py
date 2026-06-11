@@ -29,6 +29,7 @@ if str(CLI_DIR) not in sys.path:
 import run_internal_benchmark as rib
 from aircraft_diffusion_cfd import CFDConfig, LBMPhysicsConfig
 from advanced_lbm_solver import D3Q27CascadedSolver
+from lbm_utils import classify_lbm_regime
 from CLI.openfoam_mach_sweep import SPEED_OF_SOUND, parse_float_list, run_case as run_openfoam_case
 
 
@@ -105,7 +106,15 @@ def run_lbm_case(
         "lbm_converged": bool(coeffs.get("lbm_converged", False)),
         "training_drag_source": coeffs.get("training_drag_source"),
         "force_stability": coeffs.get("force_stability"),
-        "validity": "validated_low_mach_envelope" if mach <= 0.3 else "experimental_high_mach_unvalidated",
+        "validity": coeffs.get("validity_regime", classify_lbm_regime(mach)["validity_regime"]),
+        "validity_regime": coeffs.get("validity_regime"),
+        "claim_grade": coeffs.get("claim_grade"),
+        "high_mach_warning": coeffs.get("high_mach_warning"),
+        "u_lattice": coeffs.get("u_lattice"),
+        "lattice_mach": coeffs.get("lattice_mach"),
+        "sound_speed_model": coeffs.get("sound_speed_model"),
+        "compressibility_model": coeffs.get("compressibility_model"),
+        "thermal_model": coeffs.get("thermal_model"),
         "coefficients": coeffs,
         "timings": {
             "geometry_seconds": geometry_seconds,
@@ -176,6 +185,9 @@ def compare_cases(openfoam_cases: list[dict[str, Any]], lbm_cases: list[dict[str
                     "lbm_seconds": lbm_case["timings"]["total_seconds"],
                     "lbm_converged": lbm_case.get("lbm_converged"),
                     "lbm_validity": lbm_case.get("validity"),
+                    "lbm_claim_grade": lbm_case.get("claim_grade"),
+                    "lbm_compressibility_model": lbm_case.get("compressibility_model"),
+                    "lbm_thermal_model": lbm_case.get("thermal_model"),
                     "cd_error_percent": cd_error,
                     "cl_error_percent": cl_error,
                 }
@@ -199,6 +211,9 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "lbm_seconds",
         "lbm_converged",
         "lbm_validity",
+        "lbm_claim_grade",
+        "lbm_compressibility_model",
+        "lbm_thermal_model",
         "cd_error_percent",
         "cl_error_percent",
     ]

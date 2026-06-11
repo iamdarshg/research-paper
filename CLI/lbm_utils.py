@@ -1,6 +1,85 @@
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import torch
+
+
+D3Q27_LATTICE_SOUND_SPEED = 1.0 / math.sqrt(3.0)
+LOW_MACH_VALIDATED_LIMIT = 0.3
+LOW_MACH_VALIDITY_REGIME = "validated_low_mach_envelope"
+HIGH_MACH_EXPERIMENTAL_REGIME = "experimental_high_mach_unvalidated"
+
+
+def mach_to_lattice_velocity(mach_number: float) -> float:
+    """Map physical Mach number to D3Q27 lattice velocity for the current isothermal model."""
+    return float(mach_number) * D3Q27_LATTICE_SOUND_SPEED
+
+
+def classify_lbm_regime(mach_number: float, external_validation: str | None = None) -> dict[str, Any]:
+    """Classify the current internal LBM result without upgrading the underlying physics."""
+    mach = float(mach_number)
+    mach_magnitude = abs(mach)
+    base = {
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+    }
+    if external_validation:
+        return {
+            **base,
+            "validity_regime": "external_compressible_reference_available",
+            "claim_grade": "external_reference_only",
+            "high_mach_warning": (
+                "Internal D3Q27 remains weakly compressible/isothermal; high-Mach claim support comes only "
+                f"from external validation: {external_validation}."
+            ),
+        }
+    if mach_magnitude <= LOW_MACH_VALIDATED_LIMIT:
+        return {
+            **base,
+            "validity_regime": LOW_MACH_VALIDITY_REGIME,
+            "claim_grade": "low_mach_sanity_only",
+            "high_mach_warning": None,
+        }
+    return {
+        **base,
+        "validity_regime": HIGH_MACH_EXPERIMENTAL_REGIME,
+        "claim_grade": "no_claim_experimental",
+        "high_mach_warning": (
+            f"Mach {mach_magnitude:.3g} exceeds the current internal D3Q27 low-Mach validation envelope; "
+            "this run is not validated compressible CFD."
+        ),
+    }
+
+
+def build_lbm_compressibility_metadata(
+    *,
+    mach_number: float,
+    u_lattice: float,
+    lbm_converged: bool,
+    force_stability: float | None,
+    external_validation: str | None = None,
+) -> dict[str, Any]:
+    """Build the standard compressibility metadata block for solver outputs and evidence JSON."""
+    regime = classify_lbm_regime(mach_number, external_validation=external_validation)
+    lattice_mach = float(u_lattice) / D3Q27_LATTICE_SOUND_SPEED
+    if regime["validity_regime"] == HIGH_MACH_EXPERIMENTAL_REGIME:
+        training_drag_source = "none_high_mach_internal_lbm_unvalidated"
+    elif regime["validity_regime"] == "external_compressible_reference_available":
+        training_drag_source = "external_validated_reference"
+    else:
+        training_drag_source = "internal_lbm_raw_low_mach"
+    return {
+        "mach_number": float(mach_number),
+        "lattice_mach": lattice_mach,
+        "u_lattice": float(u_lattice),
+        **regime,
+        "lbm_converged": bool(lbm_converged),
+        "force_stability": None if force_stability is None else float(force_stability),
+        "training_drag_source": training_drag_source,
+    }
 
 
 def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref=1.225):
