@@ -224,23 +224,27 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({field: row.get(field) for field in fields})
 
 
-def write_plot(path: Path, rows: list[dict[str, Any]]) -> None:
+def write_plot(path: Path, rows: list[dict[str, Any]]) -> bool:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     plot_rows = [row for row in rows if finite(row.get("cd_error_percent"))]
+    if not plot_rows:
+        if path.exists():
+            path.unlink()
+        return False
+
     fig = plt.figure(figsize=(10, 7))
     ax = fig.add_subplot(111, projection="3d")
-    if plot_rows:
-        x = np.array([float(row["mach"]) for row in plot_rows])
-        y = np.array([float(row["openfoam_grid"]) for row in plot_rows])
-        z = np.array([float(row["cd_error_percent"]) for row in plot_rows])
-        colors = np.array([0.0 if row.get("lbm_validity") == "validated_low_mach_envelope" else 1.0 for row in plot_rows])
-        scatter = ax.scatter(x, y, z, c=colors, cmap="coolwarm", s=48)
-        legend = ax.legend(*scatter.legend_elements(), title="LBM validity", loc="upper left")
-        ax.add_artist(legend)
+    x = np.array([float(row["mach"]) for row in plot_rows])
+    y = np.array([float(row["openfoam_grid"]) for row in plot_rows])
+    z = np.array([float(row["cd_error_percent"]) for row in plot_rows])
+    colors = np.array([0.0 if row.get("lbm_validity") == "validated_low_mach_envelope" else 1.0 for row in plot_rows])
+    scatter = ax.scatter(x, y, z, c=colors, cmap="coolwarm", s=48)
+    legend = ax.legend(*scatter.legend_elements(), title="LBM validity", loc="upper left")
+    ax.add_artist(legend)
     ax.set_xlabel("Mach")
     ax.set_ylabel("OpenFOAM grid resolution")
     ax.set_zlabel("Cd error (%)")
@@ -249,6 +253,7 @@ def write_plot(path: Path, rows: list[dict[str, Any]]) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -318,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = compare_cases(openfoam_cases, lbm_cases)
     write_csv(args.output_dir / "comparison_rows.csv", rows)
-    write_plot(args.output_dir / "cd_error_surface.png", rows)
+    plot_written = write_plot(args.output_dir / "cd_error_surface.png", rows)
     summary = {
         "stl": str(stl),
         "mach_values": mach_values,
@@ -330,6 +335,8 @@ def main(argv: list[str] | None = None) -> int:
         "openfoam_cases": openfoam_cases,
         "lbm_cases": lbm_cases,
         "comparisons": rows,
+        "cd_error_surface_plot": str(args.output_dir / "cd_error_surface.png") if plot_written else None,
+        "plot_gate": None if plot_written else "No finite paired OpenFOAM/LBM Cd-error rows exist.",
     }
     (args.output_dir / "grid_speed_study_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return 0
