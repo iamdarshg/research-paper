@@ -29,6 +29,15 @@ class ThermalLBMConfig:
     min_pressure: float = 1e-6
     equilibrium_cu_limit: float = 0.25
     max_thermal_steps_per_call: int = 64
+    shock_stabilization_enabled: bool = True
+    shock_sensor_threshold: float = 0.02
+    shock_diffusivity_multiplier: float = 3.0
+    shock_sensor_epsilon: float = 1e-6
+    inlet_temperature: float | None = None
+    outlet_temperature: float | None = None
+    thermal_boundary_model: str = "fixed_temperature_inlet_zero_gradient_outlet"
+    pressure_coupling_strength: float = 0.0
+    pressure_gradient_clip: float = 0.02
     dtype: torch.dtype = torch.float32
 
 
@@ -105,6 +114,27 @@ class ThermalBGKSolver:
         zero_velocity = tuple(torch.zeros(self.shape, dtype=self.dtype, device=self.device) for _ in range(3))
         self.g = self.compute_equilibrium(self.temperature, zero_velocity)
         self._stream_buffer = torch.empty_like(self.g)
+        self.shock_sensor = torch.zeros(self.shape, dtype=self.dtype, device=self.device)
+        self.effective_omega = torch.full(self.shape, float(self.omega), dtype=self.dtype, device=self.device)
+        self.shock_stabilization_mask = torch.zeros(self.shape, dtype=torch.bool, device=self.device)
+
+    def _nonperiodic_gradient(self, field: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gx = torch.zeros_like(field)
+        gy = torch.zeros_like(field)
+        gz = torch.zeros_like(field)
+
+        gx[1:-1, :, :] = 0.5 * (field[2:, :, :] - field[:-2, :, :])
+        gx[0, :, :] = field[1, :, :] - field[0, :, :]
+        gx[-1, :, :] = field[-1, :, :] - field[-2, :, :]
+
+        gy[:, 1:-1, :] = 0.5 * (field[:, 2:, :] - field[:, :-2, :])
+        gy[:, 0, :] = field[:, 1, :] - field[:, 0, :]
+        gy[:, -1, :] = field[:, -1, :] - field[:, -2, :]
+
+        gz[:, :, 1:-1] = 0.5 * (field[:, :, 2:] - field[:, :, :-2])
+        gz[:, :, 0] = field[:, :, 1] - field[:, :, 0]
+        gz[:, :, -1] = field[:, :, -1] - field[:, :, -2]
+        return gx, gy, gz
 
     def _clamp_temperature_value(self, value: float) -> float:
         return float(min(max(float(value), float(self.config.min_temperature)), float(self.config.max_temperature)))
@@ -154,6 +184,25 @@ class ThermalBGKSolver:
         cu = torch.clamp(cu, min=-cu_limit, max=cu_limit)
         return self.weights.view(7, 1, 1, 1) * temperature.unsqueeze(0) * (1.0 + 3.0 * cu)
 
+    def compute_shock_sensor(self, scalar_field: torch.Tensor) -> torch.Tensor:
+        field = self._coerce_field(scalar_field)
+        gx, gy, gz = self._nonperiodic_gradient(field)
+        grad_mag = torch.sqrt(gx * gx + gy * gy + gz * gz)
+        normalized = grad_mag / (torch.abs(field) + float(self.config.shock_sensor_epsilon))
+        threshold = max(float(self.config.shock_sensor_threshold), 1e-12)
+        return torch.clamp(normalized / threshold, min=0.0, max=1.0)
+
+    def compute_effective_omega(self, shock_sensor: torch.Tensor) -> torch.Tensor:
+        sensor = self._coerce_field(shock_sensor).clamp(0.0, 1.0)
+        if not bool(self.config.shock_stabilization_enabled):
+            return torch.full(self.shape, float(self.omega), dtype=self.dtype, device=self.device)
+
+        base_alpha = max(float(self.config.thermal_diffusivity_lattice), 1e-12)
+        multiplier = max(float(self.config.shock_diffusivity_multiplier), 1.0)
+        alpha_field = base_alpha * (1.0 + (multiplier - 1.0) * sensor)
+        tau_field = (0.5 + 3.0 * alpha_field).clamp_min(0.500001)
+        return 1.0 / tau_field
+
     def build_thermodynamic_state(self, density: torch.Tensor, temperature: torch.Tensor | None = None) -> ThermodynamicState:
         if temperature is None:
             temperature = self.temperature
@@ -164,6 +213,26 @@ class ThermalBGKSolver:
         )
         pressure = (rho * float(self.config.gas_constant) * temp).clamp_min(float(self.config.min_pressure))
         return ThermodynamicState(density=rho, temperature=temp, pressure=pressure)
+
+    def apply_thermal_boundaries(self, velocity: tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        if str(self.config.thermal_boundary_model).lower() == "none":
+            return
+
+        inlet_temperature = (
+            float(self.config.reference_temperature)
+            if self.config.inlet_temperature is None
+            else float(self.config.inlet_temperature)
+        )
+        self.temperature[0, :, :] = self._clamp_temperature_value(inlet_temperature)
+
+        if self.config.outlet_temperature is None:
+            self.temperature[-1, :, :] = self.temperature[-2, :, :]
+        else:
+            self.temperature[-1, :, :] = self._clamp_temperature_value(float(self.config.outlet_temperature))
+
+        boundary_equilibrium = self.compute_equilibrium(self.temperature, velocity)
+        self.g[:, 0, :, :] = boundary_equilibrium[:, 0, :, :]
+        self.g[:, -1, :, :] = boundary_equilibrium[:, -1, :, :]
 
     def collide_stream(
         self,
@@ -180,8 +249,11 @@ class ThermalBGKSolver:
                 min=float(self.config.min_temperature),
                 max=float(self.config.max_temperature),
             )
+            self.shock_sensor = self.compute_shock_sensor(temperature)
+            self.effective_omega = self.compute_effective_omega(self.shock_sensor)
+            self.shock_stabilization_mask = self.shock_sensor > 0.5
             geq = self.compute_equilibrium(temperature, velocity)
-            post_collision = self.g + self.omega * (geq - self.g)
+            post_collision = self.g + self.effective_omega.unsqueeze(0) * (geq - self.g)
 
             for i, shift in enumerate(self._stream_shifts):
                 streamed = torch.roll(post_collision[i], shifts=shift, dims=(0, 1, 2))
@@ -196,6 +268,7 @@ class ThermalBGKSolver:
                     max=float(self.config.max_temperature),
                 )
             )
+            self.apply_thermal_boundaries(velocity)
 
         return self.temperature
 
@@ -217,6 +290,11 @@ class ThermalD3Q27Solver:
         self.temperature = self.thermal_solver.temperature
         self.thermodynamic_state = self.thermal_solver.build_thermodynamic_state(self.rho, self.temperature)
         self.thermodynamic_pressure = self.thermodynamic_state.pressure
+        self.thermal_pressure_gradient_force = torch.zeros(
+            (3, self.flow_solver.resolution, self.flow_solver.resolution, self.flow_solver.resolution),
+            dtype=self.thermal_config.dtype,
+            device=self.device,
+        )
 
     def __getattr__(self, name: str):
         flow_solver = self.__dict__.get("flow_solver")
@@ -260,9 +338,42 @@ class ThermalD3Q27Solver:
         self.thermodynamic_pressure = self.thermodynamic_state.pressure
         return self.thermodynamic_state
 
+    def _nonperiodic_gradient(self, field: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.thermal_solver._nonperiodic_gradient(field)
+
+    def compute_thermal_pressure_force(self) -> torch.Tensor:
+        state = self._refresh_thermodynamic_state()
+        pressure = state.pressure
+        strength = float(self.thermal_config.pressure_coupling_strength)
+        if strength == 0.0:
+            self.thermal_pressure_gradient_force = torch.zeros(
+                (3, *pressure.shape),
+                dtype=pressure.dtype,
+                device=self.device,
+            )
+            return self.thermal_pressure_gradient_force
+
+        gx, gy, gz = self._nonperiodic_gradient(pressure)
+        pressure_scale = pressure.mean().clamp_min(float(self.thermal_config.min_pressure))
+        force = -(strength / pressure_scale) * torch.stack([gx, gy, gz])
+        clip = max(float(self.thermal_config.pressure_gradient_clip), 0.0)
+        if clip > 0.0:
+            force = torch.clamp(force, min=-clip, max=clip)
+        self.thermal_pressure_gradient_force = force.nan_to_num(0.0, posinf=clip, neginf=-clip)
+        return self.thermal_pressure_gradient_force
+
     def collide_stream(self, geometry_mask: torch.Tensor, steps: int = 100, ext_force=None):
         geometry = geometry_mask.to(self.device, non_blocking=True)
-        result = self.flow_solver.collide_stream(geometry, steps=steps, ext_force=ext_force)
+        pressure_coupled = float(self.thermal_config.pressure_coupling_strength) != 0.0
+        thermal_force = self.compute_thermal_pressure_force()
+        if not pressure_coupled:
+            coupled_force = ext_force
+        elif ext_force is None:
+            coupled_force = thermal_force
+        else:
+            coupled_force = ext_force.to(self.device, dtype=thermal_force.dtype, non_blocking=True) + thermal_force
+
+        result = self.flow_solver.collide_stream(geometry, steps=steps, ext_force=coupled_force)
         self._sync_flow_fields()
 
         requested_steps = max(0, int(steps))
@@ -282,6 +393,9 @@ class ThermalD3Q27Solver:
         pressure = state.pressure
         density = state.density
         flow_isothermal_pressure_sum = results.get("pressure_sum")
+        shock_sensor = self.thermal_solver.shock_sensor
+        shock_mask = self.thermal_solver.shock_stabilization_mask
+        thermal_force = self.thermal_pressure_gradient_force
         thermal_stats = torch.stack(
             [
                 temperature.min(),
@@ -294,6 +408,10 @@ class ThermalD3Q27Solver:
                 pressure.min(),
                 pressure.max(),
                 pressure.mean(),
+                shock_sensor.max(),
+                shock_mask.to(dtype=temperature.dtype).sum(),
+                torch.linalg.vector_norm(thermal_force),
+                torch.abs(thermal_force).max(),
             ]
         ).detach().cpu().tolist()
         (
@@ -307,8 +425,21 @@ class ThermalD3Q27Solver:
             thermodynamic_pressure_min,
             thermodynamic_pressure_max,
             thermodynamic_pressure_mean,
+            shock_sensor_max,
+            shock_cell_count,
+            thermal_pressure_gradient_force_norm,
+            thermal_pressure_gradient_force_max,
         ) = (float(value) for value in thermal_stats)
         mach_number = float(getattr(self.config, "mach_number", 0.0))
+        mach_magnitude = abs(mach_number)
+        if mach_magnitude >= 1.0:
+            inlet_outlet_regime = "supersonic_experimental"
+        elif mach_magnitude > 0.3:
+            inlet_outlet_regime = "high_mach_experimental"
+        else:
+            inlet_outlet_regime = "low_mach_staged"
+        pressure_coupled = float(self.thermal_config.pressure_coupling_strength) != 0.0
+        shock_stabilization_enabled = bool(self.thermal_config.shock_stabilization_enabled)
 
         results.update(
             {
@@ -326,7 +457,24 @@ class ThermalD3Q27Solver:
                 "pinn_ready": False,
                 "shock_capable": False,
                 "thermodynamic_solver": THERMODYNAMIC_SOLVER_NAME,
-                "thermal_force_coupling": "diagnostic_pressure_not_force_coupled",
+                "thermal_force_coupling": (
+                    "pressure_gradient_guo_forcing_experimental"
+                    if pressure_coupled
+                    else "diagnostic_pressure_not_force_coupled"
+                ),
+                "thermal_boundary_model": str(self.thermal_config.thermal_boundary_model),
+                "compressible_boundary_status": "staged_thermal_boundary_not_characteristic_validated",
+                "inlet_outlet_regime": inlet_outlet_regime,
+                "shock_capture_model": "sensor_artificial_thermal_diffusion_not_flow_shock_capture",
+                "shock_stabilization_model": (
+                    "local_artificial_thermal_diffusivity"
+                    if shock_stabilization_enabled
+                    else "disabled"
+                ),
+                "shock_sensor_max": shock_sensor_max,
+                "shock_cell_count": shock_cell_count,
+                "thermal_pressure_gradient_force_norm": thermal_pressure_gradient_force_norm,
+                "thermal_pressure_gradient_force_max": thermal_pressure_gradient_force_max,
                 "thermal_lattice_tau": float(self.thermal_solver.tau),
                 "thermal_lattice_omega": float(self.thermal_solver.omega),
                 "thermal_diffusivity_lattice": float(self.thermal_config.thermal_diffusivity_lattice),

@@ -116,6 +116,54 @@ class TestThermalLBMSolver(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(adjacent, torch.full_like(adjacent, 300.0)))
 
+    def test_shock_sensor_is_low_for_uniform_temperature_and_high_at_jump(self):
+        device = torch.device("cpu")
+        solver = ThermalBGKSolver((8, 4, 4), device, ThermalLBMConfig(shock_sensor_threshold=0.02))
+        uniform = torch.full((8, 4, 4), 300.0, dtype=torch.float32, device=device)
+        jump = uniform.clone()
+        jump[4:, :, :] = 600.0
+
+        uniform_sensor = solver.compute_shock_sensor(uniform)
+        jump_sensor = solver.compute_shock_sensor(jump)
+
+        self.assertLess(float(uniform_sensor.max().item()), 1e-6)
+        self.assertGreater(float(jump_sensor.max().item()), 0.5)
+
+    def test_shock_stabilization_lowers_local_omega_near_jump(self):
+        device = torch.device("cpu")
+        config = ThermalLBMConfig(
+            reference_temperature=300.0,
+            shock_stabilization_enabled=True,
+            shock_diffusivity_multiplier=4.0,
+        )
+        solver = ThermalBGKSolver((8, 4, 4), device, config)
+        temperature = torch.full((8, 4, 4), 300.0, dtype=torch.float32, device=device)
+        temperature[4:, :, :] = 600.0
+
+        sensor = solver.compute_shock_sensor(temperature)
+        omega_field = solver.compute_effective_omega(sensor)
+
+        self.assertLess(float(omega_field[sensor > 0.5].mean().item()), float(solver.omega))
+
+    def test_thermal_inlet_outlet_boundaries_set_inlet_and_extrapolate_outlet(self):
+        device = torch.device("cpu")
+        config = ThermalLBMConfig(
+            reference_temperature=300.0,
+            inlet_temperature=350.0,
+            outlet_temperature=None,
+            thermal_boundary_model="fixed_temperature_inlet_zero_gradient_outlet",
+        )
+        solver = ThermalBGKSolver((6, 4, 4), device, config)
+        geometry = torch.zeros((6, 4, 4), dtype=torch.float32, device=device)
+        zero_velocity = tuple(torch.zeros_like(geometry) for _ in range(3))
+        solver.temperature[-2, :, :] = 325.0
+        solver.g.copy_(solver.compute_equilibrium(solver.temperature, zero_velocity))
+
+        solver.collide_stream(zero_velocity, geometry, steps=1)
+
+        self.assertTrue(torch.allclose(solver.temperature[0], torch.full_like(solver.temperature[0], 350.0)))
+        self.assertTrue(torch.allclose(solver.temperature[-1], solver.temperature[-2]))
+
     def test_pressure_density_temperature_consistency(self):
         device = torch.device("cpu")
         config = ThermalLBMConfig(gas_constant=287.05)
@@ -178,6 +226,122 @@ class TestThermalLBMSolver(unittest.TestCase):
         self.assertTrue(torch.allclose(solver.pressure, solver.flow_solver.pressure))
         self.assertFalse(torch.allclose(solver.pressure, solver.thermodynamic_pressure))
 
+    def test_pressure_gradient_coupling_produces_clipped_guo_force(self):
+        cfg = make_config(0.5, thermal_enabled=True)
+        cfg.thermal_lbm_config = ThermalLBMConfig(
+            reference_temperature=300.0,
+            pressure_coupling_strength=0.1,
+            pressure_gradient_clip=0.02,
+        )
+        solver = create_thermal_lbm_solver(cfg, torch.device("cpu"), TestPhysicsConfig)
+        ramp = torch.linspace(300.0, 600.0, solver.resolution).view(-1, 1, 1).expand(
+            solver.resolution,
+            solver.resolution,
+            solver.resolution,
+        )
+        solver.thermal_solver.set_temperature(ramp)
+
+        force = solver.compute_thermal_pressure_force()
+
+        self.assertEqual(force.shape, (3, solver.resolution, solver.resolution, solver.resolution))
+        self.assertGreater(float(torch.abs(force[0]).max().item()), 0.0)
+        self.assertLess(float(torch.abs(force[1]).max().item()), 1e-8)
+        self.assertLess(float(torch.abs(force[2]).max().item()), 1e-8)
+        self.assertLessEqual(float(torch.abs(force).max().item()), 0.020001)
+
+    def test_pressure_gradient_coupling_adds_to_user_ext_force_without_mutation(self):
+        cfg = make_config(0.5, thermal_enabled=True)
+        cfg.thermal_lbm_config = ThermalLBMConfig(
+            reference_temperature=300.0,
+            pressure_coupling_strength=0.1,
+            pressure_gradient_clip=0.02,
+        )
+        solver = create_thermal_lbm_solver(cfg, torch.device("cpu"), TestPhysicsConfig)
+        geometry = torch.zeros((8, 8, 8), dtype=torch.float32)
+        ramp = torch.linspace(300.0, 600.0, solver.resolution).view(-1, 1, 1).expand(
+            solver.resolution,
+            solver.resolution,
+            solver.resolution,
+        )
+        solver.thermal_solver.set_temperature(ramp)
+        caller_force = torch.full((3, 8, 8, 8), 0.001, dtype=torch.float32)
+        caller_force_before = caller_force.clone()
+        captured = {}
+
+        def fake_flow_step(_geometry_mask, steps=100, ext_force=None):
+            captured["ext_force"] = ext_force.clone()
+
+        solver.flow_solver.collide_stream = fake_flow_step
+        solver.collide_stream(geometry, steps=1, ext_force=caller_force)
+
+        self.assertTrue(torch.allclose(caller_force, caller_force_before))
+        self.assertTrue(torch.allclose(captured["ext_force"], caller_force_before + solver.thermal_pressure_gradient_force))
+
+    def test_disabled_pressure_coupling_passes_user_ext_force_through(self):
+        cfg = make_config(0.5, thermal_enabled=True)
+        cfg.thermal_lbm_config = ThermalLBMConfig(
+            reference_temperature=300.0,
+            pressure_coupling_strength=0.0,
+        )
+        solver = create_thermal_lbm_solver(cfg, torch.device("cpu"), TestPhysicsConfig)
+        geometry = torch.zeros((8, 8, 8), dtype=torch.float32)
+        caller_force = torch.full((3, 8, 8, 8), 0.001, dtype=torch.float32)
+        captured = {}
+
+        def fake_flow_step(_geometry_mask, steps=100, ext_force=None):
+            captured["ext_force"] = ext_force
+
+        solver.flow_solver.collide_stream = fake_flow_step
+        solver.collide_stream(geometry, steps=1, ext_force=caller_force)
+
+        self.assertIs(captured["ext_force"], caller_force)
+
+    def test_staged_features_do_not_promote_high_mach_claims(self):
+        cfg = make_config(2.0, thermal_enabled=True)
+        cfg.thermal_lbm_config = ThermalLBMConfig(
+            reference_temperature=310.0,
+            inlet_temperature=350.0,
+            pressure_coupling_strength=0.1,
+            pressure_gradient_clip=0.02,
+            shock_stabilization_enabled=True,
+        )
+        solver = create_thermal_lbm_solver(cfg, torch.device("cpu"), TestPhysicsConfig)
+        geometry = torch.zeros((8, 8, 8), dtype=torch.float32)
+        geometry[3:5, 3:5, 3:5] = 1.0
+
+        solver.collide_stream(geometry, steps=1)
+        results = solver.compute_aerodynamic_coefficients(geometry)
+
+        self.assertEqual(results["claim_grade"], "no_claim_experimental")
+        self.assertEqual(results["validity_regime"], "experimental_thermal_lbm_unvalidated")
+        self.assertFalse(results["pinn_ready"])
+        self.assertFalse(results["shock_capable"])
+        self.assertIn("shock_sensor_max", results)
+        self.assertIn("shock_cell_count", results)
+        self.assertEqual(results["thermal_boundary_model"], "fixed_temperature_inlet_zero_gradient_outlet")
+        self.assertEqual(results["compressible_boundary_status"], "staged_thermal_boundary_not_characteristic_validated")
+        self.assertEqual(results["inlet_outlet_regime"], "supersonic_experimental")
+        self.assertEqual(results["thermal_force_coupling"], "pressure_gradient_guo_forcing_experimental")
+        self.assertIn("thermal_pressure_gradient_force_norm", results)
+
+    def test_disabled_shock_stabilization_metadata_reports_disabled(self):
+        cfg = make_config(2.0, thermal_enabled=True)
+        cfg.thermal_lbm_config = ThermalLBMConfig(
+            reference_temperature=310.0,
+            shock_stabilization_enabled=False,
+            pressure_coupling_strength=0.0,
+        )
+        solver = create_thermal_lbm_solver(cfg, torch.device("cpu"), TestPhysicsConfig)
+        geometry = torch.zeros((8, 8, 8), dtype=torch.float32)
+        geometry[3:5, 3:5, 3:5] = 1.0
+
+        solver.collide_stream(geometry, steps=1)
+        results = solver.compute_aerodynamic_coefficients(geometry)
+
+        self.assertEqual(results["shock_stabilization_model"], "disabled")
+        self.assertEqual(results["thermal_force_coupling"], "diagnostic_pressure_not_force_coupled")
+        self.assertFalse(results["shock_capable"])
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA thermal wrapper path requires a CUDA device")
     def test_cuda_wrapper_accepts_cpu_geometry_and_steps_thermal_path(self):
         cfg = make_config(2.0, thermal_enabled=True)
@@ -191,6 +355,37 @@ class TestThermalLBMSolver(unittest.TestCase):
         self.assertEqual(solver.thermal_solver.g.device.type, "cuda")
         self.assertEqual(results["thermal_solver_device"], "cuda")
         self.assertTrue(math.isfinite(results["thermodynamic_pressure_mean"]))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA thermal coupling path requires a CUDA device")
+    def test_cuda_cpu_ext_force_is_coerced_before_thermal_addition(self):
+        cfg = make_config(0.5, thermal_enabled=True)
+        cfg.thermal_lbm_config = ThermalLBMConfig(
+            reference_temperature=300.0,
+            pressure_coupling_strength=0.1,
+            pressure_gradient_clip=0.02,
+        )
+        solver = create_thermal_lbm_solver(cfg, torch.device("cuda"), TestPhysicsConfig)
+        geometry_cpu = torch.zeros((8, 8, 8), dtype=torch.float32)
+        ramp = torch.linspace(300.0, 600.0, solver.resolution).view(-1, 1, 1).expand(
+            solver.resolution,
+            solver.resolution,
+            solver.resolution,
+        )
+        solver.thermal_solver.set_temperature(ramp)
+        caller_force = torch.full((3, 8, 8, 8), 0.001, dtype=torch.float32)
+        caller_force_before = caller_force.clone()
+        captured = {}
+
+        def fake_flow_step(_geometry_mask, steps=100, ext_force=None):
+            captured["ext_force"] = ext_force.clone()
+
+        solver.flow_solver.collide_stream = fake_flow_step
+        solver.collide_stream(geometry_cpu, steps=1, ext_force=caller_force)
+
+        self.assertEqual(captured["ext_force"].device.type, "cuda")
+        self.assertEqual(solver.thermal_pressure_gradient_force.device.type, "cuda")
+        self.assertTrue(torch.allclose(caller_force, caller_force_before))
+        self.assertTrue(torch.allclose(captured["ext_force"].cpu(), caller_force_before + solver.thermal_pressure_gradient_force.cpu()))
 
     def test_mach_mapping_helper_is_unchanged_by_thermal_path(self):
         self.assertAlmostEqual(mach_to_lattice_velocity(2.0), 2.0 / math.sqrt(3.0), places=12)
