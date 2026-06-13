@@ -287,6 +287,15 @@ def choose_solver(mach: float, threshold: float) -> str:
 
 
 def pressure_force_latest(case: Path, patch_name: str, reference_area: float, speed: float, solver: str) -> dict[str, Any]:
+    if solver == "simpleFoam":
+        return rib.pressure_force_from_case(
+            case,
+            patch_name,
+            reference_area=reference_area,
+            pressure_reference=0.0,
+            density=RHO_INF,
+            freestream_speed=speed,
+        )
     moved = temporarily_hide_force_files(case)
     try:
         pressure_reference = rib.OPENFOAM_PRESSURE_REFERENCE if solver == "sonicFoam" else 0.0
