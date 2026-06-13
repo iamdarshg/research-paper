@@ -20,6 +20,15 @@ def wsl_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def windows_path_to_wsl(path: Path) -> str:
+    resolved = Path(path).resolve()
+    drive = resolved.drive.rstrip(":").lower()
+    if not drive:
+        raise ValueError(f"Cannot convert path without drive to WSL path: {resolved}")
+    parts = [part for part in resolved.parts[1:]]
+    return "/mnt/" + drive + "/" + "/".join(part.replace("\\", "/") for part in parts)
+
+
 def tar_directory_bytes(root: Path) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
@@ -53,7 +62,28 @@ def copy_windows_dir_to_wsl(src: Path, wsl_dst: str, *, distro: str = "Ubuntu-24
         capture_output=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.decode(errors="ignore"))
+        fallback_src = windows_path_to_wsl(src)
+        fallback = subprocess.run(
+            [
+                "wsl",
+                "-d",
+                distro,
+                "--",
+                "bash",
+                "-lc",
+                f"rm -rf {wsl_quote(wsl_dst)} && mkdir -p {wsl_quote(wsl_dst)} && cp -a {wsl_quote(fallback_src)}/. {wsl_quote(wsl_dst)}/",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if fallback.returncode != 0:
+            stderr = proc.stderr.decode(errors="ignore")
+            stdout = proc.stdout.decode(errors="ignore")
+            raise RuntimeError(
+                "WSL tar staging failed and path-copy fallback failed. "
+                f"tar rc={proc.returncode}, tar stdout={stdout!r}, tar stderr={stderr!r}, "
+                f"fallback rc={fallback.returncode}, fallback stdout={fallback.stdout!r}, fallback stderr={fallback.stderr!r}"
+            )
 
 
 def copy_wsl_dir_to_windows(wsl_src: str, dst: Path, *, distro: str = "Ubuntu-24.04") -> None:

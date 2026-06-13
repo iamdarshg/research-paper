@@ -76,13 +76,15 @@ def patch_snappy_strategy(case: Path, patch_name: str, *, snap: bool, refinement
 
 def patch_sonic_case(case: Path, *, end_time: float, max_delta_t: float) -> None:
     control = (case / "system" / "controlDict").read_text(encoding="utf-8")
+    write_interval = max(end_time / 25.0, max_delta_t)
     control = re.sub(r"application\s+\w+;", "application sonicFoam;", control)
     control = re.sub(r"endTime\s+[^;]+;", f"endTime {end_time:.8g};", control)
     control = re.sub(r"deltaT\s+[^;]+;", f"deltaT {max_delta_t:.8g};", control)
     control = re.sub(r"adjustTimeStep\s+[^;]+;", "adjustTimeStep yes;", control)
     control = re.sub(r"maxCo\s+[^;]+;", "maxCo 0.35;", control)
     control = re.sub(r"maxDeltaT\s+[^;]+;", f"maxDeltaT {max_delta_t:.8g};", control)
-    control = re.sub(r"writeInterval\s+[^;]+;", "writeInterval 1;", control)
+    control = re.sub(r"writeControl\s+[^;]+;", "writeControl adjustableRunTime;", control)
+    control = re.sub(r"writeInterval\s+[^;]+;", f"writeInterval {write_interval:.8g};", control)
     (case / "system" / "controlDict").write_text(control, encoding="utf-8")
 
 
