@@ -852,6 +852,28 @@ class D3Q27CascadedSolver:
         v_inf = coeffs.get('freestream_speed', 0.0)
         nu_turb_mean = float(self.nu_turb.mean().item())
         reynolds_turbulent = float(v_inf * h * self.resolution / max(self.nu + nu_turb_mean, 1e-12))
+        drag_coefficient = float(coeffs['drag_coefficient'])
+        lift_coefficient = float(coeffs['lift_coefficient'])
+        calibrated_drag_coefficient = float(drag_coefficient_surrogate)
+        training_drag_coefficient = calibrated_drag_coefficient
+        training_drag_label_source = 'lbm_calibrated'
+        if lbm_converged and np.isfinite(drag_coefficient) and drag_coefficient > 0.0:
+            training_drag_coefficient = drag_coefficient
+            training_drag_label_source = 'lbm_raw'
+        training_drag_source = str(compressibility_metadata.get('training_drag_source', 'internal_lbm_raw_low_mach'))
+        if training_drag_source.startswith('none_'):
+            training_drag_coefficient = None
+            training_drag_label_source = training_drag_source
+        lift_to_drag = float(lift_coefficient / max(abs(drag_coefficient), 1e-12))
+        solver_quality_checks = {
+            'finite_coefficients': bool(np.isfinite(drag_coefficient) and np.isfinite(lift_coefficient)),
+            'positive_reference_area': bool(ref_area > 0.0),
+            'nonempty_geometry': bool(torch.sum(solid.float()).item() > 0.0),
+            'finite_force_outputs': bool(
+                np.isfinite(float(physical_net_drag_force.item()))
+                and np.isfinite(float(physical_lift_force.item()))
+            ),
+        }
 
         return {
             'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
@@ -870,8 +892,13 @@ class D3Q27CascadedSolver:
 
             'raw_force_x': float(projected_drag.item() if isinstance(projected_drag, torch.Tensor) else projected_drag),
             'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
-            'drag_coefficient': coeffs['drag_coefficient'],
-            'lift_coefficient': coeffs['lift_coefficient'],
+            'drag_coefficient': drag_coefficient,
+            'calibrated_drag_coefficient': calibrated_drag_coefficient,
+            'training_drag_coefficient': training_drag_coefficient,
+            'training_drag_source': training_drag_source,
+            'training_drag_label_source': training_drag_label_source,
+            'lift_coefficient': lift_coefficient,
+            'lift_to_drag': lift_to_drag,
             'net_momentum_exchange_force_x': float(physical_net_drag_force.item() if isinstance(physical_net_drag_force, torch.Tensor) else physical_net_drag_force),
             'raw_net_momentum_exchange_force_x': float(net_drag_force.item() if isinstance(net_drag_force, torch.Tensor) else net_drag_force),
             'projected_area_lattice': projected_area_lattice,
@@ -888,10 +915,24 @@ class D3Q27CascadedSolver:
             'max_vorticity': float(vorticity_mag.max().item()),
             'vortex_core_volume': float(vortex_cells * h**3),
             'reference_area': ref_area,
+            'reference_area_source': 'projected_frontal_voxel_area_yz',
+            'reference_area_lattice': projected_area_lattice,
             'reference_length': h * self.resolution,
+            'reference_length_source': 'grid_spacing_times_resolution',
             'freestream_speed': v_inf,
             'density': coeffs['density'],
-            'reynolds_number_turbulent': reynolds_turbulent
+            'reynolds_number_turbulent': reynolds_turbulent,
+            'empty_geometry': bool(torch.sum(solid.float()).item() <= 0.0),
+            'claim_bearing_cfd': False,
+            'solver_quality_checks': solver_quality_checks,
+            'solver_provenance': {
+                'primary_solver': 'D3Q27',
+                'label_tier': 'lbm_raw',
+                'lbm_converged': lbm_converged,
+                'grid_resolution': int(self.resolution),
+                'force_samples': int(self._solver.force_samples),
+                'reference_area_source': 'projected_frontal_voxel_area_yz',
+            },
         } | shape_drag_metrics
 
 

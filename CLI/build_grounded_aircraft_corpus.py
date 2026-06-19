@@ -193,6 +193,23 @@ def choose_manufacturing_method(thickness_ratio: float, code: str) -> str:
     return "sheet_balsa_tabbed"
 
 
+def validate_cfd_outputs(*, source_id: str, grid_size: int, steps: int, cfd: Dict[str, Any]) -> None:
+    drag = cfd.get("drag_coefficient")
+    lift = cfd.get("lift_coefficient")
+    if not isinstance(drag, (int, float)) or not np.isfinite(float(drag)):
+        raise ValueError(
+            f"{source_id}: CFD drag_coefficient is non-finite at grid={grid_size}, steps={steps}: {drag}"
+        )
+    if float(drag) <= 0.0:
+        raise ValueError(
+            f"{source_id}: CFD drag_coefficient must be positive at grid={grid_size}, steps={steps}: {drag}"
+        )
+    if not isinstance(lift, (int, float)) or not np.isfinite(float(lift)):
+        raise ValueError(
+            f"{source_id}: CFD lift_coefficient is non-finite at grid={grid_size}, steps={steps}: {lift}"
+        )
+
+
 def run_local_analysis(
     *,
     stl_path: Path,
@@ -208,6 +225,12 @@ def run_local_analysis(
 
     simulator = AdvancedCFDSimulator(CFDConfig(base_grid_resolution=grid_size), torch.device("cpu"))
     cfd = simulator.simulate_aerodynamics(voxels, steps=steps)
+    validate_cfd_outputs(
+        source_id=stl_path.stem,
+        grid_size=grid_size,
+        steps=steps,
+        cfd=cfd,
+    )
 
     voxel_sum = float(voxels.sum().item())
     occupancy_ratio = float((voxels > 0.5).float().mean().item())
@@ -367,6 +390,12 @@ def run_refinement_study(
             voxels = dataset._voxelize_stl(str(stl_path), grid_size)
             simulator = AdvancedCFDSimulator(CFDConfig(base_grid_resolution=grid_size), torch.device("cpu"))
             cfd = simulator.simulate_aerodynamics(voxels, steps=steps)
+            validate_cfd_outputs(
+                source_id=f"{stl_path.stem}_grid{grid_size}",
+                grid_size=grid_size,
+                steps=steps,
+                cfd=cfd,
+            )
             ladder.append(
                 {
                     "grid_size": grid_size,

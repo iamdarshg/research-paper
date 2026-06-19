@@ -84,6 +84,33 @@ def _configure_console_output() -> None:
         except Exception:
             pass
 
+
+def resolve_grounded_grid_size(
+    requested_grid_size: Optional[int],
+    *,
+    detected_grid_size: Optional[int] = None,
+    solver: Optional[str] = None,
+    source_label: Optional[str] = None,
+) -> int:
+    """Resolve the voxel grid while preserving native grounded-data resolution."""
+    if requested_grid_size is not None:
+        requested = int(requested_grid_size)
+    elif solver == "D3Q27":
+        requested = 16
+    else:
+        requested = 32
+
+    if detected_grid_size is None:
+        return requested
+
+    detected = int(detected_grid_size)
+    if requested_grid_size is not None and requested != detected:
+        raise ValueError(
+            f"Requested grid size {requested} conflicts with {source_label or 'grounded dataset'} "
+            f"native grid size {detected}. Use the grounded grid size end to end."
+        )
+    return detected
+
 OPENFOAM_ROOT = Path(os.environ.get("OPENFOAM_ROOT", "/home/darsh/.openclaw/openfoam/usr/share/openfoam"))
 OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
 OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam"))
@@ -1793,8 +1820,9 @@ class AdvancedCFDSimulator:
     def init_flow_field(self):
         """Initialize flow field for incompressible flow"""
         # Initialize LBM solver
-        self.lbm_solver._initialize_equilibrium()
-        if self.amr_solver:
+        if hasattr(self.lbm_solver, "_initialize_equilibrium"):
+            self.lbm_solver._initialize_equilibrium()
+        if self.amr_solver and hasattr(self.amr_solver, "_initialize_equilibrium"):
             self.amr_solver._initialize_equilibrium()
 
     def simulate_aerodynamics(self, geometry: torch.Tensor, steps: int = 100) -> Dict[str, float]:
@@ -1803,13 +1831,11 @@ class AdvancedCFDSimulator:
         geometry: [D, H, W] binary voxel grid (1 = solid, 0 = fluid)
         """
         self.init_flow_field()
-        device = geometry.device
-
         # Step 1: Run the base solver
         geometry_mask = (geometry > 0.5).float()
         print(f"Running {self.config.solver_type} GPU LBM solver at base resolution...")
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
-        results = self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask)
+        results = dict(self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask))
 
         # Step 2: If AMR is enabled, run the high-resolution solver
         if self.amr_solver:
@@ -1833,9 +1859,50 @@ class AdvancedCFDSimulator:
         # Step 3: Run FluidX3D for validation (if available)
         fluidx3d_results = self._run_fluidx3d_validation(geometry)
         if fluidx3d_results:
-            # Blend results for accuracy
-            results['drag_coefficient'] = 0.7 * results['drag_coefficient'] + 0.3 * fluidx3d_results['drag_coefficient']
-            results['lift_coefficient'] = 0.7 * results['lift_coefficient'] + 0.3 * fluidx3d_results['lift_coefficient']
+            fluidx3d_results = dict(fluidx3d_results)
+            results["external_validation"] = {
+                **fluidx3d_results,
+                "status": (
+                    "claim_bearing_validation_available"
+                    if fluidx3d_results.get("claim_bearing", False)
+                    else "heuristic_proxy_not_blended"
+                ),
+            }
+        else:
+            results["external_validation"] = {"status": "not_run"}
+
+        drag = float(results.get("drag_coefficient", 0.0))
+        lift = float(results.get("lift_coefficient", 0.0))
+        reference_area = float(results.get("reference_area", 0.0))
+        if reference_area <= 0.0:
+            reference_area = float((geometry_mask.sum(dim=0) > 0).float().sum().item())
+            results["reference_area"] = reference_area
+            results.setdefault("reference_area_source", "projected_frontal_voxel_area_yz")
+
+        results["drag_coefficient"] = drag
+        results["lift_coefficient"] = lift
+        results["lift_to_drag"] = float(lift / max(abs(drag), 1e-12))
+        results.setdefault("label_source", "lbm_d3q27")
+        results.setdefault("label_tier", "lbm_raw")
+        results.setdefault("claim_bearing_cfd", False)
+        results["solver_quality_checks"] = {
+            **results.get("solver_quality_checks", {}),
+            "finite_coefficients": bool(np.isfinite(drag) and np.isfinite(lift)),
+            "positive_reference_area": bool(reference_area > 0.0),
+            "nonempty_geometry": bool(torch.sum(geometry_mask).item() > 0.0),
+        }
+        grid_resolution = getattr(self, "resolution", None)
+        if not isinstance(grid_resolution, (int, np.integer)):
+            config_resolution = getattr(self.config, "base_grid_resolution", None)
+            grid_resolution = config_resolution if isinstance(config_resolution, (int, np.integer)) else int(geometry_mask.shape[-1])
+        results["solver_provenance"] = {
+            **results.get("solver_provenance", {}),
+            "primary_solver": str(results.get("solver_provenance", {}).get("primary_solver", self.config.solver_type)),
+            "label_tier": str(results.get("label_tier", "lbm_raw")),
+            "grid_resolution": int(grid_resolution),
+            "steps": int(steps),
+        }
+        results["solver_gate_support"] = self._build_solver_gate_support()
 
         return results
 
@@ -1886,7 +1953,43 @@ class AdvancedCFDSimulator:
         volume = 0.1  # Approximate volume fraction
         return {
             'drag_coefficient': 0.02 + volume * 0.1,
-            'lift_coefficient': volume * 0.4
+            'lift_coefficient': volume * 0.4,
+            'label_source': 'fluidx3d_fast',
+            'label_tier': 'heuristic_proxy',
+            'claim_bearing': False,
+            'claim_boundary': 'FluidX3D fast proxy is not claim-bearing without independent PDE validation.',
+        }
+
+    def _build_solver_gate_support(self) -> Dict[str, Any]:
+        from gate_readiness import build_gate_readiness_report
+
+        readiness = build_gate_readiness_report()
+        gates = []
+        not_solver_applicable = []
+        for gate in readiness["gates"]:
+            gate_id = gate["id"]
+            solver_side_status = "implemented"
+            if gate_id == "manifest_validation":
+                solver_side_status = "not_applicable"
+                not_solver_applicable.append(gate_id)
+            gates.append(
+                {
+                    "id": gate_id,
+                    "name": gate["name"],
+                    "solver_side_status": solver_side_status,
+                }
+            )
+
+        return {
+            "gate_count": len(gates),
+            "gates": gates,
+            "implemented_count": sum(1 for gate in gates if gate["solver_side_status"] == "implemented"),
+            "not_solver_applicable": not_solver_applicable,
+            "claim_bearing_evidence": False,
+            "claim_boundary": (
+                "Solver-side implementation exists for most scientific gates, "
+                "but claim-bearing evidence requires grounded artifacts and final reports."
+            ),
         }
 
 # ============================================================================
@@ -2216,6 +2319,22 @@ class AerodynamicLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
+    @staticmethod
+    def _select_loss_drag_coefficient(cfd_results: Dict[str, Any]) -> float:
+        training_source = str(cfd_results.get("training_drag_source", ""))
+        if training_source.startswith("none_"):
+            return 0.1
+        candidate = cfd_results.get("training_drag_coefficient")
+        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
+            return float(candidate)
+        candidate = cfd_results.get("calibrated_drag_coefficient")
+        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
+            return float(candidate)
+        candidate = cfd_results.get("drag_coefficient", 0.1)
+        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
+            return float(candidate)
+        return 0.1
+
     def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec, cfd_simulator: "AdvancedCFDSimulator") -> torch.Tensor:
         """
         Compute aerodynamic loss balancing drag, lift, and volume using advanced CFD.
@@ -2236,7 +2355,7 @@ class AerodynamicLoss(nn.Module):
             volume_loss = design_spec.space_weight * volume
 
             # Drag coefficient penalty (drag weight)
-            cd = cfd_results.get('drag_coefficient', 0.1)
+            cd = self._select_loss_drag_coefficient(cfd_results)
             drag_loss = design_spec.drag_weight * cd
 
             # Lift coefficient encouragement (lift weight)
@@ -3420,6 +3539,34 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     # Create directories
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
+    requested_resolution = resolve_grounded_grid_size(
+        grid_size,
+        detected_grid_size=None,
+        solver=solver,
+    )
+
+    # Dataset
+    dataset = AircraftDesignDataset(
+        num_samples=num_samples,
+        grid_size=requested_resolution,
+        latent_dim=model_config_override.latent_dim if model_config_override else latent_dim,
+        artifact_path=dataset_artifact,
+        manifest_path=dataset_manifest,
+    )
+    detected_dataset_grid_size = getattr(dataset, "grid_size", None) if dataset_manifest or dataset_artifact else None
+    if not isinstance(detected_dataset_grid_size, (int, np.integer)):
+        detected_dataset_grid_size = None
+    base_resolution = resolve_grounded_grid_size(
+        grid_size,
+        detected_grid_size=detected_dataset_grid_size,
+        solver=solver,
+        source_label=dataset_manifest or dataset_artifact,
+    )
+    if dataset_manifest:
+        print(f"Using grounded manifest lattice resolution: {base_resolution}^3")
+    elif dataset_artifact:
+        print(f"Using dataset artifact lattice resolution: {base_resolution}^3")
+
     # Optimized configs
     model_config = model_config_override if model_config_override else ModelConfig(
         latent_dim=latent_dim,
@@ -3427,7 +3574,13 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         enable_gradient_checkpointing=enable_checkpointing,
         use_torch_compile=enable_compile  # Respect the enable-compile flag
     )
-    if model_config_override is None and model_config.conditioning_dim == 0:
+    if model_config_override is not None:
+        checkpoint_grid = int(model_config_override.grid_resolution)
+        if checkpoint_grid != base_resolution:
+            raise ValueError(
+                f"Checkpoint grid resolution {checkpoint_grid} conflicts with grounded training grid {base_resolution}."
+            )
+    if model_config.conditioning_dim == 0:
         model_config.conditioning_dim = infer_conditioning_dim()
 
     diffusion_config = DiffusionConfig(
@@ -3444,14 +3597,6 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         enable_pipeline_parallelism=enable_pipeline
     )
 
-    # Determine correct grid resolution based on solver type
-    if grid_size is not None:
-        base_resolution = int(grid_size)
-    elif solver == "D3Q27":
-        base_resolution = 16  # Use smaller grid for D3Q27 due to memory
-    else:
-        base_resolution = 32  # Standard resolution
-
     cfd_config = CFDConfig(
         base_grid_resolution=base_resolution,  # Match the grid resolution used
         adaptive_cells_target=5000,
@@ -3462,14 +3607,6 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     model_config.base_grid_resolution = base_resolution
     model_config.grid_resolution = base_resolution
 
-    # Dataset
-    dataset = AircraftDesignDataset(
-        num_samples=num_samples,
-        grid_size=base_resolution,
-        latent_dim=model_config.latent_dim,
-        artifact_path=dataset_artifact,
-        manifest_path=dataset_manifest,
-    )
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
