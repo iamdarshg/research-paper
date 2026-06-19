@@ -9,7 +9,7 @@ This directory contains a proof-of-concept CLI for synthetic aircraft-like voxel
 - The repo now has structured conditioning plumbing: dataset generation, the diffusion model, and the generator consume a documented 22-slot condition vector.
 - The public CLI/config surface exposes the current documented conditioning fields. What is still missing is grounded condition-response evidence on aircraft-like data.
 - `batch-generate` now records a manifest with the exact `DesignSpec` payload and condition vector for each STL. It still uses a fixed `num_steps=4`.
-- Several flags are exposed as on-switches only in the current implementation: `--enable-consistency`, `--enable-pipeline`, `--enable-checkpointing`, and `--use-marching-cubes`.
+- The consistency/pipeline/checkpointing flags and marching-cubes toggle are paired enable/disable switches (for example `--enable-consistency/--disable-consistency` and `--use-marching-cubes/--no-marching-cubes`).
 - `info` and `performance-benchmark` report compiled-in feature/status messages; they are smoke-oriented status checks, not full runtime validation of every optimization path.
 
 ## Install
@@ -74,13 +74,13 @@ Current training options:
 - `--dataset-artifact` optional densified dataset artifact
 - `--dataset-manifest` optional grounded dataset manifest (`.json`, `.jsonl`, `.yaml`)
 - `--resume-from` optional checkpoint path
-- `--save-dir` default `./checkpoints`
+- `--save-dir` default `./checkpoints` (use smoke/final-specific paths to keep artifacts separated)
 - `--run-class` `smoke` or `final`
 - `--baseline-config` required for final runs
 - `--claim-gates` required for final runs
-- `--enable-consistency` exposed, currently defaults on
-- `--enable-pipeline` exposed, currently defaults on
-- `--enable-checkpointing` exposed, currently defaults on
+- `--enable-consistency` / `--disable-consistency` (defaults on)
+- `--enable-pipeline` / `--disable-pipeline` (defaults on)
+- `--enable-checkpointing` / `--disable-checkpointing` (defaults on)
 - `--enable-compile` defaults off
 - `--solver` default `D3Q27`
 
@@ -111,7 +111,7 @@ Generate one STL artifact from a checkpoint:
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --checkpoint ./checkpoints_smoke/final_optimized_model.pt \
   --output aircraft_optimized.stl \
   --target-speed 7.0 \
   --num-steps 4 \
@@ -135,7 +135,7 @@ Current generation options:
 - `--part-count-min` / `--part-count-max`
 - `--manufacturing-method`
 - `--num-steps` default `4`
-- `--use-marching-cubes` exposed, currently defaults on
+- `--use-marching-cubes` / `--no-marching-cubes` (defaults on)
 - `--solver` default `D3Q27`
 
 What the command does today:
@@ -157,7 +157,7 @@ Important nuance:
 
 ```bash
 python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --checkpoint ./checkpoints_smoke/final_optimized_model.pt \
   --output-dir ./generations_optimized \
   --num-designs 3
 ```
@@ -194,7 +194,7 @@ Run a multi-seed condition-response sweep and compute Pearson correlations:
 
 ```bash
 python aircraft_diffusion_cfd.py validate-conditions \
-  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --checkpoint ./checkpoints_smoke/final_optimized_model.pt \
   --num-seeds 20 \
   --output ./condition_validation.json
 ```
@@ -205,7 +205,7 @@ Automate aggregated performance studies across multiple seeds using the standalo
 
 ```bash
 python multi_seed_eval.py \
-  --checkpoint ./checkpoints/final_optimized_model.pt \
+  --checkpoint ./checkpoints_smoke/final_optimized_model.pt \
   --num-seeds 10 \
   --baseline-config ./baseline_config.yaml \
   --baseline-report ./baseline_report.json \
@@ -262,6 +262,8 @@ python final_evidence.py \
 
 Missing, failed, or blocked reports keep claim-bearing wording blocked.
 
+The protocol runner is the canonical, repeatable entry point for smoke and final runs. The checked-in configs keep smoke outputs (`checkpoints_protocol_smoke`, `build/protocol_smoke`) and final-eval outputs (`checkpoints_protocol_final`, `build/protocol_final`) in clearly separated paths.
+
 ## Condition-Response Smoke Benchmark
 
 ```bash
@@ -298,7 +300,7 @@ Checkpoint path missing:
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint ./checkpoints/final_optimized_model.pt
+  --checkpoint ./checkpoints_smoke/final_optimized_model.pt
 ```
 
 If that path does not exist yet, train first or point `--checkpoint` at a real file.

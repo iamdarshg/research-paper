@@ -66,6 +66,9 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("--run-class", result.output)
         self.assertIn("--baseline-config", result.output)
         self.assertIn("--claim-gates", result.output)
+        self.assertIn("--disable-consistency", result.output)
+        self.assertIn("--disable-pipeline", result.output)
+        self.assertIn("--disable-checkpointing", result.output)
 
     def test_manifest_dataset_loads_grounded_samples(self):
         with self.runner.isolated_filesystem():
@@ -214,6 +217,7 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("--manufacturing-method", result.output)
         self.assertIn("--num-steps", result.output)
         self.assertIn("--use-marching-cubes", result.output)
+        self.assertIn("--no-marching-cubes", result.output)
         self.assertIn("--solver", result.output)
 
     def test_densify_help_lists_current_options(self):

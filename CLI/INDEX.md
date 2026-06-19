@@ -7,6 +7,7 @@ This directory exposes a proof-of-concept command-line interface for synthetic a
 - `README.md`: full CLI reference, current behavior notes, and proof-of-concept limits
 - `QUICKSTART.md`: fastest path to a smoke run
 - `examples.py`: runnable command recipes plus clearly labeled pseudocode where the CLI does not expose a workflow directly
+- `run_protocol.py` + `run_protocols/*.yaml`: canonical, repeatable smoke/final run entry points
 
 ## Current Commands
 

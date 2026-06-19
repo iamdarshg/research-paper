@@ -11,7 +11,7 @@ This repository combines a latent generative model, voxel decoding, internal lat
 - The model consumes structured conditions end to end through the dataset, model, and generator paths.
 - The public CLI/config surface exposes the documented conditioning fields for propulsion, maneuverability, payload, takeoff, manufacturing, and geometry bounds.
 - Condition-response and claim-gate tooling exists through `validate-conditions`, `condition-response-smoke`, `run_condition_benchmark.py`, `aircraft_validity.py`, `final_evidence.py`, `multi_seed_eval.py`, and the checked-in protocol runner.
-- The repo does not yet provide scientific validation of conditioned aircraft generation on grounded aircraft-like data.
+- The repo includes grounded-data wiring and aircraft-corpus artifacts for reproducibility checks, but it does not yet provide scientific validation of conditioned aircraft generation on a publication-grade aircraft corpus.
 
 ## Current Scope
 
@@ -19,15 +19,15 @@ This repository combines a latent generative model, voxel decoding, internal lat
 - Internal D3Q27/OpenFOAM benchmark path for solver cross-checks
 - STL export and reproducible local validation tooling
 - Small-scale training smoke runs on commodity hardware
-- Checked-in smoke/final protocol scaffolding and a minimal manifest-backed grounded wiring path
+- Checked-in smoke/final protocol scaffolding and manifest-backed grounded wiring paths
 
 ## Not Yet Implemented At Claimable Quality
 
-- Grounded condition-response evidence on an aircraft-like corpus
-- A passing final evidence package that combines manifest, validity, condition-response, manufacturing, and baseline-statistics reports
-- Real aircraft dataset training
-- Structural validation beyond connectivity heuristics
+- Passing final evidence package across all gates
+- Real aircraft dataset training at publication scale
+- Structural validation beyond connectivity and manufacturing heuristics
 - Publication-grade aerodynamic optimization claims
+- Validated evidence that each exposed condition reliably steers aircraft-like outputs in the intended direction
 
 ## Quick Start
 
@@ -48,6 +48,8 @@ python aircraft_diffusion_cfd.py --help
 python aircraft_diffusion_cfd.py info
 ```
 
+Expected output shows the PyTorch version, CUDA availability, GPU memory when CUDA is present, and a smoke-status summary. It is not a measured benchmark.
+
 ### 3. Run A Small Training Smoke Test
 
 ```bash
@@ -57,6 +59,8 @@ python aircraft_diffusion_cfd.py train \
   --num-samples 8 \
   --save-dir ./checkpoints_smoke
 ```
+
+Use larger training settings only after the smoke path works on your machine.
 
 ### 4. Generate One STL
 
@@ -68,15 +72,24 @@ python aircraft_diffusion_cfd.py generate \
   --num-steps 4
 ```
 
-### 5. Run The Internal Benchmark
+### 5. Batch Generate Optional Designs
 
 ```bash
-python run_internal_benchmark.py
+python aircraft_diffusion_cfd.py batch-generate \
+  --checkpoint ./checkpoints_smoke/final_optimized_model.pt \
+  --output-dir ./artifacts/designs \
+  --num-designs 5
 ```
 
-Treat that benchmark as a solver cross-check and implementation smoke test, not as a publication-grade aerodynamic benchmark.
+### 6. Print Runtime Status
 
-### 6. Run Tests
+```bash
+python aircraft_diffusion_cfd.py performance-benchmark
+```
+
+This command reports compiled-in smoke-run status. Do not treat it as a measured speed, memory, accuracy, or aerodynamic benchmark.
+
+### 7. Run Tests
 
 For a normal Python environment:
 
@@ -97,7 +110,7 @@ If you want the script to create a Windows venv first:
 .\run_tests.ps1 -BootstrapVenv -q
 ```
 
-### 7. Run A Checked-In Protocol
+### 8. Run A Checked-In Protocol
 
 Smoke path:
 
@@ -112,6 +125,8 @@ Guarded final path preview:
 cd CLI
 python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
 ```
+
+The checked-in protocol configs are the canonical, repeatable entry points for smoke and final runs. They keep smoke artifacts (`checkpoints_protocol_smoke`, `build/protocol_smoke`) and final-eval artifacts (`checkpoints_protocol_final`, `build/protocol_final`) in separate paths.
 
 Final claim-bearing wording remains blocked until the final evidence package passes:
 
@@ -137,6 +152,10 @@ Key arguments:
 - `--save-dir` default `./checkpoints`
 - `--run-class` `smoke` or `final`
 - `--baseline-config`, `--claim-gates` required for final runs
+- `--enable-consistency` / `--disable-consistency`
+- `--enable-pipeline` / `--disable-pipeline`
+- `--enable-checkpointing` / `--disable-checkpointing`
+- `--enable-compile`
 
 ### `generate`
 
@@ -149,7 +168,7 @@ Key arguments:
 - `--engine-diameter-mm`, `--engine-length-mm`, `--engine-count-min`, `--engine-count-max`
 - `--wingspan-limit-m`, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and `--manufacturing-method`
 - `--num-steps` default `4`
-- `--use-marching-cubes` exposed and defaults on in the current CLI
+- `--use-marching-cubes` / `--no-marching-cubes`
 
 The generator path consumes the documented condition vector from [`CLI/conditioning_schema.yaml`](CLI/conditioning_schema.yaml). What is still missing is grounded scientific validation that those controls reliably steer aircraft-like outputs in the intended direction.
 
@@ -171,15 +190,20 @@ Voxelizes and evaluates the bundled grounded STL examples. This is runnable repo
 
 Runs a multi-seed condition-response sweep and writes correlation summaries for the current checkpoint. Treat the result as checkpoint-level evidence only, not grounded aircraft validation.
 
+### `performance-benchmark`
+
+Prints the smoke-run feature status summary. It is intentionally phrased as status output, not a benchmark claim.
+
 ## Data Status
 
-The current repo does not ship a publication-grade aircraft corpus. It has:
+The current repo does not ship a publication-grade aircraft training corpus. It has:
 
 - a procedural/synthetic training path
 - checked-in densification artifacts for smoke workflows
 - a minimal manifest-backed grounded wiring artifact at [`docs/dataset/minimal_grounded_manifest.jsonl`](docs/dataset/minimal_grounded_manifest.jsonl)
+- a larger grounded aircraft manifest and corpus artifacts used by the guarded final protocol
 
-That minimal manifest exists to validate the dataset wiring and protocol guardrails. It is not a scientifically adequate aircraft corpus.
+Those artifacts validate dataset wiring, provenance, and protocol guardrails. They do not by themselves prove aircraft-design performance.
 
 ## Reproducibility Files
 
@@ -188,13 +212,19 @@ That minimal manifest exists to validate the dataset wiring and protocol guardra
 - [`CLI/run_protocol.py`](CLI/run_protocol.py)
 - [`CLI/run_protocols/smoke_8gb.yaml`](CLI/run_protocols/smoke_8gb.yaml)
 - [`CLI/run_protocols/final_cloud.yaml`](CLI/run_protocols/final_cloud.yaml)
+- [`docs/dataset/minimal_grounded_manifest.jsonl`](docs/dataset/minimal_grounded_manifest.jsonl)
+- [`docs/dataset/grounded_aircraft_manifest.jsonl`](docs/dataset/grounded_aircraft_manifest.jsonl)
 - [`paper/FINAL_RUN_GATES.md`](paper/FINAL_RUN_GATES.md)
 - [`paper/CITATION_AUDIT.md`](paper/CITATION_AUDIT.md)
 - [`paper/CLAIMS_EVIDENCE_MATRIX.md`](paper/CLAIMS_EVIDENCE_MATRIX.md)
 
+## Historical Schedule Notes
+
+Earlier experiments used progressive 16^3, 24^3, and 32^3 grids and informal RTX 3090 timing estimates. Those notes are historical context only. The current CLI distinguishes smoke runs from guarded final runs, and the current trainer executes one configured grid size rather than an automatic progressive schedule.
+
 ## System Requirements
 
-- GPU: NVIDIA CUDA-capable GPU with 8GB+ VRAM
+- GPU: NVIDIA CUDA-capable GPU with 8GB+ VRAM recommended
 - CPU: multi-core processor
 - RAM: 16GB+ system RAM recommended
 - Python: 3.9+

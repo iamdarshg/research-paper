@@ -100,7 +100,6 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertIn("24", commands[1])
             self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), commands[1])
             self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), commands[1])
-            self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[3])
             self.assertEqual(commands[2][2], "evaluate-baselines")
             self.assertIn("--baseline-config", commands[2])
             self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), commands[2])
@@ -109,6 +108,7 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertIn("--checkpoint", commands[2])
             self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[2])
             self.assertEqual(commands[3][2], "validate-conditions")
+            self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[3])
             self.assertEqual(commands[4][1], str((cli_dir / "run_condition_benchmark.py").resolve()))
             self.assertIn(str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()), commands[4])
             self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[4])
@@ -119,6 +119,38 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertEqual(commands[9][1], str((cli_dir / "validate_manifest.py").resolve()))
             self.assertEqual(commands[10][1], str((cli_dir / "final_evidence.py").resolve()))
             self.assertIn("--require-run-consistency", commands[10])
+
+    def test_build_protocol_commands_supports_disable_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            cli_dir = repo_root / "CLI"
+            protocol_dir = cli_dir / "run_protocols"
+            protocol_dir.mkdir(parents=True)
+
+            config_path = protocol_dir / "smoke.yaml"
+            payload = {
+                "train": {
+                    "enabled": True,
+                    "num_epochs": 1,
+                    "batch_size": 1,
+                    "num_samples": 2,
+                    "save_dir": "../../checkpoints_test",
+                    "enable_consistency": False,
+                    "enable_pipeline": False,
+                    "enable_checkpointing": False,
+                    "enable_compile": False,
+                },
+            }
+            config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+            config = run_protocol.load_protocol_config(str(config_path))
+            commands = run_protocol.build_protocol_commands(config)
+
+            train_cmd = commands[0]
+            self.assertIn("--disable-consistency", train_cmd)
+            self.assertIn("--disable-pipeline", train_cmd)
+            self.assertIn("--disable-checkpointing", train_cmd)
+            self.assertNotIn("--enable-compile", train_cmd)
 
     def test_checked_in_protocols_resolve_repo_assets(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -159,7 +191,9 @@ class TestProtocolRunner(unittest.TestCase):
             any(command[1] == str((repo_root / "CLI" / "aircraft_validity.py").resolve()) for command in final_commands)
         )
         builder_command = next(
-            command for command in final_commands if command[1] == str((repo_root / "CLI" / "build_aircraft_validity_inputs.py").resolve())
+            command
+            for command in final_commands
+            if command[1] == str((repo_root / "CLI" / "build_aircraft_validity_inputs.py").resolve())
         )
         self.assertIn(str((repo_root / "build" / "protocol_final" / "generated_voxels").resolve()), builder_command)
         self.assertTrue(
