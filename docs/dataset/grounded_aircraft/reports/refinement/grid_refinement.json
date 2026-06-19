@@ -1,0 +1,61 @@
+{
+  "cases": {
+    "0012": [
+      {
+        "drag_coefficient": 124.48180553932708,
+        "grid_size": 24,
+        "lift_coefficient": 0.0072756441200193915,
+        "occupancy_ratio": 0.0377604179084301,
+        "steps": 15
+      },
+      {
+        "drag_coefficient": 43.33845934962341,
+        "grid_size": 32,
+        "lift_coefficient": 0.01080999400033369,
+        "occupancy_ratio": 0.02960205078125,
+        "steps": 20
+      },
+      {
+        "drag_coefficient": 37.912802453786675,
+        "grid_size": 40,
+        "lift_coefficient": 0.011790874283792047,
+        "occupancy_ratio": 0.021906249225139618,
+        "steps": 25
+      }
+    ],
+    "23015": [
+      {
+        "drag_coefficient": 89.55947324134529,
+        "grid_size": 24,
+        "lift_coefficient": 0.00995414854682665,
+        "occupancy_ratio": 0.0416666679084301,
+        "steps": 15
+      },
+      {
+        "drag_coefficient": 48.1042178574639,
+        "grid_size": 32,
+        "lift_coefficient": 0.010056030436268414,
+        "occupancy_ratio": 0.032135009765625,
+        "steps": 20
+      },
+      {
+        "drag_coefficient": 33.67386845964957,
+        "grid_size": 40,
+        "lift_coefficient": 0.01105565052692455,
+        "occupancy_ratio": 0.026109375059604645,
+        "steps": 25
+      }
+    ]
+  },
+  "claim_boundary": "Internal-solver consistency study only. It is not an external validation against wind-tunnel or TMR reference coefficients.",
+  "grid_ladder": [
+    24,
+    32,
+    40
+  ],
+  "source_context": {
+    "nasa_tmr_naca0012": "https://tmbwg.github.io/turbmodels/naca0012numerics_grids.html",
+    "nasa_tmr_onera_m6": "https://tmbwg.github.io/turbmodels/onerawingnumerics_grids.html"
+  },
+  "study": "grid_refinement"
+}

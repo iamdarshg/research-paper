@@ -6,6 +6,7 @@ import json
 import shutil
 import gc
 import time
+import tempfile
 from pathlib import Path
 import sys
 
@@ -19,27 +20,36 @@ from data_utils import GroundTruthExporter
 from models import AeroSurrogate, MissionEncoder, LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel
 
 
-def _cleanup_ground_truth():
-    ground_truth_dir = Path("./ground_truth")
-    if not ground_truth_dir.exists():
+def _cleanup_path(path: Path):
+    if not path.exists():
         return
 
     gc.collect()
     for _ in range(10):
         try:
-            shutil.rmtree(ground_truth_dir)
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
             return
         except PermissionError:
             gc.collect()
             time.sleep(0.1)
 
-    shutil.rmtree(ground_truth_dir, ignore_errors=True)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _cleanup_ground_truth():
+    _cleanup_path(Path("./ground_truth"))
 
 class TestIssue15Pipeline(unittest.TestCase):
     def setUp(self):
+        self.original_cwd = Path.cwd()
+        self.workspace = Path(tempfile.mkdtemp(prefix="issue15_pipeline_"))
+        os.chdir(self.workspace)
         _cleanup_ground_truth()
         self.test_dir = Path("./test_issue_15_pipeline")
-        self.test_dir.mkdir(exist_ok=True)
+        _cleanup_path(self.test_dir)
+        self.test_dir.mkdir(exist_ok=True, parents=True)
         self.device = torch.device('cpu')
 
         # 1. CREATE REAL LIGHTWEIGHT COMPONENTS (Review Feedback Fix 4)
@@ -75,9 +85,12 @@ class TestIssue15Pipeline(unittest.TestCase):
         torch.save(checkpoint, self.checkpoint_path)
 
     def tearDown(self):
-        if self.test_dir.exists():
-            shutil.rmtree(self.test_dir)
-        _cleanup_ground_truth()
+        try:
+            _cleanup_path(self.test_dir)
+            _cleanup_ground_truth()
+        finally:
+            os.chdir(self.original_cwd)
+            _cleanup_path(self.workspace)
 
     def test_label_tier_serialization(self):
         """Verify label tiers survive export/load."""

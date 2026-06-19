@@ -260,7 +260,7 @@ class GroundTruthExporter:
         with open(sample_path / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)
 
-        print(f"✅ Exported CFD label {sample_id} ({label_dict['tier']}) to {sample_path}")
+        print(f"[ok] Exported CFD label {sample_id} ({label_dict['tier']}) to {sample_path}")
 
 class CFDLabelDataset(Dataset):
     """Dataset for training AeroSurrogate from CFD labels (Issue #15)"""

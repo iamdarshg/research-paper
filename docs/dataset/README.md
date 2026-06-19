@@ -39,6 +39,36 @@ Its purpose is limited:
 
 It is **not** a scientifically adequate aircraft corpus. It contains only the repository's bundled STL examples and should be treated as wiring validation, not dataset completion.
 
+The repo now also includes an executable validator:
+
+```bash
+python CLI/validate_manifest.py --manifest docs/dataset/minimal_grounded_manifest.jsonl --level basic
+python CLI/validate_manifest.py --manifest docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
+```
+
+Current expected behavior:
+
+- `basic` should pass for the checked-in minimal manifest.
+- `claim-bearing` should return `blocked`, because the file is intentionally a wiring artifact and not a publication-grade corpus.
+
+See `docs/dataset/GROUNDED_CORPUS_SPEC.md` for the stricter claim-bearing contract and
+`docs/dataset/manifest_schema.example.json` for a machine-readable example record shape.
+
+## Claim-Bearing Corpus Artifacts
+
+The repository now also contains a claim-bearing grounded corpus package built
+from public NACA source geometry code plus local preprocessing and analysis:
+
+- `docs/dataset/grounded_aircraft_manifest.jsonl`
+- `docs/dataset/grounded_aircraft_provenance.json`
+- `docs/dataset/GROUNDED_AIRCRAFT_CORPUS_REPORT.md`
+- `docs/dataset/grounded_aircraft/`
+
+This package is intentionally narrower than a full-aircraft dataset. It is
+airfoil-section-heavy, uses explicit local response-metric proxies, and should
+be treated as grounded manifest evidence for the current protocol contracts, not
+as whole-aircraft flight-validation evidence.
+
 Each record may include:
 
 - `geometry_path` or `stl_path`

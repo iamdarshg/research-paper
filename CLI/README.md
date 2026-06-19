@@ -6,8 +6,8 @@ This directory contains a proof-of-concept CLI for synthetic aircraft-like voxel
 
 - The training dataset is synthetic.
 - The workflow is not validated for real aircraft design, certification, or manufacturing decisions.
-- The repo now has partial structured conditioning plumbing: dataset generation, the diffusion model, and the generator consume a documented 22-slot condition vector.
-- The public CLI exposes only a subset of that path today. `generate` and `batch-generate` surface speed, maneuverability, propulsion, wingspan, payload, takeoff, wall-thickness, part-count, and manufacturing options, but the full schema still needs config-driven evaluation flows plus condition-response benchmarks on grounded aircraft-like data.
+- The repo now has structured conditioning plumbing: dataset generation, the diffusion model, and the generator consume a documented 22-slot condition vector.
+- The public CLI/config surface exposes the current documented conditioning fields. What is still missing is grounded condition-response evidence on aircraft-like data.
 - `batch-generate` now records a manifest with the exact `DesignSpec` payload and condition vector for each STL. It still uses a fixed `num_steps=4`.
 - Several flags are exposed as on-switches only in the current implementation: `--enable-consistency`, `--enable-pipeline`, `--enable-checkpointing`, and `--use-marching-cubes`.
 - `info` and `performance-benchmark` report compiled-in feature/status messages; they are smoke-oriented status checks, not full runtime validation of every optimization path.
@@ -41,6 +41,10 @@ Commands exposed by the current file:
 Standalone helpers:
 
 - `run_protocol.py`
+- `validate_manifest.py`
+- `run_condition_benchmark.py`
+- `aircraft_validity.py`
+- `final_evidence.py`
 - `run_protocols/smoke_8gb.yaml`
 - `run_protocols/final_cloud.yaml`
 - `baseline_config.yaml`
@@ -63,6 +67,7 @@ Current training options:
 - `--batch-size` default `4`
 - `--learning-rate` default `2e-4`
 - `--latent-dim` default `16`
+- `--grid-size` optional explicit training/CFD voxel resolution override
 - `--precision` default `float32`
 - `--disconnection-penalty` default `30.0`
 - `--num-samples` default `500`
@@ -86,7 +91,8 @@ Checkpoint behavior in the current code:
 
 Resolution behavior in the current code:
 
-- `D3Q27` training uses a base grid resolution of `16`.
+- If `--grid-size` is provided, training uses that explicit resolution.
+- Otherwise `D3Q27` training uses a base grid resolution of `16`.
 - Any other solver string falls back to `32`.
 - The current trainer runs one configured grid size; it does not execute the older staged `16 -> 24 -> 32` schedule described in stale docs.
 
@@ -97,6 +103,7 @@ Grounded-manifest behavior:
 - Each manifest record may optionally provide `design_spec`, `condition_vector`, `latent_path`, and `split`.
 - Relative paths are resolved from the manifest file's directory.
 - The checked-in minimal example is [`docs/dataset/minimal_grounded_manifest.jsonl`](../docs/dataset/minimal_grounded_manifest.jsonl).
+- That checked-in manifest is wiring validation only, not a publication-grade aircraft corpus.
 
 ## Generation
 
@@ -142,7 +149,7 @@ What the command does today:
 Important nuance:
 
 - The condition-vector seam is real code plumbing, not just a TODO. See `conditioning_schema.yaml` and `config.yaml`.
-- Public CLI exposure is still partial. The repo is not yet validated as a mission-conditioned or manufacturing-conditioned aircraft generator.
+- The CLI/config surface exposes the documented condition fields, but the repo is not yet validated as a mission-conditioned or manufacturing-conditioned aircraft generator.
 - `condition-response-smoke` writes a JSON report for directional smoke evidence only; it is not a scientific benchmark.
 - No grounded condition-response benchmark currently demonstrates that changing payload, takeoff, wingspan, wall-thickness, part-count, or manufacturing inputs reliably changes generated outputs in the intended direction.
 
@@ -162,7 +169,7 @@ Current batch options:
 - `--num-designs` default `5`
 - `--seed` default `0`
 - `--vary-conditions` to sample deterministic `DesignSpec` variation
-- the same public conditioning subset exposed by `generate`
+- the same documented public conditioning fields exposed by `generate`
 
 Current limitations:
 
@@ -183,7 +190,7 @@ python aircraft_diffusion_cfd.py evaluate-baselines \
 
 ## Condition-Response Validation
 
-Perform scientific condition-response validation and compute Pearson correlations:
+Run a multi-seed condition-response sweep and compute Pearson correlations:
 
 ```bash
 python aircraft_diffusion_cfd.py validate-conditions \
@@ -200,8 +207,14 @@ Automate aggregated performance studies across multiple seeds using the standalo
 python multi_seed_eval.py \
   --checkpoint ./checkpoints/final_optimized_model.pt \
   --num-seeds 10 \
-  --output-dir ./eval_results
+  --baseline-config ./baseline_config.yaml \
+  --baseline-report ./baseline_report.json \
+  --validation-report ./condition_validation.json \
+  --output-dir ./eval_results \
+  --output-report ./baseline_statistics.json
 ```
+
+The script now emits the claim-gate statistics bundle consumed by `final_evidence.py`.
 
 ## Protocol Runner
 
@@ -217,7 +230,37 @@ Preview the guarded final-eval protocol without executing it:
 python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
 ```
 
-The final protocol is intentionally conservative: it references `baseline_config.yaml`, `paper/FINAL_RUN_GATES.md`, and the minimal grounded manifest so claim-bearing runs must name their baselines and dataset inputs explicitly.
+The final protocol is intentionally conservative: it starts with grounded-manifest validation, trains against explicitly named dataset/baseline inputs, emits `baseline_statistics.json`, and then re-validates the manifest before assembling the final evidence package so report lineage fields can agree on one checkpoint.
+
+Validate a manifest directly:
+
+```bash
+python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level basic
+python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
+python validate_manifest.py --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl --level claim-bearing
+```
+
+Run the grounded condition-response gate directly:
+
+```bash
+python run_condition_benchmark.py \
+  --checkpoint ../checkpoints_protocol_final/final_optimized_model.pt \
+  --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl \
+  --output ../build/protocol_final/condition_benchmark.json
+```
+
+Evaluate the final evidence package:
+
+```bash
+python final_evidence.py \
+  --manifest-validation ../build/protocol_final/manifest_validation.json \
+  --aircraft-validity ../build/protocol_final/aircraft_validity.json \
+  --condition-benchmark ../build/protocol_final/condition_benchmark.json \
+  --manufacturing-constraints ../build/protocol_final/manufacturing_constraints.json \
+  --baseline-statistics ../build/protocol_final/baseline_statistics.json
+```
+
+Missing, failed, or blocked reports keep claim-bearing wording blocked.
 
 ## Condition-Response Smoke Benchmark
 

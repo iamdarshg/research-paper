@@ -1,0 +1,192 @@
+{
+  "claim_boundary": "Local whole-aircraft geometry-plus-internal-solver report for manifest grounding. It is not a wind-tunnel match or certification-grade CFD study.",
+  "configuration": "cruise_ae2.50deg",
+  "design_family": "nasa_crm_hs_transport",
+  "geometry_paths": {
+    "full_stl_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\stl_full\\crm_hs_dpw6_ae250_full.stl",
+    "source_stl_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\stl_source\\crm_hs_dpw6_ae250.stl",
+    "step_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\step\\crm_hs_dpw6_ae250\\DPW6_CRM_wbnpt_ih+0_v09_2016-01-28_ae2.50deg_cf.stp",
+    "voxel_path": "D:\\CodeProjects\\research-paper\\docs\\dataset\\nasa_crm_whole_aircraft\\voxels\\crm_hs_dpw6_ae250_full.npy"
+  },
+  "geometry_scale_note": null,
+  "hashes": {
+    "full_stl_sha256": "7c9d19f3d4c948f4f206ec4ec11fdf423f91e507f11ada40a6f55f21ecbd6390",
+    "source_stl_sha256": "f03b0a3b5680fb85697014dc7569b94d6ab7b9641db00227b684acbd41c31828",
+    "step_sha256": "f7a0668176b291b59724b81255776e5b5d063ae33e42df00a2ddb1516f702de3",
+    "voxel_sha256": "ded30cedfd3a32b06b9d081040a198452b606007328cbb8444d8d150b86f4c60",
+    "zip_sha256": "3a5b1c6fa5482aa1eefeea8d8ee593fac61caaf2065ea64522a68add18c43d56"
+  },
+  "local_cfd": {
+    "density": 1.225,
+    "drag_coefficient": 38.62452518148087,
+    "drag_link_metric_exponent": 1.68,
+    "drag_reference_speed": 80.0,
+    "drag_speed_normalization": 9.32944606413994,
+    "drag_speed_normalization_exponent": 1.0,
+    "force_stability": 1.0,
+    "force_x": 133.44459533691406,
+    "force_z": -25.295671463012695,
+    "freestream_speed": 8.575000000000001,
+    "lbm_converged": 0.0,
+    "lift_coefficient": -7.307934058747341,
+    "max_turbulent_viscosity": 9.396226232638583e-06,
+    "max_vorticity": 0.3415586054325104,
+    "mean_smagorinsky_constant": 0.17,
+    "net_momentum_exchange_force_x": 133.44459533691406,
+    "physical_force_source": 133.44459533691406,
+    "pressure_only_fallback": 1.177747493926625,
+    "pressure_sum": 10923.5029296875,
+    "projected_area_lattice": 55.0,
+    "raw_force_x": 26.777978897094727,
+    "raw_force_z": -0.17973053455352783,
+    "raw_net_momentum_exchange_force_x": 0.9481490254402161,
+    "raw_projected_drag_coefficient": 0.4868723435835405,
+    "reference_area": 0.0537109375,
+    "reference_length": 1.0,
+    "reynolds_number_turbulent": 6864064.6684548445,
+    "shape_drag_blockage": 0.0537109375,
+    "shape_drag_fullness": 0.2383838383838384,
+    "shape_drag_projected_side": 7.416198487095663,
+    "shape_drag_scale": 0.3515696120855448,
+    "shape_drag_surface_to_volume": 2.1412429378531073,
+    "surrogate_proxy_force": 3.862952579120756,
+    "vortex_core_volume": 0.080810546875
+  },
+  "local_validity": {
+    "canonicalization": {
+      "metrics": {
+        "center_body_density": 0.02421874925494194,
+        "center_body_density_ratio": 4.191549279429188,
+        "center_body_fraction": 0.3502824858757062,
+        "high_end_fraction": 0.05649717514124294,
+        "left_wing_density": 0.0057705966755747795,
+        "left_wing_fraction": 0.18361581920903955,
+        "length_fraction_x": 0.78125,
+        "longitudinal_profile_cv": 1.2854938591724747,
+        "low_end_fraction": 0.05649717514124294,
+        "occupancy_ratio": 0.01080322265625,
+        "right_wing_density": 0.0057779946364462376,
+        "right_wing_fraction": 0.20056497175141244,
+        "span_fraction_y": 0.84375,
+        "symmetry_score": 0.7627118644067796,
+        "tail_fraction": 0.05649717514124294,
+        "thickness_fraction_z": 0.125,
+        "voxel_symmetry_score": 0.016949152542372836
+      },
+      "permutation": [
+        2,
+        0,
+        1
+      ],
+      "score": 15.011471976794429
+    },
+    "checks": {
+      "body_centerline_dominance": true,
+      "longitudinal_profile_variation": true,
+      "nonempty_occupancy": true,
+      "span_sanity": true,
+      "symmetry": true,
+      "tail_body_plausibility": true,
+      "wing_body_balance": true
+    },
+    "claim_boundary": "First-pass aircraft-specific heuristic validity, not structural or aerodynamic proof.",
+    "failed_checks": [],
+    "metrics": {
+      "center_body_density": 0.02421874925494194,
+      "center_body_density_ratio": 4.191549279429188,
+      "center_body_fraction": 0.3502824858757062,
+      "high_end_fraction": 0.05649717514124294,
+      "left_wing_density": 0.0057705966755747795,
+      "left_wing_fraction": 0.18361581920903955,
+      "length_fraction_x": 0.78125,
+      "longitudinal_profile_cv": 1.2854938591724747,
+      "low_end_fraction": 0.05649717514124294,
+      "occupancy_ratio": 0.01080322265625,
+      "right_wing_density": 0.0057779946364462376,
+      "right_wing_fraction": 0.20056497175141244,
+      "span_fraction_y": 0.84375,
+      "symmetry_score": 0.7627118644067796,
+      "tail_fraction": 0.05649717514124294,
+      "thickness_fraction_z": 0.125,
+      "voxel_symmetry_score": 0.016949152542372836
+    },
+    "status": "pass"
+  },
+  "mirror_info": {
+    "full_bounds": [
+      [
+        2349.5,
+        -29446.833984375,
+        -40.5738525390625
+      ],
+      [
+        66711.890625,
+        29446.833984375,
+        8715.755859375
+      ]
+    ],
+    "full_extents": [
+      64362.390625,
+      58893.66796875,
+      8756.329711914062
+    ],
+    "full_faces": 5312,
+    "full_is_watertight": false,
+    "full_vertices": 2722,
+    "mirror_axis_index": 1,
+    "mirror_axis_label": "y",
+    "mode": "mirror_semispan_source",
+    "source_bounds": [
+      [
+        2349.5,
+        -0.0025811605155467987,
+        -40.5738525390625
+      ],
+      [
+        66711.890625,
+        29446.833984375,
+        8715.755859375
+      ]
+    ],
+    "source_extents": [
+      64362.390625,
+      29446.836565535516,
+      8756.329711914062
+    ],
+    "source_faces": 2656,
+    "source_is_watertight": false,
+    "source_vertices": 1361
+  },
+  "represented_dimensions_m": {
+    "actual_length_m": 64.362390625,
+    "actual_span_m": 58.89366796875,
+    "actual_thickness_m": 8.756329711914063,
+    "represented_length_m": 64.362390625,
+    "represented_scale_factor": 1.0,
+    "represented_span_m": 58.89366796875,
+    "represented_thickness_m": 8.756329711914063
+  },
+  "response_metrics": {
+    "maneuverability_response": 0.757831,
+    "payload_response": 358571.859672,
+    "structural_response": 0.333355,
+    "thrust_response": 0.023819
+  },
+  "response_metrics_provenance": {
+    "maneuverability_response": "local_geometry_validity_symmetry_planform_proxy",
+    "payload_response": "local_geometry_analysis_represented_volume_proxy",
+    "structural_response": "local_geometry_validity_centerline_thickness_proxy",
+    "thrust_response": "local_internal_cfd_drag_inverse_proxy"
+  },
+  "sample_id": "crm_hs_dpw6_ae250",
+  "solver_config": {
+    "device": "cpu",
+    "grid_size": 32,
+    "solver_type": "D3Q27",
+    "steps": 20
+  },
+  "source_id": "crm_hs_dpw6_ae250",
+  "source_page": "https://commonresearchmodel.larc.nasa.gov/geometry/dpw6-geometries/",
+  "source_url": "https://commonresearchmodel.larc.nasa.gov/wp-content/uploads/sites/7/2020/10/DPW6_v09_2016_01_28_STEP.zip",
+  "split": "holdout"
+}

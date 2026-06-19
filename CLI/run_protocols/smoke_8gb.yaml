@@ -4,6 +4,7 @@ train:
   batch_size: 1
   learning_rate: 0.0002
   latent_dim: 16
+  grid_size: 16
   precision: float32
   disconnection_penalty: 30.0
   num_samples: 8

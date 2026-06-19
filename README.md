@@ -1,109 +1,82 @@
 # Aircraft Diffusion CFD - Research Repo
 
-> Current status: a proof-of-concept research codebase for synthetic voxel generation, CFD-informed scoring, reproducible smoke checks, and partial structured conditioning plumbing. It is not yet a validated aircraft-design system or a scientifically supported mission/manufacturing-conditioned airplane generator.
+> Current status: a proof-of-concept research codebase for synthetic voxel generation, CFD-informed scoring, reproducible smoke checks, and structured conditioning plumbing. It is not yet a validated aircraft-design system or a scientifically supported mission/manufacturing-conditioned airplane generator.
 
 ## Overview
 
 This repository combines a latent generative model, voxel decoding, internal lattice-Boltzmann-style scoring, and an OpenFOAM export path. The current experiments are intentionally narrow: they use synthetic training data and reduced sanity runs to validate the code path, not to establish publication-grade aerodynamic or structural performance.
 
+## What Is True Today
+
+- The model consumes structured conditions end to end through the dataset, model, and generator paths.
+- The public CLI/config surface exposes the documented conditioning fields for propulsion, maneuverability, payload, takeoff, manufacturing, and geometry bounds.
+- Condition-response and claim-gate tooling exists through `validate-conditions`, `condition-response-smoke`, `run_condition_benchmark.py`, `aircraft_validity.py`, `final_evidence.py`, `multi_seed_eval.py`, and the checked-in protocol runner.
+- The repo does not yet provide scientific validation of conditioned aircraft generation on grounded aircraft-like data.
+
 ## Current Scope
 
 - Proof-of-concept latent generation of freeform or aircraft-like voxel geometries
-- Partial structured conditioning path: dataset, model, and generator consume a documented condition vector
 - Internal D3Q27/OpenFOAM benchmark path for solver cross-checks
 - STL export and reproducible local validation tooling
 - Small-scale training smoke runs on commodity hardware
+- Checked-in smoke/final protocol scaffolding and a minimal manifest-backed grounded wiring path
 
 ## Not Yet Implemented At Claimable Quality
 
-- Full public CLI/config exposure for mission and manufacturing conditioning
-- Condition-response benchmarks for payload, takeoff, wingspan, wall-thickness, part-count, and manufacturing controls
+- Grounded condition-response evidence on an aircraft-like corpus
+- A passing final evidence package that combines manifest, validity, condition-response, manufacturing, and baseline-statistics reports
 - Real aircraft dataset training
 - Structural validation beyond connectivity heuristics
 - Publication-grade aerodynamic optimization claims
-
-### Key Features
-
-- 🚀 **Prototype Training Path**: Includes smoke-run and final-run guardrails for the current research workflow
-- 💾 **Memory-Aware Implementation**: Uses gradient checkpointing and sparse-grid-oriented code paths
-- ✈️ **CFD-Informed Scoring**: Built-in solver paths can score generated shapes for research experiments
-- 🎯 **Connectivity Heuristics**: Applies connectedness-oriented penalties rather than validated structural analysis
-- 📊 **Real-time Monitoring**: TensorBoard integration for training visualization
-- 📦 **STL Export**: Convert volumetric designs to STL mesh artifacts for inspection and downstream experiments
 
 ## Quick Start
 
 ### 1. Installation
 
 ```bash
-# Clone the repository
 git clone <your-repo-url>
 cd research-paper/CLI
-
-# Create and activate virtual environment
 python -m venv venv
-venv\Scripts\activate  # On Windows
-
-# Install dependencies
+venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Verify Setup
+### 2. Verify The CLI Loads
 
 ```bash
+python aircraft_diffusion_cfd.py --help
 python aircraft_diffusion_cfd.py info
 ```
 
-Expected output shows PyTorch version, CUDA availability, and GPU memory.
-
-### 3. Train a Model
-
-```bash
-python aircraft_diffusion_cfd.py train \
-  --num-epochs 100 \
-  --batch-size 4 \
-  --num-samples 100 \
-  --save-dir ./checkpoints
-```
-
-For an honest local smoke run on 8 GB hardware, use much smaller settings first:
+### 3. Run A Small Training Smoke Test
 
 ```bash
 python aircraft_diffusion_cfd.py train \
   --num-epochs 1 \
   --batch-size 1 \
-  --num-samples 2 \
+  --num-samples 8 \
   --save-dir ./checkpoints_smoke
 ```
 
-### 4. Generate Designs
+### 4. Generate One STL
 
 ```bash
 python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
-  --output ./designs\design_0.stl \
-  --target-speed 50.0 \
+  --checkpoint ./checkpoints_smoke/final_optimized_model.pt \
+  --output ./artifacts/smoke_design.stl \
+  --target-speed 7.0 \
   --num-steps 4
 ```
 
-### 5. Batch Generation
+### 5. Run The Internal Benchmark
 
 ```bash
-python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
-  --output-dir ./designs \
-  --num-designs 5
+python run_internal_benchmark.py
 ```
 
-### 6. Run the Internal Benchmark
+Treat that benchmark as a solver cross-check and implementation smoke test, not as a publication-grade aerodynamic benchmark.
 
-```bash
-python3 run_internal_benchmark.py
-```
-
-This runs the internal D3Q27 solver and, when OpenFOAM is available, a local sonicFoam case for `20mm_cube.stl` plus any other root-level `*.stl` files, then prints a JSON summary with the force comparison. Treat it as a solver cross-check and implementation smoke benchmark, not as a publication-grade aerodynamic benchmark. On Linux or Windows/WSL, pass `--install-openfoam` to let the benchmark bootstrap OpenFOAM if it is missing.
-
-### 7. Run Tests
+### 6. Run Tests
 
 For a normal Python environment:
 
@@ -112,305 +85,122 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-For this repo specifically on Windows, a common failure mode is having a Unix-style `.venv` checked out from WSL or Linux. In that case, use the repo runner instead:
+For this repo on Windows, if a Unix-style `.venv` was checked out from WSL or Linux:
 
 ```powershell
 .\run_tests.ps1 -q
 ```
 
-If you need the script to create an isolated Windows venv first:
+If you want the script to create a Windows venv first:
 
 ```powershell
 .\run_tests.ps1 -BootstrapVenv -q
 ```
 
-### 8. Run A Checked-In Protocol
+### 7. Run A Checked-In Protocol
 
-For the explicit 8 GB smoke workflow:
+Smoke path:
 
 ```bash
 cd CLI
 python run_protocol.py --config run_protocols/smoke_8gb.yaml
 ```
 
-To inspect the guarded final-eval path without running it:
+Guarded final path preview:
 
 ```bash
 cd CLI
 python run_protocol.py --config run_protocols/final_cloud.yaml --dry-run
 ```
 
+Final claim-bearing wording remains blocked until the final evidence package passes:
+
+```bash
+python CLI/final_evidence.py
+```
+
 ## Commands Reference
 
 ### `train`
-Train the diffusion model from scratch or resume from checkpoint.
 
-**Key Arguments:**
-- `--num-epochs` (int): Training epochs at full resolution (default: 100)
-- `--batch-size` (int): Batch size; adjust based on VRAM (default: 4)
-- `--learning-rate` (float): Adam optimizer learning rate (default: 2e-4)
-- `--latent-dim` (int): Latent space dimensionality (default: 128)
-- `--disconnection-penalty` (float): Penalty for disconnected structures (default: 10.0)
-- `--num-samples` (int): Synthetic training data samples (default: 100)
-- `--resume-from` (str): Path to checkpoint to resume training
-- `--save-dir` (str): Directory for saving checkpoints (default: ./checkpoints)
+Key arguments:
 
-**Example:**
-```bash
-python aircraft_diffusion_cfd.py train \
-  --num-epochs 150 \
-  --batch-size 3 \
-  --learning-rate 1e-4 \
-  --disconnection-penalty 15.0 \
-  --num-samples 200
-```
+- `--num-epochs` default `100`
+- `--batch-size` default `4`
+- `--learning-rate` default `2e-4`
+- `--latent-dim` default `16`
+- `--precision` default `float32`
+- `--disconnection-penalty` default `30.0`
+- `--num-samples` default `500`
+- `--dataset-artifact` / `--dataset-manifest` optional grounded or densified dataset inputs
+- `--resume-from` optional checkpoint path
+- `--save-dir` default `./checkpoints`
+- `--run-class` `smoke` or `final`
+- `--baseline-config`, `--claim-gates` required for final runs
 
 ### `generate`
-Generate new voxel designs using a trained model.
 
-**Key Arguments:**
-- `--checkpoint` (str): Path to trained model checkpoint (required)
-- `--output` (str): Output STL path (default: `aircraft_optimized.stl`)
-- `--target-speed` (float): One scalar in the current public conditioning subset (default: `7.0`)
+Key arguments:
+
+- `--checkpoint` required
+- `--output` default `aircraft_optimized.stl`
+- `--target-speed` default `7.0`
 - `--thrust-to-weight-min`, `--turn-rate-min-deg-s`, `--required-static-thrust-n`
 - `--engine-diameter-mm`, `--engine-length-mm`, `--engine-count-min`, `--engine-count-max`
 - `--wingspan-limit-m`, payload bounds, takeoff bounds, wall-thickness bounds, part-count bounds, and `--manufacturing-method`
-- `--num-steps` (int): Number of consistency-model sampling steps (default: `4`)
-- `--use-marching-cubes` (bool flag): Export via marching cubes when possible
+- `--num-steps` default `4`
+- `--use-marching-cubes` exposed and defaults on in the current CLI
 
-Under the hood, the repository now has a partial structured conditioning path: the dataset, diffusion model, and generator all consume a condition vector documented in `CLI/conditioning_schema.yaml`. Public CLI exposure is still incomplete relative to the full scientific goal. The public commands now surface a meaningful subset of payload, takeoff, wingspan, wall-thickness, part-count, propulsion, maneuverability, and manufacturing controls, but those controls still need grounded condition-response benchmarks before they support scientific claims.
-
-**Example:**
-```bash
-python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
-  --output ./generated_designs\design_0.stl \
-  --target-speed 50.0 \
-  --num-steps 4
-```
+The generator path consumes the documented condition vector from [`CLI/conditioning_schema.yaml`](CLI/conditioning_schema.yaml). What is still missing is grounded scientific validation that those controls reliably steer aircraft-like outputs in the intended direction.
 
 ### `batch-generate`
-Generate multiple STL artifacts from a trained checkpoint.
 
-**Key Arguments:**
-- `--checkpoint` (str): Path to trained model checkpoint (required)
-- `--output-dir` (str): Output directory for generated STL files
-- `--num-designs` (int): Number of STL files to emit
-- `--seed` (int): Seed for deterministic condition variation and manifest metadata
-- `--vary-conditions` (flag): Sample deterministic `DesignSpec` variation and record each payload in `batch_manifest.json`
+Key arguments:
 
-**Example:**
-```bash
-python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
-  --output-dir ./generated_designs \
-  --num-designs 5
-```
+- `--checkpoint` required
+- `--output-dir` output directory
+- `--num-designs` number of STL files to emit
+- `--seed` deterministic seed for manifest metadata
+- `--vary-conditions` samples deterministic `DesignSpec` variation and records it in `batch_manifest.json`
 
-### `info`
-Print the runtime environment and optimization status.
+### `evaluate-baselines`
 
-```bash
-python aircraft_diffusion_cfd.py info
-```
+Voxelizes and evaluates the bundled grounded STL examples. This is runnable repo-level baseline tooling, not publication-grade baseline evidence.
 
-### `info`
-Display system information and GPU/CUDA status.
+### `validate-conditions`
 
-```bash
-python aircraft_diffusion_cfd.py info
-```
+Runs a multi-seed condition-response sweep and writes correlation summaries for the current checkpoint. Treat the result as checkpoint-level evidence only, not grounded aircraft validation.
+
+## Data Status
+
+The current repo does not ship a publication-grade aircraft corpus. It has:
+
+- a procedural/synthetic training path
+- checked-in densification artifacts for smoke workflows
+- a minimal manifest-backed grounded wiring artifact at [`docs/dataset/minimal_grounded_manifest.jsonl`](docs/dataset/minimal_grounded_manifest.jsonl)
+
+That minimal manifest exists to validate the dataset wiring and protocol guardrails. It is not a scientifically adequate aircraft corpus.
+
+## Reproducibility Files
+
+- [`CLI/conditioning_schema.yaml`](CLI/conditioning_schema.yaml)
+- [`CLI/baseline_config.yaml`](CLI/baseline_config.yaml)
+- [`CLI/run_protocol.py`](CLI/run_protocol.py)
+- [`CLI/run_protocols/smoke_8gb.yaml`](CLI/run_protocols/smoke_8gb.yaml)
+- [`CLI/run_protocols/final_cloud.yaml`](CLI/run_protocols/final_cloud.yaml)
+- [`paper/FINAL_RUN_GATES.md`](paper/FINAL_RUN_GATES.md)
+- [`paper/CITATION_AUDIT.md`](paper/CITATION_AUDIT.md)
+- [`paper/CLAIMS_EVIDENCE_MATRIX.md`](paper/CLAIMS_EVIDENCE_MATRIX.md)
 
 ## System Requirements
 
-### Hardware
-- **GPU**: NVIDIA CUDA-capable GPU with 8GB+ VRAM
-  - 8GB: 16³ training only
-  - Larger GPUs: better suited for final-eval workflows with grounded dataset artifacts and baselines
-- **CPU**: Multi-core processor (6+ cores recommended)
-- **RAM**: 16GB+ system RAM
+- GPU: NVIDIA CUDA-capable GPU with 8GB+ VRAM
+- CPU: multi-core processor
+- RAM: 16GB+ system RAM recommended
+- Python: 3.9+
 
-### Software
-- **Python**: 3.9+ (3.10/3.11 recommended)
-- **CUDA**: 11.8+ or 12.x
-- **cuDNN**: 8.7+
+Key dependencies include PyTorch, NumPy, SciPy, scikit-image, TensorBoard, and `trimesh`.
 
-### Dependencies
-See `requirements.txt`. Key packages:
-- PyTorch ≥ 2.0.0
-- NumPy ≥ 1.24.0
-- SciPy ≥ 1.10.0
-- scikit-image ≥ 0.22.0
-- TensorBoard ≥ 2.13.0
-- TrimMesh ≥ 3.20.0
+## Bottom Line
 
-## Historical Schedule Notes
-
-### Legacy Progressive Schedule Reference
-
-| Grid Size | Epochs | Memory | Time (RTX 3090) |
-|-----------|--------|--------|-----------------|
-| 16³       | 50     | ~3GB   | 2-3 hrs         |
-| 24³       | 50     | ~6GB   | 4-5 hrs         |
-| 32³       | 100    | ~10GB  | 8-10 hrs        |
-| **Total** | 200    | Peak 10GB | ~14-18 hrs  |
-
-*Note: A100 GPUs are ~2-3x faster than RTX 3090*
-
-This table is retained as historical context from earlier experiments. The current CLI now distinguishes smoke runs from guarded final runs, and the current trainer executes one configured grid size rather than an automatic 16 -> 24 -> 32 schedule.
-
-## Configuration
-
-The repo now includes executable protocol/config scaffolding for the remaining evaluation work:
-
-- `CLI/baseline_config.yaml`
-- `CLI/run_protocols/smoke_8gb.yaml`
-- `CLI/run_protocols/final_cloud.yaml`
-- `docs/dataset/minimal_grounded_manifest.jsonl`
-
-These do not make the repo publication-ready by themselves, but they turn the smoke/final workflow and minimal grounded-data path into concrete, versioned inputs instead of informal notes.
-
-### Config File (`config.yaml`)
-
-```yaml
-diffusion:
-  timesteps: 100
-  beta_start: 0.0001
-  beta_end: 0.02
-  sampling_timesteps: 250
-  guidance_scale: 7.5
-
-model:
-  latent_dim: 128
-  encoder_channels: [32, 64, 128, 256]
-  decoder_channels: [256, 128, 64, 32]
-
-training:
-  batch_size: 4
-  learning_rate: 0.0002
-  num_epochs: 100
-  disconnection_penalty: 10.0
-
-cfd:
-  reynolds_number: 1e5
-  mach_number: 0.3
-  simulation_steps: 1000
-```
-
-## Project Structure
-
-```
-CLI/
-├── aircraft_diffusion_cfd.py    # Main CLI entry point
-├── advanced_lbm_solver.py        # GPU-accelerated CFD simulator
-├── requirements.txt              # Python dependencies
-├── config.yaml                   # Default configuration
-├── QUICKSTART.md                 # 5-minute setup guide
-├── ARCHITECTURE.md               # Technical deep dive
-├── README.md                     # Original detailed README
-├── checkpoints/                  # Trained model checkpoints
-├── runs/                         # TensorBoard logs
-└── reference/                    # Reference implementations
-    └── complete_amr_d3q27_cascaded_guide.py
-```
-
-## Examples
-
-### Example 1: Train from Scratch
-```bash
-python aircraft_diffusion_cfd.py train \
-  --num-epochs 100 \
-  --batch-size 4 \
-  --num-samples 100
-```
-
-### Example 2: Generate 100 Designs
-```bash
-python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
-  --output-dir ./generated_designs \
-  --num-designs 100
-```
-
-### Example 3: Full Pipeline
-```bash
-# Train
-python aircraft_diffusion_cfd.py train --num-epochs 100
-
-# Generate
-python aircraft_diffusion_cfd.py generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
-  --output best_aircraft.stl \
-  --target-speed 50.0 \
-  --num-steps 4
-
-# Optional batch generation
-python aircraft_diffusion_cfd.py batch-generate \
-  --checkpoint checkpoints/final_optimized_model.pt \
-  --output-dir ./designs \
-  --num-designs 20
-```
-
-## Monitoring Training
-
-Real-time training metrics are logged to TensorBoard:
-
-```bash
-tensorboard --logdir ./runs
-```
-
-Then open http://localhost:6006 in your browser to view:
-- Loss curves (total, connectivity, aerodynamic)
-- Learning rate schedule
-- Design sampling previews
-- CFD simulation results
-
-## Troubleshooting
-
-### Out of Memory (OOM)
-- Reduce `--batch-size` to 2 or 1
-- Reduce `--num-samples` to 50
-- Start with 16³ grid training only
-
-### Slow Training
-- Ensure CUDA is available: `python aircraft_diffusion_cfd.py info`
-- Check GPU utilization with `nvidia-smi`
-- Reduce `--num-samples` to speed up data loading
-
-### Poor Design Quality
-- Increase `--num-epochs` to 150+
-- Reduce `--disconnection-penalty` if too restrictive
-- Ensure training has converged (check TensorBoard)
-- Try higher `--guidance-scale` in generation
-
-## Citation
-
-If you use this project in your research, please cite:
-
-```bibtex
-@software{aircraft_diffusion_cfd,
-  title={Aircraft Diffusion CFD: Generative Design via Diffusion Models},
-  author={Your Name},
-  year={2025},
-  url={https://github.com/yourusername/research-paper}
-}
-```
-
-## License
-
-[Your License Here]
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
-
-## Contact
-
-For questions or support, open an issue on GitHub or contact the maintainers.
-
----
-
-**Last Updated**: December 2025
+This repo is release-ready as an honest proof of concept. It is not publication-ready evidence of conditioned aircraft generation.

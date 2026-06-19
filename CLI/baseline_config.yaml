@@ -1,7 +1,13 @@
 baseline_name: minimal_grounded_aircraft
+baseline_set:
+  - retrieval
+  - unconditional_checkpoint
+  - bundled_grounded_stl
 description: >
-  Minimal grounded baseline set using the repository's bundled aircraft-like STL files.
-  This config exists to make final-run guardrails executable rather than purely documentary.
+  Minimal grounded baseline policy for final-run guardrails. The checked-in
+  protocol uses generated deterministic reference records for retrieval and
+  unconditional-checkpoint baselines, plus the repository's bundled aircraft-like
+  STL files for bundled-grounded-STL smoke comparisons.
 stl_paths:
   - ../biplane.stl
   - ../F-18_Hornet.stl
@@ -11,4 +17,4 @@ evaluation:
   steps: 200
 notes:
   - Replace or extend these paths with a larger grounded corpus before making paper-level claims.
-  - The current config is suitable for smoke/final guardrail plumbing, not publication-grade benchmarking.
+  - The current config is suitable for guardrail plumbing and deterministic reference evidence, not publication-grade benchmarking.

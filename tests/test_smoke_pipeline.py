@@ -2,7 +2,9 @@ import os
 import sys
 import unittest
 import json
+import tempfile
 from dataclasses import asdict
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -120,6 +122,74 @@ class TestCLISmokePipeline(unittest.TestCase):
             self.assertEqual(sample["design_spec"].target_speed, 44.0)
             self.assertEqual(sample["condition_vector"].numel(), cli_module.infer_conditioning_dim())
 
+    def test_manifest_dataset_accepts_schema_target_speed_mps(self):
+        with self.runner.isolated_filesystem():
+            geometry = torch.zeros((8, 8, 8), dtype=torch.float32)
+            geometry[2:6, 2:6, 2:6] = 1.0
+            os.makedirs("dataset", exist_ok=True)
+            geometry_path = os.path.join("dataset", "sample.npy")
+            manifest_path = os.path.join("dataset", "manifest.jsonl")
+
+            import numpy as np
+
+            np.save(geometry_path, geometry.numpy())
+            record = {
+                "geometry_path": "sample.npy",
+                "design_spec": {
+                    "target_speed_mps": 51.0,
+                    "wingspan_limit_m": 1.7,
+                    "thrust_to_weight_min": 0.4,
+                    "turn_rate_min_deg_s": 15.0,
+                    "required_static_thrust_n": 150.0,
+                    "engine_diameter_mm": 120,
+                    "engine_length_mm": 240,
+                    "engine_count_min": 1,
+                    "engine_count_max": 1,
+                    "payload_mass_min_g": 300,
+                    "payload_mass_max_g": 900,
+                    "takeoff_distance_min_m": 80,
+                    "takeoff_distance_max_m": 150,
+                    "wall_thickness_min_mm": 1,
+                    "wall_thickness_max_mm": 2,
+                    "part_count_min": 1,
+                    "part_count_max": 5,
+                    "manufacturing_method": "fdm_pla_0p4mm",
+                },
+                "split": "train",
+            }
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+
+            dataset = cli_module.AircraftDesignDataset(
+                manifest_path=manifest_path,
+                grid_size=8,
+                latent_dim=8,
+                seed=7,
+            )
+
+            self.assertEqual(dataset[0]["design_spec"].target_speed, 51.0)
+
+    def test_checked_in_minimal_manifest_loads_through_repo_dataset_path(self):
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        manifest_path = os.path.join(repo_root, "docs", "dataset", "minimal_grounded_manifest.jsonl")
+
+        dataset = cli_module.AircraftDesignDataset(
+            manifest_path=manifest_path,
+            grid_size=32,
+            latent_dim=16,
+            seed=11,
+        )
+
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(dataset.metadata["data_source"], "grounded_manifest")
+        self.assertEqual(
+            dataset.metadata["split_assignments"],
+            ["train", "holdout"],
+        )
+        sample = dataset[0]
+        self.assertEqual(sample["geometry"].shape, (32, 32, 32))
+        self.assertEqual(sample["condition_vector"].numel(), cli_module.infer_conditioning_dim())
+
     def test_generate_help_lists_current_options(self):
         result = self.runner.invoke(cli_module.cli, ["generate", "--help"])
 
@@ -158,6 +228,14 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("--num-samples", result.output)
         self.assertIn("--num-conditions", result.output)
         self.assertIn("--num-candidates-per-condition", result.output)
+
+    def test_validate_conditions_help_avoids_scientific_validation_claim(self):
+        result = self.runner.invoke(cli_module.cli, ["validate-conditions", "--help"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("condition-response", result.output)
+        self.assertNotIn("scientific study", result.output.lower())
+        self.assertNotIn("scientific condition-response validation", result.output.lower())
 
     def test_save_checkpoint_includes_cfd_config_payload(self):
         trainer = object.__new__(cli_module.OptimizedDiffusionTrainer)
@@ -352,6 +430,24 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("dataset artifact", result.output.lower())
         self.assertIn("baseline", result.output.lower())
         self.assertIn("claim", result.output.lower())
+
+    def test_final_run_class_accepts_manifest_without_dataset_artifact(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = root / "manifest.jsonl"
+            baseline_config = root / "baseline_config.json"
+            claim_gates = root / "FINAL_RUN_GATES.md"
+            manifest.write_text('{"sample_id":"fixture","geometry_path":"fixture.npy","split":"train"}\n', encoding="utf-8")
+            baseline_config.write_text('{"baseline_name":"fixture","baseline_set":["retrieval"]}\n', encoding="utf-8")
+            claim_gates.write_text("# gates\n", encoding="utf-8")
+
+            cli_module._validate_run_class_inputs(
+                cli_module.RUN_CLASS_FINAL,
+                dataset_artifact=None,
+                dataset_manifest=str(manifest),
+                baseline_config=str(baseline_config),
+                claim_gates=str(claim_gates),
+            )
 
     def test_densify_dataset_cli_delegates_to_checkpoint_densifier(self):
         with mock.patch.object(densify_module, "densify_from_checkpoint", return_value={"num_candidates": 6, "num_accepted": 2, "output_path": "artifact.pt"}) as mock_densify, \
