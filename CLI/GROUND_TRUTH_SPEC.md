@@ -23,6 +23,23 @@ The ground truth targets the **Incompressible Navier-Stokes Equations**:
 1. **Continuity:** $\nabla \cdot \mathbf{u} = 0$
 2. **Momentum:** $\rho (\mathbf{u} \cdot \nabla) \mathbf{u} = -\nabla p + \mu \nabla^2 \mathbf{u} + \mathbf{f}$
 
+## Compressibility Boundary
+The current internal D3Q27 solver is a low-Mach, weakly compressible, isothermal LBM path. It uses a fixed lattice sound speed, second-order isothermal equilibrium, and no evolved thermal state. Internal Mach values above 0.3 may be executed for exploratory diagnostics, but they are labeled `experimental_high_mach_unvalidated` and cannot set `pinn_ready: true` or support compressible-CFD claims without independent external validation.
+
+Required solver metadata fields are:
+- `mach_number`
+- `lattice_mach`
+- `u_lattice`
+- `sound_speed_model`
+- `compressibility_model`
+- `thermal_model`
+- `validity_regime`
+- `claim_grade`
+- `high_mach_warning`
+- `lbm_converged`
+- `force_stability`
+- `training_drag_source`
+
 ## PINN-Ready Gate Requirements
 Data is only flagged as `pinn_ready: true` if it passes the following **independent validation** criteria:
 1. **Source:** Only independent PDE solvers (e.g., OpenFOAM) or analytic solutions can set `pinn_ready`. Internal D3Q27 results are labeled `lbm_converged` but *never* `pinn_ready`.
@@ -33,11 +50,11 @@ Data is only flagged as `pinn_ready: true` if it passes the following **independ
 ## Label Tiers and Sources
 The system employs a tiered labeling strategy to balance speed and fidelity:
 
-| Tier | Source | Logic | Use Case |
-| :--- | :--- | :--- | :--- |
-| `lbm_raw` | `lbm_d3q27` | Pure LBM momentum exchange. | Fast PDE training. |
-| `lbm_calibrated` | `lbm_d3q27` | LBM with heuristic corrections. | Stable surrogate training. |
-| `external_pde` | `OpenFOAM` | Validated NS solver (strict gates). | High-fidelity PINN ground truth. |
+| Tier | Source | Logic | Use Case | Compressibility boundary |
+| :--- | :--- | :--- | :--- | :--- |
+| `lbm_raw` | `lbm_d3q27` | Pure internal D3Q27 momentum exchange. | Fast low-Mach internal/surrogate training diagnostics. | Claim-grade only inside the current `validated_low_mach_envelope`; Mach > 0.3 is `experimental_high_mach_unvalidated`. |
+| `lbm_calibrated` | `lbm_d3q27` | Heuristically corrected value derived from internal LBM diagnostics. | Stable surrogate/training proxy when explicitly labeled as calibrated. | Never upgrades raw high-Mach internal LBM to validated compressible CFD. |
+| `external_pde` | `OpenFOAM` or analytic reference | Independent solver/reference with strict gates. | High-fidelity PINN ground truth when fields and residual gates pass. | Incompressible OpenFOAM and compressible OpenFOAM must be labeled separately. |
 
 ## Sampling Strategy
 To maintain performance, independent PDE validation (`external_pde`) is performed sparsely. This is controlled by the `validation_probability` parameter in `CFDConfig`.

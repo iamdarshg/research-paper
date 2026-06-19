@@ -97,6 +97,16 @@ class TestManifestValidator(unittest.TestCase):
         self.assertTrue(any("units" in error for error in report["errors"]))
         self.assertTrue(any("wingspan_limit_m" in error for error in report["errors"]))
 
+    def test_nasa_crm_whole_aircraft_manifest_passes_claim_bearing(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        manifest_path = repo_root / "docs" / "dataset" / "nasa_crm_whole_aircraft_manifest.jsonl"
+
+        report = validate_manifest.validate_manifest_file(str(manifest_path), level="claim-bearing")
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["errors"], [])
+        self.assertGreaterEqual(report["record_count"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

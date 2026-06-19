@@ -1,6 +1,6 @@
 \section{Validation and Testing Standards}
 \label{sec:validation}
-To make the validation story honest, we separate three levels of evidence:
+To keep validation claims bounded, we separate three levels of evidence:
 \begin{itemize}
     \item \textbf{Code-path validation:} the training, generation, cleanup, export, and CFD scoring routines run end-to-end in this environment.
     \item \textbf{Solver validation:} the built-in CFD path can be compared against a higher-fidelity external solver when one is available.
@@ -8,16 +8,15 @@ To make the validation story honest, we separate three levels of evidence:
 \end{itemize}
 
 \subsection{Verification}
-Verification checks that the implemented steps are executed correctly. In this revision we verified that:
+Verification checks that the implemented steps are executed as intended. In this revision we verified that:
 \begin{itemize}
-    \item the shape-plausibility loss contributes to training,
-    \item the connected-component cleanup hook reduces fragmented voxel outputs,
+    \item the shape-plausibility loss is included in the training objective,
+    \item the connected-component cleanup hook removes smaller disconnected voxel components,
     \item STL export succeeds from the cleaned voxel grid, and
-    \item the OpenFOAM export hook writes a runnable case directory skeleton, including `blockMeshDict`, `snappyHexMeshDict`, and surface STL output.
+    \item the OpenFOAM export hook writes a runnable case directory skeleton, including \texttt{blockMeshDict}, \texttt{snappyHexMeshDict}, and surface STL output.
 \end{itemize}
 
 \subsection{Validation}
-Validation is now reproducible on a single local machine with OpenFOAM installed. The built-in CFD path is exercised on the reduced CPU pipeline, and the OpenFOAM sonicFoam benchmark is run on the shared centered-cube validation object. The comparison uses the lower-level `forces` output when available, with a manual pressure integration fallback only if the function-object output is missing.
+Validation is now runnable on a single local machine with OpenFOAM installed. The built-in CFD path is exercised on the reduced CPU pipeline, and the OpenFOAM sonicFoam benchmark is run on the shared centered-cube validation object. The comparison uses the lower-level \texttt{forces} output when available, with a manual pressure integration fallback only if the function-object output is missing.
 
 The paper therefore claims the following and nothing more: the export path is concrete, the benchmark comparison is measurable, and the shared validation geometry is documented explicitly so the solver-to-solver check can be repeated without ambiguity.
-

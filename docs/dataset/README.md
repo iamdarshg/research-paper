@@ -69,6 +69,40 @@ airfoil-section-heavy, uses explicit local response-metric proxies, and should
 be treated as grounded manifest evidence for the current protocol contracts, not
 as whole-aircraft flight-validation evidence.
 
+## Public Whole-Aircraft Package
+
+The repository now also contains a separate public-source whole-aircraft package
+built from official NASA Common Research Model STEP assets plus local geometry
+and CFD proxy analysis:
+
+- `docs/dataset/nasa_crm_whole_aircraft_manifest.jsonl`
+- `docs/dataset/nasa_crm_whole_aircraft_provenance.json`
+- `docs/dataset/NASA_CRM_WHOLE_AIRCRAFT_REPORT.md`
+- `docs/dataset/nasa_crm_source_catalog.json`
+- `docs/dataset/nasa_crm_whole_aircraft/`
+
+This package is useful for whole-aircraft validity evidence and public-source
+geometry provenance, but it is still bounded:
+
+- it is entirely NASA CRM-family geometry, so family leakage cannot be fully removed,
+- some design-spec fields are explicit inferences rather than published flight data,
+- it contains fewer than the final protocol minimum of 20 grounded records,
+- it does not by itself establish external CFD agreement.
+
+The whole-aircraft builder is now catalog-driven. New ready-to-ingest NASA CRM
+entries should be added to `docs/dataset/nasa_crm_source_catalog.json`, while
+broader discovery work can live in a separate candidate sweep file before those
+entries are promoted into the ready catalog.
+
+The broader discovery lane now also has dedicated artifacts:
+
+- `docs/dataset/NASA_CRM_SOURCE_SWEEP.md`
+- `docs/dataset/nasa_crm_source_candidates.json`
+
+These files are intentionally wider than the ready catalog. They can include
+format-conversion-needed, reference-only, or not-yet-promoted candidates that
+still need an honest ingestion decision before they are fed into the builder.
+
 Each record may include:
 
 - `geometry_path` or `stl_path`

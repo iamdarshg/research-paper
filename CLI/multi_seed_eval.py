@@ -32,9 +32,29 @@ def build_statistical_summary(records, metric_keys, min_seeds=3):
 
     metrics = {}
     for key in metric_keys:
-        values = [float(record[key]) for record in records if key in record]
+        values = []
+        non_finite_seeds = []
+        for idx, record in enumerate(records):
+            if key not in record:
+                continue
+            seed = record.get("seed", idx)
+            try:
+                value = float(record[key])
+            except (TypeError, ValueError):
+                non_finite_seeds.append(str(seed))
+                continue
+            if not np.isfinite(value):
+                non_finite_seeds.append(str(seed))
+                continue
+            values.append(value)
+        if non_finite_seeds:
+            blockers.append(
+                f"metric {key} has non-finite values for seeds: {', '.join(non_finite_seeds)}"
+            )
         if len(values) < min_seeds:
             blockers.append(f"metric {key} has insufficient values: found {len(values)}, require at least {min_seeds}")
+            continue
+        if non_finite_seeds:
             continue
         metrics[key] = {
             "mean": float(np.mean(values)),
@@ -73,6 +93,28 @@ def validate_baseline_policy(config, required_baselines=None):
         "baseline_set": baseline_set,
         "blockers": blockers,
     }
+
+
+def reported_baseline_families(baseline_report: Dict[str, Any]) -> List[str]:
+    """Return claim-bearing baseline families that have concrete report entries."""
+    if not baseline_report:
+        return []
+
+    baselines = baseline_report.get("baselines")
+    if isinstance(baselines, dict):
+        families = []
+        for name, payload in baselines.items():
+            if not isinstance(payload, dict):
+                continue
+            results = payload.get("results")
+            if payload.get("status", "pass") == "pass" and results:
+                families.append(str(name))
+        return sorted(families)
+
+    # Legacy evaluate-baselines reports were flat STL-result maps. Treat them as
+    # only the bundled grounded STL family so they cannot satisfy retrieval or
+    # checkpoint-baseline gates by accident.
+    return ["bundled_grounded_stl"]
 
 
 def _load_json(path: str | Path) -> Dict[str, Any]:
@@ -116,6 +158,7 @@ def build_baseline_statistics_report(
     min_seeds: int = 3,
 ) -> Dict[str, Any]:
     baseline_policy = validate_baseline_policy(baseline_config)
+    baseline_families = reported_baseline_families(baseline_report)
     records = _records_from_validation_report(condition_validation_report)
     statistical_summary = build_statistical_summary(
         records,
@@ -130,10 +173,19 @@ def build_baseline_statistics_report(
         blockers.extend(statistical_summary["blockers"])
     if not baseline_report:
         blockers.append("missing grounded baseline report")
+    missing_report_families = [
+        name for name in baseline_policy["baseline_set"]
+        if name not in baseline_families
+    ]
+    if missing_report_families:
+        blockers.append(
+            "missing required baseline report families: " + ", ".join(missing_report_families)
+        )
 
     report = {
         "status": "pass" if not blockers else "blocked",
         "baseline_policy": baseline_policy,
+        "baseline_report_families": baseline_families,
         "multi_seed_summary": statistical_summary,
         "grounded_baseline_results": baseline_report,
         "condition_validation_correlations": condition_validation_report.get("correlations", {}),

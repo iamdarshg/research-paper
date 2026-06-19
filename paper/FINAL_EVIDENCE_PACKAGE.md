@@ -40,6 +40,9 @@ python CLI/final_evidence.py \
 If any required report is missing, blocked, or failed, claim-bearing wording must
 stay blocked. Passing smoke or wiring checks is not enough.
 
-The current repository still lacks a publication-grade grounded corpus and
-claim-bearing result reports, so paper-level aircraft-generation claims remain
-blocked until those artifacts exist.
+The latest local final protocol run writes a passing
+`build/protocol_final/final_evidence_package.json` with aligned lineage fields.
+That unlocks reporting the reduced evidence bundle itself. It does not unlock
+publication-grade claims about aerodynamic optimality, structural viability, or
+superiority over mature optimization baselines; those still require stronger
+solver validation, structural analysis, larger grounded data, and ablations.

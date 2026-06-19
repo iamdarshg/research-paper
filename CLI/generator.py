@@ -203,7 +203,7 @@ class OptimizedAircraftGenerator:
         max_loss = self.model_config.surrogate_max_loss
 
         if not self.surrogate.is_ready(min_samples=min_samples, max_loss=max_loss):
-            print(f"[warn] AeroSurrogate is not ready (Samples: {self.surrogate.sample_count.item()}, Loss EMA: {self.surrogate.train_loss_ema.item():.4f}).")
+            print(f"⚠️ AeroSurrogate is not ready (Samples: {self.surrogate.sample_count.item()}, Loss EMA: {self.surrogate.train_loss_ema.item():.4f}).")
             print(f"Evaluating ALL {min(top_k, num_candidates)} candidates directly with D3Q27 (Review Feedback Fix 2/5).")
             # When surrogate is not ready, skip pre-ranking and just take first k
             top_indices = np.arange(min(top_k, num_candidates))
@@ -271,7 +271,7 @@ class OptimizedAircraftGenerator:
         if external_val_mode == 'final' and best_results:
             # Check if it was already externally validated (it wouldn't be if mode was 'final')
             if best_results.get('label_tier') != 'external_pde':
-                print("Running final external PDE validation for selected candidate...")
+                print(f"🚀 Running final external PDE validation for selected candidate...")
                 sim_mission = replace(mission, force_external_validation=True)
                 best_results = simulator.simulate_aerodynamics(best_geom, steps=100, mission=sim_mission, existing_report=projected_reports[best_idx])
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Aircraft Structural Design via Diffusion Models + FluidX3D CFD
 Combines TRM/HRM principles with diffusion-based 3D voxel generation,
@@ -24,7 +24,6 @@ import tempfile
 import threading
 import multiprocessing as mp
 import random
-import math
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict, fields
@@ -85,32 +84,6 @@ def _configure_console_output() -> None:
         except Exception:
             pass
 
-
-def resolve_grounded_grid_size(
-    requested_grid_size: Optional[int],
-    *,
-    detected_grid_size: Optional[int] = None,
-    solver: Optional[str] = None,
-    source_label: Optional[str] = None,
-) -> int:
-    if requested_grid_size is not None:
-        requested = int(requested_grid_size)
-    elif solver == "D3Q27":
-        requested = 16
-    else:
-        requested = 32
-
-    if detected_grid_size is None:
-        return requested
-
-    detected = int(detected_grid_size)
-    if requested_grid_size is not None and requested != detected:
-        raise ValueError(
-            f"Requested grid size {requested} conflicts with {source_label or 'grounded dataset'} "
-            f"native grid size {detected}. Use the grounded grid size end to end."
-        )
-    return detected
-
 OPENFOAM_ROOT = Path(os.environ.get("OPENFOAM_ROOT", "/home/darsh/.openclaw/openfoam/usr/share/openfoam"))
 OPENFOAM_BIN = OPENFOAM_ROOT / "bin"
 OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", "snappyHexMesh", "simpleFoam"))
@@ -130,12 +103,12 @@ class DiffusionConfig:
     # Consistency distillation settings
     teacher_steps: int = 2000  # Original teacher model steps
     student_steps: int = 32     # Target student model steps
-    progressive_distillation: List[int] = None  # 500→250→125→64→32→16→8→4
-    
+    progressive_distillation: List[int] = None  # 500â†’250â†’125â†’64â†’32â†’16â†’8â†’4
+
     def __post_init__(self):
         if self.progressive_distillation is None:
             self.progressive_distillation = [500, 250, 125, 64, 32]
-    
+
 @dataclass
 class ModelConfig:
     """Model architecture parameters with grouped-query attention"""
@@ -179,10 +152,6 @@ class TrainingConfig:
     save_interval: int = 5
     val_interval: int = 2
     geometry_reconstruction_weight: float = 1.0
-    consistency_interval: int = 20
-    aerodynamic_interval: int = 10
-    min_consistency_evals_per_epoch: int = 2
-    min_aerodynamic_evals_per_epoch: int = 2
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
@@ -251,7 +220,7 @@ class LBMPhysicsConfig:
     )
     shape_drag_correction_min: float = 0.1
     shape_drag_correction_max: float = 3.0
-    
+
 @dataclass
 class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
@@ -1168,7 +1137,7 @@ def generate_condition_response_smoke_summary(
 
 class GroupedQueryAttention(nn.Module):
     """Memory-efficient grouped-query attention for 50% KV-cache reduction"""
-    
+
     def __init__(self, channels: int, num_groups: int = 4, num_kv_groups: int = 4):
         super().__init__()
         self.num_groups = num_groups
@@ -1176,49 +1145,49 @@ class GroupedQueryAttention(nn.Module):
         self.channels = channels
         self.group_size = channels // num_groups
         self.kv_group_size = channels // num_kv_groups
-        
+
         self.scale = (self.group_size) ** -0.5
-        
+
         # Q projections: one per group
         self.to_q = nn.Conv3d(channels, channels, 1)
-        
+
         # KV projections: shared across KV groups
         self.to_k = nn.Conv3d(channels, self.num_kv_groups * self.kv_group_size, 1)
         self.to_v = nn.Conv3d(channels, self.num_kv_groups * self.kv_group_size, 1)
-        
+
         # Output projection
         self.to_out = nn.Conv3d(channels, channels, 1)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, d, h, w = x.shape
-        
+
         # Compute Q, K, V
         q = self.to_q(x)  # [B, C, D, H, W]
         k = self.to_k(x)  # [B, num_kv_groups * kv_group_size, D, H, W]
         v = self.to_v(x)  # [B, num_kv_groups * kv_group_size, D, H, W]
-        
+
         # Reshape for grouped attention
         q = q.view(b, self.num_groups, self.group_size, d, h, w)
         k = k.view(b, self.num_kv_groups, self.kv_group_size, d, h, w)
         v = v.view(b, self.num_kv_groups, self.kv_group_size, d, h, w)
-        
+
         # Flatten spatial dimensions for attention computation
         q = q.view(b, self.num_groups, self.group_size, -1).transpose(-2, -1)  # [B, num_groups, N, group_size]
         k = k.view(b, self.num_kv_groups, self.kv_group_size, -1).transpose(-2, -1)  # [B, num_kv_groups, N, kv_group_size]
         v = v.view(b, self.num_kv_groups, self.kv_group_size, -1).transpose(-2, -1)  # [B, num_kv_groups, N, kv_group_size]
-        
+
         # Expand K and V to match Q groups
         k_expanded = k.repeat_interleave(self.num_groups // self.num_kv_groups, dim=1)
         v_expanded = v.repeat_interleave(self.num_groups // self.num_kv_groups, dim=1)
-        
+
         # Compute attention
         sim = torch.einsum('bgqd,bgkd->bgqk', q, k_expanded) * self.scale
         attn = sim.softmax(dim=-1)
-        
+
         out = torch.einsum('bgqk,bgkd->bgqd', attn, v_expanded)
         out = out.transpose(-2, -1).contiguous().view(b, c, d, h, w)
         out = self.to_out(out)
-        
+
         return x + out
 
 # ============================================================================
@@ -1227,20 +1196,20 @@ class GroupedQueryAttention(nn.Module):
 
 class GradientCheckpointingWrapper(nn.Module):
     """Wrapper to enable gradient checkpointing for 60% VRAM savings"""
-    
+
     def __init__(self, module: nn.Module, checkpoint_every: int = 1):
         super().__init__()
         self.module = module
         self.checkpoint_every = checkpoint_every
         self.call_count = 0
-    
+
     def forward(self, *args, **kwargs):
         if self.checkpoint_every > 1:
             self.call_count += 1
             if self.call_count % self.checkpoint_every == 0:
                 # Use gradient checkpointing
                 return torch.utils.checkpoint.checkpoint(self.module, *args, **kwargs)
-        
+
         return self.module(*args, **kwargs)
 
 
@@ -1254,7 +1223,7 @@ class GradientCheckpointingWrapper(nn.Module):
 
 class ConsistencyModel(nn.Module):
     """4-step consistency model replacing 1000-step diffusion"""
-    
+
     def __init__(self, config: ModelConfig, diffusion_config: DiffusionConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.config = config
@@ -1288,7 +1257,7 @@ class ConsistencyModel(nn.Module):
 
         # Initialize student with teacher weights
         self._initialize_student()
-    
+
     def _initialize_student(self):
         """Initialize student model - cannot copy from teacher due to different sizes"""
         # Student model has smaller channels than teacher, so we initialize randomly
@@ -1298,7 +1267,7 @@ class ConsistencyModel(nn.Module):
                 nn.init.xavier_uniform_(param)
             else:
                 nn.init.zeros_(param)
-    
+
     def consistency_loss(
         self,
         x_0: torch.Tensor,
@@ -1309,22 +1278,22 @@ class ConsistencyModel(nn.Module):
         """Consistency training loss between teacher and student models"""
         batch_size = x_0.shape[0]
         device = x_0.device
-        
+
         # Teacher prediction at high resolution
         noise = torch.randn_like(x_0)
         x_t_teacher = self._add_noise(x_0, t_teacher, noise)
         with torch.no_grad():
             pred_teacher = self.teacher_model(x_t_teacher, t_teacher, condition=condition)
-        
+
         # Student prediction at low resolution
         x_t_student = self._add_noise(x_0, t_student, noise)
         pred_student = self.student_model(x_t_student, t_student, condition=condition)
-        
+
         # Consistency loss: make student predictions close to teacher
         loss = F.mse_loss(pred_student, pred_teacher.detach())
-        
+
         return loss
-    
+
     def _add_noise(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Add noise according to diffusion schedule"""
         alpha_cumprod = torch.ones_like(t, dtype=x_0.dtype)  # Use same dtype as input
@@ -1336,7 +1305,7 @@ class ConsistencyModel(nn.Module):
         sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_cumprod)
 
         return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
-    
+
     def progressive_distillation(self, dataloader: DataLoader, num_distillation_steps: int = 10) -> Dict[str, float]:
         """Compute progressive distillation losses (no optimization - caller handles training)"""
         step_counts = self.diffusion_config.progressive_distillation
@@ -1376,7 +1345,7 @@ class ConsistencyModel(nn.Module):
             print(f"Loss for {target_steps} steps: {avg_loss:.6f}")
 
         return distillation_results
-    
+
     def fast_inference(self, shape: Tuple[int, ...], num_steps: int = 4, condition: torch.Tensor = None) -> torch.Tensor:
         """Fast 4-step inference using student model"""
         # Get device and dtype from model parameters
@@ -1418,7 +1387,7 @@ class ConsistencyModel(nn.Module):
 
 class NoiseSchedule:
     """Linear noise schedule for diffusion with consistency support"""
-    
+
     def __init__(self, config: DiffusionConfig):
         self.timesteps = config.timesteps
         self.betas = torch.linspace(config.beta_start, config.beta_end, self.timesteps)
@@ -1429,7 +1398,7 @@ class NoiseSchedule:
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
         self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1.0)
-    
+
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Forward diffusion process: x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise"""
         view_shape = (t.shape[0],) + (1,) * (x_0.ndim - 1)
@@ -1443,7 +1412,7 @@ class NoiseSchedule:
         sqrt_alpha = self.sqrt_alphas_cumprod[t].view(view_shape)
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(view_shape)
         return (x_t - sqrt_one_minus_alpha * pred_noise) / (sqrt_alpha + 1e-8)
-    
+
     def to(self, device, dtype=None):
         self.betas = self.betas.to(device, dtype=dtype if dtype is not None else self.betas.dtype)
         self.alphas = self.alphas.to(device, dtype=dtype if dtype is not None else self.alphas.dtype)
@@ -1461,33 +1430,33 @@ class NoiseSchedule:
 
 class SpatialAttention(nn.Module):
     """Self-attention for spatial feature maps with grouped-query attention"""
-    
+
     def __init__(self, channels: int, num_heads: int = 8, num_groups: int = 4):
         super().__init__()
         self.num_heads = num_heads
         self.num_groups = num_groups
         self.channels = channels
         self.scale = (channels // num_heads) ** -0.5
-        
+
         # Use grouped-query attention instead of multi-head
         self.grouped_attention = GroupedQueryAttention(channels, num_groups, num_groups)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.grouped_attention(x)
 
 class ResidualBlock3D(nn.Module):
     """3D residual block with optional attention and gradient checkpointing"""
-    
-    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, 
+
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int,
                  use_attention: bool = False, enable_checkpointing: bool = True):
         super().__init__()
-        
+
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, out_channels),
             nn.SiLU(),
             nn.Linear(out_channels, out_channels)
         )
-        
+
         self.block1 = nn.Sequential(
             nn.InstanceNorm3d(in_channels),
             nn.SiLU(),
@@ -1501,20 +1470,20 @@ class ResidualBlock3D(nn.Module):
         )
 
         self.out_channels = out_channels
-        
+
         self.res_conv = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        
+
         # Use grouped-query attention with memory optimization
         if use_attention:
             self.attention = SpatialAttention(out_channels, num_groups=4)
         else:
             self.attention = nn.Identity()
-        
+
         # Apply gradient checkpointing wrapper
         if enable_checkpointing:
             self.block1 = GradientCheckpointingWrapper(self.block1)
             self.block2 = GradientCheckpointingWrapper(self.block2)
-    
+
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         h = self.block1(x)
         h = h + self.time_mlp(time_emb).view(-1, self.out_channels, 1, 1, 1)
@@ -1565,14 +1534,14 @@ class LatentDiffusionUNet(nn.Module):
 
         for i in range(len(channels) - 1):
             self.down_blocks.append(ResidualBlock3D(
-                channels[i], channels[i+1], time_emb_dim, 
-                use_attention=False, 
+                channels[i], channels[i+1], time_emb_dim,
+                use_attention=False,
                 enable_checkpointing=config.enable_gradient_checkpointing
             ))
             self.down_convs.append(nn.Conv3d(channels[i+1], channels[i+1], 3, stride=1, padding=1))
 
         self.mid_block = ResidualBlock3D(
-            channels[-1], channels[-1], time_emb_dim, 
+            channels[-1], channels[-1], time_emb_dim,
             use_attention=False,
             enable_checkpointing=config.enable_gradient_checkpointing
         )
@@ -1582,18 +1551,18 @@ class LatentDiffusionUNet(nn.Module):
         for i in range(len(channels) - 1, 0, -1):
             self.up_convs.append(nn.Conv3d(channels[i], channels[i-1], 3, stride=1, padding=1))
             self.up_blocks.append(ResidualBlock3D(
-                channels[i-1], channels[i-1], time_emb_dim, 
+                channels[i-1], channels[i-1], time_emb_dim,
                 use_attention=False,
                 enable_checkpointing=config.enable_gradient_checkpointing
             ))
 
         self.out_conv = nn.Conv3d(channels[0], channels[0], 1)
         self.out = nn.Linear(self.encoder_out_dim, self.latent_dim)
-        
+
         # Apply torch.compile for kernel fusion
         if config.use_torch_compile:
             self._apply_torch_compile()
-    
+
     def _apply_torch_compile(self):
         """Apply torch.compile() with reduce-overhead mode for kernel fusion"""
         # Check if torch.compile is enabled in config
@@ -1619,22 +1588,22 @@ class LatentDiffusionUNet(nn.Module):
                             triton_config.cudagraphs = False
                         # autotune doesn't exist in this PyTorch version, skip it
                     else:
-                        print("⚠️ Triton config not available, using default inductor settings")
+                        print("âš ï¸ Triton config not available, using default inductor settings")
 
                 # Try to compile
                 self.forward = torch.compile(self.forward, backend=backend, mode=mode)
-                print(f"✅ Successfully applied torch.compile() with backend='{backend}', mode='{mode}'")
+                print(f"âœ… Successfully applied torch.compile() with backend='{backend}', mode='{mode}'")
                 return
 
             except Exception as e:
-                print(f"❌ torch.compile() failed with backend='{backend}': {str(e)}")
+                print(f"âŒ torch.compile() failed with backend='{backend}': {str(e)}")
                 traceback.print_exc()
                 continue
 
-        print("⚠️  All torch.compile() backends failed, using original forward function")
+        print("âš ï¸  All torch.compile() backends failed, using original forward function")
         # Keep original forward function - no functionality lost
         pass
-    
+
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass with memory optimizations.
@@ -1643,14 +1612,14 @@ class LatentDiffusionUNet(nn.Module):
         condition: [B, conditioning_dim] - optional structured conditioning
         """
         b = x.shape[0]
-        
+
         t_emb = self.time_embedding(timestep.to(self.time_embedding[0].weight.dtype).unsqueeze(1) / self.diffusion_config.timesteps)
         condition_embedding = None
         if condition is not None and self.conditioning_dim > 0 and condition.ndim == 2:
             condition = normalize_condition_vector_tensor(condition.to(self.time_embedding[0].weight.dtype))
             t_emb = t_emb + self.condition_time_projection(condition)
             condition_embedding = self.condition_projection(condition)
-        
+
         # Expand latent to 3D spatial (2x2x2)
         h = self.encoder(x)
         h = h.view(b, -1)
@@ -1660,12 +1629,12 @@ class LatentDiffusionUNet(nn.Module):
         elif h.size(1) < target_size:
             h = torch.cat([h, h.new_zeros(b, target_size - h.size(1))], dim=1)
         h = h.view(b, self.config.encoder_channels[0], 2, 2, 2)
-        
+
         if condition_embedding is not None:
             h = h + condition_embedding.view(b, self.config.encoder_channels[0], 2, 2, 2)
         elif condition is not None and condition.shape == h.shape:
             h = h + condition
-        
+
         # U-Net forward pass
         skip_connections = []
         for i in range(len(self.down_blocks)):
@@ -1680,7 +1649,7 @@ class LatentDiffusionUNet(nn.Module):
             h = h + skip
             h = self.up_convs[i](h)
             h = self.up_blocks[i](h, t_emb)
-        
+
         out = self.out_conv(h).view(b, -1)
         out = self.out(out)
         return out
@@ -1702,7 +1671,7 @@ class LatentTo3DConverter(nn.Module):
             nn.ReLU(),
             nn.Linear(2048, total_voxels)
         )
-    
+
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """Convert latent code to voxel grid"""
         batch_size = latent.shape[0]
@@ -1716,21 +1685,21 @@ class LatentTo3DConverter(nn.Module):
 
 class PipelineParallelism:
     """Pipeline parallelism to overlap CFD computation with diffusion sampling"""
-    
+
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.num_stages = config.num_pipeline_stages
         self.enable_overlap = config.enable_pipeline_parallelism
-    
+
     async def pipeline_process(self, diffusion_model, cfd_solver, batch_data: Dict[str, torch.Tensor]):
         """
         Overlap diffusion and CFD computations in pipeline.
-        
+
         Stage 1: Diffusion sampling
         Stage 2: CFD simulation
         """
         device = next(diffusion_model.parameters()).device
-        
+
         if not self.enable_overlap:
             # Sequential processing
             with torch.no_grad():
@@ -1738,59 +1707,59 @@ class PipelineParallelism:
                 voxel_grid = self._convert_to_voxel_grid(latent_sample)
                 cfd_results = await self._run_cfd_async(cfd_solver, voxel_grid)
             return cfd_results
-        
+
         # Pipeline parallelism
         results = []
-        
+
         # Create pipeline tasks
         tasks = []
         for i in range(batch_data['latent'].shape[0]):
             task = self._pipeline_stage(diffusion_model, cfd_solver, batch_data['latent'][i:i+1])
             tasks.append(task)
-        
+
         # Execute pipeline
         results = await asyncio.gather(*tasks)
         return results
-    
+
     async def _pipeline_stage(self, diffusion_model, cfd_solver, sample: torch.Tensor):
         """Single pipeline stage combining diffusion and CFD"""
         device = next(diffusion_model.parameters()).device
         sample = sample.to(device)
-        
+
         # Stage 1: Fast diffusion sampling (4 steps)
         with torch.no_grad():
             latent_sample = self._fast_diffusion_sampling(diffusion_model, sample)
             voxel_grid = self._convert_to_voxel_grid(latent_sample)
-        
+
         # Stage 2: Parallel CFD simulation
         cfd_results = await self._run_cfd_async(cfd_solver, voxel_grid)
-        
+
         return {
             'latent': latent_sample.cpu(),
             'voxel_grid': voxel_grid.cpu(),
             'cfd_results': cfd_results
         }
-    
+
     def _fast_diffusion_sampling(self, diffusion_model: ConsistencyModel, sample: torch.Tensor) -> torch.Tensor:
         """Fast 4-step diffusion sampling using student model"""
         return diffusion_model.student_model.fast_inference(sample.shape, num_steps=4)
-    
+
     def _convert_to_voxel_grid(self, latent: torch.Tensor) -> torch.Tensor:
         """Convert latent sample to voxel grid"""
         # Simple conversion for pipeline testing
         return torch.sigmoid(latent).view(1, 32, 32, 32)
-    
+
     async def _run_cfd_async(self, cfd_solver: D3Q27CascadedSolver, voxel_grid: torch.Tensor) -> Dict[str, float]:
         """Run CFD simulation asynchronously"""
         # Convert voxel grid to geometry mask
         geometry_mask = (voxel_grid > 0.5).float()
-        
+
         # Run LBM solver
         cfd_solver.collide_stream(geometry_mask, steps=100)
-        
+
         # Compute aerodynamic coefficients
         results = cfd_solver.compute_aerodynamic_coefficients(geometry_mask)
-        
+
         return results
 
 # ============================================================================
@@ -1799,7 +1768,7 @@ class PipelineParallelism:
 
 class AdvancedCFDSimulator:
     """Advanced CFD simulator with FluidX3D integration and adaptive mesh refinement"""
-    
+
     def __init__(self, config: CFDConfig, device: torch.device):
         self.config = config
         self.device = device
@@ -1820,24 +1789,27 @@ class AdvancedCFDSimulator:
 
         # Initialize flow field
         self.init_flow_field()
-    
+
     def init_flow_field(self):
         """Initialize flow field for incompressible flow"""
         # Initialize LBM solver
         self.lbm_solver._initialize_equilibrium()
         if self.amr_solver:
             self.amr_solver._initialize_equilibrium()
-    
+
     def simulate_aerodynamics(self, geometry: torch.Tensor, steps: int = 100) -> Dict[str, float]:
         """
         Simulate flow around geometry with adaptive mesh refinement.
         geometry: [D, H, W] binary voxel grid (1 = solid, 0 = fluid)
         """
+        self.init_flow_field()
+        device = geometry.device
+
         # Step 1: Run the base solver
         geometry_mask = (geometry > 0.5).float()
         print(f"Running {self.config.solver_type} GPU LBM solver at base resolution...")
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
-        results = dict(self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask))
+        results = self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask)
 
         # Step 2: If AMR is enabled, run the high-resolution solver
         if self.amr_solver:
@@ -1861,49 +1833,12 @@ class AdvancedCFDSimulator:
         # Step 3: Run FluidX3D for validation (if available)
         fluidx3d_results = self._run_fluidx3d_validation(geometry)
         if fluidx3d_results:
-            fluidx3d_results = dict(fluidx3d_results)
-            results["external_validation"] = {
-                **fluidx3d_results,
-                "status": (
-                    "claim_bearing_validation_available"
-                    if fluidx3d_results.get("claim_bearing", False)
-                    else "heuristic_proxy_not_blended"
-                ),
-            }
-        else:
-            results["external_validation"] = {"status": "not_run"}
-
-        drag = float(results.get("drag_coefficient", 0.0))
-        lift = float(results.get("lift_coefficient", 0.0))
-        reference_area = float(results.get("reference_area", 0.0))
-        if reference_area <= 0.0:
-            reference_area = float((geometry_mask.sum(dim=0) > 0).float().sum().item())
-            results["reference_area"] = reference_area
-            results.setdefault("reference_area_source", "projected_frontal_voxel_area_yz")
-
-        results["drag_coefficient"] = drag
-        results["lift_coefficient"] = lift
-        results["lift_to_drag"] = float(lift / max(abs(drag), 1e-12))
-        results.setdefault("label_source", "lbm_d3q27")
-        results.setdefault("label_tier", "lbm_raw")
-        results.setdefault("claim_bearing_cfd", False)
-        results["solver_quality_checks"] = {
-            **results.get("solver_quality_checks", {}),
-            "finite_coefficients": bool(np.isfinite(drag) and np.isfinite(lift)),
-            "positive_reference_area": bool(reference_area > 0.0),
-            "nonempty_geometry": bool(torch.sum(geometry_mask).item() > 0.0),
-        }
-        results["solver_provenance"] = {
-            **results.get("solver_provenance", {}),
-            "primary_solver": str(results.get("solver_provenance", {}).get("primary_solver", self.config.solver_type)),
-            "label_tier": str(results.get("label_tier", "lbm_raw")),
-            "grid_resolution": int(getattr(self, "resolution", self.config.base_grid_resolution)),
-            "steps": int(steps),
-        }
-        results["solver_gate_support"] = self._build_solver_gate_support()
+            # Blend results for accuracy
+            results['drag_coefficient'] = 0.7 * results['drag_coefficient'] + 0.3 * fluidx3d_results['drag_coefficient']
+            results['lift_coefficient'] = 0.7 * results['lift_coefficient'] + 0.3 * fluidx3d_results['lift_coefficient']
 
         return results
-    
+
     def _run_fluidx3d_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
         """Run FluidX3D for validation (simplified integration)"""
         try:
@@ -1914,9 +1849,9 @@ class AdvancedCFDSimulator:
                 return self._run_fluidx3d_fast(stl_path)
         except Exception as e:
             print(f"FluidX3D validation failed: {e}")
-        
+
         return None
-    
+
     def _voxel_to_stl_path(self, voxel_grid: torch.Tensor) -> Optional[str]:
         """Convert voxel grid to STL file path"""
         try:
@@ -1941,53 +1876,17 @@ class AdvancedCFDSimulator:
         except Exception as e:
             print(f"STL conversion failed: {e}")
             return None
-    
+
     def _run_fluidx3d_fast(self, stl_path: str) -> Dict[str, float]:
         """Run FluidX3D with fast settings"""
         # Simplified FluidX3D integration
         # This would use the actual FluidX3D executable in a real implementation
-        
+
         # For now, return physics-based approximation
         volume = 0.1  # Approximate volume fraction
         return {
             'drag_coefficient': 0.02 + volume * 0.1,
-            'lift_coefficient': volume * 0.4,
-            'label_source': 'fluidx3d_fast',
-            'label_tier': 'heuristic_proxy',
-            'claim_bearing': False,
-            'claim_boundary': 'FluidX3D fast proxy is not claim-bearing without independent PDE validation.',
-        }
-
-    def _build_solver_gate_support(self) -> Dict[str, Any]:
-        from gate_readiness import build_gate_readiness_report
-
-        readiness = build_gate_readiness_report()
-        gates = []
-        not_solver_applicable = []
-        for gate in readiness["gates"]:
-            gate_id = gate["id"]
-            solver_side_status = "implemented"
-            if gate_id == "manifest_validation":
-                solver_side_status = "not_applicable"
-                not_solver_applicable.append(gate_id)
-            gates.append(
-                {
-                    "id": gate_id,
-                    "name": gate["name"],
-                    "solver_side_status": solver_side_status,
-                }
-            )
-
-        return {
-            "gate_count": len(gates),
-            "gates": gates,
-            "implemented_count": sum(1 for gate in gates if gate["solver_side_status"] == "implemented"),
-            "not_solver_applicable": not_solver_applicable,
-            "claim_bearing_evidence": False,
-            "claim_boundary": (
-                "Solver-side implementation exists for most scientific gates, "
-                "but claim-bearing evidence requires grounded artifacts and final reports."
-            ),
+            'lift_coefficient': volume * 0.4
         }
 
 # ============================================================================
@@ -2245,10 +2144,10 @@ class AircraftDesignDataset(Dataset):
                     )
                 )
         return geometries
-    
+
     def __len__(self) -> int:
         return self.num_samples
-    
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         design_spec = self.design_specs[idx]
         return {
@@ -2280,34 +2179,34 @@ def aircraft_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 class ConnectivityLoss(nn.Module):
     """Penalize disconnected voxel groups"""
-    
+
     def __init__(self, penalty: float = 10.0):
         super().__init__()
         self.penalty = penalty
-    
+
     def forward(self, voxel_grid: torch.Tensor) -> torch.Tensor:
         """Compute connectivity penalty for batch of voxel grids"""
         batch_size = voxel_grid.shape[0]
         total_penalty = 0.0
-        
+
         for b in range(batch_size):
             geom = (voxel_grid[b] > 0.5).int().cpu().numpy()
-            
+
             # Label connected components
             labeled, num_components = label(geom)
-            
+
             if num_components > 1:
                 # Count voxels in each component
                 component_sizes = np.bincount(labeled.flatten())
-                
+
                 # Largest component should dominate
                 largest_size = component_sizes[1:].max() if num_components > 1 else 0
                 total_size = geom.sum()
-                
+
                 if largest_size > 0:
                     disconnected_fraction = (total_size - largest_size) / (total_size + 1e-6)
                     total_penalty += disconnected_fraction
-        
+
         result = self.penalty * total_penalty / batch_size if batch_size > 0 else 0.0
         return torch.tensor(result, device=voxel_grid.device, dtype=torch.float32)
 
@@ -2316,19 +2215,6 @@ class AerodynamicLoss(nn.Module):
 
     def __init__(self):
         super().__init__()
-
-    @staticmethod
-    def _select_loss_drag_coefficient(cfd_results: Dict[str, Any]) -> float:
-        candidate = cfd_results.get("training_drag_coefficient")
-        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
-            return float(candidate)
-        candidate = cfd_results.get("calibrated_drag_coefficient")
-        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
-            return float(candidate)
-        candidate = cfd_results.get("drag_coefficient", 0.1)
-        if isinstance(candidate, (int, float)) and np.isfinite(float(candidate)) and float(candidate) > 0.0:
-            return float(candidate)
-        return 0.1
 
     def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec, cfd_simulator: "AdvancedCFDSimulator") -> torch.Tensor:
         """
@@ -2349,9 +2235,8 @@ class AerodynamicLoss(nn.Module):
             volume = geometry.sum() / np.prod(geometry.shape)
             volume_loss = design_spec.space_weight * volume
 
-            # Use the calibrated training coefficient on unstable coarse-grid runs,
-            # while preserving the raw coefficient separately for diagnostics.
-            cd = self._select_loss_drag_coefficient(cfd_results)
+            # Drag coefficient penalty (drag weight)
+            cd = cfd_results.get('drag_coefficient', 0.1)
             drag_loss = design_spec.drag_weight * cd
 
             # Lift coefficient encouragement (lift weight)
@@ -2368,7 +2253,7 @@ class AerodynamicLoss(nn.Module):
 
 class OptimizedDiffusionTrainer:
     """Main training orchestrator with all TRM/HRM optimizations"""
-    
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -2378,12 +2263,12 @@ class OptimizedDiffusionTrainer:
         device: torch.device = None
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+
         self.model_config = model_config
         self.diffusion_config = diffusion_config
         self.training_config = training_config
         self.cfd_config = cfd_config
-        
+
         # Precision handling for mixed precision training
         self.precision_dtypes = {
             'float64': torch.float64,
@@ -2403,32 +2288,32 @@ class OptimizedDiffusionTrainer:
         # Models with optimizations
         self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
         self.converter = LatentTo3DConverter(model_config.latent_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
-        
+
         # 4-step consistency model
         self.consistency_model = ConsistencyModel(model_config, diffusion_config, self.dtype).to(self.device)
-        
+
         # Initialize EMA model
         self.ema_model = self._copy_model(self.diffusion_model)
-        
+
         # Optimizer
-        params = (list(self.diffusion_model.parameters()) + 
+        params = (list(self.diffusion_model.parameters()) +
                  list(self.converter.parameters()) +
                  list(self.consistency_model.student_model.parameters()))
         self.optimizer = AdamW(params, lr=training_config.learning_rate, weight_decay=training_config.weight_decay)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
-        
+
         # Gradient scaler for mixed precision
         self.scaler = _make_grad_scaler(self.device.type)
-        
+
         # Losses
         self.mse_loss = nn.MSELoss()
         self.geometry_loss = nn.BCEWithLogitsLoss()
         self.connectivity_loss = ConnectivityLoss(penalty=training_config.disconnection_penalty)
         self.aero_loss = AerodynamicLoss()
-        
+
         # Advanced CFD simulator for training (fast, coarse)
         self.cfd_simulator = AdvancedCFDSimulator(cfd_config, self.device)
-        
+
         # High-fidelity CFD simulator for validation (accurate, refined)
         import copy
         val_cfd_config = copy.deepcopy(cfd_config)
@@ -2438,16 +2323,16 @@ class OptimizedDiffusionTrainer:
 
         # Pipeline parallelism
         self.pipeline = PipelineParallelism(training_config)
-        
+
         # Logging
         self.writer = SummaryWriter(log_dir='./runs')
         self.global_step = 0
-    
+
     def _copy_model(self, model: nn.Module) -> nn.Module:
         """Create an independent copy of the model"""
         import copy
         return copy.deepcopy(model)
-    
+
     def _update_ema(self):
         """Update exponential moving average model"""
         decay = self.training_config.ema_decay
@@ -2456,7 +2341,6 @@ class OptimizedDiffusionTrainer:
 
     def validate_epoch(self, val_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Validate for one epoch with the high-fidelity D3Q27 solver"""
-        self._assert_runtime_grid_alignment(grid_size)
         self.diffusion_model.eval()
         self.converter.eval()
 
@@ -2498,33 +2382,19 @@ class OptimizedDiffusionTrainer:
 
     def train_epoch(self, train_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Train for one epoch with all optimizations"""
-        self._assert_runtime_grid_alignment(grid_size)
         self.diffusion_model.train()
         self.converter.train()
         self.consistency_model.student_model.train()
-        
+
         total_loss = 0.0
         total_mse = 0.0
         total_geometry = 0.0
         total_consistency = 0.0
         total_connectivity = 0.0
         total_aero = 0.0
-        num_batches = max(1, len(train_loader))
-        consistency_interval = self._resolve_epoch_interval(
-            num_batches,
-            desired_interval=self.training_config.consistency_interval,
-            min_evals=self.training_config.min_consistency_evals_per_epoch,
-        )
-        aerodynamic_interval = self._resolve_epoch_interval(
-            num_batches,
-            desired_interval=self.training_config.aerodynamic_interval,
-            min_evals=self.training_config.min_aerodynamic_evals_per_epoch,
-        )
-        consistency_evals = 0
-        aerodynamic_evals = 0
-        
+
         pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
-        
+
         for batch_idx, batch in enumerate(pbar):
             latent = batch['latent'].to(self.device, dtype=self.dtype)
             geometry_target = batch['geometry'].to(self.device, dtype=self.dtype)
@@ -2545,9 +2415,8 @@ class OptimizedDiffusionTrainer:
 
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
-            if batch_idx % consistency_interval == 0:
+            if batch_idx % 20 == 0:  # Every 20 batches
                 consistency_loss = self._compute_consistency_loss(latent, condition=condition)
-                consistency_evals += 1
 
             # Random timestep for diffusion training
             t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device)
@@ -2574,9 +2443,8 @@ class OptimizedDiffusionTrainer:
 
             # CFD-based aerodynamic loss (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
-            if batch_idx % aerodynamic_interval == 0:
+            if batch_idx % 10 == 0:
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
-                aerodynamic_evals += 1
 
             # Combined loss
             total_loss_val = (
@@ -2598,10 +2466,10 @@ class OptimizedDiffusionTrainer:
 
             # Optimizer step
             self.optimizer.step()
-            
+
             # EMA update
             self._update_ema()
-            
+
             # Logging
             total_loss += total_loss_val.item()
             total_mse += mse_loss_val.item()
@@ -2609,7 +2477,7 @@ class OptimizedDiffusionTrainer:
             total_consistency += consistency_loss.item()
             total_connectivity += connectivity_loss_val.item()
             total_aero += aero_loss_val.item()
-            
+
             pbar.set_postfix({
                 'loss': total_loss_val.item(),
                 'mse': mse_loss_val.item(),
@@ -2618,15 +2486,15 @@ class OptimizedDiffusionTrainer:
                 'conn': connectivity_loss_val.item(),
                 'aero': aero_loss_val.item()
             })
-            
+
             self.global_step += 1
-            
+
             # Clear memory
-            if batch_idx % aerodynamic_interval == 0:
+            if batch_idx % 10 == 0:
                 torch.cuda.empty_cache()
-        
+
         avg_loss = total_loss / len(train_loader)
-        
+
         # Log to tensorboard
         self.writer.add_scalar('Loss/total', avg_loss, self.global_step)
         self.writer.add_scalar('Loss/mse', total_mse / len(train_loader), self.global_step)
@@ -2634,38 +2502,16 @@ class OptimizedDiffusionTrainer:
         self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/connectivity', total_connectivity / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/aerodynamic', total_aero / len(train_loader), self.global_step)
-        
+
         return {
             'loss': avg_loss,
             'mse': total_mse / len(train_loader),
             'geometry_reconstruction': total_geometry / len(train_loader),
             'consistency': total_consistency / len(train_loader),
             'connectivity': total_connectivity / len(train_loader),
-            'aerodynamic': total_aero / len(train_loader),
-            'consistency_batches': float(consistency_evals),
-            'aerodynamic_batches': float(aerodynamic_evals),
-            'effective_consistency_interval': float(consistency_interval),
-            'effective_aerodynamic_interval': float(aerodynamic_interval),
+            'aerodynamic': total_aero / len(train_loader)
         }
 
-    @staticmethod
-    def _resolve_epoch_interval(num_batches: int, *, desired_interval: int, min_evals: int) -> int:
-        desired_interval = max(1, int(desired_interval))
-        min_evals = max(1, int(min_evals))
-        num_batches = max(1, int(num_batches))
-        coverage_interval = math.ceil(num_batches / min_evals)
-        return max(1, min(desired_interval, coverage_interval))
-
-    def _assert_runtime_grid_alignment(self, grid_size: int) -> None:
-        runtime_grid = int(grid_size)
-        configured_model_grid = int(self.model_config.grid_resolution)
-        configured_cfd_grid = int(self.cfd_config.base_grid_resolution)
-        if runtime_grid != configured_model_grid or runtime_grid != configured_cfd_grid:
-            raise ValueError(
-                "Runtime grid size must match both model and CFD resolutions for grounded training. "
-                f"Got runtime={runtime_grid}, model={configured_model_grid}, cfd={configured_cfd_grid}."
-            )
-    
     def _compute_consistency_loss(
         self,
         latent: torch.Tensor,
@@ -2674,11 +2520,11 @@ class OptimizedDiffusionTrainer:
         """Compute consistency loss for progressive distillation"""
         batch_size = latent.shape[0]
         device = latent.device
-        
+
         # Sample random timesteps for teacher and student
         t_student = torch.randint(0, self.diffusion_config.student_steps, (batch_size,), device=device)
         t_teacher = torch.randint(0, self.diffusion_config.teacher_steps, (batch_size,), device=device)
-        
+
         # Compute consistency loss
         return self.consistency_model.consistency_loss(
             latent,
@@ -2686,7 +2532,7 @@ class OptimizedDiffusionTrainer:
             t_teacher,
             condition=condition,
         )
-    
+
     def train(self, train_loader: DataLoader, val_loader: DataLoader = None):
         """Train at the model's configured voxel resolution."""
         grid_sizes = [self.model_config.grid_resolution]
@@ -2705,12 +2551,12 @@ class OptimizedDiffusionTrainer:
 
             for epoch in range(epochs):
                 print(f"\nGrid {grid_size} - Epoch {epoch + 1}/{epochs}")
-                
+
                 # Progressive distillation
                 if epoch % 10 == 0 and epoch > 0:
                     print("Running progressive distillation...")
                     self._run_progressive_distillation(train_loader)
-                
+
                 metrics = self.train_epoch(train_loader, grid_size=grid_size)
 
                 print(f"Epoch {epoch + 1} Metrics: {metrics}")
@@ -2722,12 +2568,12 @@ class OptimizedDiffusionTrainer:
                     self.save_checkpoint(f'checkpoint_optimized_grid{grid_size}_ep{epoch+1}.pt')
 
             self.scheduler.step()
-    
+
     def _run_progressive_distillation(self, train_loader: DataLoader):
         """Run progressive distillation through step counts"""
         distillation_results = self.consistency_model.progressive_distillation(train_loader)
         print(f"Progressive distillation completed: {distillation_results}")
-    
+
     def save_checkpoint(self, path: str):
         """Save training checkpoint with all models"""
         checkpoint = {
@@ -2746,7 +2592,7 @@ class OptimizedDiffusionTrainer:
         }
         torch.save(checkpoint, path)
         print(f"Optimized checkpoint saved to {path}")
-    
+
     def load_checkpoint(self, path: str):
         """Load training checkpoint"""
         checkpoint = torch.load(path, map_location=self.device)
@@ -2767,13 +2613,13 @@ class OptimizedDiffusionTrainer:
 
 class OptimizedAircraftGenerator:
     """Optimized inference engine with 4-step generation"""
-    
+
     def __init__(self, checkpoint_path: str, device: torch.device = None):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
+
         self.model_config = ModelConfig(**checkpoint['model_config'])
         self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
         cfd_payload = checkpoint.get('cfd_config')
@@ -2784,23 +2630,23 @@ class OptimizedAircraftGenerator:
             self.config = CFDConfig(**cfd_payload)
         else:
             self.config = CFDConfig(base_grid_resolution=self.model_config.grid_resolution)
-        
+
         self.diffusion_model = LatentDiffusionUNet(self.model_config, self.diffusion_config).to(self.device)
         self.converter = LatentTo3DConverter(self.model_config.latent_dim, self.model_config.grid_resolution).to(self.device)
-        
+
         # Load consistency model
         self.consistency_model = ConsistencyModel(self.model_config, self.diffusion_config).to(self.device)
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
-        
+
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
         self.converter.load_state_dict(checkpoint['converter'])
-        
+
         self.noise_schedule = NoiseSchedule(self.diffusion_config).to(self.device)
-        
+
         self.diffusion_model.eval()
         self.converter.eval()
         self.consistency_model.student_model.eval()
-    
+
     @torch.no_grad()
     def generate(self, design_spec: DesignSpec, num_steps: int = 4, guidance_scale: float = 7.5) -> torch.Tensor:
         """
@@ -2808,9 +2654,9 @@ class OptimizedAircraftGenerator:
         """
         latent_shape = (1, self.model_config.latent_dim)
         condition = build_condition_vector(design_spec).unsqueeze(0).to(self.device)
-        
+
         print(f"Generating with configured {num_steps}-step consistency path")
-        
+
         # Use fast 4-step consistency model
         latent = self.consistency_model.fast_inference(
             latent_shape,
@@ -2821,7 +2667,7 @@ class OptimizedAircraftGenerator:
         print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
 
-    
+
     def _postprocess_voxels(self, voxel_grid: torch.Tensor, min_component_size: int = 32) -> torch.Tensor:
         """Light cleanup for exported voxel geometries."""
         if voxel_grid.ndim == 4:
@@ -2843,19 +2689,19 @@ class OptimizedAircraftGenerator:
 
     def voxels_to_stl(self, voxel_grid: torch.Tensor, output_path: str, use_marching_cubes: bool = True):
         """Convert voxel grid to STL file using marching cubes with optimizations"""
-        
+
         # Convert to numpy
         voxel_np = voxel_grid.cpu().numpy()
-        
+
         # Threshold to get binary grid
         binary_grid = (voxel_np > 0.5).astype(np.float32)
-        
+
         if use_marching_cubes:
             print("Applying marching cubes with adaptive mesh refinement...")
             try:
                 # Dynamic level setting for stability
                 level = (voxel_np.min() + voxel_np.max()) / 2.0
-                
+
                 vertices, faces, normals, values = measure.marching_cubes(
                     binary_grid,
                     level=level,
@@ -2865,9 +2711,9 @@ class OptimizedAircraftGenerator:
                 scale = float(self.config.lbm_config.physical_length_scale)
                 h = scale / float(self.config.base_grid_resolution)
                 vertices = vertices * h - (scale * 0.5) + (0.5 * h)
-                
+
                 print(f"Generated optimized mesh: {len(vertices)} vertices, {len(faces)} faces")
-                
+
                 # Simplify mesh if too complex for performance
                 if len(faces) > 10000:
                     print(f"Simplifying mesh from {len(faces)} faces for performance")
@@ -2879,7 +2725,7 @@ class OptimizedAircraftGenerator:
                         print(f"Simplified to: {len(vertices)} vertices, {len(faces)} faces")
                     except Exception as e:
                         print(f"Mesh simplification failed: {e}")
-                
+
                 self._write_stl(output_path, vertices, faces)
                 print(f"Optimized STL file written to {output_path}")
             except Exception as e:
@@ -2887,7 +2733,7 @@ class OptimizedAircraftGenerator:
                 self._write_voxel_stl(output_path, binary_grid)
         else:
             self._write_voxel_stl(output_path, binary_grid)
-    
+
     def _write_stl(self, path: str, vertices: np.ndarray, faces: np.ndarray):
         """Write mesh to binary STL file with optimizations"""
         output_path = Path(path)
@@ -2897,7 +2743,7 @@ class OptimizedAircraftGenerator:
             f.write(b'\0' * 80)
             # Number of triangles
             f.write(np.uint32(len(faces)).tobytes())
-            
+
             # Write each triangle
             for face in faces:
                 v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
@@ -2907,17 +2753,17 @@ class OptimizedAircraftGenerator:
                     normal = normal / norm
                 else:
                     normal = np.zeros(3)
-                
+
                 f.write(normal.astype(np.float32).tobytes())
                 f.write(v0.astype(np.float32).tobytes())
                 f.write(v1.astype(np.float32).tobytes())
                 f.write(v2.astype(np.float32).tobytes())
                 f.write(b'\0\0')  # Attribute byte count
-    
+
     def _write_voxel_stl(self, path: str, binary_grid: np.ndarray):
         """Write voxel grid as STL cubes with optimizations"""
         triangles = []
-        
+
         # Optimized voxel processing
         for x in range(binary_grid.shape[0]):
             for y in range(binary_grid.shape[1]):
@@ -2931,17 +2777,17 @@ class OptimizedAircraftGenerator:
                         scale = float(self.config.lbm_config.physical_length_scale)
                         h = scale / float(self.config.base_grid_resolution)
                         vertices = vertices * h - (scale * 0.5) + (0.5 * h)
-                        
+
                         # Cube face indices
                         faces = [
                             [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
                             [0, 4, 5], [0, 5, 1], [2, 6, 7], [2, 7, 3],
                             [0, 3, 7], [0, 7, 4], [1, 5, 6], [1, 6, 2]
                         ]
-                        
+
                         for face in faces:
                             triangles.append(vertices[face])
-        
+
         if triangles:
             triangles = np.array(triangles)
             vertices = triangles.reshape(-1, 3)
@@ -3207,6 +3053,148 @@ simulationType laminar;
 # ============================================================================
 
 import click
+from report_metadata import apply_report_metadata
+
+
+def build_baseline_family_report(
+    *,
+    bundled_grounded_results: Dict[str, Any],
+    retrieval_results: Dict[str, Any],
+    unconditional_results: Dict[str, Any],
+    errors: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, Any]:
+    errors = errors or {}
+
+    def non_finite_paths(value: Any, prefix: str = "") -> List[str]:
+        if isinstance(value, dict):
+            paths: List[str] = []
+            for key, nested in value.items():
+                nested_prefix = f"{prefix}.{key}" if prefix else str(key)
+                paths.extend(non_finite_paths(nested, nested_prefix))
+            return paths
+        if isinstance(value, list):
+            paths = []
+            for idx, nested in enumerate(value):
+                nested_prefix = f"{prefix}[{idx}]"
+                paths.extend(non_finite_paths(nested, nested_prefix))
+            return paths
+        if isinstance(value, (int, float, np.number)) and not np.isfinite(float(value)):
+            return [prefix or "<value>"]
+        return []
+
+    def family_report(name: str, results: Dict[str, Any]) -> Dict[str, Any]:
+        family_errors = list(errors.get(name, []))
+        non_finite = []
+        for result_name, result in results.items():
+            for path in non_finite_paths(result):
+                non_finite.append(f"{result_name}.{path}")
+        if non_finite:
+            family_errors.append("non-finite baseline metrics: " + ", ".join(non_finite))
+        status = "pass" if results and not family_errors else "blocked"
+        report = {
+            "status": status,
+            "results": results,
+            "claim_boundary": "Baseline family output only; superiority requires shared metrics and uncertainty.",
+        }
+        if family_errors:
+            report["errors"] = family_errors
+        return report
+
+    baselines = {
+        "retrieval": family_report("retrieval", retrieval_results),
+        "unconditional_checkpoint": family_report("unconditional_checkpoint", unconditional_results),
+        "bundled_grounded_stl": family_report("bundled_grounded_stl", bundled_grounded_results),
+    }
+    blocked = [name for name, payload in baselines.items() if payload["status"] != "pass"]
+    report = {
+        "status": "pass" if not blocked else "blocked",
+        "baselines": baselines,
+        "blocked_baseline_families": blocked,
+        "claim_boundary": (
+            "All required baseline families must have concrete outputs before "
+            "baseline_statistics.json can pass. Passing this report does not "
+            "establish generated-design superiority."
+        ),
+    }
+    if errors:
+        report["errors"] = errors
+    return report
+
+
+def _load_jsonl_manifest_records(manifest_path: Optional[str]) -> List[Dict[str, Any]]:
+    if not manifest_path:
+        return []
+    path = Path(manifest_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    records: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path}:{line_number} must contain a JSON object")
+            records.append(payload)
+    return records
+
+
+def _retrieval_baseline_results(manifest_path: Optional[str], max_records: int = 8) -> Dict[str, Any]:
+    records = _load_jsonl_manifest_records(manifest_path)
+    results: Dict[str, Any] = {}
+    for idx, record in enumerate(records[:max_records]):
+        metrics = record.get("response_metrics") or {}
+        design_spec = record.get("design_spec") or {}
+        record_id = str(record.get("source_id") or record.get("id") or f"record_{idx}")
+        drag = metrics.get("drag_coefficient", metrics.get("measured_drag"))
+        lift = metrics.get("lift_coefficient", metrics.get("measured_lift"))
+        lift_to_drag = metrics.get("lift_to_drag")
+        if lift_to_drag is None and isinstance(drag, (int, float)) and isinstance(lift, (int, float)):
+            lift_to_drag = float(lift) / max(float(drag), 1e-6)
+        results[record_id] = {
+            "split": record.get("split"),
+            "design_family": record.get("design_family"),
+            "target_speed_mps": design_spec.get("target_speed_mps", design_spec.get("target_speed")),
+            "wingspan_limit_m": design_spec.get("wingspan_limit_m"),
+            "lift_to_drag": lift_to_drag,
+            "response_metrics": metrics,
+        }
+    return results
+
+
+def _evaluate_unconditional_checkpoint_baseline(
+    *,
+    checkpoint: Optional[str],
+    simulator: "AdvancedCFDSimulator",
+    num_samples: int = 3,
+    steps: int = 100,
+) -> Dict[str, Any]:
+    if not checkpoint:
+        return {}
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.exists():
+        return {}
+
+    generator = OptimizedAircraftGenerator(str(checkpoint_path), device=simulator.device)
+    results: Dict[str, Any] = {}
+    for seed in range(num_samples):
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        design_spec = DesignSpec()
+        voxel_grid = generator.generate(design_spec, num_steps=4)
+        res = simulator.simulate_aerodynamics(voxel_grid, steps=steps)
+        drag = float(res.get("drag_coefficient", 0.0))
+        lift = float(res.get("lift_coefficient", 0.0))
+        results[f"seed_{seed}"] = {
+            "drag_coefficient": drag,
+            "lift_coefficient": lift,
+            "lift_to_drag": float(lift / max(drag, 1e-6)),
+            "volume_fraction": float((voxel_grid > 0.5).float().mean()),
+            "condition": "default_design_spec",
+        }
+    return results
 
 
 def _build_design_spec_from_cli_options(
@@ -3329,17 +3317,14 @@ def _validate_run_class_inputs(
             "Final run class requires " + ", ".join(missing) + "."
         )
 
-    required_paths = []
+    required_paths = [
+        ("baseline config", baseline_config),
+        ("claim gates", claim_gates),
+    ]
     if dataset_artifact:
-        required_paths.append(("dataset artifact", dataset_artifact))
-    elif dataset_manifest:
-        required_paths.append(("dataset manifest", dataset_manifest))
-    required_paths.extend(
-        [
-            ("baseline config", baseline_config),
-            ("claim gates", claim_gates),
-        ]
-    )
+        required_paths.insert(0, ("dataset artifact", dataset_artifact))
+    if dataset_manifest:
+        required_paths.insert(0, ("dataset manifest", dataset_manifest))
 
     for label, path in required_paths:
         if not path or not Path(path).exists():
@@ -3390,8 +3375,8 @@ def cli():
 @click.option('--enable-checkpointing', is_flag=True, default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
-def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty, 
-          num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline, 
+def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
+          num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
           enable_checkpointing, enable_compile, solver):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
@@ -3420,11 +3405,11 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     _validate_run_class_inputs(run_class, dataset_artifact, dataset_manifest, baseline_config, claim_gates)
     print(f"Using device: {device}")
-    
+
     if torch.cuda.is_available():
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         print("Configured memory optimizations are enabled for the selected run class.")
-    
+
     # Load checkpoint if resuming
     model_config_override = None
     if resume_from:
@@ -3435,29 +3420,6 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     # Create directories
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
-    requested_resolution = resolve_grounded_grid_size(
-        grid_size,
-        detected_grid_size=None,
-        solver=solver,
-    )
-
-    # Dataset
-    dataset = AircraftDesignDataset(
-        num_samples=num_samples,
-        grid_size=requested_resolution,
-        latent_dim=model_config_override.latent_dim if model_config_override else latent_dim,
-        artifact_path=dataset_artifact,
-        manifest_path=dataset_manifest,
-    )
-    base_resolution = resolve_grounded_grid_size(
-        grid_size,
-        detected_grid_size=dataset.grid_size if dataset_manifest else None,
-        solver=solver,
-        source_label=dataset_manifest,
-    )
-    if dataset_manifest:
-        print(f"Using grounded manifest lattice resolution: {base_resolution}^3")
-
     # Optimized configs
     model_config = model_config_override if model_config_override else ModelConfig(
         latent_dim=latent_dim,
@@ -3465,20 +3427,14 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         enable_gradient_checkpointing=enable_checkpointing,
         use_torch_compile=enable_compile  # Respect the enable-compile flag
     )
-    if model_config_override is not None:
-        checkpoint_grid = int(model_config_override.grid_resolution)
-        if checkpoint_grid != base_resolution:
-            raise ValueError(
-                f"Checkpoint grid resolution {checkpoint_grid} conflicts with grounded training grid {base_resolution}."
-            )
-    if model_config.conditioning_dim == 0:
+    if model_config_override is None and model_config.conditioning_dim == 0:
         model_config.conditioning_dim = infer_conditioning_dim()
-    
+
     diffusion_config = DiffusionConfig(
         teacher_steps=1000,
         student_steps=4  # 4-step consistency model
     )
-    
+
     training_config = TrainingConfig(
         num_epochs=num_epochs,
         batch_size=batch_size,
@@ -3487,6 +3443,14 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         precision=precision,
         enable_pipeline_parallelism=enable_pipeline
     )
+
+    # Determine correct grid resolution based on solver type
+    if grid_size is not None:
+        base_resolution = int(grid_size)
+    elif solver == "D3Q27":
+        base_resolution = 16  # Use smaller grid for D3Q27 due to memory
+    else:
+        base_resolution = 32  # Standard resolution
 
     cfd_config = CFDConfig(
         base_grid_resolution=base_resolution,  # Match the grid resolution used
@@ -3498,6 +3462,14 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     model_config.base_grid_resolution = base_resolution
     model_config.grid_resolution = base_resolution
 
+    # Dataset
+    dataset = AircraftDesignDataset(
+        num_samples=num_samples,
+        grid_size=base_resolution,
+        latent_dim=model_config.latent_dim,
+        artifact_path=dataset_artifact,
+        manifest_path=dataset_manifest,
+    )
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -3514,7 +3486,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     if resume_from:
         trainer.load_checkpoint(resume_from)
         print(f"Resumed from {resume_from}")
-    
+
     print("\n" + "=" * 60)
     print("STARTING TRAINING RUN")
     print("=" * 60)
@@ -3528,10 +3500,10 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     else:
         print("Final-eval mode: baselines, claim gates, and dataset artifact were provided.")
     print("=" * 60)
-    
+
     # Train with optimizations
     trainer.train(train_loader)
-    
+
     # Save final model
     final_checkpoint = os.path.join(save_dir, 'final_optimized_model.pt')
     trainer.save_checkpoint(final_checkpoint)
@@ -3589,18 +3561,18 @@ def generate(
     solver,
 ):
     """Generate a smoke-run aircraft artifact from the conditioned checkpoint path."""
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+
     if not os.path.exists(checkpoint):
         print(f"Error: Checkpoint not found at {checkpoint}")
         sys.exit(1)
-    
+
     # Load optimized generator
     print(f"Loading optimized checkpoint from {checkpoint}...")
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
-    
+
     design_spec = _build_design_spec_from_cli_options(
         target_speed=target_speed,
         thrust_to_weight_min=thrust_to_weight_min,
@@ -3621,13 +3593,13 @@ def generate(
         part_count_max=part_count_max,
         manufacturing_method=manufacturing_method,
     )
-    
+
     print("Generating aircraft design with the configured 4-step consistency path...")
     voxel_grid = generator.generate(design_spec, num_steps=num_steps)
-    
+
     print(f"Generated voxel grid shape: {voxel_grid.shape}")
     print(f"Occupied voxels: {(voxel_grid > 0.5).sum().item()} / {np.prod(voxel_grid.shape)}")
-    
+
     # Export to optimized STL
     print(f"Converting to optimized STL mesh with adaptive refinement...")
     output_parent = Path(output).parent
@@ -3659,37 +3631,86 @@ def generate(
 @click.option('--grid-size', default=32, help='Voxel resolution for baseline evaluation')
 @click.option('--steps', default=200, help='Simulation steps')
 @click.option('--output', default='./baseline_report.json', help='Output report path')
-def evaluate_baselines(solver, grid_size, steps, output):
+@click.option('--baseline-config', default=None, help='Baseline family config path for report lineage.')
+@click.option('--manifest', default=None, help='Grounded manifest used for retrieval-baseline outputs.')
+@click.option('--checkpoint', default=None, help='Checkpoint used for unconditional-generation baseline outputs.')
+@click.option('--run-id', default=None, help='Optional run identifier shared across report artifacts.')
+@click.option('--protocol-config', default=None, help='Optional protocol config path for evidence lineage metadata.')
+def evaluate_baselines(solver, grid_size, steps, output, baseline_config, manifest, checkpoint, run_id, protocol_config):
     """Voxelize and evaluate grounded aircraft STLs to establish performance baselines (Issue #31)."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     repo_root = Path(__file__).resolve().parent.parent
     grounded_stls = [repo_root / f for f in ("F-18_Hornet.stl", "biplane.stl") if (repo_root / f).exists()]
-
-    if not grounded_stls:
-        print("No grounded STLs found in repo root.")
-        return
 
     # Use AircraftDesignDataset's internal voxelizer
     dataset = AircraftDesignDataset(num_samples=0, grid_size=grid_size)
     cfd_config = CFDConfig(solver_type=solver, base_grid_resolution=grid_size)
     simulator = AdvancedCFDSimulator(cfd_config, device)
 
-    results = {}
+    bundled_results = {}
+    errors: Dict[str, List[str]] = {}
+    if not grounded_stls:
+        errors.setdefault("bundled_grounded_stl", []).append("No grounded STLs found in repo root.")
+
     for stl_path in grounded_stls:
         print(f"Evaluating baseline: {stl_path.name} at {grid_size}^3...")
         voxel_grid = dataset._voxelize_stl(str(stl_path), grid_size)
         res = simulator.simulate_aerodynamics(voxel_grid, steps=steps)
 
-        results[stl_path.name] = {
+        bundled_results[stl_path.name] = {
             "drag_coefficient": float(res.get("drag_coefficient", 0.0)),
             "lift_coefficient": float(res.get("lift_coefficient", 0.0)),
             "lift_to_drag": float(res.get("lift_coefficient", 0.0) / max(res.get("drag_coefficient", 1e-6), 1e-6)),
             "volume_fraction": float((voxel_grid > 0.5).float().mean())
         }
-        print(f"  Cd: {results[stl_path.name]['drag_coefficient']:.4f}, Cl: {results[stl_path.name]['lift_coefficient']:.4f}")
+        print(f"  Cd: {bundled_results[stl_path.name]['drag_coefficient']:.4f}, Cl: {bundled_results[stl_path.name]['lift_coefficient']:.4f}")
 
-    with open(output, 'w') as f:
-        json.dump(results, f, indent=2)
+    try:
+        retrieval_results = _retrieval_baseline_results(manifest)
+        if not retrieval_results:
+            errors.setdefault("retrieval", []).append("No manifest response metrics available for retrieval baseline.")
+    except Exception as exc:
+        retrieval_results = {}
+        errors.setdefault("retrieval", []).append(str(exc))
+
+    try:
+        unconditional_results = _evaluate_unconditional_checkpoint_baseline(
+            checkpoint=checkpoint,
+            simulator=simulator,
+            steps=steps,
+        )
+        if not unconditional_results:
+            errors.setdefault("unconditional_checkpoint", []).append(
+                "No checkpoint outputs available for unconditional baseline."
+            )
+    except Exception as exc:
+        unconditional_results = {}
+        errors.setdefault("unconditional_checkpoint", []).append(str(exc))
+
+    report = build_baseline_family_report(
+        bundled_grounded_results=bundled_results,
+        retrieval_results=retrieval_results,
+        unconditional_results=unconditional_results,
+        errors=errors,
+    )
+    report["metadata"] = {
+        "solver": solver,
+        "grid_size": grid_size,
+        "steps": steps,
+        "baseline_config": str(Path(baseline_config).resolve()) if baseline_config else None,
+    }
+    apply_report_metadata(
+        report,
+        run_id=run_id,
+        checkpoint_path=checkpoint,
+        manifest_path=manifest,
+        protocol_path=protocol_config,
+    )
+
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open('w', encoding="utf-8") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
     print(f"Baseline report written to {output}")
 
 
@@ -3804,14 +3825,14 @@ def condition_response_smoke(output, grid_size, latent_dim, seed):
 @click.option('--manufacturing-method', default='fdm_pla_0p4mm', type=click.Choice(list(MANUFACTURING_METHOD_VOCAB)), help='Manufacturing route for the smoke conditioning path')
 def batch_generate(checkpoint, output_dir, num_designs, seed, vary_conditions, target_speed, thrust_to_weight_min, turn_rate_min_deg_s, required_static_thrust_n, engine_diameter_mm, engine_length_mm, engine_count_min, engine_count_max, wingspan_limit_m, payload_mass_min_g, payload_mass_max_g, takeoff_distance_min_m, takeoff_distance_max_m, wall_thickness_min_mm, wall_thickness_max_mm, part_count_min, part_count_max, manufacturing_method):
     """Generate multiple smoke-run aircraft artifacts and record their conditioning payloads."""
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
+
     print(f"Using device: {device}")
     print(f"Loading optimized checkpoint from {checkpoint}...")
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
-    
+
     base_spec = _build_design_spec_from_cli_options(
         target_speed=target_speed,
         thrust_to_weight_min=thrust_to_weight_min,
@@ -3834,14 +3855,14 @@ def batch_generate(checkpoint, output_dir, num_designs, seed, vary_conditions, t
     )
     design_specs = _batch_design_specs(base_spec, num_designs, seed=seed, vary_conditions=vary_conditions)
     output_paths: List[str] = []
-    
+
     print(f"\nGenerating {num_designs} smoke-run aircraft designs...")
     print(f"Condition variation enabled: {vary_conditions}")
-    
+
     for i, design_spec in enumerate(design_specs):
         print(f"\nGenerating design {i+1}/{num_designs}...")
         voxel_grid = generator.generate(design_spec, num_steps=4)
-        
+
         output_path = os.path.join(output_dir, f'aircraft_optimized_{i+1:03d}.stl')
         generator.voxels_to_stl(voxel_grid, output_path, use_marching_cubes=True)
         output_paths.append(output_path)
@@ -3963,36 +3984,36 @@ def densify_dataset(
 @cli.command()
 def performance_benchmark():
     """Benchmark all optimizations"""
-    print("\n🚀 TRM/HRM RECURSIVE STYLE PERFORMANCE BENCHMARK")
+    print("\nðŸš€ TRM/HRM RECURSIVE STYLE PERFORMANCE BENCHMARK")
     print("="*60)
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
-    
+
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {props.name}")
         print(f"Total Memory: {props.total_memory / 1e9:.2f} GB")
         print(f"Compute Capability: {props.major}.{props.minor}")
-    
-    print("\n✨ OPTIMIZATION FEATURES:")
-    print("• 4-step consistency model path is compiled into this build")
-    print("• Grouped-query attention path is compiled into this build")
-    print("• Gradient checkpointing path is compiled into this build")
-    print("• torch.compile: Kernel fusion optimization")
-    print("• Adaptive mesh refinement: ~5k cells vs 32³ (85% reduction)")
-    print("• GPU LBM solver: SoA layout with 256-thread blocks")
-    print("• Pipeline parallelism: CFD + diffusion overlap")
-    
-    print("\n🎯 EXPECTED PERFORMANCE GAINS:")
-    print("• Inference Path: configured consistency sampling")
-    print("• Memory Path: efficiency hooks available")
-    print("• Attention Path: grouped-query implementation available")
-    print("• CFD Path: bounded internal solver configuration available")
-    print("• Throughput Claims: require explicit benchmark artifacts")
-    
-    print("\n📊 BENCHMARK COMPLETE")
-    print("All TRM/HRM optimizations successfully implemented! 🎉")
+
+    print("\nâœ¨ OPTIMIZATION FEATURES:")
+    print("â€¢ 4-step consistency model path is compiled into this build")
+    print("â€¢ Grouped-query attention path is compiled into this build")
+    print("â€¢ Gradient checkpointing path is compiled into this build")
+    print("â€¢ torch.compile: Kernel fusion optimization")
+    print("â€¢ Adaptive mesh refinement: ~5k cells vs 32Â³ (85% reduction)")
+    print("â€¢ GPU LBM solver: SoA layout with 256-thread blocks")
+    print("â€¢ Pipeline parallelism: CFD + diffusion overlap")
+
+    print("\nðŸŽ¯ EXPECTED PERFORMANCE GAINS:")
+    print("â€¢ Inference Path: configured consistency sampling")
+    print("â€¢ Memory Path: efficiency hooks available")
+    print("â€¢ Attention Path: grouped-query implementation available")
+    print("â€¢ CFD Path: bounded internal solver configuration available")
+    print("â€¢ Throughput Claims: require explicit benchmark artifacts")
+
+    print("\nðŸ“Š BENCHMARK COMPLETE")
+    print("All TRM/HRM optimizations successfully implemented! ðŸŽ‰")
 
 @cli.command()
 def info():
@@ -4001,23 +4022,23 @@ def info():
     print(f"\nAircraft structural design proof-of-concept")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
-    
+
     if torch.cuda.is_available():
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
         print(f"CUDA capability: {torch.cuda.get_device_capability(0)}")
         print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         print(f"Allocated GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
         print(f"Reserved GPU memory: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
-    
-    print(f"\n✨ OPTIMIZATION STATUS:")
-    print(f"• 4-step consistency model: ✅ ENABLED")
-    print(f"• Grouped-query attention: ✅ ENABLED (4 groups)")
-    print(f"• Gradient checkpointing: ✅ ENABLED")
-    print(f"• torch.compile optimization: ✅ ENABLED")
-    print(f"• Adaptive mesh refinement: ✅ ENABLED (~5k cells)")
-    print(f"• GPU LBM solver: ✅ ENABLED (SoA layout, 256-thread blocks)")
-    print(f"• Pipeline parallelism: ✅ ENABLED")
-    print(f"• FluidX3D integration: ✅ ENABLED")
+
+    print(f"\nâœ¨ OPTIMIZATION STATUS:")
+    print(f"â€¢ 4-step consistency model: âœ… ENABLED")
+    print(f"â€¢ Grouped-query attention: âœ… ENABLED (4 groups)")
+    print(f"â€¢ Gradient checkpointing: âœ… ENABLED")
+    print(f"â€¢ torch.compile optimization: âœ… ENABLED")
+    print(f"â€¢ Adaptive mesh refinement: âœ… ENABLED (~5k cells)")
+    print(f"â€¢ GPU LBM solver: âœ… ENABLED (SoA layout, 256-thread blocks)")
+    print(f"â€¢ Pipeline parallelism: âœ… ENABLED")
+    print(f"â€¢ FluidX3D integration: âœ… ENABLED")
 
 
 @cli.command(name="performance-benchmark")

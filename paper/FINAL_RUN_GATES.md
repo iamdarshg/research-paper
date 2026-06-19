@@ -4,8 +4,9 @@ This checklist blocks the paper from using a final run to support claims that th
 
 Readiness language here is intentionally separate from evidence language:
 mapped, implemented, and scaffolded describe gate readiness, while `pass` is
-reserved for executable reports or evidence outcomes. Claim-bearing scientific
-evidence remains 0/13.
+reserved for executable reports or evidence outcomes. A passing reduced evidence
+package unlocks only the reduced evidence-bundle claim, not the stronger
+aircraft-level claims listed below.
 
 ## Current Allowed Summary
 
@@ -15,7 +16,7 @@ With the repo and hardware available on 2026-05-17, the strongest currently supp
 
 ## Claim Gates
 
-| Claim | Required run or artifact | Required baseline | Required metric | Required executable/evidence outcome | Fallback wording if outcome is unavailable | Current status |
+| Claim | Required run or artifact | Required baseline | Required metric | Minimum gate to pass | Fallback wording if gate fails | Current status |
 | --- | --- | --- | --- | --- | --- | --- |
 | `Generates aircraft structures` | Generated samples evaluated with aircraft-specific geometric checks | Hand-built aircraft-like template or curated aircraft corpus | Connectedness, symmetry, planform plausibility, tail/wing/body checks | Multiple generated samples pass `CLI/aircraft_validity.py` checks | `Generates freeform voxel geometries with some aircraft-like motifs` | Gate implemented / claim evidence blocked |
 | `Aerodynamically optimized` | Controlled comparison of generated candidates under fixed CFD settings | Baseline geometry plus ablations | `C_L`, `C_D`, `L/D`, reference area normalization | Generated candidates outperform or consistently match baseline under the same setup | `Produces candidates that can be scored by the current CFD path` | Solver provenance implemented / claim evidence blocked |
@@ -24,6 +25,7 @@ With the repo and hardware available on 2026-05-17, the strongest currently supp
 | `Outperforms prior approaches` | Reproduced baseline comparisons | Named prior methods or strong internal baselines | Same evaluation metrics across methods | Statistically defensible comparison | `We do not claim superiority over prior approaches` | Comparison scaffold implemented / claim evidence blocked |
 | `Publication-quality validation` | Convergence, sensitivity, or external validation study | External solver and/or experimental references | Grid convergence, timestep sensitivity, solver agreement | Validation plan executed and reported | `Current evidence is limited to sanity checks and code-path validation` | Validation scaffold implemented / claim evidence blocked |
 | `Conditioned on flight profile and manufacturing method` | Conditioned dataset, schema, inference examples, and condition-response evaluation | Unconditioned model or prompt-free baseline | Constraint satisfaction and conditional consistency | Model consumes structured conditions and `CLI/run_condition_benchmark.py` passes under a grounded aircraft-like evaluation corpus | `The repo has structured-conditioning plumbing, but scientific validation remains incomplete` | Benchmark gate implemented / grounded evidence blocked |
+| `Validated compressible/high-Mach internal solver` | Thermal/compressible LBM implementation or external compressible reference comparison under fixed geometries | OpenFOAM compressible solver such as `sonicFoam`/`rhoPimpleFoam` with residual, Courant, latest-time, Cd/Cl history, and force-stability records | Mach-specific Cd/Cl agreement, positive rho/T/p, stable force history, documented boundary conditions | All focused compressibility tests pass and high-Mach comparisons are finite, converged, and documented | `Internal D3Q27 high-Mach runs are experimental and unvalidated` | Gate implemented / claim evidence blocked |
 
 ## Required Final-Run Inputs Before Claim Expansion
 
@@ -34,6 +36,8 @@ With the repo and hardware available on 2026-05-17, the strongest currently supp
 5. A structural proxy stronger than simple connectivity.
 6. A fixed 8 GB GPU run protocol or access to larger hardware.
 7. A passing final evidence package from `CLI/final_evidence.py`.
+8. Compressibility audit and evidence artifacts under `build/solver_diagnostics/compressibility_*`.
+9. For high-Mach claims, an external compressible OpenFOAM comparison or a validated thermal/compressible LBM path with shock/steep-gradient and boundary-condition tests.
 
 ## Final Run Decision Rule
 

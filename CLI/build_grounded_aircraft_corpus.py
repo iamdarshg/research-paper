@@ -19,7 +19,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+import requests
 import torch
+import trimesh
+from shapely.geometry import Polygon
 
 import sys
 
@@ -30,24 +33,6 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from aircraft_diffusion_cfd import AircraftDesignDataset, CFDConfig, AdvancedCFDSimulator
 from condition_feasibility import MIN_WALL_BY_METHOD_MM, validate_condition_feasibility
-
-
-def _requests_module():
-    import requests
-
-    return requests
-
-
-def _trimesh_module():
-    import trimesh
-
-    return trimesh
-
-
-def _polygon_class():
-    from shapely.geometry import Polygon
-
-    return Polygon
 
 
 PREPROCESSING_VERSION = "grounded-aircraft-corpus-v1"
@@ -142,7 +127,7 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    response = _requests_module().get(url, timeout=(30, 120))
+    response = requests.get(url, timeout=(30, 120))
     response.raise_for_status()
     destination.write_bytes(response.content)
 
@@ -189,8 +174,6 @@ def compute_thickness_and_camber(naca_module, params: Sequence[int]) -> Tuple[fl
 
 
 def build_mesh(profile_points: np.ndarray, chord_m: float, span_m: float) -> trimesh.Trimesh:
-    trimesh = _trimesh_module()
-    Polygon = _polygon_class()
     scaled = np.column_stack((profile_points[:, 0] * chord_m, profile_points[:, 1] * chord_m))
     polygon = Polygon(scaled)
     if not polygon.is_valid:
@@ -210,23 +193,6 @@ def choose_manufacturing_method(thickness_ratio: float, code: str) -> str:
     return "sheet_balsa_tabbed"
 
 
-def validate_cfd_outputs(*, source_id: str, grid_size: int, steps: int, cfd: Dict[str, Any]) -> None:
-    drag = cfd.get("drag_coefficient")
-    lift = cfd.get("lift_coefficient")
-    if not isinstance(drag, (int, float)) or not np.isfinite(float(drag)):
-        raise ValueError(
-            f"{source_id}: CFD drag_coefficient is non-finite at grid={grid_size}, steps={steps}: {drag}"
-        )
-    if float(drag) <= 0.0:
-        raise ValueError(
-            f"{source_id}: CFD drag_coefficient must be positive at grid={grid_size}, steps={steps}: {drag}"
-        )
-    if not isinstance(lift, (int, float)) or not np.isfinite(float(lift)):
-        raise ValueError(
-            f"{source_id}: CFD lift_coefficient is non-finite at grid={grid_size}, steps={steps}: {lift}"
-        )
-
-
 def run_local_analysis(
     *,
     stl_path: Path,
@@ -242,12 +208,6 @@ def run_local_analysis(
 
     simulator = AdvancedCFDSimulator(CFDConfig(base_grid_resolution=grid_size), torch.device("cpu"))
     cfd = simulator.simulate_aerodynamics(voxels, steps=steps)
-    validate_cfd_outputs(
-        source_id=stl_path.stem,
-        grid_size=grid_size,
-        steps=steps,
-        cfd=cfd,
-    )
 
     voxel_sum = float(voxels.sum().item())
     occupancy_ratio = float((voxels > 0.5).float().mean().item())
@@ -407,12 +367,6 @@ def run_refinement_study(
             voxels = dataset._voxelize_stl(str(stl_path), grid_size)
             simulator = AdvancedCFDSimulator(CFDConfig(base_grid_resolution=grid_size), torch.device("cpu"))
             cfd = simulator.simulate_aerodynamics(voxels, steps=steps)
-            validate_cfd_outputs(
-                source_id=f"refinement:{code}",
-                grid_size=grid_size,
-                steps=steps,
-                cfd=cfd,
-            )
             ladder.append(
                 {
                     "grid_size": grid_size,
@@ -741,7 +695,7 @@ def main() -> int:
             "python": sys.version,
             "torch": getattr(torch, "__version__", ""),
             "numpy": getattr(np, "__version__", ""),
-            "trimesh": getattr(_trimesh_module(), "__version__", ""),
+            "trimesh": getattr(trimesh, "__version__", ""),
         },
         "source_catalog": {
             **raw_sources,

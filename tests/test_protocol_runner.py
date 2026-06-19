@@ -63,6 +63,12 @@ class TestProtocolRunner(unittest.TestCase):
                     "manifest": "../../docs/dataset/minimal_grounded_manifest.jsonl",
                     "output": "../../build/manufacturing_constraints.json",
                 },
+                "prepare_aircraft_validity_inputs": {
+                    "enabled": True,
+                    "output_dir": "../../build/generated_voxels",
+                    "metadata": "../../build/generated_voxels_metadata.json",
+                    "num_samples": 6,
+                },
                 "aircraft_validity": {
                     "enabled": True,
                     "input_dir": "../../build/generated_voxels",
@@ -96,16 +102,23 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertIn(str((repo_root / "paper" / "FINAL_RUN_GATES.md").resolve()), commands[1])
             self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[3])
             self.assertEqual(commands[2][2], "evaluate-baselines")
+            self.assertIn("--baseline-config", commands[2])
+            self.assertIn(str((repo_root / "CLI" / "baseline_config.yaml").resolve()), commands[2])
+            self.assertIn("--manifest", commands[2])
+            self.assertIn(str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()), commands[2])
+            self.assertIn("--checkpoint", commands[2])
+            self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[2])
             self.assertEqual(commands[3][2], "validate-conditions")
             self.assertEqual(commands[4][1], str((cli_dir / "run_condition_benchmark.py").resolve()))
             self.assertIn(str((repo_root / "docs" / "dataset" / "minimal_grounded_manifest.jsonl").resolve()), commands[4])
             self.assertIn(str((repo_root / "checkpoints_test" / "final_optimized_model.pt").resolve()), commands[4])
             self.assertEqual(commands[5][1], str((cli_dir / "condition_feasibility.py").resolve()))
-            self.assertEqual(commands[6][1], str((cli_dir / "aircraft_validity.py").resolve()))
-            self.assertEqual(commands[7][1], str((cli_dir / "multi_seed_eval.py").resolve()))
-            self.assertEqual(commands[8][1], str((cli_dir / "validate_manifest.py").resolve()))
-            self.assertEqual(commands[9][1], str((cli_dir / "final_evidence.py").resolve()))
-            self.assertIn("--require-run-consistency", commands[9])
+            self.assertEqual(commands[6][1], str((cli_dir / "build_aircraft_validity_inputs.py").resolve()))
+            self.assertEqual(commands[7][1], str((cli_dir / "aircraft_validity.py").resolve()))
+            self.assertEqual(commands[8][1], str((cli_dir / "multi_seed_eval.py").resolve()))
+            self.assertEqual(commands[9][1], str((cli_dir / "validate_manifest.py").resolve()))
+            self.assertEqual(commands[10][1], str((cli_dir / "final_evidence.py").resolve()))
+            self.assertIn("--require-run-consistency", commands[10])
 
     def test_checked_in_protocols_resolve_repo_assets(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -140,8 +153,15 @@ class TestProtocolRunner(unittest.TestCase):
             any(command[1] == str((repo_root / "CLI" / "condition_feasibility.py").resolve()) for command in final_commands)
         )
         self.assertTrue(
+            any(command[1] == str((repo_root / "CLI" / "build_aircraft_validity_inputs.py").resolve()) for command in final_commands)
+        )
+        self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "aircraft_validity.py").resolve()) for command in final_commands)
         )
+        builder_command = next(
+            command for command in final_commands if command[1] == str((repo_root / "CLI" / "build_aircraft_validity_inputs.py").resolve())
+        )
+        self.assertIn(str((repo_root / "build" / "protocol_final" / "generated_voxels").resolve()), builder_command)
         self.assertTrue(
             any(command[1] == str((repo_root / "CLI" / "final_evidence.py").resolve()) for command in final_commands)
         )

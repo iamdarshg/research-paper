@@ -2,9 +2,7 @@ import os
 import sys
 import unittest
 import json
-import tempfile
 from dataclasses import asdict
-from pathlib import Path
 from unittest import mock
 
 import torch
@@ -431,23 +429,46 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("baseline", result.output.lower())
         self.assertIn("claim", result.output.lower())
 
-    def test_final_run_class_accepts_manifest_without_dataset_artifact(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            manifest = root / "manifest.jsonl"
-            baseline_config = root / "baseline_config.json"
-            claim_gates = root / "FINAL_RUN_GATES.md"
-            manifest.write_text('{"sample_id":"fixture","geometry_path":"fixture.npy","split":"train"}\n', encoding="utf-8")
-            baseline_config.write_text('{"baseline_name":"fixture","baseline_set":["retrieval"]}\n', encoding="utf-8")
-            claim_gates.write_text("# gates\n", encoding="utf-8")
+    def test_final_run_class_accepts_manifest_instead_of_artifact(self):
+        with self.runner.isolated_filesystem():
+            manifest_path = "manifest.jsonl"
+            baseline_config_path = "baseline_config.yaml"
+            claim_gates_path = "FINAL_RUN_GATES.md"
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"split": "train"}) + "\n")
+            with open(baseline_config_path, "w", encoding="utf-8") as handle:
+                handle.write("baseline_set: []\n")
+            with open(claim_gates_path, "w", encoding="utf-8") as handle:
+                handle.write("# Gates\n")
 
             cli_module._validate_run_class_inputs(
                 cli_module.RUN_CLASS_FINAL,
                 dataset_artifact=None,
-                dataset_manifest=str(manifest),
-                baseline_config=str(baseline_config),
-                claim_gates=str(claim_gates),
+                dataset_manifest=manifest_path,
+                baseline_config=baseline_config_path,
+                claim_gates=claim_gates_path,
             )
+
+    def test_advanced_cfd_simulator_resets_flow_field_per_geometry(self):
+        class FakeSolver:
+            def collide_stream(self, geometry_mask, steps):
+                self.last_shape = tuple(geometry_mask.shape)
+
+            def compute_aerodynamic_coefficients(self, geometry_mask):
+                return {"drag_coefficient": 1.0, "lift_coefficient": 0.5}
+
+        simulator = object.__new__(cli_module.AdvancedCFDSimulator)
+        simulator.config = mock.Mock(solver_type="D3Q27", use_amr=False)
+        simulator.lbm_solver = FakeSolver()
+        simulator.amr_solver = None
+        simulator.init_flow_field = mock.Mock()
+        simulator._run_fluidx3d_validation = mock.Mock(return_value=None)
+
+        geometry = torch.zeros((4, 4, 4), dtype=torch.float32)
+        simulator.simulate_aerodynamics(geometry, steps=1)
+        simulator.simulate_aerodynamics(geometry, steps=1)
+
+        self.assertEqual(simulator.init_flow_field.call_count, 2)
 
     def test_densify_dataset_cli_delegates_to_checkpoint_densifier(self):
         with mock.patch.object(densify_module, "densify_from_checkpoint", return_value={"num_candidates": 6, "num_accepted": 2, "output_path": "artifact.pt"}) as mock_densify, \

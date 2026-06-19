@@ -1,0 +1,2036 @@
+{
+  "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+  "mach_values": [
+    0.05,
+    0.1,
+    0.2,
+    0.3
+  ],
+  "openfoam_grids": [
+    32,
+    64
+  ],
+  "lbm_grids": [
+    32,
+    64
+  ],
+  "reference_area": 0.27734375,
+  "reference_length": 1.0,
+  "reynolds": 100000.0,
+  "openfoam_cases": [
+    {
+      "solver": "sonicFoam",
+      "grid": 32,
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "cd": 0.44713565917179127,
+      "cl": -0.02269918116131795,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0583",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.05_sonicFoam",
+      "timings": {
+        "total_seconds": 81.03987209987827,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.44187629991210997,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.7629191998858005,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.31837230012752116,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.5933827999979258,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 1.19435100001283,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 75.20238199993037,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.5265885000117123,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.05,
+        "speed_mps": 17.150000000000002,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.05_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0583",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -22.34045590260905,
+          "force_y": -0.18955872522419237,
+          "force_z": -1.134130202675077,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.44713565917179127,
+          "cl_total": -0.02269918116131795,
+          "time_dir": "0.0583",
+          "force_dat": "postProcessing\\forces\\0.0583\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0583\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.44187629991210997,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.7629191998858005,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.31837230012752116,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.5933827999979258,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 1.19435100001283,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 75.20238199993037,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.5265885000117123,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    },
+    {
+      "solver": "sonicFoam",
+      "grid": 32,
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "cd": 0.4218822426299686,
+      "cl": -0.022553673731000767,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0292",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.1_sonicFoam",
+      "timings": {
+        "total_seconds": 42.32565140048973,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.2498941000085324,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.5694512000773102,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2712338001001626,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.1391372999642044,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 1.1026701000519097,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 37.47210580017418,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.5211591001134366,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.1,
+        "speed_mps": 34.300000000000004,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.1_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0292",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -84.31482879290992,
+          "force_y": -0.7577391650970879,
+          "force_z": -4.507440577318572,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.4218822426299686,
+          "cl_total": -0.022553673731000767,
+          "time_dir": "0.0292",
+          "force_dat": "postProcessing\\forces\\0.0292\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0292\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.2498941000085324,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.5694512000773102,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2712338001001626,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.1391372999642044,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 1.1026701000519097,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 37.47210580017418,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.5211591001134366,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    },
+    {
+      "solver": "sonicFoam",
+      "grid": 32,
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "cd": 0.5180561252180633,
+      "cl": -0.01974922211396795,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0146",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.2_sonicFoam",
+      "timings": {
+        "total_seconds": 26.126339599722996,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.25295839994214475,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.6083467998541892,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.28230650001205504,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.2011641999706626,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 1.004541500005871,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 21.33985190000385,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.4371702999342233,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.2,
+        "speed_mps": 68.60000000000001,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.2_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0146",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -414.1422329660907,
+          "force_y": 16.59740988466224,
+          "force_z": -15.787839478163175,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.5180561252180633,
+          "cl_total": -0.01974922211396795,
+          "time_dir": "0.0146",
+          "force_dat": "postProcessing\\forces\\0.0146\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0146\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.25295839994214475,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.6083467998541892,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.28230650001205504,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.2011641999706626,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 1.004541500005871,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 21.33985190000385,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.4371702999342233,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    },
+    {
+      "solver": "sonicFoam",
+      "grid": 32,
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "cd": 0.35864919131233325,
+      "cl": -0.02921953499500684,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0097",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.3_sonicFoam",
+      "timings": {
+        "total_seconds": 20.716754499590024,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.2690146001987159,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.5992560999002308,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.28936709999106824,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.0140725998207927,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 0.9574289999436587,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 16.083367599872872,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.5042474998626858,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.3,
+        "speed_mps": 102.89999999999999,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_32\\mach_0.3_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0097",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -645.0970886173109,
+          "force_y": 22.918285979636728,
+          "force_z": -52.55675298488355,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.35864919131233325,
+          "cl_total": -0.02921953499500684,
+          "time_dir": "0.0097",
+          "force_dat": "postProcessing\\forces\\0.0097\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0097\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.2690146001987159,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 0.5992560999002308,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.28936709999106824,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 2.0140725998207927,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 0.9574289999436587,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 16.083367599872872,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 0.5042474998626858,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    },
+    {
+      "solver": "sonicFoam",
+      "grid": 64,
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "cd": 0.29300801419747646,
+      "cl": -0.02909345233776749,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0583",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.05_sonicFoam",
+      "timings": {
+        "total_seconds": 626.3860439001583,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.27802939992398024,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 2.8210508001502603,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.28815819998271763,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 14.890803300077096,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.800962300039828,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 600.6886070999317,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.6184328000526875,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.05,
+        "speed_mps": 17.150000000000002,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.05_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0583",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -14.639701589478456,
+          "force_y": 1.461097206567256,
+          "force_z": -1.4536102761529812,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.29300801419747646,
+          "cl_total": -0.02909345233776749,
+          "time_dir": "0.0583",
+          "force_dat": "postProcessing\\forces\\0.0583\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0583\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.27802939992398024,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 2.8210508001502603,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.28815819998271763,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 14.890803300077096,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.800962300039828,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 600.6886070999317,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.6184328000526875,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    },
+    {
+      "solver": "sonicFoam",
+      "grid": 64,
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "cd": 0.26062782622871805,
+      "cl": -0.027842790083703165,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0292",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.1_sonicFoam",
+      "timings": {
+        "total_seconds": 356.96933149988763,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.3129185000434518,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 3.148890000069514,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2712783000897616,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 14.556113099912181,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.870122899999842,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 331.0804273998365,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.7295812999363989,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.1,
+        "speed_mps": 34.300000000000004,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.1_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0292",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -52.08749818469286,
+          "force_y": 6.347727254935195,
+          "force_z": -5.56449132437982,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.26062782622871805,
+          "cl_total": -0.027842790083703165,
+          "time_dir": "0.0292",
+          "force_dat": "postProcessing\\forces\\0.0292\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0292\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.3129185000434518,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 3.148890000069514,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2712783000897616,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 14.556113099912181,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.870122899999842,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 331.0804273998365,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.7295812999363989,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    },
+    {
+      "solver": "sonicFoam",
+      "grid": 64,
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "cd": 0.35972902481643204,
+      "cl": -0.021678761948028327,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0146",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.2_sonicFoam",
+      "timings": {
+        "total_seconds": 209.8041882000398,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.26620419998653233,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 2.7096559999044985,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2737507000565529,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 13.910739700077102,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.778483200119808,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 185.18676089984365,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.6785935000516474,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.2,
+        "speed_mps": 68.60000000000001,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.2_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0146",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -287.57305308856695,
+          "force_y": 39.57593324072224,
+          "force_z": -17.330344038143853,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.35972902481643204,
+          "cl_total": -0.021678761948028327,
+          "time_dir": "0.0146",
+          "force_dat": "postProcessing\\forces\\0.0146\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0146\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.26620419998653233,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 2.7096559999044985,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2737507000565529,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 13.910739700077102,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.778483200119808,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 185.18676089984365,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.6785935000516474,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    },
+    {
+      "solver": "sonicFoam",
+      "grid": 64,
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "cd": 0.26102668498728554,
+      "cl": -0.021593210761182032,
+      "mesh_ok": true,
+      "failed": false,
+      "latest_time": "0.0096811991",
+      "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.3_sonicFoam",
+      "timings": {
+        "total_seconds": 185.6710906000808,
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.26840940001420677,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 2.673631700221449,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2661276999861002,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 13.737767599988729,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.592804299900308,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 161.4071782999672,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.7251716000027955,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      },
+      "raw": {
+        "mach": 0.3,
+        "speed_mps": 102.89999999999999,
+        "solver": "sonicFoam",
+        "case_dir": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\openfoam_cases\\grid_64\\mach_0.3_sonicFoam",
+        "failed": false,
+        "latest_time": "0.0096811991",
+        "mesh_ok": true,
+        "checkmesh_line": "Mesh OK.",
+        "fatal_error_tail": "",
+        "force": {
+          "source": "manual_pressure_integration_forces_dat",
+          "force_x": -469.5049051151598,
+          "force_y": 72.69042935201904,
+          "force_z": -38.83939440925069,
+          "moment_x": 0.0,
+          "moment_y": 0.0,
+          "moment_z": 0.0,
+          "cd_total": 0.26102668498728554,
+          "cl_total": -0.021593210761182032,
+          "time_dir": "0.0096811991",
+          "force_dat": "postProcessing\\forces\\0.0096811991\\force.dat",
+          "forces_dat": "postProcessing\\forces\\0.0096811991\\forces.dat"
+        },
+        "commands": {
+          "surfaceCheck": {
+            "returncode": 0,
+            "seconds": 0.26840940001420677,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "blockMesh": {
+            "returncode": 0,
+            "seconds": 2.673631700221449,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "surfaceFeatureExtract": {
+            "returncode": 0,
+            "seconds": 0.2661276999861002,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "snappyHexMesh": {
+            "returncode": 0,
+            "seconds": 13.737767599988729,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "checkMesh": {
+            "returncode": 0,
+            "seconds": 5.592804299900308,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "sonicFoam": {
+            "returncode": 0,
+            "seconds": 161.4071782999672,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          },
+          "forces": {
+            "returncode": 0,
+            "seconds": 1.7251716000027955,
+            "stdout_tail": "",
+            "stderr_tail": ""
+          }
+        }
+      }
+    }
+  ],
+  "lbm_cases": [
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 32,
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 1.808118796269313,
+      "cl": 0.12416347130635723,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.0020671790845357093,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.028867513459481294,
+      "lattice_mach": 0.05,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 92.84019470214844,
+        "force_z": 6.375333786010742,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.0020671790845357093,
+        "mach_number": 0.05,
+        "lattice_mach": 0.05,
+        "u_lattice": 0.028867513459481294,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 92.84019470214844,
+        "pressure_only_fallback": 17.388904106610198,
+        "surrogate_proxy_force": 236.49516194775754,
+        "raw_force_x": 23.36749839782715,
+        "raw_force_z": 0.010709099471569061,
+        "drag_coefficient": 1.808118796269313,
+        "lift_coefficient": 0.12416347130635723,
+        "net_momentum_exchange_force_x": 92.84019470214844,
+        "raw_net_momentum_exchange_force_x": 0.15595023334026337,
+        "projected_area_lattice": 69.0,
+        "raw_projected_drag_coefficient": 0.3386593970699587,
+        "drag_speed_normalization": 4.66472303206997,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 2.9155747844556803,
+        "drag_link_metric_exponent": 1.68,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 10921.51171875,
+        "max_turbulent_viscosity": 1.6983034583972767e-05,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 0.19736060500144958,
+        "vortex_core_volume": 3.501469453509469,
+        "reference_area": 0.2850196089378276,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 17.150000000000002,
+        "density": 1.225,
+        "reynolds_number_turbulent": 2887633.930472325,
+        "shape_drag_fullness": 0.32270531400966185,
+        "shape_drag_blockage": 0.0673828125,
+        "shape_drag_surface_to_volume": 1.4550898203592815,
+        "shape_drag_projected_side": 8.306623862918075
+      },
+      "timings": {
+        "geometry_seconds": 0.06024090014398098,
+        "setup_seconds": 0.9779672999866307,
+        "solve_seconds": 228.72981379996054,
+        "coefficients_seconds": 0.09827419999055564,
+        "total_seconds": 229.86871719988994
+      }
+    },
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 32,
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 1.1023463048097102,
+      "cl": 0.07471244840778135,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.0006626011306297808,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.05773502691896259,
+      "lattice_mach": 0.1,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 226.40557861328125,
+        "force_z": 15.344828605651855,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.0006626011306297808,
+        "mach_number": 0.1,
+        "lattice_mach": 0.1,
+        "u_lattice": 0.05773502691896259,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 226.40557861328125,
+        "pressure_only_fallback": 69.94653431760014,
+        "surrogate_proxy_force": 475.6486337410119,
+        "raw_force_x": 23.498828887939453,
+        "raw_force_z": 0.025775792077183723,
+        "drag_coefficient": 1.1023463048097102,
+        "lift_coefficient": 0.07471244840778135,
+        "net_momentum_exchange_force_x": 226.40557861328125,
+        "raw_net_momentum_exchange_force_x": 0.38030946254730225,
+        "projected_area_lattice": 69.0,
+        "raw_projected_drag_coefficient": 0.3405627375063689,
+        "drag_speed_normalization": 2.332361516034985,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 2.9155747844556803,
+        "drag_link_metric_exponent": 1.68,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 10936.095703125,
+        "max_turbulent_viscosity": 3.594924055505544e-05,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 0.38882458209991455,
+        "vortex_core_volume": 3.20572019494479,
+        "reference_area": 0.2850196089378276,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 34.300000000000004,
+        "density": 1.225,
+        "reynolds_number_turbulent": 2872701.845136926,
+        "shape_drag_fullness": 0.32270531400966185,
+        "shape_drag_blockage": 0.0673828125,
+        "shape_drag_surface_to_volume": 1.4550898203592815,
+        "shape_drag_projected_side": 8.306623862918075
+      },
+      "timings": {
+        "geometry_seconds": 0.023245499935001135,
+        "setup_seconds": 0.014625400071963668,
+        "solve_seconds": 219.3371041000355,
+        "coefficients_seconds": 0.011167599819600582,
+        "total_seconds": 219.38671969994903
+      }
+    },
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 32,
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 0.7447711714953497,
+      "cl": 0.05285737662437242,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.00024025553289731542,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.11547005383792518,
+      "lattice_mach": 0.2,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 611.8598022460938,
+        "force_z": 43.42448425292969,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.00024025553289731542,
+        "mach_number": 0.2,
+        "lattice_mach": 0.2,
+        "u_lattice": 0.11547005383792518,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 611.8598022460938,
+        "pressure_only_fallback": 285.933952010786,
+        "surrogate_proxy_force": 972.2003737637413,
+        "raw_force_x": 24.015174865722656,
+        "raw_force_z": 0.07294317334890366,
+        "drag_coefficient": 0.7447711714953497,
+        "lift_coefficient": 0.05285737662437242,
+        "net_momentum_exchange_force_x": 611.8598022460938,
+        "raw_net_momentum_exchange_force_x": 1.0277842283248901,
+        "projected_area_lattice": 69.0,
+        "raw_projected_drag_coefficient": 0.34804601254670514,
+        "drag_speed_normalization": 1.1661807580174925,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 2.9155747844556803,
+        "drag_link_metric_exponent": 1.68,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 11044.71875,
+        "max_turbulent_viscosity": 7.358320726780221e-05,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 0.7728897929191589,
+        "vortex_core_volume": 2.6338674992999804,
+        "reference_area": 0.2850196089378276,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 68.60000000000001,
+        "density": 1.225,
+        "reynolds_number_turbulent": 2847511.7372732097,
+        "shape_drag_fullness": 0.32270531400966185,
+        "shape_drag_blockage": 0.0673828125,
+        "shape_drag_surface_to_volume": 1.4550898203592815,
+        "shape_drag_projected_side": 8.306623862918075
+      },
+      "timings": {
+        "geometry_seconds": 0.016564299818128347,
+        "setup_seconds": 0.02325260010547936,
+        "solve_seconds": 222.43476650002412,
+        "coefficients_seconds": 0.01023619994521141,
+        "total_seconds": 222.48508820007555
+      }
+    },
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 32,
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 0.3529714026253357,
+      "cl": 0.025166060476235666,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.001199550730040916,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.12,
+      "lattice_mach": 0.20784609690826525,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 652.455810546875,
+        "force_z": 46.518619537353516,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.001199550730040916,
+        "mach_number": 0.3,
+        "lattice_mach": 0.20784609690826525,
+        "u_lattice": 0.12,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 652.455810546875,
+        "pressure_only_fallback": 644.6018807607883,
+        "surrogate_proxy_force": 1461.1350744869671,
+        "raw_force_x": 24.061853408813477,
+        "raw_force_z": 0.07814061641693115,
+        "drag_coefficient": 0.3529714026253357,
+        "lift_coefficient": 0.025166060476235666,
+        "net_momentum_exchange_force_x": 652.455810546875,
+        "raw_net_momentum_exchange_force_x": 1.0959761142730713,
+        "projected_area_lattice": 69.0,
+        "raw_projected_drag_coefficient": 0.3487225131712098,
+        "drag_speed_normalization": 0.7774538386783285,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 2.9155747844556803,
+        "drag_link_metric_exponent": 1.68,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 11051.646484375,
+        "max_turbulent_viscosity": 7.665043813176453e-05,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 0.8023533821105957,
+        "vortex_core_volume": 2.5876732704038816,
+        "reference_area": 0.2850196089378276,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 102.89999999999999,
+        "density": 1.225,
+        "reynolds_number_turbulent": 4105789.199713351,
+        "shape_drag_fullness": 0.32270531400966185,
+        "shape_drag_blockage": 0.0673828125,
+        "shape_drag_surface_to_volume": 1.4550898203592815,
+        "shape_drag_projected_side": 8.306623862918075
+      },
+      "timings": {
+        "geometry_seconds": 0.010586700169369578,
+        "setup_seconds": 0.016516700154170394,
+        "solve_seconds": 221.56409230013378,
+        "coefficients_seconds": 0.010447900043800473,
+        "total_seconds": 221.6019198000431
+      }
+    },
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 64,
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 1.371012929763924,
+      "cl": 0.21263855265736384,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.02316296618720962,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.028867513459481294,
+      "lattice_mach": 0.05,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 58.91875076293945,
+        "force_z": 9.138059616088867,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.02316296618720962,
+        "mach_number": 0.05,
+        "lattice_mach": 0.05,
+        "u_lattice": 0.028867513459481294,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 58.91875076293945,
+        "pressure_only_fallback": 16.969726919782484,
+        "surrogate_proxy_force": 237.47722803194145,
+        "raw_force_x": 91.21680450439453,
+        "raw_force_z": 0.06139937788248062,
+        "drag_coefficient": 1.371012929763924,
+        "lift_coefficient": 0.21263855265736384,
+        "net_momentum_exchange_force_x": 58.91875076293945,
+        "raw_net_momentum_exchange_force_x": 0.39587995409965515,
+        "projected_area_lattice": 231.0,
+        "raw_projected_drag_coefficient": 0.39487794157746553,
+        "drag_speed_normalization": 4.66472303206997,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 3.0,
+        "drag_link_metric_exponent": 1.0313881746966542,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 87399.09375,
+        "max_turbulent_viscosity": 8.407485438510776e-06,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 0.34607675671577454,
+        "vortex_core_volume": 2.0046702436462205,
+        "reference_area": 0.23854902052405133,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 17.150000000000002,
+        "density": 1.225,
+        "reynolds_number_turbulent": 1845347.693198163,
+        "shape_drag_fullness": 0.27138378862516793,
+        "shape_drag_blockage": 0.056396484375,
+        "shape_drag_surface_to_volume": 0.922992299229923,
+        "shape_drag_projected_side": 15.198684153570664
+      },
+      "timings": {
+        "geometry_seconds": 0.04563189996406436,
+        "setup_seconds": 0.14250760013237596,
+        "solve_seconds": 233.5143661000766,
+        "coefficients_seconds": 0.010214899899438024,
+        "total_seconds": 233.71300119999796
+      }
+    },
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 64,
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 0.8045670556244024,
+      "cl": 0.06870685519686427,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.012836192731806565,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.05773502691896259,
+      "lattice_mach": 0.1,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 138.3038330078125,
+        "force_z": 11.810602188110352,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.012836192731806565,
+        "mach_number": 0.1,
+        "lattice_mach": 0.1,
+        "u_lattice": 0.05773502691896259,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 138.3038330078125,
+        "pressure_only_fallback": 68.0882053054111,
+        "surrogate_proxy_force": 476.4189292506898,
+        "raw_force_x": 91.49806213378906,
+        "raw_force_z": 0.07935641705989838,
+        "drag_coefficient": 0.8045670556244024,
+        "lift_coefficient": 0.06870685519686427,
+        "net_momentum_exchange_force_x": 138.3038330078125,
+        "raw_net_momentum_exchange_force_x": 0.92927485704422,
+        "projected_area_lattice": 231.0,
+        "raw_projected_drag_coefficient": 0.39609550707267993,
+        "drag_speed_normalization": 2.332361516034985,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 3.0,
+        "drag_link_metric_exponent": 1.0313881746966542,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 87423.765625,
+        "max_turbulent_viscosity": 1.7952996131498367e-05,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 0.7221232056617737,
+        "vortex_core_volume": 1.6556582427121171,
+        "reference_area": 0.23854902052405133,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 34.300000000000004,
+        "density": 1.225,
+        "reynolds_number_turbulent": 1843743.7112962687,
+        "shape_drag_fullness": 0.27138378862516793,
+        "shape_drag_blockage": 0.056396484375,
+        "shape_drag_surface_to_volume": 0.922992299229923,
+        "shape_drag_projected_side": 15.198684153570664
+      },
+      "timings": {
+        "geometry_seconds": 0.0441537001170218,
+        "setup_seconds": 0.0221645999699831,
+        "solve_seconds": 230.24460690002888,
+        "coefficients_seconds": 0.015671599889174104,
+        "total_seconds": 230.3268982998561
+      }
+    },
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 64,
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 0.5507789779483491,
+      "cl": 0.04631028374039067,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.015231228176227378,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.11547005383792518,
+      "lattice_mach": 0.2,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 378.71221923828125,
+        "force_z": 31.84266471862793,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.015231228176227378,
+        "mach_number": 0.2,
+        "lattice_mach": 0.2,
+        "u_lattice": 0.11547005383792518,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 378.71221923828125,
+        "pressure_only_fallback": 275.47816590349066,
+        "surrogate_proxy_force": 963.7720089918039,
+        "raw_force_x": 92.54803466796875,
+        "raw_force_z": 0.21395350992679596,
+        "drag_coefficient": 0.5507789779483491,
+        "lift_coefficient": 0.04631028374039067,
+        "net_momentum_exchange_force_x": 378.71221923828125,
+        "raw_net_momentum_exchange_force_x": 2.5445988178253174,
+        "projected_area_lattice": 231.0,
+        "raw_projected_drag_coefficient": 0.40064084271847944,
+        "drag_speed_normalization": 1.1661807580174925,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 3.0,
+        "drag_link_metric_exponent": 1.0313881746966542,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 87651.765625,
+        "max_turbulent_viscosity": 3.64356892532669e-05,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 1.4963817596435547,
+        "vortex_core_volume": 1.3313362606707566,
+        "reference_area": 0.23854902052405133,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 68.60000000000001,
+        "density": 1.225,
+        "reynolds_number_turbulent": 1837943.8837816524,
+        "shape_drag_fullness": 0.27138378862516793,
+        "shape_drag_blockage": 0.056396484375,
+        "shape_drag_surface_to_volume": 0.922992299229923,
+        "shape_drag_projected_side": 15.198684153570664
+      },
+      "timings": {
+        "geometry_seconds": 0.04635919979773462,
+        "setup_seconds": 0.020137200132012367,
+        "solve_seconds": 217.77141409995966,
+        "coefficients_seconds": 0.008702100021764636,
+        "total_seconds": 217.84693689993583
+      }
+    },
+    {
+      "solver": "internal_lbm_d3q27",
+      "stl": "build\\solver_diagnostics\\repaired_biplane_voxel_openfoam_20260610\\openfoam_case_happy_mesh_grid32_flow\\constant\\triSurface\\implicit_snappy_g32_snap0_lvl00.stl",
+      "grid": 64,
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "reynolds": 100000.0,
+      "steps": 1000,
+      "domain_scale": 2.0,
+      "domain_size": 2.0566614270210266,
+      "max_extent": 1.0283307135105133,
+      "device": "cuda",
+      "cd": 0.2603649993990964,
+      "cl": 0.02274169574024362,
+      "lbm_converged": true,
+      "training_drag_source": "internal_lbm_raw_low_mach",
+      "force_stability": 0.014906292067340258,
+      "validity": "validated_low_mach_envelope",
+      "validity_regime": "validated_low_mach_envelope",
+      "claim_grade": "low_mach_sanity_only",
+      "high_mach_warning": null,
+      "u_lattice": 0.12,
+      "lattice_mach": 0.20784609690826525,
+      "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+      "compressibility_model": "weakly_compressible_isothermal_lbm",
+      "thermal_model": "none_isothermal",
+      "coefficients": {
+        "force_x": 402.80706787109375,
+        "force_z": 35.1833610534668,
+        "label_source": "lbm_d3q27",
+        "label_tier": "lbm_raw",
+        "lbm_converged": true,
+        "force_stability": 0.014906292067340258,
+        "mach_number": 0.3,
+        "lattice_mach": 0.20784609690826525,
+        "u_lattice": 0.12,
+        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "compressibility_model": "weakly_compressible_isothermal_lbm",
+        "thermal_model": "none_isothermal",
+        "validity_regime": "validated_low_mach_envelope",
+        "claim_grade": "low_mach_sanity_only",
+        "high_mach_warning": null,
+        "training_drag_source": "internal_lbm_raw_low_mach",
+        "physical_force_source": 402.80706787109375,
+        "pressure_only_fallback": 620.5697896606985,
+        "surrogate_proxy_force": 1447.3930954185387,
+        "raw_force_x": 92.65911102294922,
+        "raw_force_z": 0.23639990389347076,
+        "drag_coefficient": 0.2603649993990964,
+        "lift_coefficient": 0.02274169574024362,
+        "net_momentum_exchange_force_x": 402.80706787109375,
+        "raw_net_momentum_exchange_force_x": 2.706494092941284,
+        "projected_area_lattice": 231.0,
+        "raw_projected_drag_coefficient": 0.4011216927400399,
+        "drag_speed_normalization": 0.7774538386783285,
+        "drag_reference_speed": 80.0,
+        "drag_speed_normalization_exponent": 1.0,
+        "shape_drag_scale": 3.0,
+        "drag_link_metric_exponent": 1.0313881746966542,
+        "force_definition": "raw bounce-back momentum exchange averaged over the last-quarter window",
+        "pressure_sum": 87668.125,
+        "max_turbulent_viscosity": 3.7842095480300486e-05,
+        "mean_smagorinsky_constant": 0.17,
+        "max_vorticity": 1.5580641031265259,
+        "vortex_core_volume": 1.3343229565045562,
+        "reference_area": 0.23854902052405133,
+        "reference_length": 2.0566614270210266,
+        "freestream_speed": 102.89999999999999,
+        "density": 1.225,
+        "reynolds_number_turbulent": 2651787.3687952585,
+        "shape_drag_fullness": 0.27138378862516793,
+        "shape_drag_blockage": 0.056396484375,
+        "shape_drag_surface_to_volume": 0.922992299229923,
+        "shape_drag_projected_side": 15.198684153570664
+      },
+      "timings": {
+        "geometry_seconds": 0.0314024998806417,
+        "setup_seconds": 0.017778800101950765,
+        "solve_seconds": 196.52886130008847,
+        "coefficients_seconds": 0.015520700020715594,
+        "total_seconds": 196.59382489998825
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "openfoam_grid": 32,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.44713565917179127,
+      "openfoam_cl": -0.02269918116131795,
+      "openfoam_seconds": 81.03987209987827,
+      "lbm_cd": 1.808118796269313,
+      "lbm_cl": 0.12416347130635723,
+      "lbm_seconds": 229.86871719988994,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 304.37812533637066,
+      "cl_error_percent": 646.9953758417782
+    },
+    {
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "openfoam_grid": 32,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.44713565917179127,
+      "openfoam_cl": -0.02269918116131795,
+      "openfoam_seconds": 81.03987209987827,
+      "lbm_cd": 1.371012929763924,
+      "lbm_cl": 0.21263855265736384,
+      "lbm_seconds": 233.71300119999796,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 206.62124606733178,
+      "cl_error_percent": 1036.7675034010683
+    },
+    {
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "openfoam_grid": 32,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.4218822426299686,
+      "openfoam_cl": -0.022553673731000767,
+      "openfoam_seconds": 42.32565140048973,
+      "lbm_cd": 1.1023463048097102,
+      "lbm_cl": 0.07471244840778135,
+      "lbm_seconds": 219.38671969994903,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 161.29241608696344,
+      "cl_error_percent": 431.26509365561424
+    },
+    {
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "openfoam_grid": 32,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.4218822426299686,
+      "openfoam_cl": -0.022553673731000767,
+      "openfoam_seconds": 42.32565140048973,
+      "lbm_cd": 0.8045670556244024,
+      "lbm_cl": 0.06870685519686427,
+      "lbm_seconds": 230.3268982998561,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 90.70891692639582,
+      "cl_error_percent": 404.6370893555334
+    },
+    {
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "openfoam_grid": 32,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.5180561252180633,
+      "openfoam_cl": -0.01974922211396795,
+      "openfoam_seconds": 26.126339599722996,
+      "lbm_cd": 0.7447711714953497,
+      "lbm_cl": 0.05285737662437242,
+      "lbm_seconds": 222.48508820007555,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 43.76264177589949,
+      "cl_error_percent": 367.64282825594535
+    },
+    {
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "openfoam_grid": 32,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.5180561252180633,
+      "openfoam_cl": -0.01974922211396795,
+      "openfoam_seconds": 26.126339599722996,
+      "lbm_cd": 0.5507789779483491,
+      "lbm_cl": 0.04631028374039067,
+      "lbm_seconds": 217.84693689993583,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 6.316468648355783,
+      "cl_error_percent": 334.4916851567384
+    },
+    {
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "openfoam_grid": 32,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.35864919131233325,
+      "openfoam_cl": -0.02921953499500684,
+      "openfoam_seconds": 20.716754499590024,
+      "lbm_cd": 0.3529714026253357,
+      "lbm_cl": 0.025166060476235666,
+      "lbm_seconds": 221.6019198000431,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 1.5831037193258222,
+      "cl_error_percent": 186.12751873202689
+    },
+    {
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "openfoam_grid": 32,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.35864919131233325,
+      "openfoam_cl": -0.02921953499500684,
+      "openfoam_seconds": 20.716754499590024,
+      "lbm_cd": 0.2603649993990964,
+      "lbm_cl": 0.02274169574024362,
+      "lbm_seconds": 196.59382489998825,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 27.40399094547102,
+      "cl_error_percent": 177.83045056716273
+    },
+    {
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "openfoam_grid": 64,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.29300801419747646,
+      "openfoam_cl": -0.02909345233776749,
+      "openfoam_seconds": 626.3860439001583,
+      "lbm_cd": 1.808118796269313,
+      "lbm_cl": 0.12416347130635723,
+      "lbm_seconds": 229.86871719988994,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 517.0885124837263,
+      "cl_error_percent": 526.7746222237612
+    },
+    {
+      "mach": 0.05,
+      "speed_mps": 17.150000000000002,
+      "openfoam_grid": 64,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.29300801419747646,
+      "openfoam_cl": -0.02909345233776749,
+      "openfoam_seconds": 626.3860439001583,
+      "lbm_cd": 1.371012929763924,
+      "lbm_cl": 0.21263855265736384,
+      "lbm_seconds": 233.71300119999796,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 367.9097032615334,
+      "cl_error_percent": 830.8811281269923
+    },
+    {
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "openfoam_grid": 64,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.26062782622871805,
+      "openfoam_cl": -0.027842790083703165,
+      "openfoam_seconds": 356.96933149988763,
+      "lbm_cd": 1.1023463048097102,
+      "lbm_cl": 0.07471244840778135,
+      "lbm_seconds": 219.38671969994903,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 322.9580243831404,
+      "cl_error_percent": 368.33678730894053
+    },
+    {
+      "mach": 0.1,
+      "speed_mps": 34.300000000000004,
+      "openfoam_grid": 64,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.26062782622871805,
+      "openfoam_cl": -0.027842790083703165,
+      "openfoam_seconds": 356.96933149988763,
+      "lbm_cd": 0.8045670556244024,
+      "lbm_cl": 0.06870685519686427,
+      "lbm_seconds": 230.3268982998561,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 208.70343633927328,
+      "cl_error_percent": 346.76713429333904
+    },
+    {
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "openfoam_grid": 64,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.35972902481643204,
+      "openfoam_cl": -0.021678761948028327,
+      "openfoam_seconds": 209.8041882000398,
+      "lbm_cd": 0.7447711714953497,
+      "lbm_cl": 0.05285737662437242,
+      "lbm_seconds": 222.48508820007555,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 107.03671934045431,
+      "cl_error_percent": 343.8210113247715
+    },
+    {
+      "mach": 0.2,
+      "speed_mps": 68.60000000000001,
+      "openfoam_grid": 64,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.35972902481643204,
+      "openfoam_cl": -0.021678761948028327,
+      "openfoam_seconds": 209.8041882000398,
+      "lbm_cd": 0.5507789779483491,
+      "lbm_cl": 0.04631028374039067,
+      "lbm_seconds": 217.84693689993583,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 53.10940734610138,
+      "cl_error_percent": 313.62051878890884
+    },
+    {
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "openfoam_grid": 64,
+      "lbm_grid": 32,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.26102668498728554,
+      "openfoam_cl": -0.021593210761182032,
+      "openfoam_seconds": 185.6710906000808,
+      "lbm_cd": 0.3529714026253357,
+      "lbm_cl": 0.025166060476235666,
+      "lbm_seconds": 221.6019198000431,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 35.22425978881383,
+      "cl_error_percent": 216.5461716396365
+    },
+    {
+      "mach": 0.3,
+      "speed_mps": 102.89999999999999,
+      "openfoam_grid": 64,
+      "lbm_grid": 64,
+      "openfoam_solver": "sonicFoam",
+      "openfoam_cd": 0.26102668498728554,
+      "openfoam_cl": -0.021593210761182032,
+      "openfoam_seconds": 185.6710906000808,
+      "lbm_cd": 0.2603649993990964,
+      "lbm_cl": 0.02274169574024362,
+      "lbm_seconds": 196.59382489998825,
+      "lbm_converged": true,
+      "lbm_validity": "validated_low_mach_envelope",
+      "lbm_claim_grade": "low_mach_sanity_only",
+      "lbm_compressibility_model": "weakly_compressible_isothermal_lbm",
+      "lbm_thermal_model": "none_isothermal",
+      "cd_error_percent": 0.2534934649387904,
+      "cl_error_percent": 205.3187318540243
+    }
+  ],
+  "cd_error_surface_plot": "build\\solver_diagnostics\\low_mach_openfoam_lbm_sweep_20260613\\cd_error_surface.png",
+  "plot_gate": null
+}

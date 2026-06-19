@@ -258,7 +258,7 @@ class AdvancedCFDSimulator:
                                             of_results['velocity_fields'] = (ux, uy, uz)
                                             of_results['pressure_field'] = p_field
                                             fields_present = True
-                                            print(f"[ok] Successfully extracted OpenFOAM fields at {res}^3")
+                                            print(f"✅ Successfully extracted OpenFOAM fields at {res}^3")
 
                             # pinn_ready requires strict convergence AND field presence
                             of_results['pinn_ready'] = converged and fields_present
@@ -286,7 +286,7 @@ class AdvancedCFDSimulator:
 
     def _run_fluidx3d_fast(self, stl_path: str) -> Optional[Dict[str, float]]:
         # Hard-coded fallbacks removed to ensure data integrity
-        print("[warn] FluidX3D placeholder reached. No ground truth returned.")
+        print("⚠️ FluidX3D placeholder reached. No ground truth returned.")
         return None
 
     def export_openfoam_case(self, voxel_grid: torch.Tensor, case_dir: str) -> Dict[str, Any]:

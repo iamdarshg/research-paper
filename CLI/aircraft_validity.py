@@ -39,89 +39,148 @@ def _extent(indices: torch.Tensor, axis: int, resolution: int) -> float:
     return float((occupied[:, axis].max() - occupied[:, axis].min() + 1).item() / resolution)
 
 
-def _profile_symmetry_score(profile: torch.Tensor) -> float:
-    total = float(profile.sum().item())
-    if total <= 0.0:
-        return 0.0
-
-    center_of_mass = float((torch.arange(profile.numel(), dtype=torch.float32) * profile).sum().item() / total)
-    candidate_centers = sorted(
-        {
-            center
-            for center in range(int(round(center_of_mass)) - 2, int(round(center_of_mass)) + 3)
-            if 1 <= center < profile.numel()
-        }
-    )
-    if not candidate_centers:
-        candidate_centers = [profile.numel() // 2]
-
-    best_score = 0.0
-    for center in candidate_centers:
-        left = profile[:center]
-        right = profile[center:]
-        overlap = min(left.numel(), right.numel())
-        if overlap <= 0:
-            continue
-        left = left[-overlap:]
-        right = torch.flip(right[:overlap], dims=[0])
-        denom = float((left + right).sum().item())
-        if denom <= 0.0:
-            continue
-        diff = float(torch.abs(left - right).sum().item())
-        best_score = max(best_score, max(0.0, 1.0 - diff / denom))
-    return best_score
+def _crop_to_occupied_bbox(grid: torch.Tensor) -> torch.Tensor:
+    occupied = torch.nonzero(grid > 0.5, as_tuple=False)
+    if occupied.numel() == 0:
+        return grid
+    mins = occupied.min(dim=0).values
+    maxs = occupied.max(dim=0).values + 1
+    return grid[
+        mins[0]:maxs[0],
+        mins[1]:maxs[1],
+        mins[2]:maxs[2],
+    ]
 
 
-def _evaluate_oriented_aircraft_validity(grid: torch.Tensor) -> Dict[str, Any]:
-    res_z, res_y, res_x = grid.shape
+def _center_in_canvas(grid: torch.Tensor, canvas_shape: torch.Size) -> torch.Tensor:
+    canvas = torch.zeros(tuple(canvas_shape), dtype=grid.dtype)
+    starts = []
+    for size, canvas_size in zip(grid.shape, canvas_shape):
+        starts.append(max(0, (int(canvas_size) - int(size)) // 2))
+    z0, y0, x0 = starts
+    z1, y1, x1 = z0 + grid.shape[0], y0 + grid.shape[1], x0 + grid.shape[2]
+    canvas[z0:z1, y0:y1, x0:x1] = grid
+    return canvas
+
+
+def _band_bounds(length: int, start_ratio: float, end_ratio: float) -> tuple[int, int]:
+    start = min(length - 1, max(0, int(length * start_ratio)))
+    end = max(start + 1, min(length, int(length * end_ratio)))
+    return start, end
+
+
+def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     occupied = float(grid.sum().item())
     total = float(grid.numel())
     occupancy_ratio = occupied / max(total, 1.0)
 
-    span_profile = grid.sum(dim=(0, 2)).float()
-    symmetry_score = _profile_symmetry_score(span_profile)
+    flipped = torch.flip(grid, dims=[1])
+    voxel_asymmetry = torch.abs(grid - flipped).sum().item() / max(occupied, 1.0)
+    voxel_symmetry_score = max(0.0, 1.0 - float(voxel_asymmetry))
+    span_profile = grid.sum(dim=(0, 2))
+    span_profile_asymmetry = torch.abs(span_profile - torch.flip(span_profile, dims=[0])).sum().item() / max(occupied, 1.0)
+    symmetry_score = max(0.0, 1.0 - float(span_profile_asymmetry))
 
+    res_z, res_y, res_x = grid.shape
+    thickness_fraction = _extent(grid, axis=0, resolution=res_z)
     span_fraction = _extent(grid, axis=1, resolution=res_y)
     length_fraction = _extent(grid, axis=2, resolution=res_x)
 
-    center_band = grid[:, int(res_y * 0.42):max(int(res_y * 0.58), int(res_y * 0.42) + 1), :]
-    left_band = grid[:, :int(res_y * 0.35), :]
-    right_band = grid[:, int(res_y * 0.65):, :]
-    rear_band = grid[:, :, :max(1, int(res_x * 0.28))]
+    center_start, center_end = _band_bounds(res_y, 0.42, 0.58)
+    left_start, left_end = _band_bounds(res_y, 0.00, 0.35)
+    right_start, right_end = _band_bounds(res_y, 0.65, 1.00)
+    low_end_start, low_end_end = _band_bounds(res_x, 0.00, 0.28)
+    high_end_start, high_end_end = _band_bounds(res_x, 0.72, 1.00)
+
+    center_band = grid[:, center_start:center_end, :]
+    left_band = grid[:, left_start:left_end, :]
+    right_band = grid[:, right_start:right_end, :]
+    low_end_band = grid[:, :, low_end_start:low_end_end]
+    high_end_band = grid[:, :, high_end_start:high_end_end]
 
     center_fraction = float(center_band.sum().item() / max(occupied, 1.0))
     left_fraction = float(left_band.sum().item() / max(occupied, 1.0))
     right_fraction = float(right_band.sum().item() / max(occupied, 1.0))
-    tail_fraction = float(rear_band.sum().item() / max(occupied, 1.0))
+    low_end_fraction = float(low_end_band.sum().item() / max(occupied, 1.0))
+    high_end_fraction = float(high_end_band.sum().item() / max(occupied, 1.0))
+    tail_fraction = min(low_end_fraction, high_end_fraction)
 
-    checks = {
-        "nonempty_occupancy": 0.005 <= occupancy_ratio <= 0.50,
-        "symmetry": symmetry_score >= 0.65,
-        "span_sanity": span_fraction >= 0.35 and length_fraction >= 0.35,
-        "wing_body_balance": center_fraction >= 0.10 and left_fraction >= 0.05 and right_fraction >= 0.05,
-        "tail_body_plausibility": 0.01 <= tail_fraction <= 0.45,
-    }
-    pass_count = sum(1 for passed in checks.values() if passed)
-    orientation_score = (
-        pass_count,
-        symmetry_score,
-        min(left_fraction, right_fraction),
-        span_fraction,
-        length_fraction,
-    )
+    center_density = float(center_band.mean().item()) if center_band.numel() else 0.0
+    left_density = float(left_band.mean().item()) if left_band.numel() else 0.0
+    right_density = float(right_band.mean().item()) if right_band.numel() else 0.0
+    wing_density = max(left_density, right_density, 1e-6)
+    longitudinal_profile = grid.sum(dim=(0, 1))
+    occupied_profile = longitudinal_profile[longitudinal_profile > 0]
+    longitudinal_profile_cv = 0.0
+    if occupied_profile.numel() > 1:
+        longitudinal_profile_cv = float(
+            occupied_profile.float().std(unbiased=False).item()
+            / max(occupied_profile.float().mean().item(), 1e-6)
+        )
+
     return {
-        "checks": checks,
-        "metrics": {
-            "occupancy_ratio": occupancy_ratio,
-            "symmetry_score": symmetry_score,
-            "span_fraction_y": span_fraction,
-            "length_fraction_x": length_fraction,
-            "center_body_fraction": center_fraction,
-            "left_wing_fraction": left_fraction,
-            "right_wing_fraction": right_fraction,
-            "tail_fraction": tail_fraction,
-        },
-        "orientation_score": orientation_score,
+        "occupancy_ratio": occupancy_ratio,
+        "symmetry_score": symmetry_score,
+        "voxel_symmetry_score": voxel_symmetry_score,
+        "thickness_fraction_z": thickness_fraction,
+        "span_fraction_y": span_fraction,
+        "length_fraction_x": length_fraction,
+        "center_body_fraction": center_fraction,
+        "left_wing_fraction": left_fraction,
+        "right_wing_fraction": right_fraction,
+        "center_body_density": center_density,
+        "left_wing_density": left_density,
+        "right_wing_density": right_density,
+        "center_body_density_ratio": center_density / wing_density,
+        "longitudinal_profile_cv": longitudinal_profile_cv,
+        "low_end_fraction": low_end_fraction,
+        "high_end_fraction": high_end_fraction,
+        "tail_fraction": tail_fraction,
+    }
+
+
+def _orientation_score(metrics: Dict[str, float]) -> float:
+    wing_fraction = min(metrics["left_wing_fraction"], metrics["right_wing_fraction"])
+    wing_density = min(metrics["left_wing_density"], metrics["right_wing_density"])
+    centerline_bonus = min(metrics["center_body_density_ratio"], 4.0)
+    missing_wing_penalty = -6.0 if wing_fraction < 0.02 else 0.0
+    return (
+        4.0 * metrics["symmetry_score"]
+        + 18.0 * wing_fraction
+        + 8.0 * wing_density
+        + 1.5 * centerline_bonus
+        + 2.0 * metrics["span_fraction_y"]
+        + 1.5 * metrics["length_fraction_x"]
+        - 2.0 * metrics["thickness_fraction_z"]
+        + missing_wing_penalty
+    )
+
+
+def _canonicalize_aircraft_grid(grid: torch.Tensor) -> tuple[torch.Tensor, Dict[str, Any]]:
+    cropped = _crop_to_occupied_bbox(grid)
+    if float(cropped.sum().item()) <= 0.0:
+        return grid, {"permutation": [0, 1, 2], "score": 0.0}
+
+    best_grid = grid
+    best_metrics = _heuristic_metrics(grid)
+    best_perm = (0, 1, 2)
+    best_score = _orientation_score(best_metrics)
+
+    for perm in itertools.permutations(range(3)):
+        oriented = cropped.permute(*perm).contiguous()
+        centered = _center_in_canvas(oriented, grid.shape)
+        metrics = _heuristic_metrics(centered)
+        score = _orientation_score(metrics)
+        if score > best_score:
+            best_grid = centered
+            best_metrics = metrics
+            best_perm = perm
+            best_score = score
+
+    return best_grid, {
+        "permutation": list(best_perm),
+        "score": float(best_score),
+        "metrics": best_metrics,
     }
 
 
@@ -129,31 +188,37 @@ def evaluate_aircraft_validity(voxels: Any) -> Dict[str, Any]:
     # Heuristic shape checks are intentionally separated from claim evidence.
     # NASA-STD-7009B treats model/simulation credibility as a lifecycle product,
     # not a single geometric proxy: https://standards.nasa.gov/standard/nasa/nasa-std-7009
-    grid = _as_tensor(voxels)
-    best_report = None
-    best_orientation = None
+    raw_grid = _as_tensor(voxels)
+    grid, canonicalization = _canonicalize_aircraft_grid(raw_grid)
+    metrics = canonicalization.get("metrics") or _heuristic_metrics(grid)
 
-    for perm in itertools.permutations(range(3)):
-        oriented = grid.permute(*perm).contiguous()
-        for length_flipped in (False, True):
-            candidate = torch.flip(oriented, dims=[2]) if length_flipped else oriented
-            report = _evaluate_oriented_aircraft_validity(candidate)
-            if best_report is None or report["orientation_score"] > best_report["orientation_score"]:
-                best_report = report
-                best_orientation = {
-                    "axis_permutation_zyx": list(perm),
-                    "length_axis_flipped": bool(length_flipped),
-                }
-
-    assert best_report is not None
-    checks = best_report["checks"]
+    checks = {
+        "nonempty_occupancy": 0.005 <= metrics["occupancy_ratio"] <= 0.50,
+        "symmetry": metrics["symmetry_score"] >= 0.55,
+        "span_sanity": (
+            metrics["span_fraction_y"] >= 0.35
+            and metrics["length_fraction_x"] >= 0.35
+            and metrics["thickness_fraction_z"] <= 0.35
+        ),
+        "wing_body_balance": (
+            metrics["center_body_fraction"] >= 0.10
+            and metrics["left_wing_fraction"] >= 0.05
+            and metrics["right_wing_fraction"] >= 0.05
+        ),
+        "body_centerline_dominance": metrics["center_body_density_ratio"] >= 1.15,
+        "longitudinal_profile_variation": metrics["longitudinal_profile_cv"] >= 0.18,
+        "tail_body_plausibility": (
+            metrics["tail_fraction"] <= 0.20
+            and max(metrics["low_end_fraction"], metrics["high_end_fraction"]) <= 0.50
+        ),
+    }
     failed = [name for name, passed in checks.items() if not passed]
     return {
         "status": "pass" if not failed else "fail",
         "checks": checks,
         "failed_checks": failed,
-        "metrics": best_report["metrics"],
-        "orientation": best_orientation,
+        "metrics": metrics,
+        "canonicalization": canonicalization,
         "claim_boundary": "First-pass aircraft-specific heuristic validity, not structural or aerodynamic proof.",
     }
 

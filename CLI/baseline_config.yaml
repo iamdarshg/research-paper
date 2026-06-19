@@ -1,13 +1,27 @@
-baseline_name: minimal_grounded_aircraft
+baseline_name: claim_bearing_guardrail_baselines
 baseline_set:
   - retrieval
   - unconditional_checkpoint
   - bundled_grounded_stl
+baselines:
+  retrieval:
+    description: >
+      Nearest-record retrieval from the grounded manifest under the same
+      condition schema. A passing baseline report must include concrete
+      retrieval outputs before this family can support claims.
+  unconditional_checkpoint:
+    description: >
+      Samples from the same architecture without structured conditioning.
+      A passing baseline report must include checkpoint-derived outputs before
+      this family can support claims.
+  bundled_grounded_stl:
+    description: >
+      Repository-bundled grounded STL references evaluated under the same solver
+      settings as generated candidates.
 description: >
-  Minimal grounded baseline policy for final-run guardrails. The checked-in
-  protocol uses generated deterministic reference records for retrieval and
-  unconditional-checkpoint baselines, plus the repository's bundled aircraft-like
-  STL files for bundled-grounded-STL smoke comparisons.
+  Claim-bearing guardrail baseline families required by the final evidence
+  package. This config names the required comparison families; the corresponding
+  baseline report still has to contain concrete outputs for every family.
 stl_paths:
   - ../biplane.stl
   - ../F-18_Hornet.stl
@@ -17,4 +31,4 @@ evaluation:
   steps: 200
 notes:
   - Replace or extend these paths with a larger grounded corpus before making paper-level claims.
-  - The current config is suitable for guardrail plumbing and deterministic reference evidence, not publication-grade benchmarking.
+  - The current config is suitable for final-run guardrail plumbing, not by itself publication-grade benchmarking.

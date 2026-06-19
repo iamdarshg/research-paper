@@ -13,29 +13,27 @@
 \usepackage{cite}
 \usepackage{pgfplots}
 \usepackage{tikz}
+\usetikzlibrary{positioning}
 \pgfplotsset{compat=1.17}
 \hyphenation{op-tical net-works semi-conduc-tor IEEE-Xplore}
-% updated with editorial comments 8/9/2021
 
 \begin{document}
 
 \title{Toward Generative Design of Aircraft-Like Structures with Diffusion Models and CFD-Informed Evaluation}
 \author{Darsh Gupta, National Public School, HSR Layout, Bengaluru \\ darshgu77@gmail.com}
 
-% Paper header metadata
-\markboth{Journal of Aerospace Engineering, Vol. 14, No. 8, August 2025}%
-{Gupta \MakeLowercase{\textit{et al.}}: A Sample Article Using IEEEtran.cls for IEEE Journals}
-\IEEEpubid{0000--0000/00\$00.00~\copyright~2025 IEEE}
-% If this is used, call \IEEEpubidadjcol in the second column so the mark clears.
+% Preprint header metadata. Publication identifiers should be added only after acceptance.
+\markboth{Preprint, June 2026}%
+{Gupta: Generative Design of Aircraft-Like Structures}
 
 \maketitle
 
 \begin{abstract}
-This paper documents a proof-of-concept generative-design pipeline for aircraft-like voxel geometries. The repository combines a latent diffusion-style model, a voxel decoder, connectivity heuristics, and a CFD-informed scoring path built around an internal lattice-Boltzmann solver plus an external OpenFOAM export route. The present implementation is intentionally scoped: training data are synthetic, the reported experiment is a reduced sanity run, and the evidence should be read as code-path validation rather than publication-grade aerodynamic or structural validation. In addition to describing the architecture and benchmark workflow, we use the current experiments to clarify which claims the codebase supports today and which claims, including mission-conditioned or manufacturing-conditioned aircraft generation, remain future work.
+This paper documents a proof-of-concept generative-design pipeline for aircraft-like voxel geometries. The repository combines a latent diffusion-style model, a voxel decoder, connectivity heuristics, and a CFD-informed scoring path built around an internal lattice-Boltzmann solver plus an external OpenFOAM export route. The present implementation is intentionally scoped: the grounded corpus is small, the protocol is a reduced final-evidence run, and the evidence should be read as code-path validation rather than publication-grade aerodynamic or structural validation. In addition to describing the architecture and benchmark workflow, we use the current experiments to clarify which claims the codebase supports today and which stronger claims, including validated mission-conditioned or manufacturing-conditioned aircraft generation, remain future work.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Generative Design, Diffusion Models, Computational Fluid Dynamics, Aerospace Engineering, Structural Optimization.
+Generative Design, Diffusion Models, Computational Fluid Dynamics, Aerospace Engineering, Voxel Geometry.
 \end{IEEEkeywords}
 
 % Sections

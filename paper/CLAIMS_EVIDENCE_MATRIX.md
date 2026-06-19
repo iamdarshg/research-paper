@@ -14,6 +14,7 @@ This matrix records the strongest claims that appeared in the paper and the word
 | C08 | `paper/sections/methodology.tex` | methods | implied differentiating through CFD solver | current code routes geometries through an aerodynamic score path | differentiable-CFD experiment if upgraded | revised |
 | C09 | `paper/sections/results-and-discussion.tex` | empirical | risk of aircraft-level interpretation | sanity-run evidence on synthetic/freeform objects plus smoke verification of conditioning code paths only | larger controlled benchmark with grounded aircraft-like data | revised |
 | C10 | `paper/sections/conclusion.tex` | project scope | implied fully AI-driven conditioned airplane generator | schema and code plumbing for structured conditions exist, but validated mission/manufacturing-conditioned aircraft generation remains future work | grounded aircraft-like corpus + condition-response benchmark + full CLI/config exposure | revised |
+| C11 | `CLI/advanced_lbm_solver.py`, `CLI/cascaded_lbm.py`, `CLI/GROUND_TRUTH_SPEC.md` | internal solver compressibility | implied that accepting Mach > 0.3 means validated compressible CFD | internal D3Q27 is validated only as a low-Mach weakly compressible/isothermal sanity path; Mach > 0.3 is experimental unless external compressible validation exists | `build/solver_diagnostics/compressibility_audit_20260612/solver_compressibility_audit.md` and focused regime tests | revised |
 
 ## Upgrade Rule
 
@@ -25,3 +26,10 @@ Do not strengthen any `allowed wording now` entry until the required evidence ex
 - That code plumbing is not enough to claim validated mission-conditioned or manufacturing-conditioned aircraft generation.
 - No condition-response benchmark currently shows that payload, takeoff, wingspan, wall-thickness, part-count, or manufacturing controls produce reliable directional changes in outputs.
 - No grounded aircraft-like corpus currently exists in-repo to support aircraft-level conditioned-generation claims.
+
+## Compressibility-Specific Evidence Boundary
+
+- Internal LBM low-Mach raw outputs are separate from calibrated/surrogate/training labels.
+- Internal LBM high-Mach outputs are executable diagnostics labeled `experimental_high_mach_unvalidated`.
+- OpenFOAM incompressible and OpenFOAM compressible references must be recorded as distinct evidence sources.
+- Paper text must not describe the internal solver as validated transonic or supersonic CFD until a thermal/compressible solver path and external validation gates pass.

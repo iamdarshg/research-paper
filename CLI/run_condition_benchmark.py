@@ -20,6 +20,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Sequence
 
+from report_metadata import apply_report_metadata
+
 
 FIXED_SWEEPS: List[Dict[str, str]] = [
     {
@@ -229,6 +231,8 @@ def main() -> int:
     parser.add_argument("--seeds", default="0-4", help="Comma-separated seeds or ranges, e.g. 0,1,4-6.")
     parser.add_argument("--min-grounded-records", type=int, default=20)
     parser.add_argument("--min-effect", type=float, default=0.0)
+    parser.add_argument("--run-id", default=None, help="Optional run identifier shared across report artifacts.")
+    parser.add_argument("--protocol-config", default=None, help="Optional protocol config path for evidence lineage metadata.")
     args = parser.parse_args()
 
     report = build_condition_benchmark_report(
@@ -237,6 +241,13 @@ def main() -> int:
         seeds=parse_seeds(args.seeds),
         min_grounded_records=args.min_grounded_records,
         min_effect=args.min_effect,
+    )
+    apply_report_metadata(
+        report,
+        run_id=args.run_id,
+        checkpoint_path=args.checkpoint,
+        manifest_path=args.manifest,
+        protocol_path=args.protocol_config,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)

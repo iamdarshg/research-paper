@@ -65,6 +65,7 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     manifest_validator_script = str((cli_dir / "validate_manifest.py").resolve())
     condition_benchmark_script = str((cli_dir / "run_condition_benchmark.py").resolve())
     aircraft_validity_script = str((cli_dir / "aircraft_validity.py").resolve())
+    aircraft_validity_input_builder_script = str((cli_dir / "build_aircraft_validity_inputs.py").resolve())
     manufacturing_constraints_script = str((cli_dir / "condition_feasibility.py").resolve())
     final_evidence_script = str((cli_dir / "final_evidence.py").resolve())
 
@@ -77,6 +78,7 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     condition_cfg = dict(config.get("validate_conditions", {}))
     condition_benchmark_cfg = dict(config.get("condition_benchmark", {}))
     manufacturing_cfg = dict(config.get("manufacturing_constraints", {}))
+    aircraft_validity_input_cfg = dict(config.get("prepare_aircraft_validity_inputs", {}))
     aircraft_validity_cfg = dict(config.get("aircraft_validity", {}))
     multi_seed_cfg = dict(config.get("multi_seed_eval", {}))
     final_evidence_cfg = dict(config.get("final_evidence", {}))
@@ -148,6 +150,11 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
             if key == "output":
                 value = _resolve_path(config, value)
             _add_option(baseline_cmd, flag, value)
+        _add_option(baseline_cmd, "--baseline-config", _resolve_path(config, train_cfg.get("baseline_config")))
+        _add_option(baseline_cmd, "--manifest", _resolve_path(config, train_cfg.get("dataset_manifest")))
+        _add_option(baseline_cmd, "--checkpoint", checkpoint)
+        _add_option(baseline_cmd, "--run-id", run_id)
+        _add_option(baseline_cmd, "--protocol-config", protocol_config_path)
         commands.append(baseline_cmd)
 
     if condition_cfg.get("enabled"):
@@ -202,6 +209,18 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
         _add_option(manufacturing_cmd, "--checkpoint", checkpoint)
         _add_option(manufacturing_cmd, "--protocol-config", protocol_config_path)
         commands.append(manufacturing_cmd)
+
+    if aircraft_validity_input_cfg.get("enabled"):
+        builder_cmd = [python_exe, aircraft_validity_input_builder_script]
+        output_dir = _resolve_path(config, aircraft_validity_input_cfg.get("output_dir"))
+        metadata_path = _resolve_path(config, aircraft_validity_input_cfg.get("metadata"))
+        _add_option(builder_cmd, "--output-dir", output_dir)
+        _add_option(builder_cmd, "--metadata", metadata_path)
+        _add_option(builder_cmd, "--num-samples", aircraft_validity_input_cfg.get("num_samples"))
+        _add_option(builder_cmd, "--grid-size", aircraft_validity_input_cfg.get("grid_size"))
+        _add_option(builder_cmd, "--seed-start", aircraft_validity_input_cfg.get("seed_start"))
+        _add_option(builder_cmd, "--max-attempts", aircraft_validity_input_cfg.get("max_attempts"))
+        commands.append(builder_cmd)
 
     if aircraft_validity_cfg.get("enabled"):
         validity_cmd = [python_exe, aircraft_validity_script]

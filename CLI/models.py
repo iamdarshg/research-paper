@@ -319,12 +319,12 @@ class LatentDiffusionUNet(nn.Module):
                         if hasattr(triton_config, 'cudagraphs'):
                             triton_config.cudagraphs = False
                 self.forward = torch.compile(self.forward, backend=backend, mode=mode)
-                print(f"[ok] Successfully applied torch.compile() with backend='{backend}', mode='{mode}'")
+                print(f"✅ Successfully applied torch.compile() with backend='{backend}', mode='{mode}'")
                 return
             except Exception as e:
-                print(f"[error] torch.compile() failed with backend='{backend}': {str(e)}")
+                print(f"❌ torch.compile() failed with backend='{backend}': {str(e)}")
                 continue
-        print("[warn] All torch.compile() backends failed, using original forward function")
+        print("⚠️  All torch.compile() backends failed, using original forward function")
 
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         b = x.shape[0]

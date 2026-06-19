@@ -4,15 +4,11 @@ This benchmark is the first fail-closed layer for checking whether grounded
 condition changes have directional response evidence. It is not a training
 recipe, and it is not publication-grade proof by itself.
 
-Its implementation contributes to gate readiness, but not to claim-bearing
-scientific evidence by itself. The broader scientific evidence package remains
-0/13 until grounded reports exist.
-
 ## Command
 
 ```bash
 python CLI/run_condition_benchmark.py \
-  --checkpoint checkpoints/candidate_or_smoke_checkpoint.pt \
+  --checkpoint checkpoints/final_optimized_model.pt \
   --manifest docs/dataset/grounded_condition_manifest.jsonl \
   --output build/condition_benchmark_report.json \
   --seeds 0-4
@@ -82,7 +78,7 @@ checkpoint was scientifically evaluated.
 
 ## Current Claim Boundary
 
-A `pass` report status means the checked manifest metadata has directional
-response support for the fixed sweeps. It does not establish aircraft-level
-validity, structural feasibility, statistical superiority, or publication-grade
-conditioned generation. Those remain separate final-run gates.
+A passing report means the checked manifest metadata has directional response
+support for the fixed sweeps. It does not establish aircraft-level validity,
+structural feasibility, statistical superiority, or publication-grade conditioned
+generation. Those remain separate final-run gates.
