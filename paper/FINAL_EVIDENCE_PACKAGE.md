@@ -46,3 +46,20 @@ That unlocks reporting the reduced evidence bundle itself. It does not unlock
 publication-grade claims about aerodynamic optimality, structural viability, or
 superiority over mature optimization baselines; those still require stronger
 solver validation, structural analysis, larger grounded data, and ablations.
+
+## Airshow Public-Corpus Smoke Addendum
+
+The 2026-06-20 Airshow run is a supplemental smoke package, not a replacement
+for the reduced final protocol above. It builds
+`build/airshow_grounded_corpus_20260620/manifest.jsonl` from 355 public VSP
+Airshow geometry records, validates that manifest at claim-bearing level, trains
+a three-epoch D3Q27 checkpoint at
+`build/airshow_training_20260620/checkpoints/final_optimized_model.pt`, and
+runs three generated flight-path checks through STL export, aircraft validity,
+and internal D3Q27 CFD.
+
+The addendum supports only a public-corpus code-path claim. All three generated
+flight-path checks are nonempty and have finite raw D3Q27 outputs, but all three
+fail the current aircraft-specific `span_sanity` validity check. The generated
+results must therefore remain non-claim-bearing for aircraft validity,
+aerodynamic prediction, structural viability, and method superiority.

@@ -13,11 +13,13 @@ mistaken for experimental validation.
 | Runnable executable/reporting entrypoint implemented | 13 / 13 | The repo has runnable code, protocol hooks, or dedicated fail-closed scaffold reports for every gate. |
 | Solver-side support implemented | 12 / 13 | CFD results now expose normalized metrics, provenance, quality checks, and solver-gate support for all solver-relevant gates; manifest validation is not solver-applicable. |
 | Deterministic reference evidence | 8 / 13 | `CLI/build_reference_evidence.py` now produces a NASA/TMR-cited 20-record reference corpus, checkpoint card, and report bundle that supports the scoped gates listed below. |
-| Publication-scale trained-model evidence | 0 / 13 | No trained generative checkpoint, matched CFD ablation, converged CFD study, structural load-path study, or prior-method superiority package exists yet. |
+| Public-corpus trained smoke evidence | 1 run | A 355-record public VSP Airshow manifest was built and used for a three-epoch training smoke run; the generated flight-path checks execute but fail aircraft span-sanity validity. |
+| Publication-scale trained-model evidence | 0 / 13 | No publication-scale trained generative checkpoint with matched CFD ablation, converged CFD study, structural load-path study, or prior-method superiority package exists yet. |
 
 The current branch is therefore strong on documented, fail-closed gate coverage,
-and now includes a small reproducible reference evidence package. It is still
-blocked for publication-scale aircraft-generation and superiority claims.
+and now includes a small reproducible reference evidence package plus a
+public-corpus Airshow training smoke run. It is still blocked for
+publication-scale aircraft-generation and superiority claims.
 
 ## Gate Table
 
@@ -80,6 +82,26 @@ report path works with a real checkpoint, but it does not satisfy the remaining
 publication-scale gates for CFD-guided ablation, converged CFD validation,
 structural load-path validation, prior-method superiority, or uncertainty/
 sensitivity studies.
+
+## Airshow Public-Corpus Training Smoke Run
+
+The 2026-06-20 Airshow run adds a larger public-geometry smoke check outside
+the deterministic reference protocol:
+
+- corpus: 381 public Airshow model documents observed, 357 eligible after
+  license and geometry filtering, 355 converted to centered `16^3` voxels;
+- licenses included: 208 CC0, 18 CC BY, and 129 CC BY-SA records;
+- manifest: `build/airshow_grounded_corpus_20260620/manifest.jsonl`, hash
+  `7bb59bab9cc8ed3a836377a35d3c38d5c0086a56b617b2695e131486451885a6`;
+- checkpoint: `build/airshow_training_20260620/checkpoints/final_optimized_model.pt`,
+  hash `71e808aa3c35142f145da267bb4eb7050300adc383e3a070d571eec36413d4f6`;
+- generated flight-path checks: `short_takeoff_payload`,
+  `high_speed_sprint`, and `endurance_turning`.
+
+All three generated flight-path checks are nonempty and produce finite raw D3Q27
+coefficients, but all three fail the current aircraft-specific `span_sanity`
+screen. This run therefore supports code-path execution on hundreds of public
+geometries, not validated aircraft generation.
 
 ## Solver-Side Gate Support
 

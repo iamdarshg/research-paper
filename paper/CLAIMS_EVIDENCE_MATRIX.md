@@ -12,9 +12,10 @@ This matrix records the strongest claims that appeared in the paper and the word
 | C06 | `paper/sections/related-work.tex` | novelty | unclear novelty relative to 3D diffusion | novelty is the assembled proof-of-concept workflow and validation discipline | related-work citations already added | revised |
 | C07 | `paper/sections/related-work.tex` | comparison | unclear distinction from topology optimization and CFD shape optimization | learned generative prior plus post hoc scoring rather than direct parameter optimization | topology/CFD optimization citations | revised |
 | C08 | `paper/sections/methodology.tex` | methods | implied differentiating through CFD solver | current code routes geometries through an aerodynamic score path | differentiable-CFD experiment if upgraded | revised |
-| C09 | `paper/sections/results-and-discussion.tex` | empirical | risk of aircraft-level interpretation | sanity-run evidence on synthetic/freeform objects plus smoke verification of conditioning code paths only | larger controlled benchmark with grounded aircraft-like data | revised |
+| C09 | `paper/sections/results-and-discussion.tex` | empirical | risk of aircraft-level interpretation | public Airshow-corpus smoke training plus synthetic/freeform/context runs supports code-path execution only; generated Airshow-checkpoint samples currently fail aircraft span-sanity validity | larger controlled benchmark with grounded aircraft-like data whose generated samples pass validity and external validation gates | revised |
 | C10 | `paper/sections/conclusion.tex` | project scope | implied fully AI-driven conditioned airplane generator | schema and code plumbing for structured conditions exist, but validated mission/manufacturing-conditioned aircraft generation remains future work | grounded aircraft-like corpus + condition-response benchmark + full CLI/config exposure | revised |
 | C11 | `CLI/advanced_lbm_solver.py`, `CLI/cascaded_lbm.py`, `CLI/GROUND_TRUTH_SPEC.md` | internal solver compressibility | implied that accepting Mach > 0.3 means validated compressible CFD | internal D3Q27 is validated only as a low-Mach weakly compressible/isothermal sanity path; Mach > 0.3 is experimental unless external compressible validation exists | `build/solver_diagnostics/compressibility_audit_20260612/solver_compressibility_audit.md` and focused regime tests | revised |
+| C12 | `paper/sections/results-and-discussion.tex`, `docs/benchmarks/airshow_grounded_training_20260620.md` | public-corpus training | implied hundreds of public models unlock validated aircraft generation | 355 public VSP Airshow records were converted and used for a smoke training run; the resulting three generated flight-path checks exercise the pipeline but fail `span_sanity` and are not claim-bearing CFD evidence | generated samples passing aircraft-validity screens, matched baselines, converged/external CFD validation, and structural/load-path evidence | revised |
 
 ## Upgrade Rule
 
@@ -24,8 +25,8 @@ Do not strengthen any `allowed wording now` entry until the required evidence ex
 
 - The repo now includes a documented condition schema and code plumbing through dataset generation, latent construction, model conditioning, and generator inference.
 - That code plumbing is not enough to claim validated mission-conditioned or manufacturing-conditioned aircraft generation.
-- No condition-response benchmark currently shows that payload, takeoff, wingspan, wall-thickness, part-count, or manufacturing controls produce reliable directional changes in outputs.
-- No grounded aircraft-like corpus currently exists in-repo to support aircraft-level conditioned-generation claims.
+- The public Airshow corpus now provides hundreds of traceable public geometry records for smoke training, but the three generated Airshow-checkpoint flight-path checks fail the current aircraft-specific `span_sanity` screen.
+- This means grounded data exists for code-path evidence; it still does not support aircraft-level conditioned-generation claims.
 
 ## Compressibility-Specific Evidence Boundary
 

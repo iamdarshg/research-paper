@@ -3,8 +3,8 @@
 Source: `paper/sections/validation-and-testing-standards.tex`
 
 Detector results:
-- lmscan: `0.2100`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.000247`, fake max `0.000247`
+- lmscan: `0.2086`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.000202`, fake max `0.000202`
 
 Overall function: this section separates execution checks, solver comparison, and physical validation so the paper does not imply that code-path success equals aircraft validation.
 

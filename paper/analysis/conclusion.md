@@ -3,8 +3,8 @@
 Source: `paper/sections/conclusion.tex`
 
 Detector results:
-- lmscan: `0.2154`, verdict `Likely human`, confidence `medium`
-- RoBERTa detector: fake mean `0.000223`, fake max `0.000223`
+- lmscan: `0.2158`, verdict `Likely human`, confidence `medium`
+- RoBERTa detector: fake mean `0.000224`, fake max `0.000224`
 
 Overall function: the conclusion restates the working implementation, reduced evidence package, and exact future work required before stronger conditioned-aircraft claims.
 

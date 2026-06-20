@@ -2,11 +2,13 @@
 
 Source: `paper/sections/results-and-discussion.tex`
 
-Detector results:
-- lmscan: `0.2173`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.013522`, fake max `0.052247`
+Detector results from the fresh local checker pass after the Airshow subsection was added:
+- lmscan: `0.2149`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.164410`, fake max `0.618411`
 
-Overall function: this section reports the reduced evidence package, smoke runs, sweep coverage, and solver sanity checks while keeping all aerodynamic and structural claims bounded.
+RoBERTa caveat: the max-fake chunk comes from the short formula-heavy tail of the section after LaTeX stripping mangled \(u = Ma / \sqrt{3}\) into incomplete plain text. I treat that max as a style-screening flag, not as authorship evidence.
+
+Overall function: this section reports the public Airshow corpus smoke run, the reduced evidence package, smoke runs, sweep coverage, and solver sanity checks while keeping all aerodynamic and structural claims bounded.
 
 ## Sentence Units
 
@@ -57,6 +59,74 @@ Overall function: this section reports the reduced evidence package, smoke runs,
    - Claim type: evidence boundary.
    - Word choices: `only` and `not` make the boundary explicit.
    - Risk status: safe.
+
+## Airshow Subsection Sentence Audit
+
+A1. `To replace the earlier synthetic-only scale-up evidence, we built a public VSP Airshow corpus from model documents exposed by the Airshow web app.`
+   - Function: explains why the new evidence exists.
+   - Claim type: corpus-source claim.
+   - Word choices: `replace` answers the review concern directly; `public` and `exposed by the Airshow web app` identify source accessibility without saying the records are manufacturer-certified.
+   - Risk status: grounded by the Airshow corpus builder and report.
+
+A2. `OpenVSP describes itself as a parametric aircraft geometry tool, and the OpenVSP project site links VSP Airshow as a public model exchange \cite{openvspGithub,openvspLicense,vspAirshow}.`
+   - Function: connects Airshow to the OpenVSP ecosystem.
+   - Claim type: source-context claim.
+   - Word choices: `describes itself` avoids independent endorsement; `links` is a narrow observable relationship.
+   - Risk status: grounded by cited public pages.
+
+A3. `The corpus builder admits only CC0, CC BY, and CC BY-SA Airshow entries with public preview geometry; it excludes NC and ND entries from the training manifest.`
+   - Function: states license filtering.
+   - Claim type: data-governance claim.
+   - Word choices: `admits only` and `excludes` make the license boundary explicit.
+   - Risk status: essential provenance guardrail.
+
+A4. `In the run reported here, the builder observed 381 public model documents, found 357 license-and-geometry-eligible documents, and converted 355 records into centered \(16^3\) voxel grids.`
+   - Function: gives corpus counts.
+   - Claim type: empirical run result.
+   - Word choices: `reported here` and exact counts make the claim audit-ready; `centered` and `voxel grids` name the preprocessing output.
+   - Risk status: grounded by `corpus_report.json`.
+
+A5. `The two rejected eligible documents had stale public storage URLs returning 404.`
+   - Function: explains the conversion gap.
+   - Claim type: failure accounting.
+   - Word choices: `two` keeps the arithmetic clear; `stale` characterizes URL state rather than model quality.
+   - Risk status: grounded by the corpus report failure list.
+
+A6. `The final training epoch reported loss \(21.5905\), MSE \(0.7997\), geometry-reconstruction loss \(0.0778\), consistency loss \(0.00109\), connectivity loss \(0.00149\), and aerodynamic loss \(20.7104\).`
+   - Function: records training diagnostics.
+   - Claim type: local run metric.
+   - Word choices: `reported` avoids implying improvement; metric names match the training output.
+   - Risk status: grounded as terminal-observed smoke evidence.
+
+A7. `These values are terminal-observed smoke-run diagnostics, not convergence evidence.`
+   - Function: blocks overinterpretation of the training numbers.
+   - Claim type: limitation.
+   - Word choices: `terminal-observed` states provenance; `not convergence evidence` prevents a training-quality overclaim.
+   - Risk status: critical.
+
+A8. `Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.`
+   - Function: separates source facts from inferred conditioning fields.
+   - Claim type: provenance boundary.
+   - Word choices: `treated as source metadata` avoids certification language; `not facts asserted` directly addresses ground-truth risk.
+   - Risk status: essential.
+
+A9. `All three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas.`
+   - Function: states what the three flight-path checks successfully exercised.
+   - Claim type: code-path evidence.
+   - Word choices: `nonempty`, `finite`, and `positive` are measurable smoke-test properties rather than quality claims.
+   - Risk status: grounded by `flight_path_results.json`.
+
+A10. `However, all three failed the current aircraft-specific validity screen on the span-sanity check, and the CFD report marks the D3Q27 outputs as non-claim-bearing raw LBM labels.`
+   - Function: reports the negative gate result.
+   - Claim type: limitation and failure disclosure.
+   - Word choices: `However` makes the reversal visible; `all three failed` avoids softening the result; `non-claim-bearing` aligns with report metadata.
+   - Risk status: critical honesty sentence.
+
+A11. `We therefore interpret this run as evidence that the public-corpus training, generator, export, heuristic-screen, and solver paths execute together; it is not evidence that the smoke checkpoint generates valid aircraft or validated aerodynamic predictions.`
+   - Function: gives the allowed interpretation.
+   - Claim type: evidence boundary.
+   - Word choices: `therefore` ties interpretation to the failed gate; `execute together` is the supported claim; the final clause blocks aircraft and CFD overclaims.
+   - Risk status: central guardrail.
 
 9. `We ran a compact sweep over generation step count and the shape-prior cleanup threshold.`
    - Function: introduces the freeform sweep.

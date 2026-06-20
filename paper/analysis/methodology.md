@@ -3,8 +3,8 @@
 Source: `paper/sections/methodology.tex`
 
 Detector results:
-- lmscan: `0.2240`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.001119`, fake max `0.002962`
+- lmscan: `0.2235`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.002193`, fake max `0.006217`
 
 Overall function: this section describes the implemented architecture while avoiding claims that the solver is fully validated, differentiable through training, or proven to improve aircraft performance.
 

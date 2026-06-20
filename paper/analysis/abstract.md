@@ -3,8 +3,8 @@
 Source: `paper/main.tex`
 
 Detector results:
-- lmscan: `0.2664`, verdict `Likely human`, confidence `medium`
-- RoBERTa detector: fake mean `0.087715`, fake max `0.087715`
+- lmscan: `0.2671`, verdict `Likely human`, confidence `medium`
+- RoBERTa detector: fake mean `0.105105`, fake max `0.105105`
 
 Overall function: the abstract deliberately frames the work as a proof-of-concept repository paper, not as a completed aircraft-design breakthrough.
 

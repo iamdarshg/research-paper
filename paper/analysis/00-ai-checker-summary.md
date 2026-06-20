@@ -38,25 +38,25 @@ These detectors are screening tools, not ground truth. A low score does not prov
 
 | Section | lmscan AI probability | lmscan verdict | RoBERTa fake mean | RoBERTa fake max |
 | --- | ---: | --- | ---: | ---: |
-| Abstract | 0.2664 | Likely human | 0.087715 | 0.087715 |
-| Introduction | 0.2192 | Likely human | 0.000206 | 0.000206 |
-| Related Work | 0.2153 | Likely human | 0.000348 | 0.000674 |
-| Methodology | 0.2240 | Likely human | 0.001119 | 0.002962 |
-| Results and Discussion | 0.2173 | Likely human | 0.013522 | 0.052247 |
-| Validation and Testing Standards | 0.2100 | Likely human | 0.000247 | 0.000247 |
-| Conclusion | 0.2154 | Likely human | 0.000223 | 0.000223 |
-| Full Paper | 0.2330 | Likely human | 0.003781 | 0.030340 |
+| Abstract | 0.2671 | Likely human | 0.105105 | 0.105105 |
+| Introduction | 0.2220 | Likely human | 0.000229 | 0.000229 |
+| Related Work | 0.2151 | Likely human | 0.012215 | 0.036288 |
+| Methodology | 0.2235 | Likely human | 0.002193 | 0.006217 |
+| Results and Discussion | 0.2149 | Likely human | 0.164410 | 0.618411 |
+| Validation and Testing Standards | 0.2086 | Likely human | 0.000202 | 0.000202 |
+| Conclusion | 0.2158 | Likely human | 0.000224 | 0.000224 |
+| Full Paper | 0.2314 | Likely human | 0.001994 | 0.016500 |
 
 ## Style Signals
 
 The final full-paper lmscan pass reports:
-- `burstiness`: 0.234788
-- `bigram_repetition`: 0.119314
-- `passive_voice_ratio`: 0.252427
-- `sentence_opening_diversity`: 0.839378
-- `chatbot_marker_score`: 0.000612
-- `word_count`: 3270 after LaTeX stripping
-- `sentence_count`: 206 after LaTeX stripping
+- `burstiness`: 0.231946
+- `bigram_repetition`: 0.118151
+- `passive_voice_ratio`: 0.272727
+- `sentence_opening_diversity`: 0.843434
+- `chatbot_marker_score`: 0.000561
+- `word_count`: 3562 after LaTeX stripping
+- `sentence_count`: 198 after LaTeX stripping
 
 The most important style cleanup was not cosmetic. The paper now repeatedly separates:
 - what the code path actually demonstrates,
@@ -69,3 +69,5 @@ The most important style cleanup was not cosmetic. The paper now repeatedly sepa
 `lmscan` is useful for local style screening but is not a formal authorship oracle. Its passive-voice and repetition signals are expected to be higher in academic writing.
 
 The RoBERTa detector is an older OpenAI detector model trained around GPT-2-era generated text. It is useful as a local second opinion, but modern LLM authorship cannot be proved or disproved from this score.
+
+The high RoBERTa maximum on `Results and Discussion` comes from one short formula-heavy tail chunk after LaTeX stripping mangled \(u = Ma / \sqrt{3}\) into incomplete plain text. The full-paper RoBERTa mean and max remain low, and the lmscan result for the same section remains `Likely human`.

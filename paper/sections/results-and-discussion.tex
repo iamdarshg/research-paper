@@ -1,6 +1,6 @@
 \section{Results and Discussion}
 \label{sec:results}
-The empirical evidence in this revision is intentionally narrow. It consists of bounded smoke runs on synthetic or procedural data, a reduced freeform-object sweep for the historical CFD path, and smoke-level checks for the new structured-conditioning seam. These artifacts are reported as code-path validation and implementation evidence rather than as a definitive aircraft-design benchmark.
+The empirical evidence in this revision is intentionally narrow. It consists of public-geometry smoke training on VSP Airshow models, bounded smoke runs on synthetic or procedural data retained for context, a reduced freeform-object sweep for the historical CFD path, and smoke-level checks for the new structured-conditioning seam. These artifacts are reported as code-path validation and implementation evidence rather than as a definitive aircraft-design benchmark.
 
 \subsection{Reduced Training Smoke Evidence}
 Figure \ref{fig:loss_curves} summarizes the scope of the reduced training evidence retained for context. Its purpose is to show which code paths were exercised in bounded smoke runs. It should not be read as a convergence study or as evidence that the current repository has validated aerodynamic or structural learning behavior.
@@ -22,6 +22,46 @@ Figure \ref{fig:loss_curves} summarizes the scope of the reduced training eviden
 \caption{Evidence scope for the reduced training runs. The current paper treats these runs as implementation evidence only, not as a full convergence study.}
 \label{fig:loss_curves}
 \end{figure}
+
+\subsection{Public Airshow Corpus Training Smoke Evidence}
+To replace the earlier synthetic-only scale-up evidence, we built a public VSP Airshow corpus from model documents exposed by the Airshow web app. OpenVSP describes itself as a parametric aircraft geometry tool, and the OpenVSP project site links VSP Airshow as a public model exchange \cite{openvspGithub,openvspLicense,vspAirshow}. The corpus builder admits only CC0, CC BY, and CC BY-SA Airshow entries with public preview geometry; it excludes NC and ND entries from the training manifest. In the run reported here, the builder observed 381 public model documents, found 357 license-and-geometry-eligible documents, and converted 355 records into centered \(16^3\) voxel grids. The two rejected eligible documents had stale public storage URLs returning 404.
+
+\begin{table}[!t]
+\centering
+\caption{Public Airshow Corpus Smoke Run}
+\label{tab:airshow_corpus_smoke}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|p{0.46\columnwidth}|p{0.38\columnwidth}|}
+\hline
+\textbf{Field} & \textbf{Value} \\ \hline
+Converted records & 355 \\ \hline
+Split counts & train 250, val 31, test 38, holdout 36 \\ \hline
+Licenses & 208 CC0, 18 CC BY, 129 CC BY-SA \\ \hline
+Manifest hash & \texttt{7bb59bab9cc8...451885a6} \\ \hline
+Checkpoint hash & \texttt{71e808aa3c35...6413d4f6} \\ \hline
+Training scope & 3 epochs, batch 8, latent 16, D3Q27, global step 135 \\ \hline
+\end{tabular}
+\end{table}
+
+The final training epoch reported loss \(21.5905\), MSE \(0.7997\), geometry-reconstruction loss \(0.0778\), consistency loss \(0.00109\), connectivity loss \(0.00149\), and aerodynamic loss \(20.7104\). These values are terminal-observed smoke-run diagnostics, not convergence evidence. Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.
+
+\begin{table}[!t]
+\centering
+\caption{Generated Flight-Path Smoke Checks from the Airshow Checkpoint}
+\label{tab:airshow_flight_path_smoke}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|p{0.28\columnwidth}|p{0.13\columnwidth}|p{0.13\columnwidth}|p{0.13\columnwidth}|p{0.20\columnwidth}|}
+\hline
+\textbf{Case} & \textbf{Occ.} & \textbf{$C_d$} & \textbf{$L/D$} & \textbf{Validity} \\ \hline
+short takeoff payload & 0.01416 & 1.2047 & 0.00438 & fail: span sanity \\ \hline
+high-speed sprint & 0.01294 & 0.9122 & 0.03051 & fail: span sanity \\ \hline
+endurance turning & 0.01245 & 0.9824 & 0.04663 & fail: span sanity \\ \hline
+\end{tabular}
+\end{table}
+
+All three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas. However, all three failed the current aircraft-specific validity screen on the span-sanity check, and the CFD report marks the D3Q27 outputs as non-claim-bearing raw LBM labels. We therefore interpret this run as evidence that the public-corpus training, generator, export, heuristic-screen, and solver paths execute together; it is not evidence that the smoke checkpoint generates valid aircraft or validated aerodynamic predictions.
 
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}
 We ran a compact sweep over generation step count and the shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, and computed aerodynamic metrics using the CPU CFD path. The sweep provides only a preliminary probe of how post-processing thresholds can alter the generated object before scoring; Figure \ref{fig:ld_sweep} documents the reduced coverage.
