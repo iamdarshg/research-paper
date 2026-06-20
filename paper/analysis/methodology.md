@@ -3,10 +3,10 @@
 Source: `paper/sections/methodology.tex`
 
 Detector results:
-- lmscan: `0.2235`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.002193`, fake max `0.006217`
+- lmscan: `0.2539`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.088077`, fake max `0.351760`
 
-Overall function: this section describes the implemented architecture while avoiding claims that the solver is fully validated, differentiable through training, or proven to improve aircraft performance.
+Overall function: this section describes the implemented architecture and the public Airshow corpus-construction path while avoiding claims that the solver is fully validated, differentiable through training, or proven to improve aircraft performance.
 
 ## Sentence Units
 
@@ -16,10 +16,10 @@ Overall function: this section describes the implemented architecture while avoi
    - Word choices: `current repository` anchors the claim to code; `proof-of-concept` limits maturity; `diffusion-style` avoids objective novelty; `CFD-oriented` avoids validated CFD overclaim.
    - Risk status: grounded.
 
-2. `The codebase operates on synthetic voxel training data and uses bounded smoke runs together with connectivity heuristics and aerodynamic score terms.`
-   - Function: identifies training-data scope and evidence level.
-   - Claim type: implementation and limitation claim.
-   - Word choices: `synthetic`, `bounded`, `smoke runs`, and `heuristics` all reduce strength to match actual evidence.
+2. `The codebase now has two evidence tracks: deterministic synthetic/procedural smoke data retained for continuity, and a public VSP Airshow corpus used for the grounded training smoke run reported in Section \ref{sec:results}.`
+   - Function: updates the data-source scope after the Airshow addition.
+   - Claim type: evidence inventory.
+   - Word choices: `two evidence tracks` makes the split explicit; `retained for continuity` explains why synthetic/procedural results remain; `public VSP Airshow corpus` names the grounded source; `smoke run` prevents treating the new corpus as final validation.
    - Risk status: grounded.
 
 3. `In this revision, the same path also carries a documented structured condition vector through dataset generation, latent construction, and checkpointed inference.`
@@ -50,6 +50,68 @@ Overall function: this section describes the implemented architecture while avoi
    - Function: explicit figure limitation.
    - Claim type: anti-overclaim sentence.
    - Word choices: `under test` and `does not by itself` keep evidence narrow; the three exclusions name likely overreads.
+   - Risk status: essential.
+
+## Airshow Corpus Construction Sentence Audit
+
+A1. `The grounded corpus path collects public model documents from the VSP Airshow web app, keeps only records whose Airshow license identifiers map to CC0, CC BY, or CC BY-SA, and requires a public preview-geometry URL before a record can enter the training manifest \cite{openvspGithub,openvspLicense,vspAirshow}.`
+   - Function: states the inclusion rule for the new corpus.
+   - Claim type: data-provenance and license-filtering claim.
+   - Word choices: `public model documents` avoids private or scraped-data implications; `keeps only` makes the license gate strict; `requires` states the geometry availability rule; `training manifest` names the artifact being controlled.
+   - Risk status: grounded by `CLI/build_airshow_corpus.py` and the corpus report.
+
+A2. `The builder parses available X3D indexed-face-set geometry, normalizes each mesh into a centered unit cube, voxelizes the occupied geometry into a \(16^3\) grid, and records source URLs, license metadata, geometry hashes, voxel hashes, split assignment, and preprocessing provenance.`
+   - Function: describes the geometry conversion method.
+   - Claim type: preprocessing method claim.
+   - Word choices: `available` avoids saying every Airshow record has usable geometry; `centered unit cube` and `16^3` state the representation; the hash/provenance list makes the corpus auditable.
+   - Risk status: grounded by the builder and manifest.
+
+A3. `The deterministic split assignment is stored in the manifest so that later validation, training, and generation commands can be tied back to the same corpus lineage.`
+   - Function: explains why split metadata matters.
+   - Claim type: reproducibility rationale.
+   - Word choices: `deterministic` and `stored` make the split repeatable; `lineage` connects later claims to the same manifest rather than loose files.
+   - Risk status: safe.
+
+A4. `Corpus construction summary for the public VSP Airshow smoke run.`
+   - Function: figure-caption title.
+   - Claim type: figure framing.
+   - Word choices: `summary` and `smoke run` keep the visual from sounding like a final benchmark.
+   - Risk status: safe.
+
+A5. `The plot shows the observed Airshow model-document count, license-and-geometry filtering, converted voxel records, admitted license mix, and deterministic train/validation/test/holdout split.`
+   - Function: tells the reader exactly what Figure \ref{fig:airshow_corpus_summary} encodes.
+   - Claim type: figure-content claim.
+   - Word choices: `observed` ties counts to one run; `admitted` reminds the reader that licenses are filtered; `deterministic` matches the split policy.
+   - Risk status: grounded by `corpus_report.json`.
+
+A6. `These counts document data provenance and coverage; they do not certify manufacturer approval or aircraft performance.`
+   - Function: blocks a visual overread of the corpus plot.
+   - Claim type: limitation.
+   - Word choices: `document` is allowed; `do not certify` directly rejects the strongest unsupported interpretation.
+   - Risk status: critical.
+
+A7. `The run used in this paper observed 381 public Airshow model documents, admitted 357 license-and-geometry-eligible documents, and converted 355 records after two public storage URLs returned 404.`
+   - Function: gives the exact corpus arithmetic.
+   - Claim type: empirical run result.
+   - Word choices: `used in this paper` anchors the count; the three numbers make the funnel auditable; `returned 404` explains the two-record gap without inventing a qualitative reason.
+   - Risk status: grounded by `build/airshow_grounded_corpus_20260620/corpus_report.json`.
+
+A8. `Figure \ref{fig:airshow_corpus_summary} visualizes that corpus funnel together with the license and split distributions.`
+   - Function: links the prose counts to the plot.
+   - Claim type: figure-navigation sentence.
+   - Word choices: `visualizes` is neutral; `funnel`, `license`, and `split` match the three panels.
+   - Risk status: safe.
+
+A9. `Airshow model names, manufacturer fields, URLs, and license labels are treated as source metadata only.`
+   - Function: separates source metadata from certification.
+   - Claim type: provenance boundary.
+   - Word choices: `treated as` describes the paper's evidentiary use; `only` prevents implied endorsement.
+   - Risk status: essential.
+
+A10. `The additional mission and manufacturing fields used by the condition vector are deterministic repository inferences from geometry and defaults, not factual claims made by NASA, Lockheed, OpenVSP, or any other named source.`
+   - Function: answers the ground-truth concern directly.
+   - Claim type: inferred-field limitation.
+   - Word choices: `additional` distinguishes these fields from source metadata; `deterministic repository inferences` says exactly where they come from; naming NASA, Lockheed, and OpenVSP blocks accidental attribution.
    - Risk status: essential.
 
 8. `The forward diffusion process gradually adds Gaussian noise to the input data over a series of T timesteps.`

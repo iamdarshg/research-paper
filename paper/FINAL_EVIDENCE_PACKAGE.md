@@ -63,3 +63,13 @@ flight-path checks are nonempty and have finite raw D3Q27 outputs, but all three
 fail the current aircraft-specific `span_sanity` validity check. The generated
 results must therefore remain non-claim-bearing for aircraft validity,
 aerodynamic prediction, structural viability, and method superiority.
+
+Tracked Airshow documentation and paper figures:
+
+- `docs/benchmarks/airshow_grounded_training_20260620.md`
+- `docs/dataset/airshow_corpus_addition_report_20260620.md`
+- `docs/dataset/airshow_corpus_replication_20260620.md`
+- `paper/figures/airshow_corpus_summary.png`
+- `paper/figures/airshow_training_losses.png`
+- `paper/figures/airshow_flight_path_metrics.png`
+- `paper/figures/airshow_generated_geometry.png`

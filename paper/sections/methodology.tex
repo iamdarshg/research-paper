@@ -1,6 +1,6 @@
 \section{Methodology}
 \label{sec:methodology}
-The current repository implements a proof-of-concept generative workflow built from four components: a noise scheduler, a latent diffusion-style denoiser, a latent-to-3D converter, and an internal CFD-oriented evaluator. The codebase operates on synthetic voxel training data and uses bounded smoke runs together with connectivity heuristics and aerodynamic score terms. In this revision, the same path also carries a documented structured condition vector through dataset generation, latent construction, and checkpointed inference. Figure \ref{fig:architecture} should therefore be read as an implementation diagram for the present repository rather than as evidence of a fully validated aircraft-design system.
+The current repository implements a proof-of-concept generative workflow built from four components: a noise scheduler, a latent diffusion-style denoiser, a latent-to-3D converter, and an internal CFD-oriented evaluator. The codebase now has two evidence tracks: deterministic synthetic/procedural smoke data retained for continuity, and a public VSP Airshow corpus used for the grounded training smoke run reported in Section \ref{sec:results}. In this revision, the same path also carries a documented structured condition vector through dataset generation, latent construction, and checkpointed inference. Figure \ref{fig:architecture} should therefore be read as an implementation diagram for the present repository rather than as evidence of a fully validated aircraft-design system.
 
 \begin{figure*}[!t]
 \centering
@@ -29,6 +29,18 @@ The current repository implements a proof-of-concept generative workflow built f
 \caption{Implementation-level view of the current repository. A latent code and optional structured condition vector are routed through denoising, voxel decoding, cleanup, internal scoring, and export paths. The diagram describes the code path under test; it does not by itself establish differentiable training, structural viability, or publication-grade CFD validation.}
 \label{fig:architecture}
 \end{figure*}
+
+\subsection{Public Airshow Corpus Construction}
+The grounded corpus path collects public model documents from the VSP Airshow web app, keeps only records whose Airshow license identifiers map to CC0, CC BY, or CC BY-SA, and requires a public preview-geometry URL before a record can enter the training manifest \cite{openvspGithub,openvspLicense,vspAirshow}. The builder parses available X3D indexed-face-set geometry, normalizes each mesh into a centered unit cube, voxelizes the occupied geometry into a \(16^3\) grid, and records source URLs, license metadata, geometry hashes, voxel hashes, split assignment, and preprocessing provenance. The deterministic split assignment is stored in the manifest so that later validation, training, and generation commands can be tied back to the same corpus lineage.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.94\textwidth]{figures/airshow_corpus_summary.png}
+\caption{Corpus construction summary for the public VSP Airshow smoke run. The plot shows the observed Airshow model-document count, license-and-geometry filtering, converted voxel records, admitted license mix, and deterministic train/validation/test/holdout split. These counts document data provenance and coverage; they do not certify manufacturer approval or aircraft performance.}
+\label{fig:airshow_corpus_summary}
+\end{figure*}
+
+The run used in this paper observed 381 public Airshow model documents, admitted 357 license-and-geometry-eligible documents, and converted 355 records after two public storage URLs returned 404. Figure \ref{fig:airshow_corpus_summary} visualizes that corpus funnel together with the license and split distributions. Airshow model names, manufacturer fields, URLs, and license labels are treated as source metadata only. The additional mission and manufacturing fields used by the condition vector are deterministic repository inferences from geometry and defaults, not factual claims made by NASA, Lockheed, OpenVSP, or any other named source.
 
 \subsection{Noise Scheduling}
 The forward diffusion process gradually adds Gaussian noise to the input data over a series of T timesteps. The noise schedule is defined by a variance schedule $\beta_t$, which is typically a linear or cosine schedule. The implementation uses a linear schedule, where $\beta_t$ increases linearly from $\beta_{start}$ to $\beta_{end}$.

@@ -44,7 +44,14 @@ Training scope & 3 epochs, batch 8, latent 16, D3Q27, global step 135 \\ \hline
 \end{tabular}
 \end{table}
 
-The final training epoch reported loss \(21.5905\), MSE \(0.7997\), geometry-reconstruction loss \(0.0778\), consistency loss \(0.00109\), connectivity loss \(0.00149\), and aerodynamic loss \(20.7104\). These values are terminal-observed smoke-run diagnostics, not convergence evidence. Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.
+The final training epoch reported loss \(21.5905\), MSE \(0.7997\), geometry-reconstruction loss \(0.0778\), consistency loss \(0.00109\), connectivity loss \(0.00149\), and aerodynamic loss \(20.7104\). These values are terminal-observed smoke-run diagnostics, not convergence evidence. Figure \ref{fig:airshow_training_losses} plots the same three-epoch history so the increasing total and aerodynamic terms remain visible rather than implied away. Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{figures/airshow_training_losses.png}
+\caption{Terminal-observed three-epoch Airshow smoke-training diagnostics. The plot is included to document the run, including the rising total and aerodynamic terms; it is not interpreted as convergence evidence.}
+\label{fig:airshow_training_losses}
+\end{figure}
 
 \begin{table}[!t]
 \centering
@@ -61,7 +68,21 @@ endurance turning & 0.01245 & 0.9824 & 0.04663 & fail: span sanity \\ \hline
 \end{tabular}
 \end{table}
 
-All three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas. However, all three failed the current aircraft-specific validity screen on the span-sanity check, and the CFD report marks the D3Q27 outputs as non-claim-bearing raw LBM labels. We therefore interpret this run as evidence that the public-corpus training, generator, export, heuristic-screen, and solver paths execute together; it is not evidence that the smoke checkpoint generates valid aircraft or validated aerodynamic predictions.
+All three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas. However, all three failed the current aircraft-specific validity screen on the span-sanity check, and the CFD report marks the D3Q27 outputs as non-claim-bearing raw LBM labels. Figures \ref{fig:airshow_flight_metrics} and \ref{fig:airshow_generated_geometry} show the raw metric spread and the generated voxel geometry/projection views. We therefore interpret this run as evidence that the public-corpus training, generator, export, heuristic-screen, and solver paths execute together; it is not evidence that the smoke checkpoint generates valid aircraft or validated aerodynamic predictions.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{figures/airshow_flight_path_metrics.png}
+\caption{Raw generated flight-path smoke metrics from the Airshow checkpoint. The occupancy, \(C_d\), and \(L/D\) values are finite internal D3Q27 outputs, but every case fails \texttt{span\_sanity} and the solver labels remain non-claim-bearing.}
+\label{fig:airshow_flight_metrics}
+\end{figure}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.94\textwidth]{figures/airshow_generated_geometry.png}
+\caption{Generated Airshow-checkpoint voxel geometries and orthographic occupancy projections for the three conditioned smoke cases. The visualized artifacts are intentionally shown despite failing \texttt{span\_sanity}: they demonstrate nonempty generation and exportable grids, while also showing why the current checkpoint should not be described as producing valid aircraft.}
+\label{fig:airshow_generated_geometry}
+\end{figure*}
 
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}
 We ran a compact sweep over generation step count and the shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, and computed aerodynamic metrics using the CPU CFD path. The sweep provides only a preliminary probe of how post-processing thresholds can alter the generated object before scoring; Figure \ref{fig:ld_sweep} documents the reduced coverage.
@@ -170,9 +191,9 @@ Unit cube & 1000 & 1.04 & $\sim$1.05 \cite{geier2015cascaded} \\ \hline
 \end{tabular}
 \end{table}
 
-The results in Table \ref{tab:cd_validation} provide an informal sanity check for our LBM implementation, framing the observations against typical literature targets for 3D flow. The tests were conducted in a $10L \times 5L \times 5L$ domain ($L$: characteristic length) using a $128^3$ grid, no-slip BFL wall conditions, and a Neumann outlet. We mapped physical velocity to $Ma=0.025$ ($u_{lattice} \approx 0.014$) and averaged forces over the final 125 steps of a 500-step simulation to reduce transient sensitivity.
+The results in Table \ref{tab:cd_validation} provide an informal sanity check for our LBM implementation, framing the observations against typical literature targets for 3D flow. The domain spans ten characteristic lengths in the streamwise direction and five characteristic lengths in each cross-stream direction, resolved with 128 cells per axis. The setup uses no-slip BFL wall conditions, a Neumann outlet, an inlet speed corresponding to \(Ma=0.025\) or approximately 0.014 in lattice units, and force averaging over the final 125 steps of a 500-step simulation to reduce transient sensitivity.
 
-Following corrections to the freestream lattice velocity initialization and BFL momentum exchange weighting ($4.0/(1+2q)$), the solver yields $C_d$ values close to or in the broad range of the cited targets. Exact 3D benchmarks are sensitive to blockage ratios and averaging criteria, so these results support continued use as a bounded implementation check while rigorous validation still requires comparison with high-fidelity PDE solvers.
+After correcting the freestream lattice-velocity initialization and the BFL momentum-exchange weighting term, the solver yields $C_d$ values close to or in the broad range of the cited targets. Exact 3D benchmarks are sensitive to blockage ratios and averaging criteria, so these results support continued use as a bounded implementation check while rigorous validation still requires comparison with high-fidelity PDE solvers.
 
 \subsection{Discussion}
 The implementation evidence supports three bounded conclusions: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM comparison case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline. The result supports a documented implementation path, not a claim of aircraft-level aerodynamic optimization.

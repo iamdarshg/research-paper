@@ -3,8 +3,8 @@
 Source: `paper/sections/related-work.tex`
 
 Detector results:
-- lmscan: `0.2151`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.012215`, fake max `0.036288`
+- lmscan: `0.2402`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.001538`, fake max `0.004273`
 
 Overall function: this section places the project among 3D diffusion, topology optimization, CFD shape optimization, physics-informed ML, and constraint-aware generation while repeatedly stating what this repository does not yet prove.
 

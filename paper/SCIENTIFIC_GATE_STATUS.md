@@ -103,6 +103,20 @@ coefficients, but all three fail the current aircraft-specific `span_sanity`
 screen. This run therefore supports code-path execution on hundreds of public
 geometries, not validated aircraft generation.
 
+Expanded Airshow artifacts:
+
+- benchmark note:
+  `docs/benchmarks/airshow_grounded_training_20260620.md`;
+- corpus addition report:
+  `docs/dataset/airshow_corpus_addition_report_20260620.md`;
+- replication document:
+  `docs/dataset/airshow_corpus_replication_20260620.md`;
+- paper figures:
+  `paper/figures/airshow_corpus_summary.png`,
+  `paper/figures/airshow_training_losses.png`,
+  `paper/figures/airshow_flight_path_metrics.png`, and
+  `paper/figures/airshow_generated_geometry.png`.
+
 ## Solver-Side Gate Support
 
 `AdvancedCFDSimulator.simulate_aerodynamics()` now emits a
@@ -147,5 +161,6 @@ Expected outcomes:
   `build/first_training/run_metadata.json`;
 - the generated reference manifest passes claim-bearing manifest validation;
 - the final evidence package passes for the deterministic reference-bundle scope;
-- larger trained-model claims remain blocked until the missing ablation,
-  convergence, structural, and prior-method studies exist.
+- larger trained-model claims remain blocked until generated samples pass
+  aircraft validity checks and the missing ablation, convergence, structural,
+  and prior-method studies exist.

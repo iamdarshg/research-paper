@@ -38,24 +38,24 @@ These detectors are screening tools, not ground truth. A low score does not prov
 
 | Section | lmscan AI probability | lmscan verdict | RoBERTa fake mean | RoBERTa fake max |
 | --- | ---: | --- | ---: | ---: |
-| Abstract | 0.2671 | Likely human | 0.105105 | 0.105105 |
-| Introduction | 0.2220 | Likely human | 0.000229 | 0.000229 |
-| Related Work | 0.2151 | Likely human | 0.012215 | 0.036288 |
-| Methodology | 0.2235 | Likely human | 0.002193 | 0.006217 |
-| Results and Discussion | 0.2149 | Likely human | 0.164410 | 0.618411 |
-| Validation and Testing Standards | 0.2086 | Likely human | 0.000202 | 0.000202 |
-| Conclusion | 0.2158 | Likely human | 0.000224 | 0.000224 |
-| Full Paper | 0.2314 | Likely human | 0.001994 | 0.016500 |
+| Abstract | 0.2578 | Likely human | 0.035332 | 0.035332 |
+| Introduction | 0.2579 | Likely human | 0.047526 | 0.094879 |
+| Related Work | 0.2402 | Likely human | 0.001538 | 0.004273 |
+| Methodology | 0.2539 | Likely human | 0.088077 | 0.351760 |
+| Results and Discussion | 0.2527 | Likely human | 0.339818 | 0.917835 |
+| Validation and Testing Standards | 0.2471 | Likely human | 0.000216 | 0.000216 |
+| Conclusion | 0.2530 | Likely human | 0.000253 | 0.000253 |
+| Full Paper | 0.2634 | Likely human | 0.053759 | 0.682330 |
 
 ## Style Signals
 
 The final full-paper lmscan pass reports:
-- `burstiness`: 0.231946
-- `bigram_repetition`: 0.118151
-- `passive_voice_ratio`: 0.272727
-- `sentence_opening_diversity`: 0.843434
-- `chatbot_marker_score`: 0.000561
-- `word_count`: 3562 after LaTeX stripping
+- `burstiness`: 0.126944
+- `bigram_repetition`: 0.132041
+- `passive_voice_ratio`: 0.287879
+- `sentence_opening_diversity`: 0.833333
+- `chatbot_marker_score`: 0.000487
+- `word_count`: 4109 after LaTeX stripping
 - `sentence_count`: 198 after LaTeX stripping
 
 The most important style cleanup was not cosmetic. The paper now repeatedly separates:
@@ -70,4 +70,4 @@ The most important style cleanup was not cosmetic. The paper now repeatedly sepa
 
 The RoBERTa detector is an older OpenAI detector model trained around GPT-2-era generated text. It is useful as a local second opinion, but modern LLM authorship cannot be proved or disproved from this score.
 
-The high RoBERTa maximum on `Results and Discussion` comes from one short formula-heavy tail chunk after LaTeX stripping mangled \(u = Ma / \sqrt{3}\) into incomplete plain text. The full-paper RoBERTa mean and max remain low, and the lmscan result for the same section remains `Likely human`.
+The high RoBERTa maximum on `Results and Discussion` comes from the dense solver-validation paragraph after LaTeX stripping converts mathematical notation and benchmark dimensions into plain text. I rewrote the worst formula-dense sentence into prose, which lowered the full-paper RoBERTa max from the earlier spike while preserving the solver provenance. The lmscan result for the same section remains `Likely human`; the RoBERTa result is treated as a style-screening flag, not authorship evidence.

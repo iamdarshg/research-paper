@@ -29,6 +29,7 @@ python CLI\build_airshow_corpus.py --output-dir build\airshow_grounded_corpus_20
 python CLI\validate_manifest.py --manifest build\airshow_grounded_corpus_20260620\manifest.jsonl --level claim-bearing
 python CLI\aircraft_diffusion_cfd.py train --num-epochs 3 --batch-size 8 --dataset-manifest build\airshow_grounded_corpus_20260620\manifest.jsonl --grid-size 16 --latent-dim 16 --save-dir build\airshow_training_20260620\checkpoints --disable-pipeline --disable-checkpointing --solver D3Q27
 python CLI\run_airshow_flight_path_tests.py --checkpoint build\airshow_training_20260620\checkpoints\final_optimized_model.pt --manifest build\airshow_grounded_corpus_20260620\manifest.jsonl --output-dir build\airshow_training_20260620\flight_path_tests --grid-size 16 --num-steps 4 --cfd-steps 100
+python CLI\render_airshow_figures.py --corpus-report build\airshow_grounded_corpus_20260620\corpus_report.json --flight-report build\airshow_training_20260620\flight_path_tests\flight_path_results.json --output-dir paper\figures
 ```
 
 ## Corpus Summary
@@ -88,6 +89,20 @@ All three cases produced nonempty voxel grids, STL files, finite D3Q27
 coefficients, and positive reference areas. All three also failed the current
 aircraft-specific validity screen on `span_sanity`, and all D3Q27 metrics are
 marked `claim_bearing_cfd=false` / `label_tier=lbm_raw`.
+
+## Paper Figures and Expanded Reports
+
+Derived paper figures:
+
+- `paper/figures/airshow_corpus_summary.png`
+- `paper/figures/airshow_training_losses.png`
+- `paper/figures/airshow_flight_path_metrics.png`
+- `paper/figures/airshow_generated_geometry.png`
+
+Expanded corpus and replication documents:
+
+- `docs/dataset/airshow_corpus_addition_report_20260620.md`
+- `docs/dataset/airshow_corpus_replication_20260620.md`
 
 ## Claim Boundary
 

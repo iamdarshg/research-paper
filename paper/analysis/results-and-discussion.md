@@ -3,10 +3,10 @@
 Source: `paper/sections/results-and-discussion.tex`
 
 Detector results from the fresh local checker pass after the Airshow subsection was added:
-- lmscan: `0.2149`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.164410`, fake max `0.618411`
+- lmscan: `0.2527`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.339818`, fake max `0.917835`
 
-RoBERTa caveat: the max-fake chunk comes from the short formula-heavy tail of the section after LaTeX stripping mangled \(u = Ma / \sqrt{3}\) into incomplete plain text. I treat that max as a style-screening flag, not as authorship evidence.
+RoBERTa caveat: the max-fake chunk comes from the dense solver-validation paragraph after LaTeX stripping converts benchmark dimensions, lattice speed, and \(C_d\) notation into plain text. I rewrote the most compressed formula sentence into prose and treat the remaining max as a style-screening flag, not authorship evidence.
 
 Overall function: this section reports the public Airshow corpus smoke run, the reduced evidence package, smoke runs, sweep coverage, and solver sanity checks while keeping all aerodynamic and structural claims bounded.
 
@@ -18,10 +18,10 @@ Overall function: this section reports the public Airshow corpus smoke run, the 
    - Word choices: `intentionally` shows deliberate claim discipline; `narrow` prevents benchmark overread.
    - Risk status: essential.
 
-2. `It consists of bounded smoke runs on synthetic or procedural data, a reduced freeform-object sweep for the historical CFD path, and smoke-level checks for the new structured-conditioning seam.`
+2. `It consists of public-geometry smoke training on VSP Airshow models, bounded smoke runs on synthetic or procedural data retained for context, a reduced freeform-object sweep for the historical CFD path, and smoke-level checks for the new structured-conditioning seam.`
    - Function: lists evidence sources.
    - Claim type: evidence inventory.
-   - Word choices: `bounded`, `synthetic`, `procedural`, `reduced`, and `smoke-level` are all maturity limiters.
+   - Word choices: `public-geometry smoke training` names the new Airshow evidence without overclaiming; `retained for context` explains why older synthetic/procedural runs remain; `reduced` and `smoke-level` are maturity limiters.
    - Risk status: grounded.
 
 3. `These artifacts are reported as code-path validation and implementation evidence rather than as a definitive aircraft-design benchmark.`
@@ -104,29 +104,77 @@ A7. `These values are terminal-observed smoke-run diagnostics, not convergence e
    - Word choices: `terminal-observed` states provenance; `not convergence evidence` prevents a training-quality overclaim.
    - Risk status: critical.
 
-A8. `Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.`
+A8. `Figure \ref{fig:airshow_training_losses} plots the same three-epoch history so the increasing total and aerodynamic terms remain visible rather than implied away.`
+   - Function: explains why the training-loss plot is included.
+   - Claim type: figure interpretation and evidence-boundary claim.
+   - Word choices: `same` prevents the figure from sounding like a second result; `remain visible` says the plot documents the non-monotone behavior; `implied away` is deliberately plain, warning against narrative smoothing.
+   - Risk status: grounded and useful.
+
+A9. `Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.`
    - Function: separates source facts from inferred conditioning fields.
    - Claim type: provenance boundary.
    - Word choices: `treated as source metadata` avoids certification language; `not facts asserted` directly addresses ground-truth risk.
    - Risk status: essential.
 
-A9. `All three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas.`
+A10. `Terminal-observed three-epoch Airshow smoke-training diagnostics.`
+   - Function: figure-caption title for the training plot.
+   - Claim type: figure framing.
+   - Word choices: `terminal-observed` gives provenance; `smoke-training` limits interpretation.
+   - Risk status: safe.
+
+A11. `The plot is included to document the run, including the rising total and aerodynamic terms; it is not interpreted as convergence evidence.`
+   - Function: caption limitation for the training plot.
+   - Claim type: figure boundary.
+   - Word choices: `document` is narrower than validate; `including` requires the negative-looking terms to stay visible; `not interpreted` blocks convergence overread.
+   - Risk status: critical.
+
+A12. `All three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas.`
    - Function: states what the three flight-path checks successfully exercised.
    - Claim type: code-path evidence.
    - Word choices: `nonempty`, `finite`, and `positive` are measurable smoke-test properties rather than quality claims.
    - Risk status: grounded by `flight_path_results.json`.
 
-A10. `However, all three failed the current aircraft-specific validity screen on the span-sanity check, and the CFD report marks the D3Q27 outputs as non-claim-bearing raw LBM labels.`
+A13. `However, all three failed the current aircraft-specific validity screen on the span-sanity check, and the CFD report marks the D3Q27 outputs as non-claim-bearing raw LBM labels.`
    - Function: reports the negative gate result.
    - Claim type: limitation and failure disclosure.
    - Word choices: `However` makes the reversal visible; `all three failed` avoids softening the result; `non-claim-bearing` aligns with report metadata.
    - Risk status: critical honesty sentence.
 
-A11. `We therefore interpret this run as evidence that the public-corpus training, generator, export, heuristic-screen, and solver paths execute together; it is not evidence that the smoke checkpoint generates valid aircraft or validated aerodynamic predictions.`
+A14. `Figures \ref{fig:airshow_flight_metrics} and \ref{fig:airshow_generated_geometry} show the raw metric spread and the generated voxel geometry/projection views.`
+   - Function: introduces the metric and geometry figures.
+   - Claim type: figure-navigation sentence.
+   - Word choices: `raw` prevents CFD overclaim; `generated voxel geometry/projection views` says exactly what the image shows.
+   - Risk status: safe.
+
+A15. `We therefore interpret this run as evidence that the public-corpus training, generator, export, heuristic-screen, and solver paths execute together; it is not evidence that the smoke checkpoint generates valid aircraft or validated aerodynamic predictions.`
    - Function: gives the allowed interpretation.
    - Claim type: evidence boundary.
    - Word choices: `therefore` ties interpretation to the failed gate; `execute together` is the supported claim; the final clause blocks aircraft and CFD overclaims.
    - Risk status: central guardrail.
+
+A16. `Raw generated flight-path smoke metrics from the Airshow checkpoint.`
+   - Function: metric-figure caption title.
+   - Claim type: figure framing.
+   - Word choices: `Raw` and `smoke` keep the metric plot from implying validated performance.
+   - Risk status: safe.
+
+A17. `The occupancy, \(C_d\), and \(L/D\) values are finite internal D3Q27 outputs, but every case fails \texttt{span\_sanity} and the solver labels remain non-claim-bearing.`
+   - Function: caption-level metric boundary.
+   - Claim type: limitation and result summary.
+   - Word choices: `finite` is the supported solver-quality property; `but every case fails` forces the negative gate into the visual summary; `non-claim-bearing` matches the JSON report.
+   - Risk status: critical.
+
+A18. `Generated Airshow-checkpoint voxel geometries and orthographic occupancy projections for the three conditioned smoke cases.`
+   - Function: geometry-figure caption title.
+   - Claim type: figure content claim.
+   - Word choices: `voxel geometries` and `orthographic occupancy projections` describe the actual rendered artifact; `smoke cases` limits significance.
+   - Risk status: safe.
+
+A19. `The visualized artifacts are intentionally shown despite failing \texttt{span\_sanity}: they demonstrate nonempty generation and exportable grids, while also showing why the current checkpoint should not be described as producing valid aircraft.`
+   - Function: turns the geometry figure into failure evidence, not decoration.
+   - Claim type: limitation and interpretive claim.
+   - Word choices: `despite failing` prevents cherry-picking; `nonempty generation` and `exportable grids` are supported positives; `should not be described` blocks the aircraft-validity overclaim.
+   - Risk status: essential.
 
 9. `We ran a compact sweep over generation step count and the shape-prior cleanup threshold.`
    - Function: introduces the freeform sweep.
@@ -284,22 +332,22 @@ A11. `We therefore interpret this run as evidence that the public-corpus trainin
    - Word choices: `informal` and `typical` soften exactness; `framing` avoids saying validated.
    - Risk status: grounded.
 
-35. `The tests were conducted in a $10L \times 5L \times 5L$ domain ($L$: characteristic length) using a $128^3$ grid, no-slip BFL wall conditions, and a Neumann outlet.`
-   - Function: gives reproducibility details.
+35. `The domain spans ten characteristic lengths in the streamwise direction and five characteristic lengths in each cross-stream direction, resolved with 128 cells per axis.`
+   - Function: gives reproducibility details in prose instead of a compressed formula.
    - Claim type: experiment setup.
-   - Word choices: exact geometry/grid/boundary terms make the claim checkable.
+   - Word choices: `spans` and `resolved` are standard setup verbs; spelling out the dimensions improves readability while preserving the domain size.
    - Risk status: grounded if generated from run configuration.
 
-36. `We mapped physical velocity to $Ma=0.025$ ($u_{lattice} \approx 0.014$) and averaged forces over the final 125 steps of a 500-step simulation to reduce transient sensitivity.`
-   - Function: records normalization and averaging details.
+36. `The setup uses no-slip BFL wall conditions, a Neumann outlet, an inlet speed corresponding to \(Ma=0.025\) or approximately 0.014 in lattice units, and force averaging over the final 125 steps of a 500-step simulation to reduce transient sensitivity.`
+   - Function: records boundary conditions, speed mapping, and averaging window.
    - Claim type: experiment setup.
-   - Word choices: `reduce transient sensitivity` is safer than `ensure stability`; exact values make it auditable.
+   - Word choices: `corresponding to` avoids overexplaining lattice conversion; `approximately` is appropriate for the lattice-speed mapping; `reduce transient sensitivity` is safer than `ensure stability`.
    - Risk status: grounded.
 
-37. `Following corrections to the freestream lattice velocity initialization and BFL momentum exchange weighting ($4.0/(1+2q)$), the solver yields $C_d$ values close to or in the broad range of the cited targets.`
+37. `After correcting the freestream lattice-velocity initialization and the BFL momentum-exchange weighting term, the solver yields $C_d$ values close to or in the broad range of the cited targets.`
    - Function: states corrected solver result level.
    - Claim type: solver sanity claim.
-   - Word choices: `close to or in the broad range` avoids exact validation; `cited targets` grounds comparison.
+   - Word choices: `After correcting` gives code-history context; `close to or in the broad range` avoids exact validation; `cited targets` grounds comparison.
    - Risk status: acceptable with caveats.
 
 38. `Exact 3D benchmarks are sensitive to blockage ratios and averaging criteria, so these results support continued use as a bounded implementation check while rigorous validation still requires comparison with high-fidelity PDE solvers.`

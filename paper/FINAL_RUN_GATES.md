@@ -45,6 +45,6 @@ Do **not** present a final training run as a paper result unless:
 - the relevant claim gate above has a passing executable/evidence report, and
 - the run can be reproduced in the current environment or on explicitly named external hardware.
 
-If a smoke run is executed only to verify the training code path or the conditioning plumbing, report it as:
+If a smoke run is executed only to verify the training code path, public-corpus path, or conditioning plumbing, report it as:
 
 > a bounded implementation smoke run on public/synthetic/freeform data that exercises the pipeline, not a publication-grade aircraft-design result.
