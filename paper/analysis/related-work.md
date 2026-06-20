@@ -3,8 +3,8 @@
 Source: `paper/sections/related-work.tex`
 
 Detector results:
-- lmscan: `0.2402`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.001538`, fake max `0.004273`
+- lmscan: `0.2248`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.003821`, fake max `0.011105`
 
 Overall function: this section places the project among 3D diffusion, topology optimization, CFD shape optimization, physics-informed ML, and constraint-aware generation while repeatedly stating what this repository does not yet prove.
 
@@ -257,3 +257,13 @@ The final table is a plan, not evidence. Its labels were chosen to name gated cl
 ## Audit Notes
 
 The section is relatively expansive: it covers five adjacent literatures and proposes future baselines. It is not hype-heavy because every comparison is paired with an evidence boundary or a future-work gate.
+
+## 2026-06-20 Originality Addendum
+
+The new comparison report `paper/analysis/originality-and-relevance-comparison.md`
+places the paper against Point-E, Shap-E, Point-Voxel Diffusion, AirfRANS,
+OpenVSP, AeroSandbox, and airfoil GAN work. The conclusion is intentionally
+mixed: the paper is not algorithmically original as a 3D diffusion method or as
+an aircraft optimization method, but it is comparatively original as a
+claim-gated, manifest-backed engineering workflow that keeps failed generated
+aircraft checks visible.

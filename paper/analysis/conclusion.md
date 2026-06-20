@@ -3,8 +3,8 @@
 Source: `paper/sections/conclusion.tex`
 
 Detector results:
-- lmscan: `0.2530`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.000253`, fake max `0.000253`
+- lmscan: `0.1767`, verdict `Human-written`, confidence `high`
+- RoBERTa detector: fake mean `0.000174`, fake max `0.000174`
 
 Overall function: the conclusion restates the working implementation, reduced evidence package, and exact future work required before stronger conditioned-aircraft claims.
 
@@ -67,3 +67,12 @@ Overall function: the conclusion restates the working implementation, reduced ev
 ## Audit Notes
 
 The conclusion is deliberately plain. It does not end with a triumphant claim. It ends with the actual state of the work and the evidence still needed.
+
+## 2026-06-20 Resolution Addendum
+
+The conclusion now names `16^3`, `32^3`, and `64^3` Airshow corpora and states
+the key limitation: completed generated samples remain solver-runnable but fail
+aircraft-specific validity checks, while the `64^3` corpus validated without a
+checkpoint being produced in the local run ceiling. This keeps the ending
+honest and prevents "higher resolution" from becoming an unsupported substitute
+for passing validity gates.

@@ -14,12 +14,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-import cadquery as cq
 import numpy as np
-import requests
 import torch
 import trimesh
-from cadquery import exporters
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +88,14 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def optional_module_version(module_name: str) -> str:
+    try:
+        module = __import__(module_name)
+    except ModuleNotFoundError:
+        return "not_installed"
+    return str(getattr(module, "__version__", ""))
 
 
 def load_source_catalog(
@@ -170,6 +175,8 @@ def load_existing_manifest_records(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def download_file(url: str, destination: Path) -> None:
+    import requests
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     response = requests.get(url, timeout=(30, 300))
     response.raise_for_status()
@@ -197,6 +204,15 @@ def extract_step(zip_path: Path, destination_dir: Path, member: str | None) -> P
 
 
 def export_step_to_stl(step_path: Path, stl_path: Path) -> None:
+    try:
+        import cadquery as cq
+        from cadquery import exporters
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "cadquery is required only for STEP-to-STL export. Install cadquery to build "
+            "the NASA CRM whole-aircraft geometry package, or use existing exported STL artifacts."
+        ) from exc
+
     shape = cq.importers.importStep(str(step_path))
     stl_path.parent.mkdir(parents=True, exist_ok=True)
     exporters.export(shape, str(stl_path), tolerance=0.5, angularTolerance=0.8)
@@ -877,7 +893,7 @@ def main() -> int:
             "torch": getattr(torch, "__version__", ""),
             "numpy": getattr(np, "__version__", ""),
             "trimesh": getattr(trimesh, "__version__", ""),
-            "cadquery": getattr(cq, "__version__", ""),
+            "cadquery": optional_module_version("cadquery"),
         },
         "source_catalog": {
             "catalog_path": str(source_catalog_path),

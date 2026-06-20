@@ -1,6 +1,6 @@
 \section{Results and Discussion}
 \label{sec:results}
-The empirical evidence in this revision is intentionally narrow. It consists of public-geometry smoke training on VSP Airshow models, bounded smoke runs on synthetic or procedural data retained for context, a reduced freeform-object sweep for the historical CFD path, and smoke-level checks for the new structured-conditioning seam. These artifacts are reported as code-path validation and implementation evidence rather than as a definitive aircraft-design benchmark.
+The empirical evidence in this revision is intentionally narrow. It consists of public-geometry smoke training on VSP Airshow models, a higher-resolution Airshow addendum, bounded smoke runs on synthetic or procedural data retained for context, a reduced freeform-object sweep for the historical CFD path, and smoke-level checks for the new structured-conditioning seam. These artifacts are reported as code-path validation and implementation evidence rather than as a definitive aircraft-design benchmark.
 
 \subsection{Reduced Training Smoke Evidence}
 Figure \ref{fig:loss_curves} summarizes the scope of the reduced training evidence retained for context. Its purpose is to show which code paths were exercised in bounded smoke runs. It should not be read as a convergence study or as evidence that the current repository has validated aerodynamic or structural learning behavior.
@@ -82,6 +82,39 @@ All three generated cases produced nonempty voxel grids, STL exports, finite int
 \includegraphics[width=0.94\textwidth]{figures/airshow_generated_geometry.png}
 \caption{Generated Airshow-checkpoint voxel geometries and orthographic occupancy projections for the three conditioned smoke cases. The visualized artifacts are intentionally shown despite failing \texttt{span\_sanity}: they demonstrate nonempty generation and exportable grids, while also showing why the current checkpoint should not be described as producing valid aircraft.}
 \label{fig:airshow_generated_geometry}
+\end{figure*}
+
+\subsection{Airshow Resolution Sweep}
+We also reran the Airshow corpus path at \(32^3\) and \(64^3\) to check whether higher voxel count alone would clear the generated-aircraft validity gate. Both higher-resolution manifests passed the claim-bearing manifest validator with the same 355 converted public Airshow records as the \(16^3\) run. The \(32^3\) training run completed one epoch with batch size 2 and produced checkpoint hash \texttt{7234e1b9b338...b95444}. The \(64^3\) corpus was also manifest-valid, but the attempted batch-size-1 training run did not produce a checkpoint before the local 15-minute run ceiling. This is an implementation limit as well as an empirical result: the current dense voxel decoder maps 2048 hidden units to \(grid\_resolution^3\) outputs, so the final decoder layer grows by roughly eight times when moving from \(32^3\) to \(64^3\).
+
+\begin{table}[!t]
+\centering
+\caption{Airshow Resolution Sweep Addendum}
+\label{tab:airshow_resolution_sweep}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|p{0.13\columnwidth}|p{0.23\columnwidth}|p{0.28\columnwidth}|p{0.24\columnwidth}|}
+\hline
+\textbf{Grid} & \textbf{Manifest} & \textbf{Training outcome} & \textbf{Generated gate outcome} \\ \hline
+\(32^3\) & pass, 355 records & one epoch completed on CUDA, batch 2 & three generated cases failed validity \\ \hline
+\(64^3\) & pass, 355 records & attempted batch 1; no checkpoint produced in local run ceiling & not run because no checkpoint existed \\ \hline
+\end{tabular}
+\end{table}
+
+The \(32^3\) manifest hash was \texttt{7684e70b...98521f1}, and the \(64^3\) manifest hash was \texttt{2627227f...4a1dbd80}. The \(32^3\) generated cases are shown in Figures \ref{fig:airshow_flight_metrics_g32} and \ref{fig:airshow_generated_geometry_g32}. Their occupancy fractions were 0.00494, 0.00476, and 0.00510. Their raw internal D3Q27 \(C_d\) values were finite, but all three failed the aircraft-validity screen: two failed \texttt{nonempty\_occupancy}, \texttt{symmetry}, and \texttt{span\_sanity}, while the third failed \texttt{symmetry} and \texttt{span\_sanity}. The result is therefore negative evidence against treating resolution alone as enough to make the present checkpoint claim-bearing.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{figures/airshow_flight_path_metrics_g32.png}
+\caption{Raw \(32^3\) generated flight-path metrics. The generated artifacts have finite internal D3Q27 outputs, but all still fail aircraft-validity gates and therefore remain non-claim-bearing.}
+\label{fig:airshow_flight_metrics_g32}
+\end{figure}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.94\textwidth]{figures/airshow_generated_geometry_g32.png}
+\caption{\(32^3\) generated Airshow-checkpoint voxel geometries and projections. The denser grid increases visual resolution but does not resolve the span-sanity and symmetry failures that block aircraft-generation claims.}
+\label{fig:airshow_generated_geometry_g32}
 \end{figure*}
 
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}

@@ -3,10 +3,10 @@
 Source paper: `paper/main.tex` and `paper/sections/*.tex`
 
 Generated artifacts:
-- Plain text extraction: `build/ai_check/*.txt`
-- Local lmscan JSON: `build/ai_check/*.lmscan.json`
-- lmscan summary: `build/ai_check/lmscan_summary.json`
-- Local RoBERTa detector summary: `build/ai_check/roberta_openai_detector_summary.json`
+- Plain text extraction: `build/ai_check_current/*.txt`
+- Local lmscan JSON: `build/ai_check_current/*.lmscan.json`
+- lmscan summary: `build/ai_check_current/lmscan_summary.json`
+- Local RoBERTa detector summary: `build/ai_check_current/roberta_openai_detector_summary.json`
 - Final evidence report: `build/protocol_final/final_evidence_package.json`
 
 Detector sources:
@@ -38,25 +38,25 @@ These detectors are screening tools, not ground truth. A low score does not prov
 
 | Section | lmscan AI probability | lmscan verdict | RoBERTa fake mean | RoBERTa fake max |
 | --- | ---: | --- | ---: | ---: |
-| Abstract | 0.2578 | Likely human | 0.035332 | 0.035332 |
-| Introduction | 0.2579 | Likely human | 0.047526 | 0.094879 |
-| Related Work | 0.2402 | Likely human | 0.001538 | 0.004273 |
-| Methodology | 0.2539 | Likely human | 0.088077 | 0.351760 |
-| Results and Discussion | 0.2527 | Likely human | 0.339818 | 0.917835 |
-| Validation and Testing Standards | 0.2471 | Likely human | 0.000216 | 0.000216 |
-| Conclusion | 0.2530 | Likely human | 0.000253 | 0.000253 |
-| Full Paper | 0.2634 | Likely human | 0.053759 | 0.682330 |
+| Abstract | 0.2571 | Likely human | 0.039344 | 0.039344 |
+| Introduction | 0.2217 | Likely human | 0.000229 | 0.000229 |
+| Related Work | 0.2248 | Likely human | 0.003821 | 0.011105 |
+| Methodology | 0.2193 | Likely human | 0.000178 | 0.000186 |
+| Results and Discussion | 0.1880 | Human-written | 0.155046 | 0.907542 |
+| Validation and Testing Standards | 0.2434 | Likely human | 0.000181 | 0.000181 |
+| Conclusion | 0.1767 | Human-written | 0.000174 | 0.000174 |
+| Full Paper | 0.2256 | Likely human | 0.086482 | 0.902928 |
 
 ## Style Signals
 
 The final full-paper lmscan pass reports:
-- `burstiness`: 0.126944
-- `bigram_repetition`: 0.132041
-- `passive_voice_ratio`: 0.287879
-- `sentence_opening_diversity`: 0.833333
-- `chatbot_marker_score`: 0.000487
-- `word_count`: 4109 after LaTeX stripping
-- `sentence_count`: 198 after LaTeX stripping
+- `burstiness`: 0.220973
+- `bigram_repetition`: 0.125275
+- `passive_voice_ratio`: 0.260664
+- `sentence_opening_diversity`: 0.829384
+- `chatbot_marker_score`: 0.000510
+- `word_count`: 3922 after LaTeX stripping
+- `sentence_count`: 211 after LaTeX stripping
 
 The most important style cleanup was not cosmetic. The paper now repeatedly separates:
 - what the code path actually demonstrates,
@@ -70,4 +70,19 @@ The most important style cleanup was not cosmetic. The paper now repeatedly sepa
 
 The RoBERTa detector is an older OpenAI detector model trained around GPT-2-era generated text. It is useful as a local second opinion, but modern LLM authorship cannot be proved or disproved from this score.
 
-The high RoBERTa maximum on `Results and Discussion` comes from the dense solver-validation paragraph after LaTeX stripping converts mathematical notation and benchmark dimensions into plain text. I rewrote the worst formula-dense sentence into prose, which lowered the full-paper RoBERTa max from the earlier spike while preserving the solver provenance. The lmscan result for the same section remains `Likely human`; the RoBERTa result is treated as a style-screening flag, not authorship evidence.
+The high RoBERTa maximum on `Results and Discussion` still comes from technical chunks after LaTeX stripping converts mathematical notation, tables, benchmark dimensions, lattice speed, and \(C_d\) notation into plain text. The lmscan result for the same section is now `Human-written`; the RoBERTa maximum is treated as a style-screening flag, not authorship evidence.
+
+## 2026-06-20 Resolution and Originality Addendum
+
+New supporting reports:
+- `docs/benchmarks/airshow_resolution_sweep_20260620.md`
+- `paper/analysis/originality-and-relevance-comparison.md`
+- `paper/analysis/local-paraphrase-and-style-pass.md`
+
+The paper now includes the `32^3` and `64^3` Airshow addendum. The update is
+negative evidence, not stronger claim evidence: the `32^3` generated samples
+failed aircraft-validity gates, and the `64^3` corpus validated but did not
+produce a checkpoint within the local run ceiling. No online paraphraser upload
+was used; the wording pass stayed local to avoid transmitting unpublished paper
+text. The refreshed local detector artifacts were written under
+`build/ai_check_current/`.

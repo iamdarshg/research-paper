@@ -19,10 +19,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
-import requests
 import torch
 import trimesh
-from shapely.geometry import Polygon
 
 import sys
 
@@ -126,6 +124,8 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def download_file(url: str, destination: Path) -> None:
+    import requests
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     response = requests.get(url, timeout=(30, 120))
     response.raise_for_status()
@@ -174,6 +174,8 @@ def compute_thickness_and_camber(naca_module, params: Sequence[int]) -> Tuple[fl
 
 
 def build_mesh(profile_points: np.ndarray, chord_m: float, span_m: float) -> trimesh.Trimesh:
+    from shapely.geometry import Polygon
+
     scaled = np.column_stack((profile_points[:, 0] * chord_m, profile_points[:, 1] * chord_m))
     polygon = Polygon(scaled)
     if not polygon.is_valid:

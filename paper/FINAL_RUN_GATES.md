@@ -12,7 +12,7 @@ aircraft-level claims listed below.
 
 With the repo and hardware available on 2026-06-20, the strongest currently supportable claim is:
 
-> The repository contains a proof-of-concept latent generative pipeline with a CFD-informed scoring path, STL export, deterministic reference evidence, structured-conditioning plumbing, and a public VSP Airshow smoke-training run on hundreds of traceable geometries. The generated Airshow-checkpoint samples currently fail aircraft span-sanity validity, so aircraft-level generation and performance claims remain blocked.
+> The repository contains a proof-of-concept latent generative pipeline with a CFD-informed scoring path, STL export, deterministic reference evidence, structured-conditioning plumbing, and public VSP Airshow smoke-training runs on hundreds of traceable geometries. The generated Airshow-checkpoint samples currently fail aircraft validity checks, and the `64^3` run did not produce a checkpoint under the local run ceiling, so aircraft-level generation and performance claims remain blocked.
 
 ## Claim Gates
 
@@ -34,7 +34,7 @@ With the repo and hardware available on 2026-06-20, the strongest currently supp
 3. At least one aircraft-specific validity test suite.
 4. A named baseline for aerodynamic comparison.
 5. A structural proxy stronger than simple connectivity.
-6. A fixed 8 GB GPU run protocol or access to larger hardware.
+6. A fixed 8 GB GPU run protocol, an architecture that scales beyond dense voxel decoding, or access to larger hardware.
 7. A passing final evidence package from `CLI/final_evidence.py`.
 8. Compressibility audit and evidence artifacts under `build/solver_diagnostics/compressibility_*`.
 9. For high-Mach claims, an external compressible OpenFOAM comparison or a validated thermal/compressible LBM path with shock/steep-gradient and boundary-condition tests.

@@ -8,6 +8,8 @@ pyyaml>=6.0
 tqdm>=4.65.0
 tensorboard>=2.13.0
 pydantic>=2.0.0
+requests>=2.31.0
+shapely>=2.0.0
 
 # Optional: For advanced CFD
 # fluidx3d>=1.0.0  # If integration desired later

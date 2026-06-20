@@ -103,6 +103,27 @@ Expanded corpus and replication documents:
 
 - `docs/dataset/airshow_corpus_addition_report_20260620.md`
 - `docs/dataset/airshow_corpus_replication_20260620.md`
+- `docs/benchmarks/airshow_resolution_sweep_20260620.md`
+
+## Higher-Resolution Addendum
+
+After the initial `16^3` Airshow run, we reran the same public-corpus builder at
+`32^3` and `64^3`. Both higher-resolution manifests passed the claim-bearing
+manifest validator with 355 converted records. The `32^3` run completed one
+training epoch on CUDA and produced checkpoint hash
+`7234e1b9b3381ce00e13776be05bff614afc008ffa675194c9b1326783b95444`, but all
+three generated flight-path checks still failed aircraft-validity gates. The
+`64^3` corpus was manifest-valid, with manifest hash
+`2627227fc337edf79a323ec63b50a79783eedbcaf3333b77aa02cfcd4a1dbd80`, but the
+attempted batch-1 training run did not produce a checkpoint within the local
+15-minute run ceiling.
+
+The added figures
+`paper/figures/airshow_flight_path_metrics_g32.png` and
+`paper/figures/airshow_generated_geometry_g32.png` show the `32^3` generated
+metrics and geometry. The result strengthens the same claim boundary: higher
+voxel count did not turn the current checkpoint into a claim-bearing aircraft
+generator.
 
 ## Claim Boundary
 

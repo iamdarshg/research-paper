@@ -3,8 +3,8 @@
 Source: `paper/sections/methodology.tex`
 
 Detector results:
-- lmscan: `0.2539`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.088077`, fake max `0.351760`
+- lmscan: `0.2193`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.000178`, fake max `0.000186`
 
 Overall function: this section describes the implemented architecture and the public Airshow corpus-construction path while avoiding claims that the solver is fully validated, differentiable through training, or proven to improve aircraft performance.
 
@@ -303,3 +303,11 @@ A10. `The additional mission and manufacturing fields used by the condition vect
 ## Audit Notes
 
 The methodology was deliberately rewritten away from phrases like "GPU-accelerated solver directly in the training loop" and "total loss" because those read stronger than the verified implementation path. The current version is technical, but its verbs are mostly code verbs: `implements`, `routes`, `exports`, `scores`, `invokes`, and `accumulates`.
+
+## 2026-06-20 Resolution Addendum
+
+The methodology now says the Airshow builder voxelizes into a fixed grid rather
+than only a `16^3` grid. That wording is necessary because the same public
+corpus path was rerun at `32^3` and `64^3`. The sentence still avoids implying
+that higher resolution validated aircraft generation; it only states that the
+corpus construction path supports multiple lattice sizes.

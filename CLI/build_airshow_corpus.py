@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import requests
 import trimesh
 
 
@@ -401,6 +400,8 @@ def _candidate_records(
 
 
 def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
+    import requests
+
     _configure_console_output()
     output_dir = Path(args.output_dir)
     raw_dir = output_dir / "raw_geometry"

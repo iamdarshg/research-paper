@@ -67,9 +67,17 @@ aerodynamic prediction, structural viability, and method superiority.
 Tracked Airshow documentation and paper figures:
 
 - `docs/benchmarks/airshow_grounded_training_20260620.md`
+- `docs/benchmarks/airshow_resolution_sweep_20260620.md`
 - `docs/dataset/airshow_corpus_addition_report_20260620.md`
 - `docs/dataset/airshow_corpus_replication_20260620.md`
 - `paper/figures/airshow_corpus_summary.png`
 - `paper/figures/airshow_training_losses.png`
 - `paper/figures/airshow_flight_path_metrics.png`
 - `paper/figures/airshow_generated_geometry.png`
+- `paper/figures/airshow_flight_path_metrics_g32.png`
+- `paper/figures/airshow_generated_geometry_g32.png`
+
+The higher-resolution addendum does not unlock stronger claims. The `32^3`
+Airshow checkpoint still produced three generated cases that failed
+aircraft-validity checks, and the `64^3` run validated the corpus but did not
+produce a checkpoint within the local run ceiling.

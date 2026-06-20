@@ -3,8 +3,8 @@
 Source: `paper/sections/results-and-discussion.tex`
 
 Detector results from the fresh local checker pass after the Airshow subsection was added:
-- lmscan: `0.2527`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.339818`, fake max `0.917835`
+- lmscan: `0.1880`, verdict `Human-written`, confidence `high`
+- RoBERTa detector: fake mean `0.155046`, fake max `0.907542`
 
 RoBERTa caveat: the max-fake chunk comes from the dense solver-validation paragraph after LaTeX stripping converts benchmark dimensions, lattice speed, and \(C_d\) notation into plain text. I rewrote the most compressed formula sentence into prose and treat the remaining max as a style-screening flag, not authorship evidence.
 
@@ -411,3 +411,17 @@ The final evidence table uses `Aircraft-shape screen` and `Manufacturing bounds`
 ## Audit Notes
 
 This section now has strong breadth: it covers training smoke evidence, shape cleanup, conditioning, package-level gates, solver sanity checks, and OpenFOAM comparison. Its wording stays defensible by using code-path verbs and by attaching every numeric or package claim to a reduced/local protocol context.
+
+## 2026-06-20 Resolution Addendum
+
+The results section now adds an `Airshow Resolution Sweep` subsection. Its
+function is to report the requested `32^3` and `64^3` reruns without converting
+them into success claims. The word choices `attempted`, `manifest-valid`, `no
+checkpoint produced`, `failed validity`, and `negative evidence` are deliberate:
+they map directly to the command outcomes.
+
+The new figures `airshow_flight_path_metrics_g32.png` and
+`airshow_generated_geometry_g32.png` serve the same purpose as the earlier
+Airshow visuals. They make the generated geometry inspectable while showing
+why the current checkpoint still should not be described as producing valid
+aircraft.

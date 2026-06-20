@@ -3,8 +3,8 @@
 Source: `paper/sections/introduction.tex`
 
 Detector results:
-- lmscan: `0.2579`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.047526`, fake max `0.094879`
+- lmscan: `0.2217`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.000229`, fake max `0.000229`
 
 Overall function: the introduction gives enough context to make the project interesting while preventing the reader from mistaking this branch for a finished aircraft-design system.
 
