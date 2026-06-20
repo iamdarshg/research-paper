@@ -181,7 +181,7 @@ class TrainingConfig:
     geometry_reconstruction_weight: float = 1.0
     generation_reconstruction_weight: float = 1.0
     # Pipeline parallelism
-    enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
+    enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
 
 
@@ -3565,7 +3565,7 @@ def cli():
 @click.option('--baseline-config', default=None, help='Required for final runs: baseline comparison config path')
 @click.option('--claim-gates', default=None, help='Required for final runs: path to FINAL_RUN_GATES.md')
 @click.option('--enable-consistency/--disable-consistency', default=True, help='Enable 4-step consistency model')
-@click.option('--enable-pipeline/--disable-pipeline', default=True, help='Enable pipeline parallelism')
+@click.option('--enable-pipeline/--disable-pipeline', default=False, help='Enable pipeline parallelism')
 @click.option('--enable-checkpointing/--disable-checkpointing', default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')

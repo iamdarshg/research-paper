@@ -12,7 +12,7 @@ train:
   run_class: smoke
   solver: D3Q27
   enable_consistency: true
-  enable_pipeline: true
+  enable_pipeline: false
   enable_checkpointing: true
   enable_compile: false
 

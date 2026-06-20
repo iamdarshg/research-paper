@@ -79,7 +79,7 @@ Current training options:
 - `--baseline-config` required for final runs
 - `--claim-gates` required for final runs
 - `--enable-consistency` / `--disable-consistency` (defaults on)
-- `--enable-pipeline` / `--disable-pipeline` (defaults on)
+- `--enable-pipeline` / `--disable-pipeline` (defaults off; sequential evaluator execution is the safe default)
 - `--enable-checkpointing` / `--disable-checkpointing` (defaults on)
 - `--enable-compile` defaults off
 - `--solver` default `D3Q27`

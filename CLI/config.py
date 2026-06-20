@@ -75,7 +75,7 @@ class TrainingConfig:
     save_interval: int = 5
     val_interval: int = 2
     # Pipeline parallelism
-    enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
+    enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
 
 @dataclass

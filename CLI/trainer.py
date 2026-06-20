@@ -211,13 +211,24 @@ class OptimizedDiffusionTrainer:
                     surrogate_loss_val = surr_loss
                     self.surrogate.last_val_mse.copy_(0.95 * self.surrogate.last_val_mse + 0.05 * surr_loss.detach())
 
-            total_loss_val = mse_loss_val + consist_loss_val + connectivity_loss_val + aero_loss_val + surrogate_loss_val
+            optimization_loss_val = (mse_loss_val + consist_loss_val + surrogate_loss_val).nan_to_num(0.0)
+            diagnostic_total_loss_val = (
+                optimization_loss_val.detach()
+                + connectivity_loss_val.detach()
+                + aero_loss_val.detach()
+            ).nan_to_num(0.0)
             self.optimizer.zero_grad()
-            total_loss_val.backward()
+            optimization_loss_val.backward()
             self.optimizer.step()
             self._update_ema()
             self.global_step += 1
-        return {'loss': total_loss_val.item()}
+        return {
+            'loss': optimization_loss_val.item(),
+            'optimization_loss': optimization_loss_val.item(),
+            'diagnostic_total': diagnostic_total_loss_val.item(),
+            'connectivity': connectivity_loss_val.item(),
+            'aerodynamic': aero_loss_val.item(),
+        }
 
     def train(self, train_loader, val_loader=None):
         from utils import get_vram_limit_resolution

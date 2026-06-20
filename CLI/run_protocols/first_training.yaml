@@ -27,7 +27,7 @@ train:
   baseline_config: ../../build/first_training/baseline_config.json
   claim_gates: ../../paper/FINAL_RUN_GATES.md
   enable_consistency: true
-  enable_pipeline: true
+  enable_pipeline: false
   enable_checkpointing: true
   enable_compile: false
 

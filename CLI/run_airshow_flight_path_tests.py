@@ -21,6 +21,10 @@ from aircraft_diffusion_cfd import (
     OptimizedAircraftGenerator,
 )
 from aircraft_validity import evaluate_aircraft_validity
+from sequential_diagnostic_optimizer import (
+    SequentialDiagnosticOptimizationConfig,
+    SequentialDiagnosticOptimizer,
+)
 
 
 CASES = [
@@ -135,6 +139,37 @@ def _prepare_voxel_for_solver(voxel_grid: torch.Tensor, device: torch.device) ->
     return voxel_grid.to(device=device, dtype=torch.float32)
 
 
+def _build_objective_optimizer(
+    args: argparse.Namespace,
+    cfd: AdvancedCFDSimulator,
+    device: torch.device,
+    seed: int,
+) -> SequentialDiagnosticOptimizer | None:
+    if args.objective_optimizer == "none":
+        return None
+    config = SequentialDiagnosticOptimizationConfig(
+        method=args.objective_optimizer,
+        population_size=args.objective_population_size,
+        generations=args.objective_generations,
+        elite_count=args.objective_elite_count,
+        mutation_rate=args.objective_mutation_rate,
+        mutation_sigma=args.objective_mutation_sigma,
+        symmetry_blend=args.objective_symmetry_blend,
+        spsa_steps=args.objective_spsa_steps,
+        spsa_perturbation=args.objective_spsa_perturbation,
+        spsa_learning_rate=args.objective_spsa_learning_rate,
+        connectivity_weight=args.objective_connectivity_weight,
+        aerodynamic_weight=args.objective_aerodynamic_weight,
+        validity_weight=args.objective_validity_weight,
+        occupancy_weight=args.objective_occupancy_weight,
+        target_occupancy=args.objective_target_occupancy,
+        enable_aerodynamic=not args.no_objective_cfd,
+        cfd_steps=args.cfd_steps,
+        seed=seed + args.objective_seed_offset,
+    )
+    return SequentialDiagnosticOptimizer(cfd, config=config, device=device)
+
+
 def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
     checkpoint_path = Path(args.checkpoint)
     manifest_path = Path(args.manifest)
@@ -161,10 +196,26 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
         with torch.no_grad():
             generated = generator.generate(spec, num_steps=args.num_steps)
         voxel = _prepare_voxel_for_solver(generated, device)
+        objective_optimizer = _build_objective_optimizer(args, cfd, device, seed)
+        optimization_report = None
+        pre_optimization_binary = (voxel > 0.5).detach().cpu().numpy().astype(np.float32)
+
+        if objective_optimizer is not None:
+            optimized = objective_optimizer.optimize(voxel, spec)
+            voxel = optimized["voxel_grid"].to(device=device, dtype=torch.float32)
+            optimization_report = {
+                key: value
+                for key, value in optimized.items()
+                if key not in {"voxel_grid", "binary_grid"}
+            }
+
         binary = (voxel > 0.5).detach().cpu().numpy().astype(np.float32)
 
         npy_path = generated_dir / f"{case['case_id']}.npy"
         stl_path = generated_dir / f"{case['case_id']}.stl"
+        pre_npy_path = generated_dir / f"{case['case_id']}_pre_objective_optimization.npy"
+        if optimization_report is not None:
+            np.save(pre_npy_path, pre_optimization_binary)
         np.save(npy_path, binary)
         generator.voxels_to_stl(voxel.detach().cpu(), str(stl_path), use_marching_cubes=True)
 
@@ -179,16 +230,23 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
                 "artifact_paths": {
                     "voxels_npy": str(npy_path),
                     "stl": str(stl_path),
+                    "pre_objective_optimization_voxels_npy": (
+                        str(pre_npy_path) if optimization_report is not None else None
+                    ),
                 },
                 "artifact_hashes": {
                     "voxels_npy_sha256": _sha256_file(npy_path),
                     "stl_sha256": _sha256_file(stl_path),
+                    "pre_objective_optimization_voxels_npy_sha256": (
+                        _sha256_file(pre_npy_path) if optimization_report is not None else None
+                    ),
                 },
                 "geometry_summary": {
                     "shape": list(binary.shape),
                     "occupied_voxels": occupied,
                     "occupancy_ratio": float(occupied / max(1, binary.size)),
                 },
+                "sequential_objective_optimization": _to_jsonable(optimization_report),
                 "cfd_metrics": _to_jsonable(cfd_metrics),
                 "validity": _to_jsonable(validity),
             }
@@ -205,12 +263,15 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
         "grid_size": args.grid_size,
         "num_steps": args.num_steps,
         "cfd_steps": args.cfd_steps,
+        "objective_optimizer": args.objective_optimizer,
         "case_count": len(results),
         "cases": results,
         "claim_boundary": (
             "Generated flight-path smoke checks from a public Airshow-corpus checkpoint. "
             "CFD metrics are internal D3Q27 implementation outputs and are not validated "
-            "aircraft-performance claims."
+            "aircraft-performance claims. When enabled, sequential objective optimization "
+            "uses measured connectivity, validity, and CFD scores as black-box candidate "
+            "selection losses; it is not gradient backpropagation through the solver."
         ),
     }
     output_path = output_dir / "flight_path_results.json"
@@ -228,6 +289,28 @@ def main() -> int:
     parser.add_argument("--num-steps", type=int, default=4)
     parser.add_argument("--cfd-steps", type=int, default=100)
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution.")
+    parser.add_argument(
+        "--objective-optimizer",
+        choices=["none", "genetic", "spsa"],
+        default="genetic",
+        help="Sequential black-box optimizer for measured connectivity/aero/validity losses.",
+    )
+    parser.add_argument("--objective-population-size", type=int, default=4)
+    parser.add_argument("--objective-generations", type=int, default=2)
+    parser.add_argument("--objective-elite-count", type=int, default=1)
+    parser.add_argument("--objective-mutation-rate", type=float, default=0.08)
+    parser.add_argument("--objective-mutation-sigma", type=float, default=0.20)
+    parser.add_argument("--objective-symmetry-blend", type=float, default=0.25)
+    parser.add_argument("--objective-spsa-steps", type=int, default=4)
+    parser.add_argument("--objective-spsa-perturbation", type=float, default=0.18)
+    parser.add_argument("--objective-spsa-learning-rate", type=float, default=0.04)
+    parser.add_argument("--objective-connectivity-weight", type=float, default=50.0)
+    parser.add_argument("--objective-aerodynamic-weight", type=float, default=1.0)
+    parser.add_argument("--objective-validity-weight", type=float, default=10.0)
+    parser.add_argument("--objective-occupancy-weight", type=float, default=0.0)
+    parser.add_argument("--objective-target-occupancy", type=float, default=0.03)
+    parser.add_argument("--objective-seed-offset", type=int, default=1000)
+    parser.add_argument("--no-objective-cfd", action="store_true", help="Disable CFD calls inside the sequential objective optimizer.")
     args = parser.parse_args()
     report = run_cases(args)
     print(json.dumps(report, indent=2, sort_keys=True))

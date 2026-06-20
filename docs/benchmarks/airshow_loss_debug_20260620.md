@@ -153,10 +153,59 @@ This argues against simply increasing epoch count on the current objective.
 The generated samples are close enough to exercise the pipeline, but the
 validity failures are systematic rather than random noise.
 
+## Sequential Objective Optimizer Follow-Up
+
+The repository now includes a sequential measured-objective optimizer in
+`CLI/sequential_diagnostic_optimizer.py`, and
+`CLI/run_airshow_flight_path_tests.py` can apply it before exporting each
+generated flight-path artifact. The optimizer turns connectivity, validity, and
+internal CFD scores into real candidate-selection losses:
+
+```text
+L_seq =
+  w_conn * D_conn
+  + w_aero * D_aero
+  + w_valid * D_valid
+  + w_occ * D_occ
+```
+
+Two methods are available:
+
+- `genetic`: sequentially evaluates a small population, keeps elites, and
+  mutates the next generation.
+- `spsa`: uses two measured perturbation evaluations to estimate a gradient-like
+  update direction in voxel-probability space.
+
+Both modes evaluate one candidate at a time. This makes the diagnostic scores
+real black-box optimization objectives, but it does not make the internal solver
+or connected-component labeling differentiable PyTorch operations. Training
+still backpropagates only through `L_opt`; the sequential objective optimizer
+acts on generated candidates during evaluation/export.
+
+Example command:
+
+```powershell
+python CLI\run_airshow_flight_path_tests.py `
+  --checkpoint build\airshow_training_20260620_g32_source_valid_lrfix\checkpoints\final_optimized_model.pt `
+  --manifest build\airshow_grounded_corpus_20260620_g32_source_valid\manifest.jsonl `
+  --output-dir build\airshow_training_20260620_g32_source_valid_lrfix\flight_path_tests_seqopt `
+  --grid-size 32 `
+  --num-steps 4 `
+  --cfd-steps 100 `
+  --objective-optimizer genetic `
+  --objective-population-size 4 `
+  --objective-generations 2 `
+  --cpu
+```
+
+The runner records the pre-optimization voxels, final selected voxels, objective
+history, candidate counts, and measured best/initial losses in
+`flight_path_results.json`.
+
 ## Recommended Next Approach
 
-The next credible route is sequential rather than pretending that raw solver
-scores are differentiable:
+The next credible route is now to run and report the sequential optimizer rather
+than pretending that raw solver scores are differentiable:
 
 1. Generate multiple candidate voxel grids per design condition.
 2. Run the aircraft-validity screen and internal solver on each candidate.
@@ -165,7 +214,7 @@ scores are differentiable:
    use a black-box optimization loop that records candidate scores and accepted
    updates.
 
-Until one of those loops exists and is validated, the paper should say that the
-repository has a CFD-oriented scoring path, not demonstrated CFD-guided
-gradient training.
-
+Until the sequential loop is run at benchmark scale and shows reliable
+candidate improvement, the paper should say that the repository has a
+CFD-oriented scoring path plus an experimental black-box candidate optimizer,
+not demonstrated CFD-guided gradient training.

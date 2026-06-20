@@ -311,3 +311,20 @@ than only a `16^3` grid. That wording is necessary because the same public
 corpus path was rerun at `32^3` and `64^3`. The sentence still avoids implying
 that higher resolution validated aircraft generation; it only states that the
 corpus construction path supports multiple lattice sizes.
+
+## 2026-06-21 Sequential Objective Addendum
+
+The methodology now adds a `Sequential Measured-Objective Candidate
+Optimization` subsection. Its function is to separate three ideas that are easy
+to conflate:
+
+- model-weight training still backpropagates through `L_opt`;
+- connectivity, validity, and aerodynamic scores can now drive a sequential
+  black-box candidate optimizer through `L_seq`;
+- that candidate optimizer is not differentiable CFD and is not yet benchmark
+  evidence that generated aircraft validity gates pass.
+
+The wording uses `measured black-box objective terms`, `sequential genetic
+search`, and `two-point SPSA-style estimator` because those phrases describe
+what the new code actually does. It avoids saying the solver is differentiable
+or that the diffusion model learns directly from the solver score.
