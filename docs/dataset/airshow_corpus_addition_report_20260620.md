@@ -94,8 +94,10 @@ Terminal-observed epoch metrics:
 | 2 | 20.2200 | 0.8463 | 0.07975 | 0.00219 | 0.04038 | 19.2514 |
 | 3 | 21.5905 | 0.7997 | 0.07782 | 0.00109 | 0.00149 | 20.7104 |
 
-The increasing total and aerodynamic terms are reported as observed. They are
-not convergence evidence.
+The increasing diagnostic total and aerodynamic diagnostic are reported as
+observed. A later loss-semantics audit showed that the connectivity and
+aerodynamic values from this trainer revision are detached diagnostics, not
+differentiable solver training signals. They are not convergence evidence.
 
 ## Generated Flight-Path Checks
 

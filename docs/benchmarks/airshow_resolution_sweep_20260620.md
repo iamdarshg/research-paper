@@ -55,9 +55,9 @@ at both resolutions.
 
 The `32^3` checkpoint hash is
 `7234e1b9b3381ce00e13776be05bff614afc008ffa675194c9b1326783b95444`.
-The observed epoch metrics were: loss `41.63597`, MSE `0.93468`,
-geometry-reconstruction loss `0.09601`, consistency loss `0.00613`,
-connectivity loss `1.05512`, and aerodynamic loss `39.54404`.
+The observed epoch metrics were: historical diagnostic total `41.63597`, MSE
+`0.93468`, geometry-reconstruction loss `0.09601`, consistency loss `0.00613`,
+connectivity diagnostic `1.05512`, and aerodynamic diagnostic `39.54404`.
 
 Three `32^3` generated flight-path checks were then run on CPU for the
 generator pass and internal D3Q27 smoke scoring:
@@ -74,6 +74,52 @@ figures added from this run are:
 
 - `paper/figures/airshow_flight_path_metrics_g32.png`
 - `paper/figures/airshow_generated_geometry_g32.png`
+
+## Source-Valid `32^3` Follow-Up
+
+The `32^3` manifest was also filtered through the same aircraft-validity screen
+used for generated outputs. Of 355 source records, 176 passed and 179 were
+rejected. The filtered manifest passed claim-bearing manifest validation with
+SHA-256
+`0d149d981730871fbab792bd28a42248e529545d03f531fc8b829f0d21d25ccc`.
+The filtered split counts are train 120, val 19, test 16, and holdout 21.
+
+The first fine-tune on this filtered manifest appeared to run, but later
+checkpoint comparison showed byte-identical model weights. The root cause was a
+resumed optimizer state whose learning rate had decayed to zero in the completed
+one-epoch checkpoint. After restoring the configured learning rate on resume, a
+three-epoch fine-tune produced checkpoint hash
+`657243eaeac0dfda9e7ca250770e860e73ad82834f591061d3609fb62145574c`.
+
+That LR-fixed source-valid checkpoint improved the generated validity profile
+but still did not pass the aircraft gate:
+
+| Case | Occupancy | Failed checks | Length fraction x | Symmetry score | Raw D3Q27 Cd |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `short_takeoff_payload` | 0.006226 | `span_sanity` | 0.25000 | 0.80392 | 0.58408 |
+| `high_speed_sprint` | 0.005554 | `span_sanity` | 0.25000 | 0.69231 | 0.57352 |
+| `endurance_turning` | 0.006104 | `span_sanity` | 0.28125 | 0.68000 | 0.44086 |
+
+An additional three-epoch continuation from that checkpoint regressed generated
+validity, with two of three samples failing both `symmetry` and `span_sanity`.
+This is negative evidence against simply increasing epoch count on the current
+objective.
+
+## Loss-Semantics Debugging
+
+The training loop now separates the differentiable optimization loss from
+detached diagnostics. The current connectivity term thresholds the voxel grid,
+runs connected-component labeling through NumPy/SciPy, and returns a fresh
+scalar tensor. The aerodynamic diagnostic thresholds geometry, runs the internal
+solver, and wraps scalar solver outputs back into a tensor. A local gradient
+probe confirmed that both terms have `requires_grad == False`.
+
+Therefore the historical `loss` values above should be read as diagnostic totals
+from the earlier trainer, not as the scalar that meaningfully taught the model
+aerodynamics or connectivity. The patched trainer reports `optimization_loss`
+for backpropagation and `diagnostic_total`, `connectivity`, and `aerodynamic`
+for monitoring. The detailed loss-debug report is
+`docs/benchmarks/airshow_loss_debug_20260620.md`.
 
 ## Implementation Scalability Note
 

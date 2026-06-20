@@ -3,8 +3,8 @@
 Source: `paper/sections/methodology.tex`
 
 Detector results:
-- lmscan: `0.2193`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.000178`, fake max `0.000186`
+- lmscan: `0.2701`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.008173`, fake max `0.043167`
 
 Overall function: this section describes the implemented architecture and the public Airshow corpus-construction path while avoiding claims that the solver is fully validated, differentiable through training, or proven to improve aircraft performance.
 
@@ -60,10 +60,10 @@ A1. `The grounded corpus path collects public model documents from the VSP Airsh
    - Word choices: `public model documents` avoids private or scraped-data implications; `keeps only` makes the license gate strict; `requires` states the geometry availability rule; `training manifest` names the artifact being controlled.
    - Risk status: grounded by `CLI/build_airshow_corpus.py` and the corpus report.
 
-A2. `The builder parses available X3D indexed-face-set geometry, normalizes each mesh into a centered unit cube, voxelizes the occupied geometry into a \(16^3\) grid, and records source URLs, license metadata, geometry hashes, voxel hashes, split assignment, and preprocessing provenance.`
+A2. `The builder parses available X3D indexed-face-set geometry, normalizes each mesh into a centered unit cube, voxelizes the occupied geometry into a fixed grid, and records source URLs, license metadata, geometry hashes, voxel hashes, split assignment, and preprocessing provenance.`
    - Function: describes the geometry conversion method.
    - Claim type: preprocessing method claim.
-   - Word choices: `available` avoids saying every Airshow record has usable geometry; `centered unit cube` and `16^3` state the representation; the hash/provenance list makes the corpus auditable.
+   - Word choices: `available` avoids saying every Airshow record has usable geometry; `centered unit cube` states the normalization; `fixed grid` covers the `16^3`, `32^3`, and `64^3` reruns without pretending resolution alone improves validity; the hash/provenance list makes the corpus auditable.
    - Risk status: grounded by the builder and manifest.
 
 A3. `The deterministic split assignment is stored in the manifest so that later validation, training, and generation commands can be tied back to the same corpus lineage.`
@@ -210,99 +210,99 @@ A10. `The additional mission and manufacturing fields used by the condition vect
    - Word choices: `useful` gives value; `not a substitute` blocks overclaim.
    - Risk status: essential.
 
-24. `A simplified loss used to describe the main claim-bearing terms combines diffusion, connectivity, and aerodynamic terms.`
-   - Function: introduces the loss without claiming full trainer completeness.
-   - Claim type: simplified-method description.
-   - Word choices: `simplified` is crucial because training code may include additional paths; `claim-bearing` tells the reader why these terms are discussed.
-   - Risk status: grounded.
+24. `A simplified view of the current training objective must distinguish the differentiable optimizer loss from detached scoring diagnostics.`
+   - Function: introduces the loss section by correcting the key implementation distinction.
+   - Claim type: method and limitation claim.
+   - Word choices: `must distinguish` is deliberately firm because the debug pass showed the older combined-loss wording was misleading; `differentiable optimizer loss` names what actually drives gradients; `detached scoring diagnostics` names what is logged but not backpropagated.
+   - Risk status: critical correction.
 
-25. `The diffusion loss is the mean squared error between the predicted noise and the actual noise.`
+25. `The optimizer step uses diffusion, decoded-geometry reconstruction, direct generation reconstruction, and consistency terms:`
+   - Function: lists the terms that actually enter the backpropagated objective.
+   - Claim type: implementation claim.
+   - Word choices: `optimizer step uses` ties the sentence to gradient flow; `direct generation reconstruction` identifies the added fast-sampler geometry term; the colon points to the equation rather than overexplaining in prose.
+   - Risk status: grounded by `combine_training_loss_terms`.
+
+26. `The diffusion loss is the mean squared error between the predicted noise and the actual noise.`
    - Function: defines diffusion loss.
    - Claim type: method claim.
    - Word choices: standard and precise.
    - Risk status: grounded.
 
-26. `The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis.`
-   - Function: defines connectivity term.
-   - Claim type: implementation/method claim.
-   - Word choices: `penalizes` describes training pressure; `connected components analysis` names mechanism.
+27. `The decoded-geometry and generation-reconstruction terms compare voxel logits against the target voxel grid, while the consistency term supports the reduced-step sampler.`
+   - Function: explains the non-diffusion optimizer terms.
+   - Claim type: implementation claim.
+   - Word choices: `compare` is accurate for the BCE-style loss; `voxel logits` avoids saying probabilities are compared at that point; `supports` avoids claiming validated sample quality improvement.
    - Risk status: grounded.
 
-27. `The aerodynamic term combines internal drag and lift-related scores as a heuristic pressure toward lower-drag and higher-lift proxy scores.`
-   - Function: describes aero term without claiming validated optimization.
-   - Claim type: heuristic scoring claim.
-   - Word choices: `heuristic pressure` and `proxy scores` are deliberately cautious; `internal` distinguishes from validated external CFD.
-   - Risk status: grounded and conservative.
+28. `The repository also logs a detached diagnostic total,`
+   - Function: introduces the diagnostic-total equation.
+   - Claim type: logging-contract claim.
+   - Word choices: `also logs` separates monitoring from optimization; `detached` encodes the gradient boundary.
+   - Risk status: grounded.
 
-28. `The codebase is designed to couple geometry generation and CFD-informed scoring during training.`
+29. `where \(\mathcal{D}_{conn}\) is a connected-component diagnostic on thresholded voxels and \(\mathcal{D}_{aero}\) is an internal solver score on thresholded generated geometry.`
+   - Function: defines the two diagnostic components.
+   - Claim type: implementation claim.
+   - Word choices: `diagnostic` replaces `loss` to avoid training-pressure overclaim; `thresholded` makes the nondifferentiable step visible; `internal solver score` avoids validated CFD wording.
+   - Risk status: critical.
+
+30. `These diagnostics are useful for monitoring and candidate ranking, but the present implementation does not backpropagate through connected-component labeling or through the CFD solver.`
+   - Function: states what the diagnostics can and cannot do.
+   - Claim type: limitation and future-route claim.
+   - Word choices: `useful` preserves their value; `monitoring and candidate ranking` names legitimate uses; `does not backpropagate` directly answers the aero/connectivity-loss concern.
+   - Risk status: essential.
+
+31. `The codebase is designed to couple geometry generation and CFD-informed scoring during training.`
    - Function: opens training-loop coupling section.
    - Claim type: design intent and code-path claim.
    - Word choices: `designed to` allows implementation without claiming effect; `CFD-informed` stays cautious.
    - Risk status: acceptable.
 
-29. `In the present implementation, that coupling should be understood as a practical score path rather than as a demonstrated differentiable CFD-training result.`
+32. `In the present implementation, that coupling should be understood as a practical score path rather than as a demonstrated differentiable CFD-training result.`
    - Function: prevents differentiability overclaim.
    - Claim type: limitation claim.
    - Word choices: `present implementation` and `practical score path` name the true status; `rather than` blocks a strong claim.
    - Risk status: critical.
 
-30. `The current repository evidence is limited to a reduced final protocol, so we only claim that the training code can invoke aerodynamic scoring terms and route generated geometries through the evaluator.`
+33. `The current repository evidence is limited to a reduced final protocol, so we only claim that the training code can invoke aerodynamic scoring terms and route generated geometries through the evaluator.`
    - Function: states exactly what the evidence supports.
    - Claim type: evidence boundary.
    - Word choices: `only claim` is intentionally strict; `invoke` and `route` are code-path verbs, not performance verbs.
    - Risk status: central guardrail.
 
-31. `Step 1: Sample noisy latent z_t.`
-   - Function: first algorithm step.
+34. `In the current loop, training starts by sampling a noisy latent \(z_t\), asking the UNet for a noise estimate or denoised latent estimate, and decoding the resulting \(z_0\) candidate into a voxel grid \(V\).`
+   - Function: describes the differentiable model-side training path in prose.
    - Claim type: procedural description.
-   - Word choices: terse step language supports reproducibility.
+   - Word choices: `current loop` anchors the description to implementation; `asking the UNet` is plainer than a step list; `candidate` keeps the decoded grid provisional.
    - Risk status: grounded.
 
-32. `Step 2: Predict noise or a denoised latent estimate using the UNet.`
-   - Function: second algorithm step.
-   - Claim type: procedural description.
-   - Word choices: `or` is important because code paths can differ; avoids forcing a single theoretical interpretation.
+35. `That decoded grid can then be routed through the internal D3Q27 LBM evaluator to compute \(C_L\) and \(C_D\) diagnostics.`
+   - Function: states where solver diagnostics enter the loop.
+   - Claim type: procedural and limitation claim.
+   - Word choices: `can then be routed` avoids saying the route always drives gradients; `internal` and `diagnostics` keep solver evidence bounded.
    - Risk status: grounded.
 
-33. `Step 3: Decode z_0 to voxel grid V.`
-   - Function: third algorithm step.
-   - Claim type: procedural description.
-   - Word choices: notation is compact and standard.
-   - Risk status: grounded.
+36. `The optimizer update itself still comes from \(\mathcal{L}_{opt}\), while connectivity and aerodynamic scores are logged as detached diagnostics.`
+   - Function: closes the loop description with the optimizer/diagnostic split.
+   - Claim type: implementation contract.
+   - Word choices: `itself still comes from` is intentionally explicit; `logged as detached diagnostics` is the core correction from the debugging pass.
+   - Risk status: critical.
 
-34. `Step 4: Run the internal D3Q27 LBM evaluator on V.`
-   - Function: fourth algorithm step.
-   - Claim type: procedural description.
-   - Word choices: `internal` and `evaluator` avoid pretending this is the final external solver.
-   - Risk status: grounded.
-
-35. `Step 5: Compute aerodynamic coefficients C_L, C_D.`
-   - Function: fifth algorithm step.
-   - Claim type: procedural description.
-   - Word choices: coefficient notation is standard; this remains tied to the internal evaluator context.
-   - Risk status: acceptable with surrounding caveats.
-
-36. `Step 6: Accumulate scalar loss terms for the optimizer.`
-   - Function: sixth algorithm step.
-   - Claim type: procedural description.
-   - Word choices: `accumulate scalar loss terms` is more accurate than claiming each term directly updates weights.
-   - Risk status: grounded.
-
-37. `In a stronger future version of this pipeline, the repository would need ablations showing that the aerodynamic term measurably changes either the training dynamics or the ranking of generated candidates.`
-   - Function: defines the future evidence needed for mechanism claims.
+37. `In a stronger future version of this pipeline, the repository would need either a validated differentiable surrogate or a sequential candidate-scoring loop showing that solver feedback measurably changes generated candidates.`
+   - Function: defines the future evidence needed for solver-guided generation claims.
    - Claim type: future validation requirement.
-   - Word choices: `stronger future version` keeps the current claim limited; `measurably changes` defines what proof would look like.
+   - Word choices: `either` gives the two credible paths; `validated differentiable surrogate` and `sequential candidate-scoring loop` avoid pretending the current solver already supplies gradients; `measurably changes` defines the evidence threshold.
    - Risk status: good guardrail.
 
-38. `Until such evidence exists, the paper treats the CFD term as an implemented scoring mechanism whose training effect is not yet fully validated.`
+38. `For now, the CFD path is an implemented scoring mechanism rather than evidence of CFD-guided gradient training.`
    - Function: closes with the correct present claim.
    - Claim type: limitation and grounding claim.
-   - Word choices: `implemented scoring mechanism` is the defensible claim; `not yet fully validated` reserves stronger conclusions.
+   - Word choices: `For now` keeps future room; `implemented scoring mechanism` is the defensible claim; `rather than evidence` blocks the exact overclaim found during debugging.
    - Risk status: essential.
 
 ## Audit Notes
 
-The methodology was deliberately rewritten away from phrases like "GPU-accelerated solver directly in the training loop" and "total loss" because those read stronger than the verified implementation path. The current version is technical, but its verbs are mostly code verbs: `implements`, `routes`, `exports`, `scores`, `invokes`, and `accumulates`.
+The methodology was deliberately rewritten away from phrases like "GPU-accelerated solver directly in the training loop" and "combined aerodynamic loss" because those read stronger than the verified implementation path. The current version is technical, but its verbs are mostly code verbs: `implements`, `routes`, `exports`, `scores`, `invokes`, `logs`, and `updates`.
 
 ## 2026-06-20 Resolution Addendum
 

@@ -35,12 +35,26 @@ class TestTrainingStability(unittest.TestCase):
         metrics = {
             "mse": 1.0,
             "geometry_reconstruction": 2.0,
-            "consistency": 3.0,
+            "generation_reconstruction": 3.0,
+            "consistency": 4.0,
             "connectivity": 4.0,
             "aerodynamic": 100.0,
         }
 
         self.assertEqual(compute_core_loss(metrics), 10.0)
+
+    def test_compute_core_loss_prefers_explicit_optimization_loss(self):
+        metrics = {
+            "optimization_loss": 7.5,
+            "mse": 1.0,
+            "geometry_reconstruction": 2.0,
+            "generation_reconstruction": 3.0,
+            "consistency": 4.0,
+            "connectivity": 400.0,
+            "aerodynamic": 1000.0,
+        }
+
+        self.assertEqual(compute_core_loss(metrics), 7.5)
 
     def test_summarize_stability_marks_converged_window(self):
         history = []

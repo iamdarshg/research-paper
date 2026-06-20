@@ -73,12 +73,14 @@ Expected final epoch metrics:
 - MSE: 0.7997
 - geometry-reconstruction loss: 0.0778
 - consistency loss: 0.00109
-- connectivity loss: 0.00149
-- aerodynamic loss: 20.7104
+- connectivity diagnostic: 0.00149
+- aerodynamic diagnostic: 20.7104
 - global step: 135
 
-These are smoke-run diagnostics. They should not be interpreted as convergence
-or generalization evidence.
+These are smoke-run diagnostics. A later loss-semantics audit showed that the
+connectivity and aerodynamic values are detached diagnostics, not differentiable
+solver training signals. They should not be interpreted as convergence,
+generalization, or CFD-guided gradient evidence.
 
 ## Step 4: Run Three Flight-Path Smoke Checks
 

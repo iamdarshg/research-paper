@@ -62,23 +62,26 @@ The latent-to-3D converter is a multi-layer perceptron (MLP) that maps the denoi
 The repository uses an internal lattice-Boltzmann-style CFD evaluator to score generated voxel grids. The evaluator takes a voxel geometry and flow settings such as Mach number or Reynolds number and returns drag- and lift-related quantities. In addition, the repository can export benchmark cases for comparison against an external OpenFOAM run. This combination is useful for code-path validation, but the present paper does not treat it as a substitute for a full aerodynamic validation campaign.
 
 \subsection{Loss Function}
-A simplified loss used to describe the main claim-bearing terms combines diffusion, connectivity, and aerodynamic terms.
+A simplified view of the current training objective must distinguish the differentiable optimizer loss from detached scoring diagnostics. The optimizer step uses diffusion, decoded-geometry reconstruction, direct generation reconstruction, and consistency terms:
 
 \begin{equation}
-\mathcal{L} = \lambda_{diff} \mathcal{L}_{diff} + \lambda_{conn} \mathcal{L}_{conn} + \lambda_{aero} \mathcal{L}_{aero}
+\mathcal{L}_{opt} =
+\mathcal{L}_{diff}
++ \lambda_{geom}\mathcal{L}_{geom}
++ \lambda_{gen}\mathcal{L}_{gen}
++ \mathcal{L}_{cons}.
 \end{equation}
 
-The diffusion loss is the mean squared error between the predicted noise and the actual noise. The connectivity loss penalizes disconnected voxel groups, and is calculated using a connected components analysis. The aerodynamic term combines internal drag and lift-related scores as a heuristic pressure toward lower-drag and higher-lift proxy scores.
+The diffusion loss is the mean squared error between the predicted noise and the actual noise. The decoded-geometry and generation-reconstruction terms compare voxel logits against the target voxel grid, while the consistency term supports the reduced-step sampler. The repository also logs a detached diagnostic total,
+
+\begin{equation}
+\mathcal{D}_{total} = \mathcal{L}_{opt} + \mathcal{D}_{conn} + \mathcal{D}_{aero},
+\end{equation}
+
+where \(\mathcal{D}_{conn}\) is a connected-component diagnostic on thresholded voxels and \(\mathcal{D}_{aero}\) is an internal solver score on thresholded generated geometry. These diagnostics are useful for monitoring and candidate ranking, but the present implementation does not backpropagate through connected-component labeling or through the CFD solver.
 
 \subsection{Current CFD Coupling In The Training Loop}
 The codebase is designed to couple geometry generation and CFD-informed scoring during training. In the present implementation, that coupling should be understood as a practical score path rather than as a demonstrated differentiable CFD-training result. The current repository evidence is limited to a reduced final protocol, so we only claim that the training code can invoke aerodynamic scoring terms and route generated geometries through the evaluator.
 
-\begin{itemize}
-    \item \textbf{Step 1:} Sample noisy latent $z_t$.
-    \item \textbf{Step 2:} Predict noise or a denoised latent estimate using the UNet.
-    \item \textbf{Step 3:} Decode $z_0$ to voxel grid $V$.
-    \item \textbf{Step 4:} Run the internal D3Q27 LBM evaluator on $V$.
-    \item \textbf{Step 5:} Compute aerodynamic coefficients $C_L, C_D$.
-    \item \textbf{Step 6:} Accumulate scalar loss terms for the optimizer.
-\end{itemize}
-In a stronger future version of this pipeline, the repository would need ablations showing that the aerodynamic term measurably changes either the training dynamics or the ranking of generated candidates. Until such evidence exists, the paper treats the CFD term as an implemented scoring mechanism whose training effect is not yet fully validated.
+In the current loop, training starts by sampling a noisy latent \(z_t\), asking the UNet for a noise estimate or denoised latent estimate, and decoding the resulting \(z_0\) candidate into a voxel grid \(V\). That decoded grid can then be routed through the internal D3Q27 LBM evaluator to compute \(C_L\) and \(C_D\) diagnostics. The optimizer update itself still comes from \(\mathcal{L}_{opt}\), while connectivity and aerodynamic scores are logged as detached diagnostics.
+In a stronger future version of this pipeline, the repository would need either a validated differentiable surrogate or a sequential candidate-scoring loop showing that solver feedback measurably changes generated candidates. For now, the CFD path is an implemented scoring mechanism rather than evidence of CFD-guided gradient training.

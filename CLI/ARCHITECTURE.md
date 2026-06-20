@@ -258,10 +258,11 @@ For each batch:
   2. Add noise to latent (forward diffusion)
   3. Predict noise (diffusion model)
   4. Compute MSE loss (diffusion term)
-  5. Compute connectivity loss (constraint)
-  6. Every 5 batches: Simulate CFD, compute aero loss
+  5. Compute connectivity diagnostic (detached score)
+  6. Every 10 batches: Simulate CFD, compute aerodynamic diagnostic
   
-  Total loss = α₁ * MSE + α₂ * Connectivity + α₃ * Aero
+  Optimization loss = MSE + geometry reconstruction + generation reconstruction + consistency
+  Diagnostic total = optimization loss + connectivity diagnostic + aerodynamic diagnostic
 ```
 
 ### Phase 3: Backpropagation

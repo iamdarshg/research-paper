@@ -3,8 +3,8 @@
 Source: `paper/sections/introduction.tex`
 
 Detector results:
-- lmscan: `0.2217`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.000229`, fake max `0.000229`
+- lmscan: `0.2614`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.000174`, fake max `0.000179`
 
 Overall function: the introduction gives enough context to make the project interesting while preventing the reader from mistaking this branch for a finished aircraft-design system.
 
@@ -76,41 +76,17 @@ Overall function: the introduction gives enough context to make the project inte
    - Word choices: `issue-driven` points to repository process; `distinguishes` is the core contribution; the named stronger claims are listed so they are explicitly not implied.
    - Risk status: grounded by the final evidence gate structure and validation section.
 
-12. `The rest of the paper is organized as follows.`
-   - Function: starts the roadmap.
-   - Claim type: structure sentence.
-   - Word choices: conventional and unobtrusive.
-   - Risk status: no factual risk.
-
-13. `Section \ref{sec:related_work} positions the repository relative to 3D generative modeling, topology optimization, and CFD-driven design practice.`
-   - Function: previews Related Work.
+12. `The remainder of the paper first places the repository beside 3D generative modeling, topology optimization, and CFD-driven design practice, then describes the implementation that exists in the codebase.`
+   - Function: previews the related-work and methodology sequence without repetitive section-name phrasing.
    - Claim type: roadmap.
-   - Word choices: `positions` avoids claiming exhaustive survey; the three fields match the section.
+   - Word choices: `places the repository beside` avoids claiming an exhaustive survey; `exists in the codebase` keeps the method preview tied to implemented behavior.
    - Risk status: grounded.
 
-14. `Section \ref{sec:methodology} describes the implementation that currently exists in the codebase.`
-   - Function: previews Methodology.
-   - Claim type: roadmap.
-   - Word choices: `currently exists` prevents future or intended features from leaking into methodology claims.
-   - Risk status: grounded if methodology remains code-aligned.
-
-15. `Section \ref{sec:results} reports the reduced final-protocol evidence and explains its limits.`
-   - Function: previews Results.
-   - Claim type: roadmap.
-   - Word choices: `reduced` and `limits` are deliberate guardrails; `reports` avoids claiming proof.
-   - Risk status: grounded by final evidence package.
-
-16. `Section \ref{sec:validation} records the validation requirements that remain before stronger claims can be made.`
-   - Function: previews Validation.
+13. `It then reports the reduced final-protocol evidence, records the validation requirements that still block stronger claims, and closes by summarizing the present scope and the minimum future work needed for a conditioned airplane generator.`
+   - Function: previews the evidence, validation, and conclusion sequence.
    - Claim type: roadmap and future-work boundary.
-   - Word choices: `remain` and `before` make the unfinished nature explicit; `stronger claims` ties back to contribution three.
-   - Risk status: grounded.
-
-17. `Section \ref{sec:conclusion} summarizes the present scope and the minimum future work needed for a conditioned airplane generator.`
-   - Function: previews Conclusion.
-   - Claim type: roadmap.
-   - Word choices: `present scope` and `minimum future work` keep the close bounded; `conditioned airplane generator` names the desired stronger target without claiming it exists.
-   - Risk status: grounded by conclusion wording.
+   - Word choices: `reduced`, `still block`, `present scope`, and `minimum future work` keep the roadmap bounded; `conditioned airplane generator` names the desired stronger target without claiming it exists.
+   - Risk status: grounded by results, validation, and conclusion wording.
 
 ## Audit Notes
 

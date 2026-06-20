@@ -44,12 +44,12 @@ Training scope & 3 epochs, batch 8, latent 16, D3Q27, global step 135 \\ \hline
 \end{tabular}
 \end{table}
 
-The final training epoch reported loss \(21.5905\), MSE \(0.7997\), geometry-reconstruction loss \(0.0778\), consistency loss \(0.00109\), connectivity loss \(0.00149\), and aerodynamic loss \(20.7104\). These values are terminal-observed smoke-run diagnostics, not convergence evidence. Figure \ref{fig:airshow_training_losses} plots the same three-epoch history so the increasing total and aerodynamic terms remain visible rather than implied away. Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.
+The last epoch's terminal output is kept in the paper because it is the run record: diagnostic total \(21.5905\), MSE \(0.7997\), geometry-reconstruction loss \(0.0778\), consistency loss \(0.00109\), connectivity diagnostic \(0.00149\), and aerodynamic diagnostic \(20.7104\). These values are smoke-run diagnostics only, not convergence evidence. A later loss-semantics audit showed that the connectivity and aerodynamic quantities in this implementation are detached diagnostics rather than differentiable solver-training signals. Figure \ref{fig:airshow_training_losses} plots the same three-epoch history so the increasing diagnostic total and aerodynamic diagnostic remain visible rather than implied away. Airshow names, manufacturer fields, licenses, and URLs are treated as source metadata; the generated mission and manufacturing fields in the manifest are deterministic conditioning inferences, not facts asserted by the named manufacturers or agencies.
 
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/airshow_training_losses.png}
-\caption{Terminal-observed three-epoch Airshow smoke-training diagnostics. The plot is included to document the run, including the rising total and aerodynamic terms; it is not interpreted as convergence evidence.}
+\caption{Terminal-observed three-epoch Airshow smoke-training diagnostics. The plot is included to document the run, including the rising diagnostic total and aerodynamic diagnostic; it is not interpreted as convergence evidence.}
 \label{fig:airshow_training_losses}
 \end{figure}
 
@@ -84,7 +84,7 @@ All three generated cases produced nonempty voxel grids, STL exports, finite int
 \label{fig:airshow_generated_geometry}
 \end{figure*}
 
-\subsection{Airshow Resolution Sweep}
+\subsection{Airshow Resolution Sweep and Loss Debugging}
 We also reran the Airshow corpus path at \(32^3\) and \(64^3\) to check whether higher voxel count alone would clear the generated-aircraft validity gate. Both higher-resolution manifests passed the claim-bearing manifest validator with the same 355 converted public Airshow records as the \(16^3\) run. The \(32^3\) training run completed one epoch with batch size 2 and produced checkpoint hash \texttt{7234e1b9b338...b95444}. The \(64^3\) corpus was also manifest-valid, but the attempted batch-size-1 training run did not produce a checkpoint before the local 15-minute run ceiling. This is an implementation limit as well as an empirical result: the current dense voxel decoder maps 2048 hidden units to \(grid\_resolution^3\) outputs, so the final decoder layer grows by roughly eight times when moving from \(32^3\) to \(64^3\).
 
 \begin{table}[!t]
@@ -98,10 +98,15 @@ We also reran the Airshow corpus path at \(32^3\) and \(64^3\) to check whether 
 \textbf{Grid} & \textbf{Manifest} & \textbf{Training outcome} & \textbf{Generated gate outcome} \\ \hline
 \(32^3\) & pass, 355 records & one epoch completed on CUDA, batch 2 & three generated cases failed validity \\ \hline
 \(64^3\) & pass, 355 records & attempted batch 1; no checkpoint produced in local run ceiling & not run because no checkpoint existed \\ \hline
+\(32^3\), source-valid filter & pass, 176 records & three-epoch LR-fixed fine-tune completed from the \(32^3\) checkpoint & three generated cases failed only \texttt{span\_sanity} \\ \hline
 \end{tabular}
 \end{table}
 
 The \(32^3\) manifest hash was \texttt{7684e70b...98521f1}, and the \(64^3\) manifest hash was \texttt{2627227f...4a1dbd80}. The \(32^3\) generated cases are shown in Figures \ref{fig:airshow_flight_metrics_g32} and \ref{fig:airshow_generated_geometry_g32}. Their occupancy fractions were 0.00494, 0.00476, and 0.00510. Their raw internal D3Q27 \(C_d\) values were finite, but all three failed the aircraft-validity screen: two failed \texttt{nonempty\_occupancy}, \texttt{symmetry}, and \texttt{span\_sanity}, while the third failed \texttt{symmetry} and \texttt{span\_sanity}. The result is therefore negative evidence against treating resolution alone as enough to make the present checkpoint claim-bearing.
+
+We then filtered the \(32^3\) corpus with the same aircraft-validity screen used for generated outputs. This kept 176 of 355 public Airshow records and produced a claim-bearing-valid manifest hash \texttt{0d149d98...d25ccc}. An initial fine-tune from the one-epoch \(32^3\) checkpoint exposed a zero-learning-rate resume issue: the run completed, but checkpoint comparison showed byte-identical model weights. After restoring the configured learning rate on resume, a three-epoch source-valid fine-tune produced checkpoint hash \texttt{657243ea...45574c}. Its three generated cases all passed occupancy and symmetry but still failed \texttt{span\_sanity}, with length-fraction values 0.25, 0.25, and 0.28125. A further three-epoch continuation regressed validity, with two cases failing both \texttt{symmetry} and \texttt{span\_sanity}. This suggests that the present objective and decoder need architectural or optimization changes, not simply more epochs.
+
+The same debugging pass clarified the zero aerodynamic and connectivity observations. The connectivity diagnostic thresholds voxel probabilities and runs connected-component labeling through NumPy/SciPy. The aerodynamic diagnostic thresholds geometry, invokes the internal solver, and wraps scalar solver outputs back into PyTorch tensors. A local gradient probe confirmed that both diagnostics have no gradient function. The training code has therefore been revised to report \texttt{optimization\_loss} separately from \texttt{diagnostic\_total}. This does not turn the existing solver path into a differentiable teacher; it makes the claim boundary explicit and points toward a sequential candidate-ranking or surrogate-training loop as the next credible route.
 
 \begin{figure}[!t]
 \centering
@@ -224,9 +229,9 @@ Unit cube & 1000 & 1.04 & $\sim$1.05 \cite{geier2015cascaded} \\ \hline
 \end{tabular}
 \end{table}
 
-The results in Table \ref{tab:cd_validation} provide an informal sanity check for our LBM implementation, framing the observations against typical literature targets for 3D flow. The domain spans ten characteristic lengths in the streamwise direction and five characteristic lengths in each cross-stream direction, resolved with 128 cells per axis. The setup uses no-slip BFL wall conditions, a Neumann outlet, an inlet speed corresponding to \(Ma=0.025\) or approximately 0.014 in lattice units, and force averaging over the final 125 steps of a 500-step simulation to reduce transient sensitivity.
+The results in Table \ref{tab:cd_validation} are an informal sanity check for the LBM implementation, not a full solver validation. The domain spans ten characteristic lengths in the streamwise direction and five characteristic lengths in each cross-stream direction, with 128 cells per axis. Boundary conditions are no-slip BFL walls and a Neumann outlet. The inlet speed corresponds to \(Ma=0.025\), or approximately 0.014 in lattice units, and the force estimate is averaged over the final 125 steps of a 500-step simulation to reduce transient sensitivity.
 
-After correcting the freestream lattice-velocity initialization and the BFL momentum-exchange weighting term, the solver yields $C_d$ values close to or in the broad range of the cited targets. Exact 3D benchmarks are sensitive to blockage ratios and averaging criteria, so these results support continued use as a bounded implementation check while rigorous validation still requires comparison with high-fidelity PDE solvers.
+After correcting the freestream lattice-velocity initialization and the BFL momentum-exchange weighting term, the observed $C_d$ values sit close to or inside the broad range of the cited targets. Because exact 3D benchmarks depend on blockage ratio and averaging policy, these results support continued use as a bounded implementation check; rigorous validation still requires comparison with high-fidelity PDE solvers.
 
 \subsection{Discussion}
 The implementation evidence supports three bounded conclusions: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM comparison case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline. The result supports a documented implementation path, not a claim of aircraft-level aerodynamic optimization.

@@ -179,9 +179,47 @@ class TrainingConfig:
     save_interval: int = 5
     val_interval: int = 2
     geometry_reconstruction_weight: float = 1.0
+    generation_reconstruction_weight: float = 1.0
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = True  # Overlap CFD with diffusion
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
+
+
+def restore_resume_learning_rate_if_zero(optimizer: torch.optim.Optimizer, learning_rate: float) -> bool:
+    """Restore configured LR when a completed checkpoint resumes with scheduler-decayed zero LR."""
+    if learning_rate <= 0.0:
+        return False
+    current_lrs = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+    if current_lrs and max(current_lrs) > 0.0:
+        return False
+    for group in optimizer.param_groups:
+        group["lr"] = learning_rate
+    return True
+
+
+def combine_training_loss_terms(
+    mse_loss_val: torch.Tensor,
+    geometry_loss_val: torch.Tensor,
+    generation_geometry_loss_val: torch.Tensor,
+    consistency_loss: torch.Tensor,
+    connectivity_loss_val: torch.Tensor,
+    aero_loss_val: torch.Tensor,
+    training_config: TrainingConfig,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return the backpropagated loss and a detached total that includes diagnostics."""
+    optimization_loss = (
+        mse_loss_val
+        + training_config.geometry_reconstruction_weight * geometry_loss_val
+        + training_config.generation_reconstruction_weight * generation_geometry_loss_val
+        + consistency_loss
+    ).nan_to_num(0.0)
+    diagnostic_total = (
+        optimization_loss.detach()
+        + connectivity_loss_val.detach()
+        + aero_loss_val.detach()
+    ).nan_to_num(0.0)
+    return optimization_loss, diagnostic_total
+
 
 @dataclass
 class LBMPhysicsConfig:
@@ -1327,7 +1365,8 @@ class ConsistencyModel(nn.Module):
         for i in range(len(t)):
             alpha_cumprod[i] = 0.5 ** (t[i].to(x_0.dtype) / self.teacher_steps)  # Convert to same dtype
 
-        alpha_cumprod = alpha_cumprod.view(-1, 1, 1, 1, 1)
+        broadcast_shape = (x_0.shape[0],) + (1,) * (x_0.ndim - 1)
+        alpha_cumprod = alpha_cumprod.view(broadcast_shape)
         sqrt_alpha = torch.sqrt(alpha_cumprod)
         sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_cumprod)
 
@@ -2281,7 +2320,7 @@ def aircraft_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ============================================================================
 
 class ConnectivityLoss(nn.Module):
-    """Penalize disconnected voxel groups"""
+    """Diagnostic penalty for disconnected thresholded voxel groups."""
 
     def __init__(self, penalty: float = 10.0):
         super().__init__()
@@ -2314,7 +2353,7 @@ class ConnectivityLoss(nn.Module):
         return torch.tensor(result, device=voxel_grid.device, dtype=torch.float32)
 
 class AerodynamicLoss(nn.Module):
-    """Loss based on aerodynamic properties using advanced CFD"""
+    """Diagnostic score based on thresholded geometry and advanced CFD."""
 
     def __init__(self):
         super().__init__()
@@ -2337,7 +2376,7 @@ class AerodynamicLoss(nn.Module):
 
     def forward(self, voxel_grid: torch.Tensor, design_spec: DesignSpec, cfd_simulator: "AdvancedCFDSimulator") -> torch.Tensor:
         """
-        Compute aerodynamic loss balancing drag, lift, and volume using advanced CFD.
+        Compute a detached aerodynamic diagnostic balancing drag, lift, and volume.
         """
         batch_size = voxel_grid.shape[0]
         loss = torch.tensor(0.0, device=voxel_grid.device)
@@ -2486,7 +2525,7 @@ class OptimizedDiffusionTrainer:
                 voxel_grid = self.converter(generated_latent).nan_to_num(0.0)
                 voxel_grid = torch.sigmoid(voxel_grid).nan_to_num(0.0)
 
-                # CFD-based aerodynamic loss with the D3Q27 solver
+                # CFD-based aerodynamic diagnostic with the D3Q27 solver
                 aero_loss_val = self.aero_loss(voxel_grid, design_spec, self.val_cfd_simulator).nan_to_num(0.0)
 
                 total_aero_loss += aero_loss_val.item()
@@ -2506,8 +2545,10 @@ class OptimizedDiffusionTrainer:
         self.consistency_model.student_model.train()
 
         total_loss = 0.0
+        total_optimization_loss = 0.0
         total_mse = 0.0
         total_geometry = 0.0
+        total_generation_geometry = 0.0
         total_consistency = 0.0
         total_connectivity = 0.0
         total_aero = 0.0
@@ -2550,33 +2591,45 @@ class OptimizedDiffusionTrainer:
             geom_logits = self.converter(x0_pred).nan_to_num(0.0)
             voxel_grid = torch.sigmoid(geom_logits).nan_to_num(0.0)
 
+            generation_latent = self.consistency_model.fast_inference(
+                latent.shape,
+                num_steps=self.diffusion_config.student_steps,
+                condition=condition,
+            ).nan_to_num(0.0)
+            generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
+
             # MSE loss
             mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
             geometry_loss_val = self.geometry_loss(
                 geom_logits.float(),
                 geometry_target.float(),
             ).nan_to_num(0.0)
+            generation_geometry_loss_val = self.geometry_loss(
+                generation_geom_logits.float(),
+                geometry_target.float(),
+            ).nan_to_num(0.0)
 
-            # Connectivity loss
+            # Connectivity diagnostic
             connectivity_loss_val = self.connectivity_loss(voxel_grid).nan_to_num(0.0)
 
-            # CFD-based aerodynamic loss (every 10 batches for speed)
+            # CFD-based aerodynamic diagnostic (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
             if batch_idx % 10 == 0:
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
 
-            # Combined loss
-            total_loss_val = (
-                mse_loss_val
-                + self.training_config.geometry_reconstruction_weight * geometry_loss_val
-                + consistency_loss
-                + connectivity_loss_val
-                + aero_loss_val
+            optimization_loss_val, diagnostic_total_loss_val = combine_training_loss_terms(
+                mse_loss_val,
+                geometry_loss_val,
+                generation_geometry_loss_val,
+                consistency_loss,
+                connectivity_loss_val,
+                aero_loss_val,
+                self.training_config,
             )
 
             # Backward pass
             self.optimizer.zero_grad()
-            total_loss_val.backward()
+            optimization_loss_val.backward()
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), self.training_config.gradient_clip)
@@ -2590,17 +2643,21 @@ class OptimizedDiffusionTrainer:
             self._update_ema()
 
             # Logging
-            total_loss += total_loss_val.item()
+            total_loss += diagnostic_total_loss_val.item()
+            total_optimization_loss += optimization_loss_val.item()
             total_mse += mse_loss_val.item()
             total_geometry += geometry_loss_val.item()
+            total_generation_geometry += generation_geometry_loss_val.item()
             total_consistency += consistency_loss.item()
             total_connectivity += connectivity_loss_val.item()
             total_aero += aero_loss_val.item()
 
             pbar.set_postfix({
-                'loss': total_loss_val.item(),
+                'opt_loss': optimization_loss_val.item(),
+                'diag_total': diagnostic_total_loss_val.item(),
                 'mse': mse_loss_val.item(),
                 'geom': geometry_loss_val.item(),
+                'gen_geom': generation_geometry_loss_val.item(),
                 'consistency': consistency_loss.item(),
                 'conn': connectivity_loss_val.item(),
                 'aero': aero_loss_val.item()
@@ -2613,19 +2670,26 @@ class OptimizedDiffusionTrainer:
                 torch.cuda.empty_cache()
 
         avg_loss = total_loss / len(train_loader)
+        avg_optimization_loss = total_optimization_loss / len(train_loader)
 
         # Log to tensorboard
-        self.writer.add_scalar('Loss/total', avg_loss, self.global_step)
+        self.writer.add_scalar('Loss/total', avg_optimization_loss, self.global_step)
+        self.writer.add_scalar('Loss/optimization', avg_optimization_loss, self.global_step)
+        self.writer.add_scalar('Loss/diagnostic_total', avg_loss, self.global_step)
         self.writer.add_scalar('Loss/mse', total_mse / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / len(train_loader), self.global_step)
+        self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/connectivity', total_connectivity / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/aerodynamic', total_aero / len(train_loader), self.global_step)
 
         return {
-            'loss': avg_loss,
+            'loss': avg_optimization_loss,
+            'optimization_loss': avg_optimization_loss,
+            'diagnostic_total': avg_loss,
             'mse': total_mse / len(train_loader),
             'geometry_reconstruction': total_geometry / len(train_loader),
+            'generation_reconstruction': total_generation_geometry / len(train_loader),
             'consistency': total_consistency / len(train_loader),
             'connectivity': total_connectivity / len(train_loader),
             'aerodynamic': total_aero / len(train_loader)
@@ -2720,7 +2784,18 @@ class OptimizedDiffusionTrainer:
         self.converter.load_state_dict(checkpoint['converter'])
         self.ema_model.load_state_dict(checkpoint['ema_model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        restored_zero_lr = restore_resume_learning_rate_if_zero(self.optimizer, self.training_config.learning_rate)
+        if restored_zero_lr:
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, self.training_config.num_epochs),
+            )
+            print(
+                "Restored optimizer learning rate from the current training config "
+                f"({self.training_config.learning_rate}) after loading a zero-LR checkpoint."
+            )
+        elif 'scheduler' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
         if 'scaler' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler'])
         self.global_step = checkpoint['global_step']

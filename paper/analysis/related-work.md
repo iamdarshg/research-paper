@@ -3,8 +3,8 @@
 Source: `paper/sections/related-work.tex`
 
 Detector results:
-- lmscan: `0.2248`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.003821`, fake max `0.011105`
+- lmscan: `0.2404`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.091919`, fake max `0.452249`
 
 Overall function: this section places the project among 3D diffusion, topology optimization, CFD shape optimization, physics-informed ML, and constraint-aware generation while repeatedly stating what this repository does not yet prove.
 
@@ -238,16 +238,16 @@ Overall function: this section places the project among 3D diffusion, topology o
    - Word choices: `standard fuselage-wing primitive` keeps the target controlled; `adjoint-based` ties to ASO literature.
    - Risk status: proposed.
 
-39. `Ablations should isolate the impact of the aerodynamic loss, connectivity loss, connected-component cleanup hook, semantic constraint projector, and consistency-step count.`
+39. `Ablations should isolate the impact of aerodynamic scoring diagnostics, connectivity diagnostics, the connected-component cleanup hook, the semantic constraint projector, and the consistency-step count.`
    - Function: states mechanism-level tests needed later.
    - Claim type: ablation protocol.
-   - Word choices: `isolate` is the key scientific requirement; each listed component maps to a claim-bearing mechanism.
+   - Word choices: `isolate` is the key scientific requirement; `scoring diagnostics` and `connectivity diagnostics` avoid implying the current terms are differentiable training signals; each listed component maps to a claim-bearing mechanism.
    - Risk status: future requirement, not current evidence.
 
-40. `Until those ablations are executed on larger grounded aircraft-like data with shared solver settings, they remain a protocol rather than evidence for mechanism-level causality.`
+40. `For now, that list is a protocol rather than a causal result; it becomes evidence only after larger grounded aircraft-like runs with shared solver settings.`
    - Function: prevents the protocol from being mistaken for results.
    - Claim type: limitation.
-   - Word choices: `Until` creates a clear gate; `larger grounded aircraft-like data` names the missing dataset standard; `mechanism-level causality` is deliberately reserved.
+   - Word choices: `For now` is more direct than formulaic gate phrasing; `causal result` is the claim being withheld; `only after` preserves the evidence gate.
    - Risk status: critical guardrail.
 
 ## Table Claim Labels

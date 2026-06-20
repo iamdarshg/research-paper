@@ -8,11 +8,13 @@ import numpy as np
 
 
 def compute_core_loss(epoch_metrics: Dict[str, Any]) -> float:
+    if "optimization_loss" in epoch_metrics:
+        return float(epoch_metrics["optimization_loss"])
     return float(
         epoch_metrics.get("mse", 0.0)
         + epoch_metrics.get("geometry_reconstruction", 0.0)
+        + epoch_metrics.get("generation_reconstruction", 0.0)
         + epoch_metrics.get("consistency", 0.0)
-        + epoch_metrics.get("connectivity", 0.0)
     )
 
 
