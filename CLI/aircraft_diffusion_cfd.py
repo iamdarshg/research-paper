@@ -182,7 +182,18 @@ class TrainingConfig:
     generation_reconstruction_weight: float = 1.0
     coordinate_training_samples: int = 32768
     coordinate_positive_fraction: float = 0.5
+    coordinate_decoder_threshold: int = 96
     full_diagnostic_interval: int = 100
+    direct_solver_loss_weight: float = 0.0
+    direct_solver_interval: int = 1
+    direct_solver_steps: int = 5
+    direct_solver_perturbation: float = 0.15
+    direct_solver_perturbation_grid_size: int = 0
+    direct_solver_gradient_clip: float = 1.0
+    direct_connectivity_weight: float = 0.0
+    direct_solver_target_occupancy: Optional[float] = None
+    connectivity_monitor_interval: int = 1
+    aerodynamic_monitor_interval: int = 10
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
@@ -208,13 +219,17 @@ def combine_training_loss_terms(
     connectivity_loss_val: torch.Tensor,
     aero_loss_val: torch.Tensor,
     training_config: TrainingConfig,
+    direct_solver_loss_val: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return the backpropagated loss and a detached total that includes diagnostics."""
+    """Return the backpropagated loss and a detached total that includes monitors."""
+    zero = mse_loss_val.new_tensor(0.0)
+    direct_solver_loss_val = direct_solver_loss_val if direct_solver_loss_val is not None else zero
     optimization_loss = (
         mse_loss_val
         + training_config.geometry_reconstruction_weight * geometry_loss_val
         + training_config.generation_reconstruction_weight * generation_geometry_loss_val
         + consistency_loss
+        + training_config.direct_solver_loss_weight * direct_solver_loss_val
     ).nan_to_num(0.0)
     diagnostic_total = (
         optimization_loss.detach()
@@ -2478,6 +2493,243 @@ class AerodynamicLoss(nn.Module):
 
         return loss / batch_size
 
+
+def _largest_component_fraction_from_binary(binary_geometry: np.ndarray) -> float:
+    """Return the occupied-voxel fraction belonging to the largest component."""
+    occupied = binary_geometry.astype(bool, copy=False)
+    total_occupied = int(occupied.sum())
+    if total_occupied <= 0:
+        return 0.0
+    labeled, num_components = label(occupied)
+    if num_components <= 0:
+        return 0.0
+    component_sizes = np.bincount(labeled.reshape(-1))
+    largest_component = int(component_sizes[1:].max()) if component_sizes.size > 1 else 0
+    return float(largest_component) / float(total_occupied)
+
+
+def _binarize_probability_grid_for_solver(
+    probability_grid: torch.Tensor,
+    threshold: float = 0.5,
+    target_occupancy: Optional[float] = None,
+) -> torch.Tensor:
+    """Materialize a probability grid into the thresholded geometry used by the solver."""
+    probs = probability_grid.detach().float().clamp(0.0, 1.0)
+    if target_occupancy is None:
+        return (probs > float(threshold)).to(dtype=torch.float32)
+
+    target_fraction = float(np.clip(target_occupancy, 0.0, 1.0))
+    flat = probs.reshape(-1)
+    if flat.numel() == 0:
+        return torch.zeros_like(probs, dtype=torch.float32)
+    occupied_count = int(round(target_fraction * flat.numel()))
+    occupied_count = max(1, min(int(flat.numel()), occupied_count))
+    topk_indices = torch.topk(flat, k=occupied_count, largest=True).indices
+    binary_flat = torch.zeros_like(flat, dtype=torch.float32)
+    binary_flat.scatter_(0, topk_indices, 1.0)
+    return binary_flat.reshape_as(probs)
+
+
+def _direct_measured_objective_for_single(
+    probability_grid: torch.Tensor,
+    design_spec: DesignSpec,
+    cfd_simulator: "AdvancedCFDSimulator",
+    cfd_steps: int,
+    connectivity_weight: float,
+    threshold: float,
+    target_occupancy: Optional[float],
+) -> float:
+    """Evaluate the actual thresholded-geometry solver objective for one sample."""
+    geometry = _binarize_probability_grid_for_solver(
+        probability_grid,
+        threshold=threshold,
+        target_occupancy=target_occupancy,
+    )
+    cfd_results = cfd_simulator.simulate_aerodynamics(geometry, steps=max(1, int(cfd_steps)))
+
+    occupancy = float(geometry.mean().detach().cpu().item())
+    drag_coefficient = AerodynamicLoss._select_loss_drag_coefficient(cfd_results)
+    raw_lift = cfd_results.get("lift_coefficient", 0.0)
+    lift_coefficient = abs(float(raw_lift)) if isinstance(raw_lift, (int, float, np.floating)) else 0.0
+    lift_term = 1.0 - float(np.clip(lift_coefficient, 0.0, 1.0))
+
+    aero_loss = (
+        float(design_spec.space_weight) * occupancy
+        + float(design_spec.drag_weight) * float(drag_coefficient)
+        + float(design_spec.lift_weight) * lift_term
+    )
+    if connectivity_weight <= 0.0:
+        return float(np.nan_to_num(aero_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6))
+
+    connected_fraction = _largest_component_fraction_from_binary(geometry.detach().cpu().numpy())
+    connectivity_loss = 1.0 - connected_fraction
+    total_loss = aero_loss + float(connectivity_weight) * connectivity_loss
+    return float(np.nan_to_num(total_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6))
+
+
+class DirectSolverSPSAFunction(torch.autograd.Function):
+    """Black-box direct solver loss with a two-sided SPSA gradient estimate."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        voxel_grid: torch.Tensor,
+        design_spec: DesignSpec,
+        cfd_simulator: "AdvancedCFDSimulator",
+        cfd_steps: int,
+        perturbation: float,
+        gradient_clip: float,
+        connectivity_weight: float,
+        threshold: float,
+        target_occupancy: Optional[float],
+        perturbation_grid_size: int,
+        seed: int,
+    ) -> torch.Tensor:
+        original_ndim = voxel_grid.ndim
+        probs = voxel_grid.detach().float().clamp(0.0, 1.0)
+        if probs.ndim == 3:
+            probs = probs.unsqueeze(0)
+        if probs.ndim != 4:
+            raise ValueError(f"Expected voxel probabilities with shape [B,Z,Y,X] or [Z,Y,X], got {tuple(voxel_grid.shape)}")
+
+        batch_size = int(probs.shape[0])
+        grad_estimate = torch.zeros_like(probs)
+        base_losses: List[float] = []
+        eps = max(float(perturbation), 1.0e-6)
+        generator = torch.Generator(device=probs.device)
+        generator.manual_seed(int(seed) % (2**63 - 1))
+
+        for batch_idx in range(batch_size):
+            sample_probs = probs[batch_idx]
+            base_loss = _direct_measured_objective_for_single(
+                sample_probs,
+                design_spec,
+                cfd_simulator,
+                cfd_steps,
+                connectivity_weight,
+                threshold,
+                target_occupancy,
+            )
+            low_frequency_grid = int(perturbation_grid_size)
+            if low_frequency_grid > 1 and any(dim > low_frequency_grid for dim in sample_probs.shape):
+                coarse_shape = tuple(max(1, min(low_frequency_grid, int(dim))) for dim in sample_probs.shape)
+                coarse_delta = torch.randint(
+                    low=0,
+                    high=2,
+                    size=(1, 1, *coarse_shape),
+                    generator=generator,
+                    device=probs.device,
+                    dtype=torch.int8,
+                ).to(dtype=probs.dtype)
+                coarse_delta = coarse_delta.mul(2.0).sub(1.0)
+                delta = F.interpolate(
+                    coarse_delta,
+                    size=tuple(sample_probs.shape),
+                    mode="trilinear",
+                    align_corners=False,
+                )[0, 0]
+                delta = (delta / delta.abs().mean().clamp_min(1.0e-6)).clamp(-2.0, 2.0)
+            else:
+                delta = torch.randint(
+                    low=0,
+                    high=2,
+                    size=tuple(sample_probs.shape),
+                    generator=generator,
+                    device=probs.device,
+                    dtype=torch.int8,
+                ).to(dtype=probs.dtype)
+                delta = delta.mul(2.0).sub(1.0)
+            plus_loss = _direct_measured_objective_for_single(
+                (sample_probs + eps * delta).clamp(0.0, 1.0),
+                design_spec,
+                cfd_simulator,
+                cfd_steps,
+                connectivity_weight,
+                threshold,
+                target_occupancy,
+            )
+            minus_loss = _direct_measured_objective_for_single(
+                (sample_probs - eps * delta).clamp(0.0, 1.0),
+                design_spec,
+                cfd_simulator,
+                cfd_steps,
+                connectivity_weight,
+                threshold,
+                target_occupancy,
+            )
+            sample_grad = ((plus_loss - minus_loss) / (2.0 * eps)) * delta
+            grad_norm = sample_grad.norm()
+            clip_value = float(gradient_clip)
+            if clip_value > 0.0 and torch.isfinite(grad_norm) and float(grad_norm.item()) > clip_value:
+                sample_grad = sample_grad * (clip_value / grad_norm.clamp_min(1.0e-12))
+            grad_estimate[batch_idx] = sample_grad / max(batch_size, 1)
+            base_losses.append(base_loss)
+
+        if original_ndim == 3:
+            grad_estimate = grad_estimate[0]
+        ctx.save_for_backward(grad_estimate.to(dtype=voxel_grid.dtype))
+        ctx.original_ndim = original_ndim
+        mean_loss = float(np.mean(base_losses)) if base_losses else 0.0
+        return voxel_grid.new_tensor(mean_loss)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (grad_estimate,) = ctx.saved_tensors
+        grad = grad_output.to(dtype=grad_estimate.dtype) * grad_estimate
+        return grad, None, None, None, None, None, None, None, None, None, None
+
+
+class DirectSolverSPSALoss(nn.Module):
+    """Direct measured solver objective with finite-difference gradients.
+
+    The forward value is the actual thresholded-geometry CFD/connectivity loss.
+    The backward pass uses two additional solver evaluations around random
+    Rademacher perturbations to estimate a gradient; no surrogate model is used.
+    """
+
+    def __init__(
+        self,
+        cfd_steps: int = 5,
+        perturbation: float = 0.15,
+        perturbation_grid_size: int = 0,
+        gradient_clip: float = 1.0,
+        connectivity_weight: float = 0.0,
+        threshold: float = 0.5,
+        target_occupancy: Optional[float] = None,
+        seed: int = 0,
+    ):
+        super().__init__()
+        self.cfd_steps = int(cfd_steps)
+        self.perturbation = float(perturbation)
+        self.perturbation_grid_size = int(perturbation_grid_size)
+        self.gradient_clip = float(gradient_clip)
+        self.connectivity_weight = float(connectivity_weight)
+        self.threshold = float(threshold)
+        self.target_occupancy = target_occupancy
+        self.seed = int(seed)
+
+    def forward(
+        self,
+        voxel_grid: torch.Tensor,
+        design_spec: DesignSpec,
+        cfd_simulator: "AdvancedCFDSimulator",
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        effective_seed = self.seed if seed is None else int(seed)
+        return DirectSolverSPSAFunction.apply(
+            voxel_grid,
+            design_spec,
+            cfd_simulator,
+            self.cfd_steps,
+            self.perturbation,
+            self.gradient_clip,
+            self.connectivity_weight,
+            self.threshold,
+            self.target_occupancy,
+            self.perturbation_grid_size,
+            effective_seed,
+        )
+
 # ============================================================================
 # TRAINING PIPELINE WITH ALL OPTIMIZATIONS
 # ============================================================================
@@ -2518,7 +2770,11 @@ class OptimizedDiffusionTrainer:
 
         # Models with optimizations
         self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
-        self.converter = LatentTo3DConverter(model_config.latent_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
+        self.converter = LatentTo3DConverter(
+            model_config.latent_dim,
+            model_config.grid_resolution,
+            coordinate_decoder_threshold=training_config.coordinate_decoder_threshold,
+        ).to(self.device).to(self.dtype)
 
         # 4-step consistency model
         self.consistency_model = ConsistencyModel(model_config, diffusion_config, self.dtype).to(self.device)
@@ -2541,6 +2797,14 @@ class OptimizedDiffusionTrainer:
         self.geometry_loss = nn.BCEWithLogitsLoss()
         self.connectivity_loss = ConnectivityLoss(penalty=training_config.disconnection_penalty)
         self.aero_loss = AerodynamicLoss()
+        self.direct_solver_loss = DirectSolverSPSALoss(
+            cfd_steps=training_config.direct_solver_steps,
+            perturbation=training_config.direct_solver_perturbation,
+            perturbation_grid_size=training_config.direct_solver_perturbation_grid_size,
+            gradient_clip=training_config.direct_solver_gradient_clip,
+            connectivity_weight=training_config.direct_connectivity_weight,
+            target_occupancy=training_config.direct_solver_target_occupancy,
+        )
 
         # Advanced CFD simulator for training (fast, coarse)
         self.cfd_simulator = AdvancedCFDSimulator(cfd_config, self.device)
@@ -2558,6 +2822,7 @@ class OptimizedDiffusionTrainer:
         # Logging
         self.writer = SummaryWriter(log_dir='./runs')
         self.global_step = 0
+        self.training_history: List[Dict[str, Any]] = []
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
         """Create an independent copy of the model"""
@@ -2623,6 +2888,9 @@ class OptimizedDiffusionTrainer:
         total_geometry = 0.0
         total_generation_geometry = 0.0
         total_consistency = 0.0
+        total_direct_solver = 0.0
+        total_direct_solver_eval = 0.0
+        direct_solver_eval_count = 0
         total_connectivity = 0.0
         total_aero = 0.0
 
@@ -2744,11 +3012,19 @@ class OptimizedDiffusionTrainer:
                     weight=importance_weights.float(),
                     reduction="mean",
                 ).nan_to_num(0.0)
+                direct_solver_interval = max(1, int(self.training_config.direct_solver_interval))
+                run_optimizer_grid_loss = (
+                    float(self.training_config.direct_solver_loss_weight) > 0.0
+                    and batch_idx % direct_solver_interval == 0
+                )
                 run_full_diagnostic = (
                     int(self.training_config.full_diagnostic_interval) > 0
                     and batch_idx % int(self.training_config.full_diagnostic_interval) == 0
                 )
-                if run_full_diagnostic:
+                if run_optimizer_grid_loss:
+                    optimizer_logits = self.converter(x0_pred).nan_to_num(0.0)
+                    voxel_grid = torch.sigmoid(optimizer_logits).nan_to_num(0.0)
+                elif run_full_diagnostic:
                     with torch.no_grad():
                         diagnostic_logits = self.converter(x0_pred.detach()).nan_to_num(0.0)
                         voxel_grid = torch.sigmoid(diagnostic_logits).nan_to_num(0.0)
@@ -2769,12 +3045,38 @@ class OptimizedDiffusionTrainer:
 
             # Connectivity diagnostic
             connectivity_loss_val = torch.tensor(0.0, device=self.device)
-            if voxel_grid is not None:
+            connectivity_monitor_interval = int(self.training_config.connectivity_monitor_interval)
+            if (
+                voxel_grid is not None
+                and connectivity_monitor_interval > 0
+                and batch_idx % connectivity_monitor_interval == 0
+            ):
                 connectivity_loss_val = self.connectivity_loss(voxel_grid).nan_to_num(0.0)
+
+            direct_solver_loss_val = torch.tensor(0.0, device=self.device)
+            direct_solver_evaluated = False
+            if (
+                voxel_grid is not None
+                and float(self.training_config.direct_solver_loss_weight) > 0.0
+                and batch_idx % max(1, int(self.training_config.direct_solver_interval)) == 0
+                and voxel_grid.requires_grad
+            ):
+                direct_solver_loss_val = self.direct_solver_loss(
+                    voxel_grid.float(),
+                    design_spec,
+                    self.cfd_simulator,
+                    seed=self.global_step,
+                ).nan_to_num(0.0)
+                direct_solver_evaluated = True
 
             # CFD-based aerodynamic diagnostic (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
-            if voxel_grid is not None and batch_idx % 10 == 0:
+            aerodynamic_monitor_interval = int(self.training_config.aerodynamic_monitor_interval)
+            if (
+                voxel_grid is not None
+                and aerodynamic_monitor_interval > 0
+                and batch_idx % aerodynamic_monitor_interval == 0
+            ):
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
 
             optimization_loss_val, diagnostic_total_loss_val = combine_training_loss_terms(
@@ -2785,6 +3087,7 @@ class OptimizedDiffusionTrainer:
                 connectivity_loss_val,
                 aero_loss_val,
                 self.training_config,
+                direct_solver_loss_val=direct_solver_loss_val,
             )
 
             # Backward pass
@@ -2809,6 +3112,10 @@ class OptimizedDiffusionTrainer:
             total_geometry += geometry_loss_val.item()
             total_generation_geometry += generation_geometry_loss_val.item()
             total_consistency += consistency_loss.item()
+            total_direct_solver += direct_solver_loss_val.item()
+            if direct_solver_evaluated:
+                total_direct_solver_eval += direct_solver_loss_val.item()
+                direct_solver_eval_count += 1
             total_connectivity += connectivity_loss_val.item()
             total_aero += aero_loss_val.item()
 
@@ -2819,6 +3126,7 @@ class OptimizedDiffusionTrainer:
                 'geom': geometry_loss_val.item(),
                 'gen_geom': generation_geometry_loss_val.item(),
                 'consistency': consistency_loss.item(),
+                'direct_solver': direct_solver_loss_val.item(),
                 'conn': connectivity_loss_val.item(),
                 'aero': aero_loss_val.item()
             })
@@ -2840,8 +3148,17 @@ class OptimizedDiffusionTrainer:
         self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
+        self.writer.add_scalar('Loss/direct_solver', total_direct_solver / len(train_loader), self.global_step)
+        if direct_solver_eval_count > 0:
+            self.writer.add_scalar('Loss/direct_solver_eval', total_direct_solver_eval / direct_solver_eval_count, self.global_step)
         self.writer.add_scalar('Loss/connectivity', total_connectivity / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/aerodynamic', total_aero / len(train_loader), self.global_step)
+
+        avg_direct_solver_eval = (
+            total_direct_solver_eval / direct_solver_eval_count
+            if direct_solver_eval_count > 0
+            else 0.0
+        )
 
         return {
             'loss': avg_optimization_loss,
@@ -2851,6 +3168,9 @@ class OptimizedDiffusionTrainer:
             'geometry_reconstruction': total_geometry / len(train_loader),
             'generation_reconstruction': total_generation_geometry / len(train_loader),
             'consistency': total_consistency / len(train_loader),
+            'direct_solver_loss': total_direct_solver / len(train_loader),
+            'direct_solver_eval_loss': avg_direct_solver_eval,
+            'direct_solver_eval_count': direct_solver_eval_count,
             'connectivity': total_connectivity / len(train_loader),
             'aerodynamic': total_aero / len(train_loader)
         }
@@ -2876,9 +3196,10 @@ class OptimizedDiffusionTrainer:
             condition=condition,
         )
 
-    def train(self, train_loader: DataLoader, val_loader: DataLoader = None):
+    def train(self, train_loader: DataLoader, val_loader: DataLoader = None) -> List[Dict[str, Any]]:
         """Train at the model's configured voxel resolution."""
         grid_sizes = [self.model_config.grid_resolution]
+        history: List[Dict[str, Any]] = []
 
         for grid_size in grid_sizes:
             print(f"\n{'='*60}")
@@ -2901,6 +3222,14 @@ class OptimizedDiffusionTrainer:
                     self._run_progressive_distillation(train_loader)
 
                 metrics = self.train_epoch(train_loader, grid_size=grid_size)
+                epoch_record = {
+                    "grid_size": int(grid_size),
+                    "epoch": int(epoch + 1),
+                    "decoder_mode": getattr(self.converter, "decoder_mode", "dense"),
+                    **{key: float(value) for key, value in metrics.items()},
+                }
+                history.append(epoch_record)
+                self.training_history.append(epoch_record)
 
                 print(f"Epoch {epoch + 1} Metrics: {metrics}")
 
@@ -2911,6 +3240,7 @@ class OptimizedDiffusionTrainer:
                     self.save_checkpoint(f'checkpoint_optimized_grid{grid_size}_ep{epoch+1}.pt')
 
             self.scheduler.step()
+        return history
 
     def _run_progressive_distillation(self, train_loader: DataLoader):
         """Run progressive distillation through step counts"""
@@ -2976,6 +3306,8 @@ class OptimizedAircraftGenerator:
 
         self.model_config = ModelConfig(**checkpoint['model_config'])
         self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
+        training_payload = checkpoint.get('training_config', {}) or {}
+        coordinate_decoder_threshold = int(training_payload.get('coordinate_decoder_threshold', 96))
         cfd_payload = checkpoint.get('cfd_config')
         if cfd_payload is not None:
             cfd_payload = dict(cfd_payload)
@@ -2986,7 +3318,11 @@ class OptimizedAircraftGenerator:
             self.config = CFDConfig(base_grid_resolution=self.model_config.grid_resolution)
 
         self.diffusion_model = LatentDiffusionUNet(self.model_config, self.diffusion_config).to(self.device)
-        self.converter = LatentTo3DConverter(self.model_config.latent_dim, self.model_config.grid_resolution).to(self.device)
+        self.converter = LatentTo3DConverter(
+            self.model_config.latent_dim,
+            self.model_config.grid_resolution,
+            coordinate_decoder_threshold=coordinate_decoder_threshold,
+        ).to(self.device)
 
         # Load consistency model
         self.consistency_model = ConsistencyModel(self.model_config, self.diffusion_config).to(self.device)
@@ -3731,10 +4067,24 @@ def cli():
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
 @click.option('--coordinate-training-samples', default=32768, help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
 @click.option('--coordinate-positive-fraction', default=0.5, help='Fraction of sampled high-resolution coordinates drawn from occupied voxels when available')
+@click.option('--coordinate-decoder-threshold', default=96, help='Use the coordinate decoder at this grid size or above; set to 1 for matched coordinate-decoder sweeps.')
 @click.option('--full-diagnostic-interval', default=100, help='Full-grid diagnostic decode interval for high-resolution coordinate decoders; 0 disables full diagnostics')
+@click.option('--direct-solver-loss-weight', default=0.0, help='Weight for direct measured CFD/connectivity SPSA optimizer loss.')
+@click.option('--direct-solver-interval', default=1, help='For coordinate decoders, materialize full-grid direct solver loss every N batches.')
+@click.option('--direct-solver-steps', default=5, help='Internal solver steps per direct loss evaluation.')
+@click.option('--direct-solver-perturbation', default=0.15, help='Two-sided SPSA voxel-probability perturbation size.')
+@click.option('--direct-solver-perturbation-grid-size', default=0, help='Optional low-frequency SPSA perturbation grid edge length; 0 uses per-voxel noise.')
+@click.option('--direct-solver-gradient-clip', default=1.0, help='L2 clip applied to the estimated direct solver gradient.')
+@click.option('--direct-connectivity-weight', default=0.0, help='Weight for exact connected-component loss inside the direct measured objective.')
+@click.option('--direct-solver-target-occupancy', default=None, type=float, help='Optional top-k occupancy fraction for direct solver binarization.')
+@click.option('--connectivity-monitor-interval', default=1, help='Exact connected-component monitor interval; 0 disables it.')
+@click.option('--aerodynamic-monitor-interval', default=10, help='Raw internal CFD monitor interval; 0 disables it.')
 def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
           num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
-          enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, full_diagnostic_interval):
+          enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, coordinate_decoder_threshold,
+          full_diagnostic_interval, direct_solver_loss_weight, direct_solver_interval, direct_solver_steps, direct_solver_perturbation,
+          direct_solver_perturbation_grid_size, direct_solver_gradient_clip, direct_connectivity_weight, direct_solver_target_occupancy,
+          connectivity_monitor_interval, aerodynamic_monitor_interval):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
@@ -3835,7 +4185,18 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         enable_pipeline_parallelism=enable_pipeline,
         coordinate_training_samples=coordinate_training_samples,
         coordinate_positive_fraction=coordinate_positive_fraction,
+        coordinate_decoder_threshold=coordinate_decoder_threshold,
         full_diagnostic_interval=full_diagnostic_interval,
+        direct_solver_loss_weight=direct_solver_loss_weight,
+        direct_solver_interval=direct_solver_interval,
+        direct_solver_steps=direct_solver_steps,
+        direct_solver_perturbation=direct_solver_perturbation,
+        direct_solver_perturbation_grid_size=direct_solver_perturbation_grid_size,
+        direct_solver_gradient_clip=direct_solver_gradient_clip,
+        direct_connectivity_weight=direct_connectivity_weight,
+        direct_solver_target_occupancy=direct_solver_target_occupancy,
+        connectivity_monitor_interval=connectivity_monitor_interval,
+        aerodynamic_monitor_interval=aerodynamic_monitor_interval,
     )
 
     cfd_config = CFDConfig(
@@ -3880,7 +4241,22 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     print("=" * 60)
 
     # Train with optimizations
-    trainer.train(train_loader)
+    history = trainer.train(train_loader)
+    metrics_path = Path(save_dir) / "training_metrics.json"
+    metrics_payload = {
+        "model_config": asdict(model_config),
+        "training_config": asdict(training_config),
+        "cfd_config": asdict(cfd_config),
+        "history": history,
+        "claim_boundary": (
+            "optimization_loss is the backpropagated scalar. Exact connectivity and raw CFD scores "
+            "are measured monitors unless included through direct_solver_loss with a nonzero "
+            "direct_solver_loss_weight. direct_solver_loss calls the solver on thresholded geometry "
+            "and uses a two-sided SPSA finite-difference gradient estimate; it is not a surrogate."
+        ),
+    }
+    metrics_path.write_text(json.dumps(metrics_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Training metrics written to {metrics_path}")
 
     # Save final model
     final_checkpoint = os.path.join(save_dir, 'final_optimized_model.pt')

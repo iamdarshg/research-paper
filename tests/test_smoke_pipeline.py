@@ -383,6 +383,7 @@ class TestCLISmokePipeline(unittest.TestCase):
         fake_dataset = mock.Mock()
         fake_loader = mock.Mock()
         fake_trainer = mock.Mock()
+        fake_trainer.train.return_value = []
 
         with mock.patch.object(cli_module.torch._logging, "set_logs"), \
              mock.patch.object(cli_module.torch.cuda, "is_available", return_value=False), \

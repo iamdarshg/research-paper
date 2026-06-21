@@ -13,6 +13,7 @@ from aircraft_diffusion_cfd import (
     AerodynamicLoss,
     ConnectivityLoss,
     DesignSpec,
+    DirectSolverSPSALoss,
     TrainingConfig,
     combine_training_loss_terms,
 )
@@ -24,6 +25,21 @@ class _FakeSimulator:
 
     def simulate_aerodynamics(self, geometry, steps=100):
         return dict(self.results)
+
+
+class _GeometrySensitiveSimulator:
+    def __init__(self):
+        self.calls = []
+
+    def simulate_aerodynamics(self, geometry, steps=100):
+        geom = geometry.float()
+        weights = torch.linspace(0.1, 1.0, geom.numel(), device=geom.device, dtype=geom.dtype).reshape_as(geom)
+        weighted_occupancy = float((geom * weights).sum().detach().cpu().item() / weights.sum().detach().cpu().item())
+        self.calls.append({"steps": steps, "weighted_occupancy": weighted_occupancy})
+        return {
+            "training_drag_coefficient": 0.1 + weighted_occupancy,
+            "lift_coefficient": 0.0,
+        }
 
 
 class TestAerodynamicLoss(unittest.TestCase):
@@ -103,6 +119,46 @@ class TestAerodynamicLoss(unittest.TestCase):
 
         self.assertAlmostEqual(float(parameter.grad), 26.0, places=6)
         self.assertAlmostEqual(float(diagnostic_total), float(optimization_loss.detach()) + 1100.0, places=6)
+
+    def test_direct_solver_spsa_loss_runs_solver_and_backpropagates(self):
+        voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
+        simulator = _GeometrySensitiveSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=3,
+            perturbation=0.35,
+            gradient_clip=10.0,
+            connectivity_weight=0.0,
+            seed=123,
+        )
+
+        loss = loss_fn(voxels, DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0), simulator, seed=123)
+        loss.backward()
+
+        self.assertEqual(len(simulator.calls), 3)
+        self.assertTrue(all(call["steps"] == 3 for call in simulator.calls))
+        self.assertTrue(loss.requires_grad)
+        self.assertIsNotNone(voxels.grad)
+        self.assertGreater(float(voxels.grad.abs().sum()), 0.0)
+
+    def test_training_loss_includes_direct_solver_term_when_weighted(self):
+        parameter = torch.tensor(2.0, requires_grad=True)
+        config = TrainingConfig(
+            direct_solver_loss_weight=7.0,
+        )
+
+        optimization_loss, _ = combine_training_loss_terms(
+            mse_loss_val=parameter,
+            geometry_loss_val=parameter,
+            generation_geometry_loss_val=parameter,
+            consistency_loss=parameter,
+            connectivity_loss_val=torch.tensor(100.0),
+            aero_loss_val=torch.tensor(1000.0),
+            training_config=config,
+            direct_solver_loss_val=parameter * 2.0,
+        )
+        optimization_loss.backward()
+
+        self.assertAlmostEqual(float(parameter.grad), 18.0, places=6)
 
 
 if __name__ == "__main__":
