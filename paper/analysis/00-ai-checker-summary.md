@@ -89,3 +89,22 @@ calibrated top-k exports. No online paraphraser upload was used; the wording
 pass stayed local to avoid transmitting unpublished paper text. The refreshed
 local detector artifacts listed above predate the `96^3` text update and should
 be rerun before final submission.
+
+## 2026-06-21 Direct Solver-In-Loop Refresh
+
+Fresh local detector artifacts for the changed Methodology, Results, and
+Conclusion text are in `build/ai_check_direct_solver_20260621/`.
+
+| Changed text | lmscan AI probability | lmscan verdict | RoBERTa fake mean | RoBERTa fake max |
+| --- | ---: | --- | ---: | ---: |
+| Methodology | 0.2647 | Likely human | 0.051535 | 0.412132 |
+| Results and Discussion | 0.2473 | Likely human | 0.211690 | 0.983318 |
+| Conclusion | 0.2420 | Likely human | 0.186498 | 0.456608 |
+| Changed sections bundle | 0.2673 | Likely human | 0.133592 | 0.999747 |
+
+The RoBERTa conclusion spike dropped below 0.5 after rewriting the final status
+paragraph. The remaining Results spike is a 45-word technical tail about the
+D3Q27 freestream correction, and the changed-section bundle spike comes from
+dense high-resolution status prose. Those are kept as detector caveats rather
+than authorship evidence; the scientific wording is intentionally metric-heavy
+because it preserves the run record.

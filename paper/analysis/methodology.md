@@ -3,8 +3,8 @@
 Source: `paper/sections/methodology.tex`
 
 Detector results:
-- lmscan: `0.2701`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.008173`, fake max `0.043167`
+- lmscan: `0.2647`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.051535`, fake max `0.412132`
 
 Overall function: this section describes the implemented architecture and the public Airshow corpus-construction path while avoiding claims that the solver is fully validated, differentiable through training, or proven to improve aircraft performance.
 
@@ -222,17 +222,17 @@ A10. `The additional mission and manufacturing fields used by the condition vect
    - Word choices: `useful` gives value; `not a substitute` blocks overclaim.
    - Risk status: essential.
 
-24. `A simplified view of the current training objective must distinguish the differentiable optimizer loss from detached scoring diagnostics.`
-   - Function: introduces the loss section by correcting the key implementation distinction.
-   - Claim type: method and limitation claim.
-   - Word choices: `must distinguish` is deliberately firm because the debug pass showed the older combined-loss wording was misleading; `differentiable optimizer loss` names what actually drives gradients; `detached scoring diagnostics` names what is logged but not backpropagated.
+24. `A simplified view of the current training objective distinguishes the base differentiable model losses from the measured solver-in-loop term.`
+   - Function: opens the loss section with the corrected split.
+   - Claim type: method and implementation-semantics claim.
+   - Word choices: `base differentiable model losses` names the normal autograd path; `measured solver-in-loop term` says the CFD term is evaluated by the solver rather than invented by the paper.
    - Risk status: critical correction.
 
-25. `The optimizer step uses diffusion, decoded-geometry reconstruction, direct generation reconstruction, and consistency terms:`
-   - Function: lists the terms that actually enter the backpropagated objective.
+25. `The optimizer step uses diffusion, decoded-geometry reconstruction, direct generation reconstruction, consistency, and, when scheduled, a direct internal-solver objective:`
+   - Function: lists what can enter the backpropagated optimizer scalar.
    - Claim type: implementation claim.
-   - Word choices: `optimizer step uses` ties the sentence to gradient flow; `direct generation reconstruction` identifies the added fast-sampler geometry term; the colon points to the equation rather than overexplaining in prose.
-   - Risk status: grounded by `combine_training_loss_terms`.
+   - Word choices: `when scheduled` explains why the term is not present on every batch; `direct internal-solver objective` rejects the old detached-monitor-only interpretation.
+   - Risk status: grounded by `combine_training_loss_terms` and `DirectSolverSPSALoss`.
 
 26. `The diffusion loss is the mean squared error between the predicted noise and the actual noise.`
    - Function: defines diffusion loss.
@@ -241,80 +241,138 @@ A10. `The additional mission and manufacturing fields used by the condition vect
    - Risk status: grounded.
 
 27. `The decoded-geometry and generation-reconstruction terms compare voxel logits against the target voxel grid, while the consistency term supports the reduced-step sampler.`
-   - Function: explains the non-diffusion optimizer terms.
+   - Function: explains the non-diffusion model losses.
    - Claim type: implementation claim.
-   - Word choices: `compare` is accurate for the BCE-style loss; `voxel logits` avoids saying probabilities are compared at that point; `supports` avoids claiming validated sample quality improvement.
+   - Word choices: `compare` is accurate for BCE-style reconstruction; `voxel logits` keeps the logit/probability boundary clear; `supports` avoids overclaiming sampler quality.
    - Risk status: grounded.
 
-28. `The repository also logs a detached diagnostic total,`
+28. `The solver term materializes voxel probabilities into a full grid, converts them to a binary geometry by thresholding or top-k occupancy selection, calls the internal D3Q27 lattice-Boltzmann evaluator on that geometry, and combines the measured aerodynamic score with an optional exact connected-component penalty.`
+   - Function: explains what the direct solver loss actually does.
+   - Claim type: implementation claim.
+   - Word choices: `materializes`, `converts`, `calls`, and `combines` are code-path verbs; `measured` is important because the scalar is produced by solver evaluation; `optional exact connected-component penalty` accounts for the connectivity contribution without implying analytic differentiability.
+   - Risk status: grounded.
+
+29. `This path is not a learned stand-in: the scalar used in \(\mathcal{L}_{solver\mbox{-}SPSA}\) comes from solver calls made during training.`
+   - Function: directly addresses the rejected learned-substitute path.
+   - Claim type: implementation boundary.
+   - Word choices: `not a learned stand-in` is plain enough to prevent misreading; `solver calls made during training` gives the evidence mechanism.
+   - Risk status: essential.
+
+30. `The connected-component operation, binary materialization step, and internal CFD evaluator are not ordinary PyTorch operations with analytic gradients.`
+   - Function: explains why a derivative estimator is needed.
+   - Claim type: limitation and method rationale.
+   - Word choices: `ordinary PyTorch operations` and `analytic gradients` are precise about the autograd boundary without saying gradients are impossible in every sense.
+   - Risk status: grounded.
+
+31. `The training loop therefore uses a two-sided simultaneous perturbation estimate when this term is active.`
+   - Function: names the derivative-estimation method.
+   - Claim type: method claim.
+   - Word choices: `therefore` ties the estimator to the nondifferentiable solver boundary; `when this term is active` matches scheduled training.
+   - Risk status: grounded.
+
+32. `For a probability grid \(V\), a perturbation field \(\Delta\), and perturbation scale \(\epsilon\), it evaluates the measured objective on \(V+\epsilon\Delta\) and \(V-\epsilon\Delta\) and uses ... as the backward signal.`
+   - Function: explains the SPSA equation in prose.
+   - Claim type: mathematical method claim.
+   - Word choices: `measured objective` reinforces that both sides call the real objective; `backward signal` avoids saying exact gradient.
+   - Risk status: grounded.
+
+33. `The implementation can draw \(\Delta\) directly at voxel resolution or on a lower-frequency grid that is upsampled to the solver lattice before evaluation.`
+   - Function: records the variance-control option used in the final sweep.
+   - Claim type: implementation option.
+   - Word choices: `can draw` allows both modes; `lower-frequency grid` explains the `8^3` perturbation field without making it a new physics claim.
+   - Risk status: grounded.
+
+34. `The latter reduces high-frequency finite-difference noise and keeps the expensive solver work sequential and scheduled rather than evaluating many independent CFD calls in parallel.`
+   - Function: gives the engineering reason for low-frequency SPSA.
+   - Claim type: design rationale.
+   - Word choices: `reduces` refers to estimator noise structure; `sequential and scheduled` matches the user requirement and the implementation; `expensive` justifies the scheduling.
+   - Risk status: reasonable, but should remain tied to local smoke evidence.
+
+35. `The exact connected-component score and raw internal solver score can still be run as measured monitors,`
    - Function: introduces the diagnostic-total equation.
    - Claim type: logging-contract claim.
-   - Word choices: `also logs` separates monitoring from optimization; `detached` encodes the gradient boundary.
+   - Word choices: `still` says monitors were not removed; `measured monitors` separates them from the optimizer-facing scheduled term.
    - Risk status: grounded.
 
-29. `where \(\mathcal{D}_{conn}\) is a connected-component diagnostic on thresholded voxels and \(\mathcal{D}_{aero}\) is an internal solver score on thresholded generated geometry.`
-   - Function: defines the two diagnostic components.
+36. `where \(\mathcal{D}_{conn}\) is a connected-component score on thresholded voxels and \(\mathcal{D}_{aero}\) is an internal solver score on thresholded generated geometry.`
+   - Function: defines the two detached monitor components.
    - Claim type: implementation claim.
-   - Word choices: `diagnostic` replaces `loss` to avoid training-pressure overclaim; `thresholded` makes the nondifferentiable step visible; `internal solver score` avoids validated CFD wording.
+   - Word choices: `score` rather than `loss` prevents accidental optimizer overclaim; `thresholded` exposes the nondifferentiable conversion.
+   - Risk status: grounded.
+
+37. `In the direct-solver runs, those detached monitor intervals are set to zero so the limited full-grid compute is spent on the solver term that contributes to \(\mathcal{L}_{opt}\).`
+   - Function: explains why logged aero/connectivity monitor values remain zero in the direct sweep.
+   - Claim type: run-configuration explanation.
+   - Word choices: `detached monitor intervals` names the zero fields correctly; `contributes to L_opt` makes clear where the solver compute goes.
    - Risk status: critical.
 
-30. `These diagnostics are useful for monitoring and candidate ranking, but the present implementation does not backpropagate through connected-component labeling or through the CFD solver.`
-   - Function: states what the diagnostics can and cannot do.
-   - Claim type: limitation and future-route claim.
-   - Word choices: `useful` preserves their value; `monitoring and candidate ranking` names legitimate uses; `does not backpropagate` directly answers the aero/connectivity-loss concern.
-   - Risk status: essential.
+38. `The reported \texttt{direct\_solver\_loss} is the optimizer-facing term averaged over all training batches, and \texttt{direct\_solver\_eval\_loss} is the mean over the scheduled solver evaluations.`
+   - Function: defines the two direct-solver metrics.
+   - Claim type: metric semantics.
+   - Word choices: `optimizer-facing` and `scheduled` prevent readers from comparing the two averages incorrectly.
+   - Risk status: grounded.
 
-31. `The codebase is designed to couple geometry generation and CFD-informed scoring during training.`
+39. `The codebase is designed to couple geometry generation and CFD-informed scoring during training.`
    - Function: opens training-loop coupling section.
    - Claim type: design intent and code-path claim.
-   - Word choices: `designed to` allows implementation without claiming effect; `CFD-informed` stays cautious.
+   - Word choices: `designed to` allows implementation without claiming final design validity; `CFD-informed` stays cautious.
    - Risk status: acceptable.
 
-32. `In the present implementation, that coupling should be understood as a practical score path rather than as a demonstrated differentiable CFD-training result.`
-   - Function: prevents differentiability overclaim.
-   - Claim type: limitation claim.
-   - Word choices: `present implementation` and `practical score path` name the true status; `rather than` blocks a strong claim.
+40. `In the present implementation, that coupling has two honest forms: direct black-box solver optimization inside the training loop and measured black-box candidate optimization after generation.`
+   - Function: states the two solver-feedback routes now implemented.
+   - Claim type: implementation claim.
+   - Word choices: `honest forms` is blunt but useful; `direct black-box` distinguishes SPSA from analytic differentiability; `after generation` separates sequential candidate optimization from model-weight training.
+   - Risk status: grounded.
+
+41. `The raw internal LBM evaluator remains sequential and nondifferentiable in the analytic-autograd sense, but its scalar outputs can still influence model weights through the SPSA estimator described above.`
+   - Function: reconciles nondifferentiable solver mechanics with optimizer-facing training.
+   - Claim type: method boundary.
+   - Word choices: `analytic-autograd sense` keeps the statement precise; `can still influence model weights` is the key new result; `through the SPSA estimator` names the mechanism.
    - Risk status: critical.
 
-33. `The current repository evidence is limited to a reduced final protocol, so we only claim that the training code can invoke aerodynamic scoring terms and route generated geometries through the evaluator.`
-   - Function: states exactly what the evidence supports.
-   - Claim type: evidence boundary.
-   - Word choices: `only claim` is intentionally strict; `invoke` and `route` are code-path verbs, not performance verbs.
-   - Risk status: central guardrail.
-
-34. `In the current loop, training starts by sampling a noisy latent \(z_t\), asking the UNet for a noise estimate or denoised latent estimate, and decoding the resulting \(z_0\) candidate into a voxel grid \(V\).`
-   - Function: describes the differentiable model-side training path in prose.
+42. `In the current loop, training starts by sampling a noisy latent \(z_t\), asking the UNet for a noise estimate or denoised latent estimate, and decoding the resulting \(z_0\) candidate into voxel probabilities \(V\).`
+   - Function: describes the model-side loop.
    - Claim type: procedural description.
-   - Word choices: `current loop` anchors the description to implementation; `asking the UNet` is plainer than a step list; `candidate` keeps the decoded grid provisional.
+   - Word choices: `current loop` anchors the description to code; `voxel probabilities` matches the sigmoid materialization boundary.
    - Risk status: grounded.
 
-35. `That decoded grid can then be routed through the internal D3Q27 LBM evaluator to compute \(C_L\) and \(C_D\) diagnostics.`
-   - Function: states where solver diagnostics enter the loop.
-   - Claim type: procedural and limitation claim.
-   - Word choices: `can then be routed` avoids saying the route always drives gradients; `internal` and `diagnostics` keep solver evidence bounded.
+43. `For high-resolution coordinate decoders, the loop normally trains on sampled coordinates and only materializes the full grid when a full-grid objective is scheduled.`
+   - Function: explains why full-grid solver work is scheduled, not constant.
+   - Claim type: implementation detail.
+   - Word choices: `normally` and `only` describe the compute-saving control flow; `full-grid objective` covers direct solver and other full-grid losses.
    - Risk status: grounded.
 
-36. `The optimizer update itself still comes from \(\mathcal{L}_{opt}\), while connectivity and aerodynamic scores are logged as detached diagnostics.`
-   - Function: closes the loop description with the optimizer/diagnostic split.
-   - Claim type: implementation contract.
-   - Word choices: `itself still comes from` is intentionally explicit; `logged as detached diagnostics` is the core correction from the debugging pass.
-   - Risk status: critical.
+44. `When \(\mathcal{L}_{solver\mbox{-}SPSA}\) is active, the loop materializes that grid, evaluates the internal D3Q27 LBM objective on the base geometry and on two perturbed geometries, and folds the resulting measured scalar into the same \texttt{optimization\_loss} that is backpropagated through the decoder and denoiser weights.`
+   - Function: states the exact direct-solver training path.
+   - Claim type: implementation claim.
+   - Word choices: `base geometry and two perturbed geometries` gives the solver-call pattern; `folds` makes consolidation into the loss explicit; `same optimization_loss` addresses the earlier diagnostic-loss confusion.
+   - Risk status: grounded.
 
-37. `In a stronger future version of this pipeline, the repository would need either a validated differentiable surrogate or a sequential candidate-scoring loop showing that solver feedback measurably changes generated candidates.`
-   - Function: defines the future evidence needed for solver-guided generation claims.
-   - Claim type: future validation requirement.
-   - Word choices: `either` gives the two credible paths; `validated differentiable surrogate` and `sequential candidate-scoring loop` avoid pretending the current solver already supplies gradients; `measurably changes` defines the evidence threshold.
-   - Risk status: good guardrail.
+45. `The OpenFOAM setup is the external PDE-validation foundation.`
+   - Function: starts the ground-truth tier boundary.
+   - Claim type: validation-route claim.
+   - Word choices: `foundation` means route and apparatus, not completed validation.
+   - Risk status: grounded.
 
-38. `For now, the CFD path is an implemented scoring mechanism rather than evidence of CFD-guided gradient training.`
-   - Function: closes with the correct present claim.
-   - Claim type: limitation and grounding claim.
-   - Word choices: `For now` keeps future room; `implemented scoring mechanism` is the defensible claim; `rather than evidence` blocks the exact overclaim found during debugging.
+46. `Its role is to generate independent reference cases and, when residual and field-export gates pass, promote labels to the external-PDE tier defined in the ground-truth specification.`
+   - Function: defines how labels would become external ground truth.
+   - Claim type: future/conditional validation claim.
+   - Word choices: `when` and `gates pass` prevent automatic promotion; `external-PDE tier` matches the repo's claim taxonomy.
    - Risk status: essential.
+
+47. `The present Airshow grid-loss sweep uses the internal D3Q27 solver as a measured training objective and does not use OpenFOAM labels, so it should be read as internal-LBM-guided optimization plus a validation route, not as externally validated aerodynamic learning.`
+   - Function: closes the section with the precise claim boundary.
+   - Claim type: evidence boundary.
+   - Word choices: `measured training objective` gives credit for the new direct loss; `does not use OpenFOAM labels` blocks ground-truth overclaim; `not externally validated` is the necessary caveat.
+   - Risk status: critical.
 
 ## Audit Notes
 
-The methodology was deliberately rewritten away from phrases like "GPU-accelerated solver directly in the training loop" and "combined aerodynamic loss" because those read stronger than the verified implementation path. The current version is technical, but its verbs are mostly code verbs: `implements`, `routes`, `exports`, `scores`, `invokes`, `logs`, and `updates`.
+The methodology now deliberately distinguishes analytic autograd from black-box
+gradient estimation. It no longer says the solver is merely detached from
+training, because the direct SPSA path does fold measured solver values into
+the optimizer loss. It also refuses to upgrade those values to external PDE
+ground truth.
 
 ## 2026-06-20 Resolution Addendum
 

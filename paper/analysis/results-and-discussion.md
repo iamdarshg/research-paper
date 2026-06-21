@@ -2,11 +2,11 @@
 
 Source: `paper/sections/results-and-discussion.tex`
 
-Detector results from the fresh local checker pass after the Airshow subsection was added:
-- lmscan: `0.2371`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.005829`, fake max `0.030862`
+Detector results from the fresh local checker pass after the direct solver-in-loop subsection was added:
+- lmscan: `0.2473`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.211690`, fake max `0.983318`
 
-RoBERTa caveat: after preserving list text during extraction and rewriting the densest metric and solver paragraphs, the section-level maximum is below 0.05. The remaining detector flags are lmscan style signals, mainly passive voice and uniformity expected in technical writing.
+RoBERTa caveat: the section-level maximum is a short 45-word technical tail about the D3Q27 freestream correction. lmscan still classifies the section as likely human; the RoBERTa spike is treated as a style-screening flag, not authorship evidence.
 
 Overall function: this section reports the public Airshow corpus smoke run, the reduced evidence package, smoke runs, sweep coverage, and solver sanity checks while keeping all aerodynamic and structural claims bounded.
 
@@ -289,38 +289,98 @@ R17. `This suggests that the present objective and decoder need architectural or
 R18. `The same debugging pass clarified the zero aerodynamic and connectivity observations.`
    - Function: transitions from rerun results to loss semantics.
    - Claim type: process summary.
-   - Word choices: `clarified` is modest; it does not claim to solve CFD-guided learning.
+   - Word choices: `clarified` is modest; it introduces the fix without pretending validation is complete.
    - Risk status: safe.
 
-R19. `The connectivity diagnostic thresholds voxel probabilities and runs connected-component labeling through NumPy/SciPy.`
-   - Function: explains why connectivity is detached.
+R19. `The exact connectivity score thresholds voxel probabilities and runs connected-component labeling through NumPy/SciPy.`
+   - Function: explains the graph break in the exact connectivity path.
    - Claim type: implementation explanation.
-   - Word choices: `diagnostic` and `thresholds` make the non-gradient path clear.
+   - Word choices: `exact` distinguishes it from softer training approximations; `thresholds` and `NumPy/SciPy` expose why analytic autograd is not available.
    - Risk status: grounded.
 
-R20. `The aerodynamic diagnostic thresholds geometry, invokes the internal solver, and wraps scalar solver outputs back into PyTorch tensors.`
-   - Function: explains why aerodynamic scoring is detached.
+R20. `The raw aerodynamic score thresholds geometry, invokes the internal solver, and returns scalar solver outputs.`
+   - Function: explains the graph break in the aerodynamic path.
    - Claim type: implementation explanation.
-   - Word choices: `wraps scalar solver outputs` identifies the graph break; `internal solver` keeps CFD claim bounded.
+   - Word choices: `raw` and `internal` keep CFD evidence bounded; `returns scalar solver outputs` avoids implying an analytic differentiable field solve.
    - Risk status: grounded.
 
-R21. `A local gradient probe confirmed that both diagnostics have no gradient function.`
+R21. `A local gradient probe confirmed that these measured scores do not provide analytic PyTorch gradients by themselves.`
    - Function: records the direct gradient test.
    - Claim type: debugging result.
-   - Word choices: `confirmed` is appropriate because it was directly tested; `no gradient function` is precise PyTorch language.
+   - Word choices: `analytic PyTorch gradients by themselves` is precise: it leaves room for finite-difference estimators while still naming the autograd boundary.
    - Risk status: grounded by the local probe and tests.
 
-R22. `The training code has therefore been revised to report \texttt{optimization\_loss} separately from \texttt{diagnostic\_total}.`
-   - Function: states the code correction.
+R22. `The training code was therefore revised to report \texttt{optimization\_loss} separately from detached monitor terms and to add a direct solver-in-loop loss that calls the internal D3Q27 LBM evaluator during training and estimates its backward signal with two-sided SPSA finite differences.`
+   - Function: states the implementation correction and the new derivative route.
    - Claim type: implementation change.
-   - Word choices: `therefore` ties fix to root cause; the exact metric names make the logging contract inspectable.
+   - Word choices: `therefore` ties fix to root cause; `direct solver-in-loop` and `calls` make clear that real solver evaluations occur; `estimates` prevents exact-gradient overclaim.
    - Risk status: grounded.
 
-R23. `This does not turn the existing solver path into a differentiable teacher; it makes the claim boundary explicit and points toward a sequential candidate-ranking or surrogate-training loop as the next credible route.`
-   - Function: prevents the logging fix from becoming a scientific overclaim.
-   - Claim type: limitation and future-work recommendation.
-   - Word choices: `does not turn` is deliberately blunt; `claim boundary` names the paper-writing purpose; `sequential candidate-ranking or surrogate-training loop` identifies realistic next mechanisms.
+R23. `This is a measured black-box gradient estimator around real solver calls, not a learned substitute for the solver.`
+   - Function: blocks the rejected learned-substitute interpretation.
+   - Claim type: claim-boundary sentence.
+   - Word choices: `measured`, `black-box`, and `real solver calls` are the important words; `not` keeps the boundary sharp.
    - Risk status: essential.
+
+R24. `The first direct-solver sweep was intentionally diagnostic.`
+   - Function: frames the failed threshold/top-k attempts.
+   - Claim type: experiment-scope sentence.
+   - Word choices: `intentionally diagnostic` tells the reader those runs were for root-cause discovery, not final performance claims.
+   - Risk status: safe.
+
+R25. `A naive 0.5 probability threshold produced empty or effectively empty scheduled geometries, so the direct solver objective stayed nearly constant.`
+   - Function: records the first failed calibration.
+   - Claim type: negative run result.
+   - Word choices: `naive` is appropriate because the corpus is sparse; `empty or effectively empty` explains the constant objective without inventing success.
+   - Risk status: grounded by the initial sweep.
+
+R26. `A 5\% top-k occupancy target then made the solver-visible shapes too dense relative to the public Airshow corpus, whose mean occupancy was 0.01495 at \(32^3\), 0.00802 at \(64^3\), and 0.00565 at \(96^3\).`
+   - Function: records why 5% top-k was rejected.
+   - Claim type: corpus-statistic and run-configuration interpretation.
+   - Word choices: `too dense relative to` ties the conclusion to observed corpus occupancy; the three means make the calibration visible.
+   - Risk status: grounded by corpus occupancy measurement.
+
+R27. `The final sweep therefore used a 1\% top-k target, a low-frequency \(8^3\) perturbation field upsampled to the solver grid, a direct-solver loss weight of 0.2, three D3Q27 solver steps per scheduled objective call, and zero detached aerodynamic/connectivity monitor intervals.`
+   - Function: lists the final direct-solver training configuration.
+   - Claim type: run-configuration claim.
+   - Word choices: exact hyperparameters make the run reproducible; `zero detached...monitor intervals` explains why monitor fields are zero without saying the losses are absent.
+   - Risk status: grounded by `training_metrics.json`.
+
+R28. `That setting spends the full-grid compute on the loss being optimized rather than on diagnostics that cannot change the weights.`
+   - Function: explains the scheduling choice.
+   - Claim type: implementation rationale.
+   - Word choices: `loss being optimized` is the central distinction; `cannot change the weights` refers to detached monitors only.
+   - Risk status: grounded.
+
+R29. `Table \ref{tab:direct_solver_grid_sweep} shows both the matched two-epoch sweep and the required \(96^3\) continuation.`
+   - Function: frames the new table.
+   - Claim type: table-navigation sentence.
+   - Word choices: `both` and `continuation` prevent hiding the apples-to-apples limitation.
+   - Risk status: safe.
+
+R30. `After two epochs, the \(96^3\) optimizer loss and scheduled solver evaluation were still worse than the \(64^3\) run even though its geometry BCE was lower.`
+   - Function: reports the non-monotone result the user asked to address.
+   - Claim type: local run result.
+   - Word choices: `still worse` is direct; `even though` separates reconstruction quality from solver objective.
+   - Risk status: grounded.
+
+R31. `Continuing from the \(96^3\) checkpoint corrected that behavior: the scheduled direct solver evaluation dropped from 180.29967 to 3.87060 on the first continuation epoch and remained much lower than the \(64^3\) value at 7.48613 on the second continuation epoch.`
+   - Function: reports the continued high-resolution result.
+   - Claim type: local run result.
+   - Word choices: `corrected that behavior` is limited to the metric trend; exact values make the claim auditable.
+   - Risk status: grounded.
+
+R32. `The increase from 3.87060 to 7.48613 while the optimizer loss continued to decrease is a useful warning that the direct objective can start to overfit or drift under this short local protocol.`
+   - Function: interprets the continuation's second epoch carefully.
+   - Claim type: cautionary inference.
+   - Word choices: `warning`, `can start`, and `short local protocol` avoid overgeneralizing one run.
+   - Risk status: reasonable inference.
+
+R33. `Figure \ref{fig:airshow_grid_loss_vs_resolution} therefore uses the final continuation point for the \(96^3\) visual trend while the table preserves the non-monotone intermediate result.`
+   - Function: explains the figure/table relationship.
+   - Claim type: figure-method sentence.
+   - Word choices: `therefore` links plotting choice to the continuation; `preserves` shows the paper is not hiding the intermediate failure.
+   - Risk status: important transparency sentence.
 
 9. `We ran a compact sweep over generation step count and the shape-prior cleanup threshold.`
    - Function: introduces the freeform sweep.
@@ -544,16 +604,22 @@ R23. `This does not turn the existing solver path into a differentiable teacher;
    - Word choices: `higher-confidence` avoids binary valid/invalid framing; `still need` is explicit.
    - Risk status: future work.
 
-46. `The next recorded physics correction was applied in \texttt{CLI/cascaded\_lbm.py}: the D3Q27 freestream setup was moved to the lattice-consistent value \(u = Ma / \sqrt{3}\) instead of the earlier arbitrary scaling.`
-   - Function: records a specific implementation correction.
+46. `We also recorded one physics correction in \texttt{CLI/cascaded\_lbm.py}.`
+   - Function: introduces a specific implementation correction.
    - Claim type: code-change history.
-   - Word choices: `recorded` and file path make it auditable; `instead of` explains the correction.
+   - Word choices: `We also recorded` is active and less formulaic than passive correction language; the file path makes it auditable.
    - Risk status: grounded if file history matches.
 
-47. `That change is now part of the benchmark history and is being checked against the Cd mismatch before broader coordinate-transform changes.`
+47. `The D3Q27 freestream setup now uses the lattice-consistent value \(u = Ma / \sqrt{3}\); the earlier version used arbitrary scaling.`
+   - Function: states the correction itself.
+   - Claim type: implementation detail.
+   - Word choices: `now uses` and `earlier version used` make the before/after relationship plain; the semicolon keeps the two clauses tightly paired.
+   - Risk status: grounded.
+
+48. `That correction is part of the benchmark history, and we are checking it against the Cd mismatch before making broader coordinate-transform changes.`
    - Function: explains how the correction fits into future debugging.
    - Claim type: process/status claim.
-   - Word choices: `being checked` avoids claiming solved; `broader` replaces vague `deeper`.
+   - Word choices: `we are checking` avoids claiming solved; `before making` states the sequencing without overclaiming.
    - Risk status: grounded as ongoing status.
 
 ## Table Label Audit
@@ -597,3 +663,17 @@ aircraft-validity screen. The two new figures
 `airshow_generated_geometry_g96_topk0075.png` therefore serve as a mixed-result
 visual record, not as proof of reliable aircraft generation or aerodynamic
 optimization.
+
+## 2026-06-21 Direct Solver-In-Loop Addendum
+
+The results section now records the move from detached aero/connectivity
+monitors to a scheduled direct solver loss. The sentence choices deliberately
+use `analytic PyTorch gradients by themselves` rather than `cannot
+backpropagate` because the solver still lacks analytic autograd, but SPSA now
+supplies a black-box backward estimate from real D3Q27 evaluations.
+
+The table keeps the non-monotone evidence visible: the matched two-epoch
+`96^3` run was worse than `64^3` on the scheduled solver objective, then the
+continued `96^3` run dropped that objective below both lower-resolution runs.
+The wording `internal solver-in-loop evidence, not external PDE validation`
+is the ground-truth boundary for this result.

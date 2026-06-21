@@ -109,7 +109,35 @@ We then filtered the \(32^3\) corpus with the same aircraft-validity screen used
 
 The \(96^3\) follow-up replaced the dense decoder with a coordinate decoder that evaluates sampled \((z,y,x)\) coordinates conditioned on the latent vector. The public \(96^3\) source corpus had mean occupancy 0.00565 and median occupancy 0.00458, so naive coordinate sampling either collapsed toward empty fixed-threshold grids or, when occupied coordinates were oversampled without correction, biased the decoder toward overly dense outputs. The final run used importance-weighted coordinate BCE for three epochs over all 355 records and produced checkpoint hash \texttt{1bfdcfcf...59774d3}. With the default 0.5 threshold, all three flight-path exports remained below the aircraft-validity occupancy gate. With an explicit top-k export at 0.75\% occupancy, one case, \texttt{endurance\_turning}, passed the heuristic aircraft-validity screen; \texttt{short\_takeoff\_payload} and \texttt{high\_speed\_sprint} still failed \texttt{symmetry}, \texttt{span\_sanity}, and \texttt{wing\_body\_balance}. Figures \ref{fig:airshow_flight_metrics_g96_topk} and \ref{fig:airshow_generated_geometry_g96_topk} show that calibrated export result. This is evidence that the coordinate-decoder path can train and export \(96^3\) geometry, not evidence of reliable aircraft generation or validated aerodynamic optimization.
 
-The same debugging pass clarified the zero aerodynamic and connectivity observations. The connectivity diagnostic thresholds voxel probabilities and runs connected-component labeling through NumPy/SciPy. The aerodynamic diagnostic thresholds geometry, invokes the internal solver, and wraps scalar solver outputs back into PyTorch tensors. A local gradient probe confirmed that both diagnostics have no gradient function. The training code has therefore been revised to report \texttt{optimization\_loss} separately from \texttt{diagnostic\_total}. This does not turn the existing solver path into a differentiable teacher; it makes the claim boundary explicit and points toward a sequential candidate-ranking or surrogate-training loop as the next credible route.
+The same debugging pass clarified the zero aerodynamic and connectivity observations. The exact connectivity score thresholds voxel probabilities and runs connected-component labeling through NumPy/SciPy. The raw aerodynamic score thresholds geometry, invokes the internal solver, and returns scalar solver outputs. A local gradient probe confirmed that these measured scores do not provide analytic PyTorch gradients by themselves. The training code was therefore revised to report \texttt{optimization\_loss} separately from detached monitor terms and to add a direct solver-in-loop loss that calls the internal D3Q27 LBM evaluator during training and estimates its backward signal with two-sided SPSA finite differences. This is a measured black-box gradient estimator around real solver calls, not a learned substitute for the solver.
+
+The first direct-solver sweep was intentionally diagnostic. A naive 0.5 probability threshold produced empty or effectively empty scheduled geometries, so the direct solver objective stayed nearly constant. A 5\% top-k occupancy target then made the solver-visible shapes too dense relative to the public Airshow corpus, whose mean occupancy was 0.01495 at \(32^3\), 0.00802 at \(64^3\), and 0.00565 at \(96^3\). The final sweep therefore used a 1\% top-k target, a low-frequency \(8^3\) perturbation field upsampled to the solver grid, a direct-solver loss weight of 0.2, three D3Q27 solver steps per scheduled objective call, and zero detached aerodynamic/connectivity monitor intervals. That setting spends the full-grid compute on the loss being optimized rather than on diagnostics that cannot change the weights.
+
+\begin{table}[!t]
+\centering
+\caption{Direct Solver-In-Loop Grid Sweep}
+\label{tab:direct_solver_grid_sweep}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|p{0.19\columnwidth}|p{0.17\columnwidth}|p{0.17\columnwidth}|p{0.17\columnwidth}|p{0.18\columnwidth}|}
+\hline
+\textbf{Run} & \textbf{Opt. loss} & \textbf{Geom. BCE} & \textbf{Direct loss} & \textbf{Scheduled eval} \\ \hline
+\(32^3\), epoch 2 & 2.10166 & 0.08267 & 5.83028 & 172.47912 \\ \hline
+\(64^3\), epoch 2 & 1.11359 & 0.05038 & 1.30224 & 38.52468 \\ \hline
+\(96^3\), epoch 2 & 2.05984 & 0.04066 & 6.09464 & 180.29967 \\ \hline
+\(96^3\), continuation epoch 1 & 0.68305 & 0.03802 & 0.13084 & 3.87060 \\ \hline
+\(96^3\), continuation epoch 2 & 0.60605 & 0.03739 & 0.25305 & 7.48613 \\ \hline
+\end{tabular}
+\end{table}
+
+Table \ref{tab:direct_solver_grid_sweep} shows both the matched two-epoch sweep and the required \(96^3\) continuation. After two epochs, the \(96^3\) optimizer loss and scheduled solver evaluation were still worse than the \(64^3\) run even though its geometry BCE was lower. Continuing from the \(96^3\) checkpoint corrected that behavior: the scheduled direct solver evaluation dropped from 180.29967 to 3.87060 on the first continuation epoch and remained much lower than the \(64^3\) value at 7.48613 on the second continuation epoch. The increase from 3.87060 to 7.48613 while the optimizer loss continued to decrease is a useful warning that the direct objective can start to overfit or drift under this short local protocol. Figure \ref{fig:airshow_grid_loss_vs_resolution} therefore uses the final continuation point for the \(96^3\) visual trend while the table preserves the non-monotone intermediate result.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{figures/airshow_grid_loss_vs_resolution.png}
+\caption{Grid-size loss sweep with the coordinate decoder forced at \(32^3\), \(64^3\), and \(96^3\). The plotted \(96^3\) point uses the continuation run because the matched two-epoch \(96^3\) loss was still worse than \(64^3\). The right panel reports the scheduled measured D3Q27 solver objective used by the SPSA loss; it is internal solver-in-loop evidence, not external PDE validation.}
+\label{fig:airshow_grid_loss_vs_resolution}
+\end{figure}
 
 \begin{figure}[!t]
 \centering
@@ -255,4 +283,7 @@ The implementation evidence supports three bounded conclusions: the repository's
 
 The OpenFOAM export path now writes a plain \texttt{forces} function-object dictionary, and the resulting force vector is normalized manually to recover coefficients when coefficient output is not available. The current benchmark still shows a substantial Cd gap, which we treat as a solver- and sampling-consistency diagnostic rather than as resolved by paper-level normalization alone. A higher-confidence CFD comparison will still need a more systematic hyperparameter sweep and consistent normalization of reference area and flow conditions.
 
-The next recorded physics correction was applied in \texttt{CLI/cascaded\_lbm.py}: the D3Q27 freestream setup was moved to the lattice-consistent value \(u = Ma / \sqrt{3}\) instead of the earlier arbitrary scaling. That change is now part of the benchmark history and is being checked against the Cd mismatch before broader coordinate-transform changes.
+The current ground-truth foundation is therefore tiered. Internal D3Q27 LBM values can drive the direct SPSA training loss and sequential candidate selection, but they stay in the internal-label tier. The OpenFOAM/simpleFoam and sonicFoam scripts define the external PDE route: cases must complete, residual and field-export checks must pass, and the resulting labels must remain separate from internal LBM labels until they satisfy the \texttt{external\_pde} gate. This separation is important for future PDE validation because it lets the repository compare internal LBM coefficients against OpenFOAM under shared geometry, Mach, Reynolds, grid, and reference-area settings without silently upgrading the internal solver to ground truth.
+
+We also recorded one physics correction in \texttt{CLI/cascaded\_lbm.py}. The D3Q27 freestream setup now uses the lattice-consistent value \(u = Ma / \sqrt{3}\); the earlier version used arbitrary scaling. That correction is part of the benchmark history, and we are checking it against the Cd mismatch before making broader coordinate-transform changes.
+\par

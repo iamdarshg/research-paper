@@ -3,8 +3,8 @@
 Source: `paper/sections/conclusion.tex`
 
 Detector results:
-- lmscan: `0.2412`, verdict `Likely human`, confidence `high`
-- RoBERTa detector: fake mean `0.022462`, fake max `0.044746`
+- lmscan: `0.2420`, verdict `Likely human`, confidence `high`
+- RoBERTa detector: fake mean `0.186498`, fake max `0.456608`
 
 Overall function: the conclusion restates the working implementation, reduced evidence package, and exact future work required before stronger conditioned-aircraft claims.
 
@@ -70,16 +70,40 @@ Overall function: the conclusion restates the working implementation, reduced ev
    - Word choices: `not yet` leaves future room; `fully AI-driven airplane generator` names the overclaim exactly; the three condition types match user-facing expectations.
    - Risk status: critical.
 
-10. `What exists today is structured-conditioning plumbing plus a reduced evidence package, a grounded public-corpus smoke run, a mixed higher-resolution result, a clarified CFD-oriented scoring path whose aerodynamic and connectivity diagnostics are not differentiable training signals, and an experimental sequential candidate optimizer that can use those scores as measured black-box losses.`
+10. `The direct solver-in-loop follow-up changes what the optimizer actually sees.`
+   - Function: announces the key correction in plain language without overstating validation.
+   - Claim type: implementation-semantics claim.
+   - Word choices: `changes what the optimizer actually sees` explains why this is more than a logging cleanup; `actually` is used once to contrast optimized loss against detached diagnostics.
+   - Risk status: grounded by the trainer change and metrics schema.
+
+11. `Earlier runs could print aerodynamic and connectivity numbers without letting those numbers alter the weights.`
+   - Function: states the old failure mode plainly.
+   - Claim type: implementation-semantics claim.
+   - Word choices: `print` and `alter the weights` are deliberately concrete; this makes the detached-monitor issue understandable without extra framework jargon.
+   - Risk status: grounded by the gradient probe and old metrics.
+
+12. `In the new path, scheduled batches decode a full grid, call the internal D3Q27 LBM evaluator, add the measured score to \texttt{optimization\_loss}, and use two-sided SPSA perturbations as the backward estimate.`
+   - Function: states exactly what now makes the solver term optimizer-facing.
+   - Claim type: implementation claim.
+   - Word choices: `decode`, `call`, `add`, and `use` are active code-path verbs; `measured score` is precise about what is folded into the loss; `backward estimate` prevents pretending this is analytic autograd.
+   - Risk status: grounded by `DirectSolverSPSALoss` and the completed runs.
+
+13. `In the local grid sweep, continuing the \(96^3\) run drove the scheduled direct solver objective below the \(32^3\) and \(64^3\) values, but this remains internal-LBM smoke evidence rather than external PDE validation.`
+   - Function: reports the improved high-resolution run and immediately bounds it.
+   - Claim type: local run result and limitation.
+   - Word choices: `continuing` is important because the plotted `96^3` point is not the matched two-epoch result; `drove` is less formulaic than `reduced`; `internal-LBM smoke evidence` keeps ground truth tiering explicit.
+   - Risk status: grounded by `g96_more/checkpoints/training_metrics.json`.
+
+14. `The present system is narrower: structured-conditioning plumbing, a reduced evidence package, a grounded public-corpus smoke run, a mixed higher-resolution result, a direct internal-solver training term with black-box SPSA gradients, and a sequential candidate optimizer that can reuse the same measured scores after generation.`
    - Function: states the actual present status in plain language.
    - Claim type: implementation and evidence summary.
-   - Word choices: `plumbing` is intentionally humble; `reduced` keeps scope honest; `mixed higher-resolution result` is accurate after the one-of-three `96^3` top-k pass; `measured black-box losses` names the sequential optimizer without implying autograd.
+   - Word choices: `narrower` blocks the airplane-generator overclaim; `plumbing` is intentionally humble; `mixed higher-resolution result` captures the one-of-three top-k export and the solver-loss continuation; `black-box SPSA gradients` states the derivative route without claiming analytic CFD.
    - Risk status: grounded.
 
-11. `That stronger version needs more evidence first: validity-bearing aircraft-like training runs, conditional ablations, stricter structural and aerodynamic checks, decoder and export-calibration studies that make higher-resolution training practical and reliable, benchmark reports showing that the sequential or surrogate solver-feedback loop reliably improves candidates, and repeated runs beyond the present reduced local protocol.`
+15. `Stronger claims need stronger evidence: aircraft-like training runs that pass validity gates, conditional ablations, stricter structural and aerodynamic checks, decoder and export-calibration studies, repeated solver-in-loop benchmarks, OpenFOAM or comparable PDE validation, and repeated runs beyond the present reduced local protocol.`
    - Function: names the minimum future requirements.
    - Claim type: future-work gate.
-   - Word choices: `validity-bearing` makes passing generated gates the priority; `decoder and export-calibration studies` reflects the `96^3` result; `reliably improves candidates` is the missing evidence for solver feedback; `first` prevents premature claims.
+   - Word choices: `Stronger claims need stronger evidence` is plain and compact; `pass validity gates` makes generated-shape success the priority; `repeated solver-in-loop benchmarks` is the new evidence bar after adding SPSA; `OpenFOAM or comparable PDE validation` preserves the ground-truth boundary.
    - Risk status: future requirement, not current evidence.
 
 ## Audit Notes
@@ -112,3 +136,13 @@ following future-work phrase, `decoder and export-calibration studies that make
 higher-resolution training practical and reliable`, is intentionally broader
 than `decoder changes`: the new run shows that the decoder can train at
 `96^3`, but binary extraction and repeated validity remain unsolved.
+
+## 2026-06-21 Direct Solver-In-Loop Addendum
+
+The conclusion now separates three ideas that were previously too easy to blur:
+the internal D3Q27 solver can be scheduled as a measured training objective, its
+backward signal is an SPSA finite-difference estimate rather than analytic
+solver autograd, and OpenFOAM remains the external PDE validation route. The
+wording deliberately says `internal-LBM-guided smoke result` because the
+improved `96^3` direct solver objective is real training evidence but still not
+external ground truth.

@@ -62,23 +62,37 @@ The latent-to-3D converter maps the denoised latent vector to voxel logits. For 
 The repository uses an internal lattice-Boltzmann-style CFD evaluator to score generated voxel grids. The evaluator takes a voxel geometry and flow settings such as Mach number or Reynolds number and returns drag- and lift-related quantities. In addition, the repository can export benchmark cases for comparison against an external OpenFOAM run. This combination is useful for code-path validation, but the present paper does not treat it as a substitute for a full aerodynamic validation campaign.
 
 \subsection{Loss Function}
-A simplified view of the current training objective must distinguish the differentiable optimizer loss from detached scoring diagnostics. The optimizer step uses diffusion, decoded-geometry reconstruction, direct generation reconstruction, and consistency terms:
+A simplified view of the current training objective distinguishes the base differentiable model losses from the measured solver-in-loop term. The optimizer step uses diffusion, decoded-geometry reconstruction, direct generation reconstruction, consistency, and, when scheduled, a direct internal-solver objective:
 
 \begin{equation}
 \mathcal{L}_{opt} =
 \mathcal{L}_{diff}
 + \lambda_{geom}\mathcal{L}_{geom}
 + \lambda_{gen}\mathcal{L}_{gen}
-+ \mathcal{L}_{cons}.
++ \mathcal{L}_{cons}
++ \lambda_{solver}\mathcal{L}_{solver\mbox{-}SPSA}.
 \end{equation}
 
-The diffusion loss is the mean squared error between the predicted noise and the actual noise. The decoded-geometry and generation-reconstruction terms compare voxel logits against the target voxel grid, while the consistency term supports the reduced-step sampler. The repository also logs a detached diagnostic total,
+The diffusion loss is the mean squared error between the predicted noise and the actual noise. The decoded-geometry and generation-reconstruction terms compare voxel logits against the target voxel grid, while the consistency term supports the reduced-step sampler. The solver term materializes voxel probabilities into a full grid, converts them to a binary geometry by thresholding or top-k occupancy selection, calls the internal D3Q27 lattice-Boltzmann evaluator on that geometry, and combines the measured aerodynamic score with an optional exact connected-component penalty. This path is not a learned stand-in: the scalar used in \(\mathcal{L}_{solver\mbox{-}SPSA}\) comes from solver calls made during training.
+
+The connected-component operation, binary materialization step, and internal CFD evaluator are not ordinary PyTorch operations with analytic gradients. The training loop therefore uses a two-sided simultaneous perturbation estimate when this term is active. For a probability grid \(V\), a perturbation field \(\Delta\), and perturbation scale \(\epsilon\), it evaluates the measured objective on \(V+\epsilon\Delta\) and \(V-\epsilon\Delta\) and uses
+
+\begin{equation}
+\widehat{\nabla}_V \mathcal{L}_{solver}
+\approx
+\frac{\mathcal{J}(V+\epsilon\Delta)-\mathcal{J}(V-\epsilon\Delta)}
+{2\epsilon}\Delta
+\end{equation}
+
+as the backward signal. The implementation can draw \(\Delta\) directly at voxel resolution or on a lower-frequency grid that is upsampled to the solver lattice before evaluation. The latter reduces high-frequency finite-difference noise and keeps the expensive solver work sequential and scheduled rather than evaluating many independent CFD calls in parallel.
+
+The exact connected-component score and raw internal solver score can still be run as measured monitors,
 
 \begin{equation}
 \mathcal{D}_{total} = \mathcal{L}_{opt} + \mathcal{D}_{conn} + \mathcal{D}_{aero},
 \end{equation}
 
-where \(\mathcal{D}_{conn}\) is a connected-component diagnostic on thresholded voxels and \(\mathcal{D}_{aero}\) is an internal solver score on thresholded generated geometry. These diagnostics are useful for monitoring and candidate ranking, but the present implementation does not backpropagate through connected-component labeling or through the CFD solver.
+where \(\mathcal{D}_{conn}\) is a connected-component score on thresholded voxels and \(\mathcal{D}_{aero}\) is an internal solver score on thresholded generated geometry. In the direct-solver runs, those detached monitor intervals are set to zero so the limited full-grid compute is spent on the solver term that contributes to \(\mathcal{L}_{opt}\). The reported \texttt{direct\_solver\_loss} is the optimizer-facing term averaged over all training batches, and \texttt{direct\_solver\_eval\_loss} is the mean over the scheduled solver evaluations.
 
 \subsection{Sequential Measured-Objective Candidate Optimization}
 The repository now includes an experimental sequential optimizer for generated candidates. This path treats the connectivity, validity, and aerodynamic evaluations as measured black-box objective terms:
@@ -94,7 +108,8 @@ w_{conn}\mathcal{D}_{conn}
 The implementation supports a sequential genetic search and a two-point SPSA-style estimator. Both methods evaluate one candidate at a time, record the measured objective terms, and keep or update candidates based on the scalar score. This is a real optimizer over generated candidates, but it is not backpropagation through the CFD solver and it does not by itself update the diffusion model weights.
 
 \subsection{Current CFD Coupling In The Training Loop}
-The codebase is designed to couple geometry generation and CFD-informed scoring during training. In the present implementation, that coupling should be understood as a practical score path rather than as a demonstrated differentiable CFD-training result. The current repository evidence is limited to a reduced final protocol, so we only claim that the training code can invoke aerodynamic scoring terms and route generated geometries through the evaluator.
+The codebase is designed to couple geometry generation and CFD-informed scoring during training. In the present implementation, that coupling has two honest forms: direct black-box solver optimization inside the training loop and measured black-box candidate optimization after generation. The raw internal LBM evaluator remains sequential and nondifferentiable in the analytic-autograd sense, but its scalar outputs can still influence model weights through the SPSA estimator described above.
 
-In the current loop, training starts by sampling a noisy latent \(z_t\), asking the UNet for a noise estimate or denoised latent estimate, and decoding the resulting \(z_0\) candidate into a voxel grid \(V\). That decoded grid can then be routed through the internal D3Q27 LBM evaluator to compute \(C_L\) and \(C_D\) diagnostics. The optimizer update itself still comes from \(\mathcal{L}_{opt}\), while connectivity and aerodynamic scores are logged as detached diagnostics.
-The new sequential path is the first implementation of that candidate-scoring loop, but the claim boundary remains narrow until benchmark reports show that it reliably improves generated candidates under the aircraft-validity and solver-score gates. A stronger future version would still need either a validated differentiable surrogate or repeated black-box optimization evidence showing that solver feedback measurably changes generated candidates.
+In the current loop, training starts by sampling a noisy latent \(z_t\), asking the UNet for a noise estimate or denoised latent estimate, and decoding the resulting \(z_0\) candidate into voxel probabilities \(V\). For high-resolution coordinate decoders, the loop normally trains on sampled coordinates and only materializes the full grid when a full-grid objective is scheduled. When \(\mathcal{L}_{solver\mbox{-}SPSA}\) is active, the loop materializes that grid, evaluates the internal D3Q27 LBM objective on the base geometry and on two perturbed geometries, and folds the resulting measured scalar into the same \texttt{optimization\_loss} that is backpropagated through the decoder and denoiser weights.
+
+The OpenFOAM setup is the external PDE-validation foundation. Its role is to generate independent reference cases and, when residual and field-export gates pass, promote labels to the external-PDE tier defined in the ground-truth specification. The present Airshow grid-loss sweep uses the internal D3Q27 solver as a measured training objective and does not use OpenFOAM labels, so it should be read as internal-LBM-guided optimization plus a validation route, not as externally validated aerodynamic learning.

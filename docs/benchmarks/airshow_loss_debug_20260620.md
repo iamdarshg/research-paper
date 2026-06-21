@@ -204,20 +204,22 @@ history, candidate counts, and measured best/initial losses in
 
 ## Recommended Next Approach
 
-The next credible route is now to run and report the sequential optimizer rather
-than pretending that raw solver scores are differentiable:
+The next credible route is now to use the direct solver-in-loop SPSA loss for
+model-weight training and the sequential optimizer for candidate selection,
+rather than pretending that raw solver scores have analytic PyTorch gradients:
 
 1. Generate multiple candidate voxel grids per design condition.
 2. Run the aircraft-validity screen and internal solver on each candidate.
 3. Rank or filter candidates using explicit logged criteria.
-4. Train either a differentiable surrogate on the solver-labeled candidates or
-   use a black-box optimization loop that records candidate scores and accepted
-   updates.
+4. For model-weight updates, schedule the direct measured solver objective and
+   estimate its backward signal with two-sided SPSA.
+5. For generated candidates, use a black-box optimization loop that records
+   candidate scores and accepted updates.
 
-Until the sequential loop is run at benchmark scale and shows reliable
-candidate improvement, the paper should say that the repository has a
-CFD-oriented scoring path plus an experimental black-box candidate optimizer,
-not demonstrated CFD-guided gradient training.
+Until the direct solver-in-loop path and sequential loop are run at benchmark
+scale and show reliable candidate improvement, the paper should say that the
+repository has internal-LBM-guided smoke optimization, not externally validated
+CFD-guided aircraft design.
 
 ## 2026-06-21 `96^3` Coordinate-Decoder Addendum
 
