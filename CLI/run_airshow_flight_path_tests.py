@@ -159,6 +159,15 @@ def _binarize_voxel(
     return binary.reshape_as(grid).numpy().astype(np.float32)
 
 
+def _blend_lateral_symmetry(voxel_grid: torch.Tensor, blend: float) -> torch.Tensor:
+    blend = float(np.clip(blend, 0.0, 1.0))
+    if blend <= 0.0:
+        return voxel_grid
+    mirrored = torch.flip(voxel_grid, dims=[1])
+    symmetric = 0.5 * (voxel_grid + mirrored)
+    return ((1.0 - blend) * voxel_grid + blend * symmetric).clamp(0.0, 1.0)
+
+
 def _build_objective_optimizer(
     args: argparse.Namespace,
     cfd: AdvancedCFDSimulator,
@@ -183,6 +192,11 @@ def _build_objective_optimizer(
         validity_weight=args.objective_validity_weight,
         occupancy_weight=args.objective_occupancy_weight,
         target_occupancy=args.objective_target_occupancy,
+        binarization_target_occupancy=(
+            args.objective_binarization_target_occupancy
+            if args.objective_binarization_target_occupancy is not None
+            else args.export_target_occupancy
+        ),
         enable_aerodynamic=not args.no_objective_cfd,
         cfd_steps=args.cfd_steps,
         seed=seed + args.objective_seed_offset,
@@ -216,6 +230,7 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
         with torch.no_grad():
             generated = generator.generate(spec, num_steps=args.num_steps)
         voxel = _prepare_voxel_for_solver(generated, device)
+        voxel = _blend_lateral_symmetry(voxel, args.export_symmetry_blend)
         objective_optimizer = _build_objective_optimizer(args, cfd, device, seed)
         optimization_report = None
         pre_optimization_binary = _binarize_voxel(
@@ -293,10 +308,12 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
         "num_steps": args.num_steps,
         "cfd_steps": args.cfd_steps,
         "objective_optimizer": args.objective_optimizer,
+        "objective_binarization_target_occupancy": args.objective_binarization_target_occupancy,
         "binarization": {
             "export_threshold": args.export_threshold,
             "export_target_occupancy": args.export_target_occupancy,
             "method": "top_k_target_occupancy" if args.export_target_occupancy is not None else "fixed_threshold",
+            "export_symmetry_blend": args.export_symmetry_blend,
         },
         "case_count": len(results),
         "cases": results,
@@ -343,10 +360,25 @@ def main() -> int:
     parser.add_argument("--objective-validity-weight", type=float, default=10.0)
     parser.add_argument("--objective-occupancy-weight", type=float, default=0.0)
     parser.add_argument("--objective-target-occupancy", type=float, default=0.03)
+    parser.add_argument(
+        "--objective-binarization-target-occupancy",
+        type=float,
+        default=None,
+        help=(
+            "If set, score sequential optimizer candidates with top-k binarization "
+            "at this occupancy. Defaults to --export-target-occupancy when provided."
+        ),
+    )
     parser.add_argument("--objective-seed-offset", type=int, default=1000)
     parser.add_argument("--no-objective-cfd", action="store_true", help="Disable CFD calls inside the sequential objective optimizer.")
     parser.add_argument("--export-threshold", type=float, default=0.5, help="Fixed probability threshold for binary export when no target occupancy is set.")
     parser.add_argument("--export-target-occupancy", type=float, default=None, help="If set, export the top-k probability voxels at this target occupancy instead of a fixed threshold.")
+    parser.add_argument(
+        "--export-symmetry-blend",
+        type=float,
+        default=0.0,
+        help="Blend generated probabilities with their lateral mirror before objective optimization and export.",
+    )
     args = parser.parse_args()
     report = run_cases(args)
     print(json.dumps(report, indent=2, sort_keys=True))

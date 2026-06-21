@@ -39,6 +39,7 @@ class SequentialDiagnosticOptimizationConfig:
     validity_weight: float = 10.0
     occupancy_weight: float = 0.0
     target_occupancy: float = 0.03
+    binarization_target_occupancy: Optional[float] = None
     enable_aerodynamic: bool = True
     cfd_steps: int = 100
     seed: Optional[int] = None
@@ -64,6 +65,10 @@ class SequentialDiagnosticOptimizationConfig:
         config.validity_weight = max(0.0, float(config.validity_weight))
         config.occupancy_weight = max(0.0, float(config.occupancy_weight))
         config.target_occupancy = float(np.clip(config.target_occupancy, 0.0, 1.0))
+        if config.binarization_target_occupancy is not None:
+            config.binarization_target_occupancy = float(
+                np.clip(config.binarization_target_occupancy, 0.0, 1.0)
+            )
         config.cfd_steps = max(1, int(config.cfd_steps))
         return config
 
@@ -89,6 +94,22 @@ def _largest_component_fraction(binary: np.ndarray) -> float:
     sizes = np.bincount(labeled.ravel())
     largest = int(sizes[1:].max()) if sizes.size > 1 else 0
     return float(largest) / float(max(occupied, 1))
+
+
+def _binarize_candidate(grid: torch.Tensor, config: SequentialDiagnosticOptimizationConfig) -> np.ndarray:
+    if config.binarization_target_occupancy is None:
+        return (grid > config.threshold).detach().cpu().numpy().astype(np.uint8)
+
+    target = float(config.binarization_target_occupancy)
+    flat = grid.detach().cpu().float().reshape(-1)
+    if flat.numel() == 0 or target <= 0.0:
+        return np.zeros(tuple(grid.shape), dtype=np.uint8)
+
+    keep = min(flat.numel(), max(1, int(round(flat.numel() * target))))
+    selected = torch.topk(flat, keep, largest=True).indices
+    binary = torch.zeros_like(flat, dtype=torch.uint8)
+    binary[selected] = 1
+    return binary.reshape(tuple(grid.shape)).numpy().astype(np.uint8)
 
 
 def _select_drag_coefficient(cfd_results: Dict[str, Any]) -> float:
@@ -150,7 +171,7 @@ class SequentialDiagnosticOptimizer:
 
     def evaluate(self, candidate: torch.Tensor, design_spec: Any) -> Dict[str, Any]:
         grid = _to_3d_probability_grid(candidate).to(self.device)
-        binary = (grid > self.config.threshold).detach().cpu().numpy().astype(np.uint8)
+        binary = _binarize_candidate(grid, self.config)
         occupancy = float(binary.mean()) if binary.size else 0.0
         connected_fraction = _largest_component_fraction(binary)
         connectivity_loss = 1.0 - connected_fraction
@@ -284,7 +305,11 @@ class SequentialDiagnosticOptimizer:
             "candidates_evaluated": candidates_evaluated,
             "history": history,
             "voxel_grid": best_candidate.detach(),
-            "binary_grid": (best_candidate > self.config.threshold).float().detach(),
+            "binary_grid": torch.as_tensor(
+                _binarize_candidate(best_candidate, self.config),
+                device=best_candidate.device,
+                dtype=torch.float32,
+            ).detach(),
         }
 
     def _optimize_spsa(self, initial: torch.Tensor, design_spec: Any) -> Dict[str, Any]:
@@ -344,5 +369,9 @@ class SequentialDiagnosticOptimizer:
             "candidates_evaluated": candidates_evaluated,
             "history": [{"generation": 0, "candidates": [initial_eval]}, *history],
             "voxel_grid": best_candidate.detach(),
-            "binary_grid": (best_candidate > self.config.threshold).float().detach(),
+            "binary_grid": torch.as_tensor(
+                _binarize_candidate(best_candidate, self.config),
+                device=best_candidate.device,
+                dtype=torch.float32,
+            ).detach(),
         }

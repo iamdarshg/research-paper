@@ -161,8 +161,8 @@ def _canonicalize_aircraft_grid(grid: torch.Tensor) -> tuple[torch.Tensor, Dict[
     if float(cropped.sum().item()) <= 0.0:
         return grid, {"permutation": [0, 1, 2], "score": 0.0}
 
-    best_grid = grid
-    best_metrics = _heuristic_metrics(grid)
+    best_grid = _center_in_canvas(cropped, grid.shape)
+    best_metrics = _heuristic_metrics(best_grid)
     best_perm = (0, 1, 2)
     best_score = _orientation_score(best_metrics)
 

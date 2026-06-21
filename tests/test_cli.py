@@ -14,7 +14,7 @@ from aircraft_diffusion_cfd import (
     OptimizedDiffusionTrainer, AircraftDesignDataset, DesignSpec, aircraft_collate_fn,
     AdvancedCFDSimulator
 )
-from run_airshow_flight_path_tests import _binarize_voxel
+from run_airshow_flight_path_tests import _binarize_voxel, _blend_lateral_symmetry
 
 class TestCLI(unittest.TestCase):
     def setUp(self):
@@ -79,6 +79,16 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(int(topk.sum()), 2)
         self.assertEqual(float(topk[0, 1, 1]), 1.0)
         self.assertEqual(float(topk[1, 0, 1]), 1.0)
+
+    def test_export_symmetry_blend_mirrors_lateral_axis(self):
+        grid = torch.zeros((2, 4, 2), dtype=torch.float32)
+        grid[:, 0, :] = 1.0
+
+        symmetric = _blend_lateral_symmetry(grid, 1.0)
+
+        self.assertTrue(torch.allclose(symmetric[:, 0, :], symmetric[:, -1, :]))
+        self.assertTrue(torch.allclose(symmetric[:, 1, :], symmetric[:, -2, :]))
+        self.assertGreater(float(symmetric[:, -1, :].sum()), 0.0)
 
     def test_simulator_base(self):
         simulator = AdvancedCFDSimulator(self.cfd_config, self.device)

@@ -104,3 +104,20 @@ def test_spsa_optimizer_records_two_point_measurements():
     assert len(result["history"]) == 3
     assert "spsa_gradient_scale" in result["history"][1]
     assert result["best"]["total_loss"] <= result["initial"]["total_loss"]
+
+
+def test_topk_binarization_scores_sparse_probability_grid():
+    cfd = _FakeCFD()
+    config = SequentialDiagnosticOptimizationConfig(
+        enable_aerodynamic=True,
+        threshold=0.5,
+        binarization_target_occupancy=0.125,
+        cfd_steps=3,
+    )
+    optimizer = SequentialDiagnosticOptimizer(cfd, config=config)
+    grid = torch.linspace(0.01, 0.49, 8 * 8 * 8, dtype=torch.float32).reshape(8, 8, 8)
+
+    result = optimizer.evaluate(grid, _Spec())
+
+    assert result["metrics"]["occupancy_ratio"] == 0.125
+    assert cfd.calls == [{"occupied": 64.0, "steps": 3}]
