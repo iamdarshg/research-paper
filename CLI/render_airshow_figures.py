@@ -64,8 +64,12 @@ def _figure_style() -> None:
     )
 
 
-def render_corpus_summary(report: Dict[str, Any], output_dir: Path) -> Path:
-    path = output_dir / "airshow_corpus_summary.png"
+def _with_suffix(stem: str, suffix: str) -> str:
+    return f"{stem}{suffix}.png"
+
+
+def render_corpus_summary(report: Dict[str, Any], output_dir: Path, suffix: str = "") -> Path:
+    path = output_dir / _with_suffix("airshow_corpus_summary", suffix)
     fig, axes = plt.subplots(1, 3, figsize=(7.1, 2.35), constrained_layout=True)
 
     funnel_labels = ["public docs", "eligible", "converted", "404 rejects"]
@@ -111,8 +115,8 @@ def render_corpus_summary(report: Dict[str, Any], output_dir: Path) -> Path:
     return path
 
 
-def render_training_losses(output_dir: Path) -> Path:
-    path = output_dir / "airshow_training_losses.png"
+def render_training_losses(output_dir: Path, suffix: str = "") -> Path:
+    path = output_dir / _with_suffix("airshow_training_losses", suffix)
     epochs = np.asarray([row["epoch"] for row in TRAINING_METRICS])
     fig, axes = plt.subplots(1, 2, figsize=(7.1, 2.45), constrained_layout=True)
 
@@ -140,8 +144,8 @@ def render_training_losses(output_dir: Path) -> Path:
     return path
 
 
-def render_flight_metrics(report: Dict[str, Any], output_dir: Path) -> Path:
-    path = output_dir / "airshow_flight_path_metrics.png"
+def render_flight_metrics(report: Dict[str, Any], output_dir: Path, suffix: str = "") -> Path:
+    path = output_dir / _with_suffix("airshow_flight_path_metrics", suffix)
     cases = report["cases"]
     labels = [case["case_id"].replace("_", "\n") for case in cases]
     occupancy = [case["geometry_summary"]["occupancy_ratio"] for case in cases]
@@ -160,7 +164,7 @@ def render_flight_metrics(report: Dict[str, Any], output_dir: Path) -> Path:
         axis.set_ylabel(ylabel)
         for idx, value in enumerate(values):
             axis.text(idx, value + max(values) * 0.035, f"{value:.4f}", ha="center", va="bottom", fontsize=6)
-    fig.suptitle("Generated flight-path smoke checks: all validity results fail span sanity", fontsize=11)
+    fig.suptitle("Generated flight-path smoke checks: validity-screen summary", fontsize=11)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -171,8 +175,29 @@ def _projection_image(voxels: np.ndarray, axis: int) -> np.ndarray:
     return np.flipud(projected.T if axis == 0 else projected)
 
 
-def render_generated_geometry(report: Dict[str, Any], output_dir: Path) -> Path:
-    path = output_dir / "airshow_generated_geometry.png"
+def _downsample_for_preview(voxels: np.ndarray, max_resolution: int = 32) -> np.ndarray:
+    if max(voxels.shape) <= max_resolution:
+        return voxels
+    factor = int(np.ceil(max(voxels.shape) / max_resolution))
+    trimmed_shape = tuple((dim // factor) * factor for dim in voxels.shape)
+    trimmed = voxels[
+        : trimmed_shape[0],
+        : trimmed_shape[1],
+        : trimmed_shape[2],
+    ]
+    reshaped = trimmed.reshape(
+        trimmed_shape[0] // factor,
+        factor,
+        trimmed_shape[1] // factor,
+        factor,
+        trimmed_shape[2] // factor,
+        factor,
+    )
+    return reshaped.max(axis=(1, 3, 5))
+
+
+def render_generated_geometry(report: Dict[str, Any], output_dir: Path, suffix: str = "") -> Path:
+    path = output_dir / _with_suffix("airshow_generated_geometry", suffix)
     cases = report["cases"]
     fig = plt.figure(figsize=(7.1, 5.4), constrained_layout=True)
     subfigs = fig.subfigures(len(cases), 1, hspace=0.07)
@@ -190,9 +215,10 @@ def render_generated_geometry(report: Dict[str, Any], output_dir: Path) -> Path:
 
         ax3d = subfig.add_subplot(1, 4, 1, projection="3d")
         projection_axes = [subfig.add_subplot(1, 4, index) for index in range(2, 5)]
-        filled = np.argwhere(voxels)
+        preview_voxels = _downsample_for_preview(voxels)
+        filled = np.argwhere(preview_voxels)
         if filled.size:
-            ax3d.voxels(voxels, facecolors="#4F9D69", edgecolor="#254236", linewidth=0.18, alpha=0.88)
+            ax3d.voxels(preview_voxels, facecolors="#4F9D69", edgecolor="#254236", linewidth=0.18, alpha=0.88)
         ax3d.set_title("voxel render", fontsize=8)
         ax3d.set_axis_off()
         ax3d.view_init(elev=23, azim=42)
@@ -220,6 +246,8 @@ def main() -> int:
     parser.add_argument("--corpus-report", default="build/airshow_grounded_corpus_20260620/corpus_report.json")
     parser.add_argument("--flight-report", default="build/airshow_training_20260620/flight_path_tests/flight_path_results.json")
     parser.add_argument("--output-dir", default="paper/figures")
+    parser.add_argument("--suffix", default="", help="Optional filename suffix such as _g96.")
+    parser.add_argument("--skip-training-losses", action="store_true", help="Do not render the built-in 16^3 training-loss figure.")
     args = parser.parse_args()
 
     _figure_style()
@@ -227,12 +255,15 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     corpus_report = _load_json(Path(args.corpus_report))
     flight_report = _load_json(Path(args.flight_report))
-    paths: List[Path] = [
-        render_corpus_summary(corpus_report, output_dir),
-        render_training_losses(output_dir),
-        render_flight_metrics(flight_report, output_dir),
-        render_generated_geometry(flight_report, output_dir),
-    ]
+    paths: List[Path] = [render_corpus_summary(corpus_report, output_dir, args.suffix)]
+    if not args.skip_training_losses:
+        paths.append(render_training_losses(output_dir, args.suffix))
+    paths.extend(
+        [
+            render_flight_metrics(flight_report, output_dir, args.suffix),
+            render_generated_geometry(flight_report, output_dir, args.suffix),
+        ]
+    )
     print(json.dumps({"figures": [str(path) for path in paths]}, indent=2))
     return 0
 

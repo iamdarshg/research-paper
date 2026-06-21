@@ -14,6 +14,7 @@ from aircraft_diffusion_cfd import (
     OptimizedDiffusionTrainer, AircraftDesignDataset, DesignSpec, aircraft_collate_fn,
     AdvancedCFDSimulator
 )
+from run_airshow_flight_path_tests import _binarize_voxel
 
 class TestCLI(unittest.TestCase):
     def setUp(self):
@@ -45,6 +46,39 @@ class TestCLI(unittest.TestCase):
         latent = torch.randn(2, 16)
         voxels = conv(latent)
         self.assertEqual(voxels.shape, (2, 8, 8, 8))
+
+    def test_high_resolution_converter_uses_coordinate_decoder(self):
+        conv = LatentTo3DConverter(latent_dim=16, grid_resolution=96, coordinate_chunk_size=200000)
+        latent = torch.randn(1, 16)
+        voxels = conv(latent)
+        self.assertEqual(conv.decoder_mode, "coordinate")
+        self.assertEqual(voxels.shape, (1, 96, 96, 96))
+        max_parameter_count = max(param.numel() for param in conv.parameters())
+        self.assertLess(max_parameter_count, 1000000)
+
+    def test_high_resolution_converter_decodes_selected_indices(self):
+        conv = LatentTo3DConverter(latent_dim=16, grid_resolution=96, coordinate_chunk_size=5)
+        latent = torch.randn(2, 16)
+        indices = torch.tensor([0, 17, 96 * 96 * 96 - 1], dtype=torch.long)
+        logits = conv.forward_flat_indices(latent, indices)
+        self.assertEqual(logits.shape, (2, 3))
+
+    def test_target_occupancy_binarization_uses_topk(self):
+        grid = torch.tensor(
+            [
+                [[0.1, 0.7], [0.2, 0.9]],
+                [[0.3, 0.8], [0.4, 0.6]],
+            ],
+            dtype=torch.float32,
+        )
+
+        fixed = _binarize_voxel(grid, threshold=0.5)
+        self.assertEqual(int(fixed.sum()), 4)
+
+        topk = _binarize_voxel(grid, threshold=0.5, target_occupancy=0.25)
+        self.assertEqual(int(topk.sum()), 2)
+        self.assertEqual(float(topk[0, 1, 1]), 1.0)
+        self.assertEqual(float(topk[1, 0, 1]), 1.0)
 
     def test_simulator_base(self):
         simulator = AdvancedCFDSimulator(self.cfd_config, self.device)

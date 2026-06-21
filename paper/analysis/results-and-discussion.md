@@ -21,7 +21,7 @@ Overall function: this section reports the public Airshow corpus smoke run, the 
 2. `It consists of public-geometry smoke training on VSP Airshow models, a higher-resolution Airshow addendum, bounded smoke runs on synthetic or procedural data retained for context, a reduced freeform-object sweep for the historical CFD path, and smoke-level checks for the new structured-conditioning seam.`
    - Function: lists evidence sources.
    - Claim type: evidence inventory.
-   - Word choices: `public-geometry smoke training` names the new Airshow evidence without overclaiming; `higher-resolution Airshow addendum` covers the `32^3`, `64^3`, and source-valid follow-up without calling them validation; `retained for context` explains why older synthetic/procedural runs remain; `reduced` and `smoke-level` are maturity limiters.
+   - Word choices: `public-geometry smoke training` names the new Airshow evidence without overclaiming; `higher-resolution Airshow addendum` covers the `32^3`, `64^3`, `96^3`, and source-valid follow-up without calling them validation; `retained for context` explains why older synthetic/procedural runs remain; `reduced` and `smoke-level` are maturity limiters.
    - Risk status: grounded.
 
 3. `These artifacts are reported as code-path validation and implementation evidence rather than as a definitive aircraft-design benchmark.`
@@ -184,13 +184,13 @@ A20. `The visualized artifacts are intentionally shown despite failing \texttt{s
 
 ## Resolution and Loss-Debugging Sentence Audit
 
-R1. `We also reran the Airshow corpus path at \(32^3\) and \(64^3\) to check whether higher voxel count alone would clear the generated-aircraft validity gate.`
+R1. `We also reran the Airshow corpus path at \(32^3\), \(64^3\), and \(96^3\) to check whether higher voxel count alone would clear the generated-aircraft validity gate.`
    - Function: introduces the resolution sweep and its hypothesis.
    - Claim type: experiment description.
    - Word choices: `also` signals addendum status; `whether` makes this a test, not an assumption; `alone` is key because the result argues against resolution as a sufficient fix.
    - Risk status: grounded.
 
-R2. `Both higher-resolution manifests passed the claim-bearing manifest validator with the same 355 converted public Airshow records as the \(16^3\) run.`
+R2. `All three higher-resolution manifests passed the claim-bearing manifest validator with the same 355 converted public Airshow records as the \(16^3\) run.`
    - Function: reports corpus-level success at higher resolution.
    - Claim type: manifest-validation result.
    - Word choices: `manifests passed` is narrower than generated samples passed; `same 355` keeps data lineage consistent.
@@ -208,13 +208,13 @@ R4. `The \(64^3\) corpus was also manifest-valid, but the attempted batch-size-1
    - Word choices: `attempted` and `did not produce` avoid implying hidden success; `local` ties the ceiling to this environment.
    - Risk status: grounded.
 
-R5. `This is an implementation limit as well as an empirical result: the current dense voxel decoder maps 2048 hidden units to \(grid\_resolution^3\) outputs, so the final decoder layer grows by roughly eight times when moving from \(32^3\) to \(64^3\).`
+R5. `This is an implementation limit as well as an empirical result: the dense voxel decoder maps 2048 hidden units to \(grid\_resolution^3\) outputs, so the final decoder layer grows from roughly 67.1 million parameters at \(32^3\) to 537.1 million at \(64^3\) and 1.812 billion at \(96^3\).`
    - Function: explains why the `64^3` attempt is hard for the current architecture.
    - Claim type: architecture scaling explanation.
-   - Word choices: `implementation limit` prevents treating the run ceiling as a dataset result; `roughly eight times` states the voxel-count scaling without overprecision.
+   - Word choices: `implementation limit` prevents treating the run ceiling as a dataset result; the parameter counts make the memory pressure concrete without claiming hardware-independent impossibility.
    - Risk status: grounded by decoder structure.
 
-R6. `The \(32^3\) manifest hash was \texttt{7684e70b...98521f1}, and the \(64^3\) manifest hash was \texttt{2627227f...4a1dbd80}.`
+R6. `The \(32^3\) manifest hash was \texttt{7684e70b...98521f1}, the \(64^3\) manifest hash was \texttt{2627227f...4a1dbd80}, and the \(96^3\) manifest hash was \texttt{86f2a112...118e7cd}.`
    - Function: records manifest lineage.
    - Claim type: provenance detail.
    - Word choices: hashes are abbreviated for paper readability while preserving identity in the detailed report.
@@ -567,8 +567,8 @@ This section now has strong breadth: it covers training smoke evidence, shape cl
 ## 2026-06-20 Resolution and Loss-Debugging Addendum
 
 The results section now adds an `Airshow Resolution Sweep and Loss Debugging`
-subsection. Its function is to report the requested `32^3` and `64^3` reruns,
-the source-valid `32^3` follow-up, the zero-learning-rate resume bug, and the
+subsection. Its function is to report the requested `32^3`, `64^3`, and `96^3`
+reruns, the source-valid `32^3` follow-up, the zero-learning-rate resume bug, and the
 detached aero/connectivity diagnostics without converting any of them into
 success claims. The word choices `attempted`, `manifest-valid`, `no checkpoint
 produced`, `failed validity`, `span_sanity`, `detached diagnostics`, and
@@ -580,3 +580,20 @@ The new figures `airshow_flight_path_metrics_g32.png` and
 Airshow visuals. They make the generated geometry inspectable while showing
 why the current checkpoint still should not be described as producing valid
 aircraft.
+
+## 2026-06-21 `96^3` Coordinate-Decoder Addendum
+
+The results section now extends the resolution sweep to `96^3`. Its function is
+to report a real high-resolution training run while keeping the validity claim
+bounded. The wording `coordinate decoder`, `importance-weighted coordinate
+BCE`, `default 0.5 threshold`, `explicit top-k export`, and `one case...passed`
+is deliberate: it tells the reader exactly which part improved and which part
+did not.
+
+The key claim boundary is that `96^3` training completed and exported geometry,
+but only one of three calibrated top-k flight-path exports passed the heuristic
+aircraft-validity screen. The two new figures
+`airshow_flight_path_metrics_g96_topk0075.png` and
+`airshow_generated_geometry_g96_topk0075.png` therefore serve as a mixed-result
+visual record, not as proof of reliable aircraft generation or aerodynamic
+optimization.

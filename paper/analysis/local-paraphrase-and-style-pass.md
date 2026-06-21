@@ -21,11 +21,11 @@ to make it sound like an honest engineering paper:
 
 ## Edits Made
 
-The paper was updated to include the `32^3` and `64^3` Airshow resolution
-sweep. The wording deliberately uses terms such as "attempt", "smoke run",
-"manifest-valid", "no checkpoint was produced", and "failed aircraft-validity
-gates" because those are the ground-truth outcomes of the commands that were
-run.
+The paper was updated to include the `32^3`, `64^3`, and `96^3` Airshow
+resolution sweep. The wording deliberately uses terms such as "attempt",
+"smoke run", "manifest-valid", "no checkpoint was produced", "coordinate
+decoder", "calibrated top-k export", and "failed aircraft-validity gates"
+because those are the ground-truth outcomes of the commands that were run.
 
 The highest-risk phrases remain blocked:
 
@@ -46,6 +46,8 @@ The safe replacement wording is:
 ## Result
 
 The revised wording is intentionally less flashy and more defensible. It keeps
-the failed high-resolution results in the manuscript rather than smoothing them
-away. That makes the paper more original as an evidence-hygiene document and
-less vulnerable to the "AI-sounding overclaim" failure mode.
+the failed and mixed high-resolution results in the manuscript rather than
+smoothing them away. The `96^3` run is allowed to be a useful implementation
+result, but not a reliable aircraft-generation claim. That makes the paper more
+original as an evidence-hygiene document and less vulnerable to the
+"AI-sounding overclaim" failure mode.

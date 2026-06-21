@@ -218,3 +218,28 @@ Until the sequential loop is run at benchmark scale and shows reliable
 candidate improvement, the paper should say that the repository has a
 CFD-oriented scoring path plus an experimental black-box candidate optimizer,
 not demonstrated CFD-guided gradient training.
+
+## 2026-06-21 `96^3` Coordinate-Decoder Addendum
+
+The `96^3` training follow-up uses a coordinate decoder rather than the dense
+latent-to-voxel layer. To keep the sparse public Airshow objective faithful
+while avoiding a full `96^3` decode on every batch, the high-resolution branch
+now samples voxel coordinates and applies importance-weighted BCE. This means
+occupied coordinates can be oversampled for signal without changing the
+effective full-grid reconstruction objective.
+
+Two failed probes are recorded because they explain the final setting:
+
+- uniform coordinate sampling completed but drove generated fixed-threshold
+  grids toward near-empty occupancies;
+- unweighted 50% occupied-coordinate sampling completed but biased the decoder
+  toward overly dense grids.
+
+The final three-epoch `96^3` run used importance weighting and produced
+checkpoint hash
+`1bfdcfcf844010a0a5af463662bed94c7462748add21f0d337234b41d59774d3`.
+Its optimizer loss decreased across epochs, but full-grid aero/connectivity
+diagnostics were intentionally disabled during training to keep the run
+sequential and memory-bounded. That zero diagnostic value should be read as
+`not evaluated on this batch`, not as evidence of perfect aerodynamics or
+connectivity.

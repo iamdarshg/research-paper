@@ -94,10 +94,12 @@ and claim-gating study. It is especially relevant to the gap between attractive
 3D generative outputs and the much stricter evidence needed for aircraft
 geometry, solver validation, manufacturability, and baseline comparison.
 
-The new `32^3` and `64^3` Airshow reruns strengthen that relevance by showing a
-negative result: higher voxel count did not cause the present checkpoint to
-pass aircraft-validity gates, and `64^3` exposes a dense-decoder scalability
-limit. Keeping that result in the paper makes the manuscript more credible.
+The new `32^3`, `64^3`, and `96^3` Airshow reruns strengthen that relevance by
+showing a mixed but still non-claim-bearing result: `32^3` generated samples did
+not pass aircraft-validity gates, `64^3` exposed a dense-decoder scalability
+limit, and the `96^3` coordinate-decoder run produced one heuristic-screen pass
+out of three calibrated top-k exports. Keeping that result in the paper makes
+the manuscript more credible.
 
 ## Recommendations
 

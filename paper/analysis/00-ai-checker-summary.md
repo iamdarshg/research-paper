@@ -80,10 +80,12 @@ New supporting reports:
 - `paper/analysis/originality-and-relevance-comparison.md`
 - `paper/analysis/local-paraphrase-and-style-pass.md`
 
-The paper now includes the `32^3` and `64^3` Airshow addendum. The update is
-negative evidence, not stronger claim evidence: the `32^3` generated samples
-failed aircraft-validity gates, and the `64^3` corpus validated but did not
-produce a checkpoint within the local run ceiling. No online paraphraser upload
-was used; the wording pass stayed local to avoid transmitting unpublished paper
-text. The refreshed local detector artifacts were written under
-`build/ai_check_current/`.
+The paper now includes the `32^3`, `64^3`, and `96^3` Airshow addendum. The
+update is still non-claim-bearing evidence: the `32^3` generated samples failed
+aircraft-validity gates, the `64^3` corpus validated but did not produce a
+dense-decoder checkpoint within the local run ceiling, and the `96^3`
+coordinate-decoder run produced one heuristic-screen pass out of three
+calibrated top-k exports. No online paraphraser upload was used; the wording
+pass stayed local to avoid transmitting unpublished paper text. The refreshed
+local detector artifacts listed above predate the `96^3` text update and should
+be rerun before final submission.

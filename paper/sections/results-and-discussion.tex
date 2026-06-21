@@ -85,7 +85,7 @@ All three generated cases produced nonempty voxel grids, STL exports, finite int
 \end{figure*}
 
 \subsection{Airshow Resolution Sweep and Loss Debugging}
-We also reran the Airshow corpus path at \(32^3\) and \(64^3\) to check whether higher voxel count alone would clear the generated-aircraft validity gate. Both higher-resolution manifests passed the claim-bearing manifest validator with the same 355 converted public Airshow records as the \(16^3\) run. The \(32^3\) training run completed one epoch with batch size 2 and produced checkpoint hash \texttt{7234e1b9b338...b95444}. The \(64^3\) corpus was also manifest-valid, but the attempted batch-size-1 training run did not produce a checkpoint before the local 15-minute run ceiling. This is an implementation limit as well as an empirical result: the current dense voxel decoder maps 2048 hidden units to \(grid\_resolution^3\) outputs, so the final decoder layer grows by roughly eight times when moving from \(32^3\) to \(64^3\).
+We also reran the Airshow corpus path at \(32^3\), \(64^3\), and \(96^3\) to check whether higher voxel count alone would clear the generated-aircraft validity gate. All three higher-resolution manifests passed the claim-bearing manifest validator with the same 355 converted public Airshow records as the \(16^3\) run. The \(32^3\) training run completed one epoch with batch size 2 and produced checkpoint hash \texttt{7234e1b9b338...b95444}. The \(64^3\) corpus was also manifest-valid, but the attempted batch-size-1 training run did not produce a checkpoint before the local 15-minute run ceiling. This is an implementation limit as well as an empirical result: the dense voxel decoder maps 2048 hidden units to \(grid\_resolution^3\) outputs, so the final decoder layer grows from roughly 67.1 million parameters at \(32^3\) to 537.1 million at \(64^3\) and 1.812 billion at \(96^3\).
 
 \begin{table}[!t]
 \centering
@@ -99,12 +99,15 @@ We also reran the Airshow corpus path at \(32^3\) and \(64^3\) to check whether 
 \(32^3\) & pass, 355 records & one epoch completed on CUDA, batch 2 & three generated cases failed validity \\ \hline
 \(64^3\) & pass, 355 records & attempted batch 1; no checkpoint produced in local run ceiling & not run because no checkpoint existed \\ \hline
 \(32^3\), source-valid filter & pass, 176 records & three-epoch LR-fixed fine-tune completed from the \(32^3\) checkpoint & three generated cases failed only \texttt{span\_sanity} \\ \hline
+\(96^3\), coordinate decoder & pass, 355 records & three epochs completed on CUDA, batch 1, importance-weighted coordinate BCE & fixed-threshold exports failed; calibrated top-k export passed 1 of 3 heuristic screens \\ \hline
 \end{tabular}
 \end{table}
 
-The \(32^3\) manifest hash was \texttt{7684e70b...98521f1}, and the \(64^3\) manifest hash was \texttt{2627227f...4a1dbd80}. The \(32^3\) generated cases are shown in Figures \ref{fig:airshow_flight_metrics_g32} and \ref{fig:airshow_generated_geometry_g32}. Their occupancy fractions were 0.00494, 0.00476, and 0.00510. Their raw internal D3Q27 \(C_d\) values were finite, but all three failed the aircraft-validity screen: two failed \texttt{nonempty\_occupancy}, \texttt{symmetry}, and \texttt{span\_sanity}, while the third failed \texttt{symmetry} and \texttt{span\_sanity}. The result is therefore negative evidence against treating resolution alone as enough to make the present checkpoint claim-bearing.
+The \(32^3\) manifest hash was \texttt{7684e70b...98521f1}, the \(64^3\) manifest hash was \texttt{2627227f...4a1dbd80}, and the \(96^3\) manifest hash was \texttt{86f2a112...118e7cd}. The \(32^3\) generated cases are shown in Figures \ref{fig:airshow_flight_metrics_g32} and \ref{fig:airshow_generated_geometry_g32}. Their occupancy fractions were 0.00494, 0.00476, and 0.00510. Their raw internal D3Q27 \(C_d\) values were finite, but all three failed the aircraft-validity screen: two failed \texttt{nonempty\_occupancy}, \texttt{symmetry}, and \texttt{span\_sanity}, while the third failed \texttt{symmetry} and \texttt{span\_sanity}. The result is therefore negative evidence against treating resolution alone as enough to make the present checkpoint claim-bearing.
 
 We then filtered the \(32^3\) corpus with the same aircraft-validity screen used for generated outputs. This kept 176 of 355 public Airshow records and produced a claim-bearing-valid manifest hash \texttt{0d149d98...d25ccc}. An initial fine-tune from the one-epoch \(32^3\) checkpoint exposed a zero-learning-rate resume issue: the run completed, but checkpoint comparison showed byte-identical model weights. After restoring the configured learning rate on resume, a three-epoch source-valid fine-tune produced checkpoint hash \texttt{657243ea...45574c}. Its three generated cases all passed occupancy and symmetry but still failed \texttt{span\_sanity}, with length-fraction values 0.25, 0.25, and 0.28125. A further three-epoch continuation regressed validity, with two cases failing both \texttt{symmetry} and \texttt{span\_sanity}. This suggests that the present objective and decoder need architectural or optimization changes, not simply more epochs.
+
+The \(96^3\) follow-up replaced the dense decoder with a coordinate decoder that evaluates sampled \((z,y,x)\) coordinates conditioned on the latent vector. The public \(96^3\) source corpus had mean occupancy 0.00565 and median occupancy 0.00458, so naive coordinate sampling either collapsed toward empty fixed-threshold grids or, when occupied coordinates were oversampled without correction, biased the decoder toward overly dense outputs. The final run used importance-weighted coordinate BCE for three epochs over all 355 records and produced checkpoint hash \texttt{1bfdcfcf...59774d3}. With the default 0.5 threshold, all three flight-path exports remained below the aircraft-validity occupancy gate. With an explicit top-k export at 0.75\% occupancy, one case, \texttt{endurance\_turning}, passed the heuristic aircraft-validity screen; \texttt{short\_takeoff\_payload} and \texttt{high\_speed\_sprint} still failed \texttt{symmetry}, \texttt{span\_sanity}, and \texttt{wing\_body\_balance}. Figures \ref{fig:airshow_flight_metrics_g96_topk} and \ref{fig:airshow_generated_geometry_g96_topk} show that calibrated export result. This is evidence that the coordinate-decoder path can train and export \(96^3\) geometry, not evidence of reliable aircraft generation or validated aerodynamic optimization.
 
 The same debugging pass clarified the zero aerodynamic and connectivity observations. The connectivity diagnostic thresholds voxel probabilities and runs connected-component labeling through NumPy/SciPy. The aerodynamic diagnostic thresholds geometry, invokes the internal solver, and wraps scalar solver outputs back into PyTorch tensors. A local gradient probe confirmed that both diagnostics have no gradient function. The training code has therefore been revised to report \texttt{optimization\_loss} separately from \texttt{diagnostic\_total}. This does not turn the existing solver path into a differentiable teacher; it makes the claim boundary explicit and points toward a sequential candidate-ranking or surrogate-training loop as the next credible route.
 
@@ -120,6 +123,20 @@ The same debugging pass clarified the zero aerodynamic and connectivity observat
 \includegraphics[width=0.94\textwidth]{figures/airshow_generated_geometry_g32.png}
 \caption{\(32^3\) generated Airshow-checkpoint voxel geometries and projections. The denser grid increases visual resolution but does not resolve the span-sanity and symmetry failures that block aircraft-generation claims.}
 \label{fig:airshow_generated_geometry_g32}
+\end{figure*}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{figures/airshow_flight_path_metrics_g96_topk0075.png}
+\caption{Calibrated \(96^3\) top-k flight-path metrics at 0.75\% occupancy. One case passes the heuristic aircraft-validity screen, while two still fail shape checks; all CFD quantities remain internal non-claim-bearing D3Q27 smoke outputs.}
+\label{fig:airshow_flight_metrics_g96_topk}
+\end{figure}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.94\textwidth]{figures/airshow_generated_geometry_g96_topk0075.png}
+\caption{Calibrated \(96^3\) coordinate-decoder geometries and projections. The figure documents the best high-resolution smoke result, including the two failing cases, rather than upgrading the result to a reliable aircraft-generation claim.}
+\label{fig:airshow_generated_geometry_g96_topk}
 \end{figure*}
 
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}

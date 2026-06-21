@@ -180,6 +180,9 @@ class TrainingConfig:
     val_interval: int = 2
     geometry_reconstruction_weight: float = 1.0
     generation_reconstruction_weight: float = 1.0
+    coordinate_training_samples: int = 32768
+    coordinate_positive_fraction: float = 0.5
+    full_diagnostic_interval: int = 100
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
@@ -1723,25 +1726,95 @@ class LatentDiffusionUNet(nn.Module):
 class LatentTo3DConverter(nn.Module):
     """Convert n-dimensional latent codes to 3D spatial representation"""
 
-    def __init__(self, latent_dim: int, grid_resolution: int = 32):
+    def __init__(
+        self,
+        latent_dim: int,
+        grid_resolution: int = 32,
+        coordinate_decoder_threshold: int = 96,
+        coordinate_chunk_size: int = 65536,
+    ):
         super().__init__()
         self.latent_dim = latent_dim
         self.grid_resolution = grid_resolution
         self.output_shape = (grid_resolution, grid_resolution, grid_resolution)
+        self.coordinate_decoder_threshold = int(coordinate_decoder_threshold)
+        self.coordinate_chunk_size = int(coordinate_chunk_size)
+        self.decoder_mode = "coordinate" if grid_resolution >= self.coordinate_decoder_threshold else "dense"
         total_voxels = grid_resolution ** 3
 
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 2048),
-            nn.ReLU(),
-            nn.Linear(2048, total_voxels)
-        )
+        if self.decoder_mode == "dense":
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim, 1024),
+                nn.ReLU(),
+                nn.Linear(1024, 2048),
+                nn.ReLU(),
+                nn.Linear(2048, total_voxels)
+            )
+        else:
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim + 3, 256),
+                nn.SiLU(),
+                nn.Linear(256, 256),
+                nn.SiLU(),
+                nn.Linear(256, 1),
+            )
+        self.register_buffer("_coordinate_grid", torch.empty(0), persistent=False)
+
+    def _coordinates(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if (
+            self._coordinate_grid.numel() != self.grid_resolution ** 3 * 3
+            or self._coordinate_grid.device != device
+            or self._coordinate_grid.dtype != dtype
+        ):
+            axis = torch.linspace(-1.0, 1.0, self.grid_resolution, device=device, dtype=dtype)
+            zz, yy, xx = torch.meshgrid(axis, axis, axis, indexing="ij")
+            self._coordinate_grid = torch.stack((zz, yy, xx), dim=-1).reshape(-1, 3)
+        return self._coordinate_grid
+
+    def forward_flat_indices(self, latent: torch.Tensor, flat_indices: torch.Tensor) -> torch.Tensor:
+        """Decode logits at selected flat voxel indices for high-resolution training."""
+        batch_size = latent.shape[0]
+        if self.decoder_mode == "dense":
+            dense = self.decoder(latent)
+            return dense.index_select(1, flat_indices.to(device=latent.device, dtype=torch.long))
+
+        flat_indices = flat_indices.to(device=latent.device, dtype=torch.long)
+        coords = self._coordinates(latent.device, latent.dtype).index_select(0, flat_indices)
+        chunks = []
+        chunk_size = max(1, int(self.coordinate_chunk_size))
+        for start in range(0, coords.shape[0], chunk_size):
+            coord_chunk = coords[start:start + chunk_size]
+            latent_chunk = latent[:, None, :].expand(-1, coord_chunk.shape[0], -1)
+            coord_batch = coord_chunk[None, :, :].expand(batch_size, -1, -1)
+            decoder_input = torch.cat((latent_chunk, coord_batch), dim=-1).reshape(
+                batch_size * coord_chunk.shape[0],
+                self.latent_dim + 3,
+            )
+            chunk_logits = self.decoder(decoder_input).view(batch_size, coord_chunk.shape[0])
+            chunks.append(chunk_logits)
+        return torch.cat(chunks, dim=1)
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """Convert latent code to voxel grid"""
         batch_size = latent.shape[0]
-        voxels = self.decoder(latent)
+        if self.decoder_mode == "dense":
+            voxels = self.decoder(latent)
+            return voxels.view(batch_size, *self.output_shape)
+
+        coords = self._coordinates(latent.device, latent.dtype)
+        chunks = []
+        chunk_size = max(1, int(self.coordinate_chunk_size))
+        for start in range(0, coords.shape[0], chunk_size):
+            coord_chunk = coords[start:start + chunk_size]
+            latent_chunk = latent[:, None, :].expand(-1, coord_chunk.shape[0], -1)
+            coord_batch = coord_chunk[None, :, :].expand(batch_size, -1, -1)
+            decoder_input = torch.cat((latent_chunk, coord_batch), dim=-1).reshape(
+                batch_size * coord_chunk.shape[0],
+                self.latent_dim + 3,
+            )
+            chunk_logits = self.decoder(decoder_input).view(batch_size, coord_chunk.shape[0])
+            chunks.append(chunk_logits)
+        voxels = torch.cat(chunks, dim=1)
         voxels = voxels.view(batch_size, *self.output_shape)
         return voxels
 
@@ -2588,33 +2661,120 @@ class OptimizedDiffusionTrainer:
             # Model prediction
             pred_noise = self.diffusion_model(noisy_latent, t, condition=condition).nan_to_num(0.0)
             x0_pred = self.noise_schedule.predict_x0(noisy_latent, t, pred_noise).nan_to_num(0.0)
-            geom_logits = self.converter(x0_pred).nan_to_num(0.0)
-            voxel_grid = torch.sigmoid(geom_logits).nan_to_num(0.0)
 
             generation_latent = self.consistency_model.fast_inference(
                 latent.shape,
                 num_steps=self.diffusion_config.student_steps,
                 condition=condition,
             ).nan_to_num(0.0)
-            generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
 
             # MSE loss
             mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
-            geometry_loss_val = self.geometry_loss(
-                geom_logits.float(),
-                geometry_target.float(),
-            ).nan_to_num(0.0)
-            generation_geometry_loss_val = self.geometry_loss(
-                generation_geom_logits.float(),
-                geometry_target.float(),
-            ).nan_to_num(0.0)
+
+            if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
+                flat_target = geometry_target.reshape(geometry_target.shape[0], -1)
+                total_voxels = flat_target.shape[1]
+                sample_count = min(
+                    max(1, int(self.training_config.coordinate_training_samples)),
+                    total_voxels,
+                )
+                positive_fraction = float(np.clip(self.training_config.coordinate_positive_fraction, 0.0, 1.0))
+                positive_target = flat_target.max(dim=0).values > 0.5
+                positive_indices = torch.nonzero(positive_target, as_tuple=False).flatten()
+                effective_positive_fraction = positive_fraction if positive_indices.numel() > 0 else 0.0
+                positive_count = int(round(sample_count * effective_positive_fraction))
+                positive_count = min(positive_count, sample_count)
+                sampled_parts = []
+                sampled_positive_count = 0
+                if positive_indices.numel() > 0 and positive_count > 0:
+                    positive_choice = torch.randint(
+                        0,
+                        positive_indices.numel(),
+                        (positive_count,),
+                        device=self.device,
+                    )
+                    positive_sample = positive_indices.index_select(0, positive_choice)
+                    sampled_parts.append(positive_sample)
+                    sampled_positive_count = positive_sample.numel()
+                remaining_count = sample_count - sum(part.numel() for part in sampled_parts)
+                if remaining_count > 0:
+                    sampled_parts.append(
+                        torch.randint(
+                            0,
+                            total_voxels,
+                            (remaining_count,),
+                            device=self.device,
+                        )
+                    )
+                flat_indices = torch.cat(sampled_parts, dim=0)
+                target_sample = flat_target.index_select(1, flat_indices)
+                positive_sample_fraction = float(sampled_positive_count) / float(flat_indices.numel())
+                uniform_sample_fraction = float(remaining_count) / float(flat_indices.numel())
+                sample_prob = torch.full(
+                    (flat_indices.numel(),),
+                    uniform_sample_fraction / float(total_voxels),
+                    device=self.device,
+                    dtype=target_sample.dtype,
+                )
+                if positive_sample_fraction > 0.0:
+                    sampled_positive_mask = positive_target.index_select(0, flat_indices).to(dtype=target_sample.dtype)
+                    sample_prob = sample_prob + sampled_positive_mask * (
+                        positive_sample_fraction / float(positive_indices.numel())
+                    )
+                importance_weights = (1.0 / float(total_voxels)) / sample_prob.clamp_min(1.0e-12)
+                importance_weights = importance_weights / importance_weights.mean().clamp_min(1.0e-12)
+                importance_weights = importance_weights.unsqueeze(0).expand_as(target_sample)
+                geom_logits_sample = self.converter.forward_flat_indices(
+                    x0_pred,
+                    flat_indices,
+                ).nan_to_num(0.0)
+                generation_geom_logits_sample = self.converter.forward_flat_indices(
+                    generation_latent,
+                    flat_indices,
+                ).nan_to_num(0.0)
+                geometry_loss_val = F.binary_cross_entropy_with_logits(
+                    geom_logits_sample.float(),
+                    target_sample.float(),
+                    weight=importance_weights.float(),
+                    reduction="mean",
+                ).nan_to_num(0.0)
+                generation_geometry_loss_val = F.binary_cross_entropy_with_logits(
+                    generation_geom_logits_sample.float(),
+                    target_sample.float(),
+                    weight=importance_weights.float(),
+                    reduction="mean",
+                ).nan_to_num(0.0)
+                run_full_diagnostic = (
+                    int(self.training_config.full_diagnostic_interval) > 0
+                    and batch_idx % int(self.training_config.full_diagnostic_interval) == 0
+                )
+                if run_full_diagnostic:
+                    with torch.no_grad():
+                        diagnostic_logits = self.converter(x0_pred.detach()).nan_to_num(0.0)
+                        voxel_grid = torch.sigmoid(diagnostic_logits).nan_to_num(0.0)
+                else:
+                    voxel_grid = None
+            else:
+                geom_logits = self.converter(x0_pred).nan_to_num(0.0)
+                voxel_grid = torch.sigmoid(geom_logits).nan_to_num(0.0)
+                generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
+                geometry_loss_val = self.geometry_loss(
+                    geom_logits.float(),
+                    geometry_target.float(),
+                ).nan_to_num(0.0)
+                generation_geometry_loss_val = self.geometry_loss(
+                    generation_geom_logits.float(),
+                    geometry_target.float(),
+                ).nan_to_num(0.0)
 
             # Connectivity diagnostic
-            connectivity_loss_val = self.connectivity_loss(voxel_grid).nan_to_num(0.0)
+            connectivity_loss_val = torch.tensor(0.0, device=self.device)
+            if voxel_grid is not None:
+                connectivity_loss_val = self.connectivity_loss(voxel_grid).nan_to_num(0.0)
 
             # CFD-based aerodynamic diagnostic (every 10 batches for speed)
             aero_loss_val = torch.tensor(0.0, device=self.device)
-            if batch_idx % 10 == 0:
+            if voxel_grid is not None and batch_idx % 10 == 0:
                 aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
 
             optimization_loss_val, diagnostic_total_loss_val = combine_training_loss_terms(
@@ -3569,9 +3729,12 @@ def cli():
 @click.option('--enable-checkpointing/--disable-checkpointing', default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
+@click.option('--coordinate-training-samples', default=32768, help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
+@click.option('--coordinate-positive-fraction', default=0.5, help='Fraction of sampled high-resolution coordinates drawn from occupied voxels when available')
+@click.option('--full-diagnostic-interval', default=100, help='Full-grid diagnostic decode interval for high-resolution coordinate decoders; 0 disables full diagnostics')
 def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
           num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
-          enable_checkpointing, enable_compile, solver):
+          enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, full_diagnostic_interval):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
@@ -3669,7 +3832,10 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         learning_rate=learning_rate,
         disconnection_penalty=disconnection_penalty,
         precision=precision,
-        enable_pipeline_parallelism=enable_pipeline
+        enable_pipeline_parallelism=enable_pipeline,
+        coordinate_training_samples=coordinate_training_samples,
+        coordinate_positive_fraction=coordinate_positive_fraction,
+        full_diagnostic_interval=full_diagnostic_interval,
     )
 
     cfd_config = CFDConfig(

@@ -139,6 +139,26 @@ def _prepare_voxel_for_solver(voxel_grid: torch.Tensor, device: torch.device) ->
     return voxel_grid.to(device=device, dtype=torch.float32)
 
 
+def _binarize_voxel(
+    voxel_grid: torch.Tensor,
+    threshold: float,
+    target_occupancy: float | None = None,
+) -> np.ndarray:
+    grid = voxel_grid.detach().cpu().float()
+    if target_occupancy is None:
+        return (grid.numpy() > threshold).astype(np.float32)
+
+    target = float(np.clip(target_occupancy, 0.0, 1.0))
+    flat = grid.reshape(-1)
+    if flat.numel() == 0 or target <= 0.0:
+        return np.zeros(tuple(grid.shape), dtype=np.float32)
+    keep = min(flat.numel(), max(1, int(round(flat.numel() * target))))
+    selected = torch.topk(flat, keep, largest=True).indices
+    binary = torch.zeros_like(flat, dtype=torch.float32)
+    binary[selected] = 1.0
+    return binary.reshape_as(grid).numpy().astype(np.float32)
+
+
 def _build_objective_optimizer(
     args: argparse.Namespace,
     cfd: AdvancedCFDSimulator,
@@ -198,7 +218,11 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
         voxel = _prepare_voxel_for_solver(generated, device)
         objective_optimizer = _build_objective_optimizer(args, cfd, device, seed)
         optimization_report = None
-        pre_optimization_binary = (voxel > 0.5).detach().cpu().numpy().astype(np.float32)
+        pre_optimization_binary = _binarize_voxel(
+            voxel,
+            threshold=args.export_threshold,
+            target_occupancy=args.export_target_occupancy,
+        )
 
         if objective_optimizer is not None:
             optimized = objective_optimizer.optimize(voxel, spec)
@@ -209,7 +233,12 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
                 if key not in {"voxel_grid", "binary_grid"}
             }
 
-        binary = (voxel > 0.5).detach().cpu().numpy().astype(np.float32)
+        binary = _binarize_voxel(
+            voxel,
+            threshold=args.export_threshold,
+            target_occupancy=args.export_target_occupancy,
+        )
+        solver_voxel = torch.as_tensor(binary, device=device, dtype=torch.float32)
 
         npy_path = generated_dir / f"{case['case_id']}.npy"
         stl_path = generated_dir / f"{case['case_id']}.stl"
@@ -217,9 +246,9 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
         if optimization_report is not None:
             np.save(pre_npy_path, pre_optimization_binary)
         np.save(npy_path, binary)
-        generator.voxels_to_stl(voxel.detach().cpu(), str(stl_path), use_marching_cubes=True)
+        generator.voxels_to_stl(solver_voxel.detach().cpu(), str(stl_path), use_marching_cubes=True)
 
-        cfd_metrics = cfd.simulate_aerodynamics(voxel, steps=args.cfd_steps)
+        cfd_metrics = cfd.simulate_aerodynamics(solver_voxel, steps=args.cfd_steps)
         validity = evaluate_aircraft_validity(binary)
         occupied = int(binary.sum())
         results.append(
@@ -264,6 +293,11 @@ def run_cases(args: argparse.Namespace) -> Dict[str, Any]:
         "num_steps": args.num_steps,
         "cfd_steps": args.cfd_steps,
         "objective_optimizer": args.objective_optimizer,
+        "binarization": {
+            "export_threshold": args.export_threshold,
+            "export_target_occupancy": args.export_target_occupancy,
+            "method": "top_k_target_occupancy" if args.export_target_occupancy is not None else "fixed_threshold",
+        },
         "case_count": len(results),
         "cases": results,
         "claim_boundary": (
@@ -311,6 +345,8 @@ def main() -> int:
     parser.add_argument("--objective-target-occupancy", type=float, default=0.03)
     parser.add_argument("--objective-seed-offset", type=int, default=1000)
     parser.add_argument("--no-objective-cfd", action="store_true", help="Disable CFD calls inside the sequential objective optimizer.")
+    parser.add_argument("--export-threshold", type=float, default=0.5, help="Fixed probability threshold for binary export when no target occupancy is set.")
+    parser.add_argument("--export-target-occupancy", type=float, default=None, help="If set, export the top-k probability voxels at this target occupancy instead of a fixed threshold.")
     args = parser.parse_args()
     report = run_cases(args)
     print(json.dumps(report, indent=2, sort_keys=True))

@@ -63,7 +63,7 @@ A1. `The grounded corpus path collects public model documents from the VSP Airsh
 A2. `The builder parses available X3D indexed-face-set geometry, normalizes each mesh into a centered unit cube, voxelizes the occupied geometry into a fixed grid, and records source URLs, license metadata, geometry hashes, voxel hashes, split assignment, and preprocessing provenance.`
    - Function: describes the geometry conversion method.
    - Claim type: preprocessing method claim.
-   - Word choices: `available` avoids saying every Airshow record has usable geometry; `centered unit cube` states the normalization; `fixed grid` covers the `16^3`, `32^3`, and `64^3` reruns without pretending resolution alone improves validity; the hash/provenance list makes the corpus auditable.
+   - Word choices: `available` avoids saying every Airshow record has usable geometry; `centered unit cube` states the normalization; `fixed grid` covers the `16^3`, `32^3`, `64^3`, and `96^3` reruns without pretending resolution alone improves validity; the hash/provenance list makes the corpus auditable.
    - Risk status: grounded by the builder and manifest.
 
 A3. `The deterministic split assignment is stored in the manifest so that later validation, training, and generation commands can be tied back to the same corpus lineage.`
@@ -174,16 +174,28 @@ A10. `The additional mission and manufacturing fields used by the condition vect
    - Word choices: `intended` avoids claiming measured effect; `intermediate spatial features` stays architecture-level.
    - Risk status: safe.
 
-18. `The latent-to-3D converter is a multi-layer perceptron (MLP) that maps the denoised latent vector to a 3D voxel grid.`
-   - Function: introduces the decoder.
+18. `The latent-to-3D converter maps the denoised latent vector to voxel logits.`
+   - Function: introduces the decoder without locking the paper to one decoder architecture.
    - Claim type: implementation claim.
-   - Word choices: `maps` is neutral; `3D voxel grid` states representation.
+   - Word choices: `maps` is neutral; `voxel logits` is precise and covers both dense and coordinate decoder paths.
    - Risk status: grounded.
 
-19. `The MLP uses fully connected layers with ReLU activations; downstream training and generation code applies a sigmoid to convert logits into voxel probabilities.`
-   - Function: corrects the earlier inaccurate final-sigmoid wording.
+19. `For lower-resolution smoke runs, this is a dense multi-layer perceptron (MLP) whose final layer emits the whole voxel grid.`
+   - Function: preserves the earlier dense-decoder description where it still applies.
    - Claim type: implementation claim.
-   - Word choices: `downstream` is important because sigmoid is not necessarily in the MLP layer itself; `logits` and `probabilities` are precise.
+   - Word choices: `lower-resolution smoke runs` prevents applying this description to the `96^3` run; `whole voxel grid` explains the memory scaling problem.
+   - Risk status: grounded.
+
+20. `For the \(96^3\) follow-up, the implementation switches to a coordinate decoder that evaluates an MLP over the latent vector concatenated with normalized \((z,y,x)\) coordinates; training samples voxel coordinates with importance-weighted BCE so occupied coordinates can be oversampled without changing the intended sparse reconstruction objective.`
+   - Function: records the high-resolution architecture and loss correction.
+   - Claim type: implementation and training-objective claim.
+   - Word choices: `follow-up` keeps this tied to the new run; `coordinate decoder` names the architecture; `importance-weighted` explains why positive oversampling is not treated as a changed target distribution; `intended sparse reconstruction objective` matches the Airshow occupancy data.
+   - Risk status: grounded by `CLI/aircraft_diffusion_cfd.py` and the `96^3` report.
+
+21. `Downstream training and generation code applies a sigmoid to convert logits into voxel probabilities.`
+   - Function: keeps the logit/probability boundary clear.
+   - Claim type: implementation claim.
+   - Word choices: `downstream` is important because sigmoid is not necessarily in the decoder layer itself; `logits` and `probabilities` are precise.
    - Risk status: grounded.
 
 20. `The repository uses an internal lattice-Boltzmann-style CFD evaluator to score generated voxel grids.`
@@ -308,9 +320,14 @@ The methodology was deliberately rewritten away from phrases like "GPU-accelerat
 
 The methodology now says the Airshow builder voxelizes into a fixed grid rather
 than only a `16^3` grid. That wording is necessary because the same public
-corpus path was rerun at `32^3` and `64^3`. The sentence still avoids implying
+corpus path was rerun at `32^3`, `64^3`, and `96^3`. The sentence still avoids implying
 that higher resolution validated aircraft generation; it only states that the
 corpus construction path supports multiple lattice sizes.
+
+The decoder subsection now distinguishes the dense lower-resolution decoder
+from the `96^3` coordinate decoder. That avoids the inaccurate implication that
+the successful `96^3` run used the dense final layer that blocked the earlier
+`64^3` attempt.
 
 ## 2026-06-21 Sequential Objective Addendum
 

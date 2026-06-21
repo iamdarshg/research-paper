@@ -16,10 +16,10 @@ Overall function: the conclusion restates the working implementation, reduced ev
    - Word choices: `present implementation` limits scope; `working proof-of-concept` is positive but bounded; `reduced` and `smoke-training` keep evidence strength modest; `installed environment` ties the claim to what was actually run.
    - Risk status: grounded.
 
-2. `The Airshow addition moves the paper beyond synthetic-only training evidence by converting 355 traceable public geometry records into manifest-backed voxel corpora at \(16^3\), \(32^3\), and \(64^3\).`
+2. `The Airshow addition moves the paper beyond synthetic-only training evidence by converting 355 traceable public geometry records into manifest-backed voxel corpora at \(16^3\), \(32^3\), \(64^3\), and \(96^3\).`
    - Function: states exactly what the new corpus contributes.
    - Claim type: corpus-addition claim.
-   - Word choices: `beyond synthetic-only` explains why the addition matters; `355` is concrete; `traceable public geometry records` captures provenance; `manifest-backed voxel corpora` defines reproducibility across the three lattice sizes without claiming higher resolution solved validity.
+   - Word choices: `beyond synthetic-only` explains why the addition matters; `355` is concrete; `traceable public geometry records` captures provenance; `manifest-backed voxel corpora` defines reproducibility across the lattice sizes without claiming higher resolution solved validity.
    - Risk status: grounded by the corpus report and manifest validation.
 
 3. `It also exposes the current generator's limit: the generated Airshow-checkpoint flight-path samples are nonempty and solver-runnable at the completed resolutions, but they still fail aircraft-specific validity screens such as \texttt{span\_sanity}.`
@@ -34,11 +34,17 @@ Overall function: the conclusion restates the working implementation, reduced ev
    - Word choices: `176 source-valid records` anchors the filter size; `zero-learning-rate resume issue` names the concrete bug; `improved` credits the result; `but it did not produce` keeps the gate status honest.
    - Risk status: critical.
 
-5. `The \(64^3\) corpus validates, but the current dense decoder did not produce a checkpoint within the local run ceiling.`
+5. `The \(64^3\) corpus validates, but the dense decoder did not produce a checkpoint within the local run ceiling.`
    - Function: states the `64^3` outcome precisely.
    - Claim type: manifest and implementation-limit result.
    - Word choices: `corpus validates` is narrower than model succeeds; `dense decoder` names the likely architecture bottleneck; `local run ceiling` bounds the negative result to this environment.
    - Risk status: grounded.
+
+5a. `A \(96^3\) coordinate-decoder run trained for three epochs over the full public corpus and produced one heuristic-screen-passing calibrated top-k export out of three flight-path cases; this is a useful implementation result, not a reliable aircraft-generation or aerodynamic-validation result.`
+   - Function: records the strongest new positive result and its boundary in the same sentence.
+   - Claim type: high-resolution implementation and limitation claim.
+   - Word choices: `coordinate-decoder` names the architecture that made the run feasible; `one...out of three` prevents cherry-picking; `heuristic-screen-passing` avoids certification language; `not` blocks aircraft-generation and aerodynamic-validation overclaims.
+   - Risk status: critical.
 
 6. `The OpenFOAM cross-check completes on the shared centered-cube validation object and gives the repository an external CFD comparison path.`
    - Function: summarizes external solver route.
@@ -64,16 +70,16 @@ Overall function: the conclusion restates the working implementation, reduced ev
    - Word choices: `not yet` leaves future room; `fully AI-driven airplane generator` names the overclaim exactly; the three condition types match user-facing expectations.
    - Risk status: critical.
 
-10. `What exists today is structured-conditioning plumbing plus a reduced evidence package, a grounded public-corpus smoke run, a higher-resolution negative result, and a clarified CFD-oriented scoring path whose aerodynamic and connectivity diagnostics are not yet differentiable training signals.`
+10. `What exists today is structured-conditioning plumbing plus a reduced evidence package, a grounded public-corpus smoke run, a mixed higher-resolution result, a clarified CFD-oriented scoring path whose aerodynamic and connectivity diagnostics are not differentiable training signals, and an experimental sequential candidate optimizer that can use those scores as measured black-box losses.`
    - Function: states the actual present status in plain language.
    - Claim type: implementation and evidence summary.
-   - Word choices: `plumbing` is intentionally humble; `reduced` keeps scope honest; `grounded public-corpus smoke run` adds the Airshow achievement without upgrading it to validation; `clarified CFD-oriented scoring path` describes the debug result without claiming solver-guided learning.
+   - Word choices: `plumbing` is intentionally humble; `reduced` keeps scope honest; `mixed higher-resolution result` is accurate after the one-of-three `96^3` top-k pass; `measured black-box losses` names the sequential optimizer without implying autograd.
    - Risk status: grounded.
 
-11. `That stronger version needs more evidence first: validity-bearing aircraft-like training runs, conditional ablations, stricter structural and aerodynamic checks, decoder changes that make higher-resolution training practical, a sequential candidate-ranking or surrogate-training loop for solver feedback, and repeated runs beyond the present reduced local protocol.`
+11. `That stronger version needs more evidence first: validity-bearing aircraft-like training runs, conditional ablations, stricter structural and aerodynamic checks, decoder and export-calibration studies that make higher-resolution training practical and reliable, benchmark reports showing that the sequential or surrogate solver-feedback loop reliably improves candidates, and repeated runs beyond the present reduced local protocol.`
    - Function: names the minimum future requirements.
    - Claim type: future-work gate.
-   - Word choices: `validity-bearing` makes passing generated gates the priority; `decoder changes` reflects the `64^3` bottleneck; `sequential candidate-ranking or surrogate-training loop` is included because raw solver diagnostics are detached from gradients; `first` prevents premature claims.
+   - Word choices: `validity-bearing` makes passing generated gates the priority; `decoder and export-calibration studies` reflects the `96^3` result; `reliably improves candidates` is the missing evidence for solver feedback; `first` prevents premature claims.
    - Risk status: future requirement, not current evidence.
 
 ## Audit Notes
@@ -82,10 +88,27 @@ The conclusion is deliberately plain. It does not end with a triumphant claim. I
 
 ## 2026-06-20 Resolution Addendum
 
-The conclusion now names `16^3`, `32^3`, and `64^3` Airshow corpora, the
+The conclusion now names `16^3`, `32^3`, `64^3`, and `96^3` Airshow corpora, the
 176-record source-valid filter, the zero-learning-rate resume fix, and the
 loss-semantics correction. This keeps the ending honest: completed generated
 samples remain solver-runnable but fail aircraft-specific validity checks, the
 `64^3` corpus validated without a checkpoint being produced in the local run
-ceiling, and the CFD-oriented diagnostics are not yet differentiable training
-signals.
+ceiling, the `96^3` coordinate-decoder run produced only one heuristic-screen
+pass out of three calibrated top-k exports, and the CFD-oriented diagnostics
+are not yet differentiable training signals.
+
+## 2026-06-21 `96^3` Addendum
+
+The conclusion now includes the `96^3` coordinate-decoder result. The added
+sentence says the model trained for three epochs over the full public corpus
+and produced one heuristic-screen-passing calibrated top-k export out of three
+flight-path cases. Its function is to acknowledge the strongest new positive
+result while immediately blocking the overclaim that this is reliable aircraft
+generation or aerodynamic validation.
+
+The phrase `mixed higher-resolution result` replaces `higher-resolution
+negative result` because the evidence is no longer purely negative. The
+following future-work phrase, `decoder and export-calibration studies that make
+higher-resolution training practical and reliable`, is intentionally broader
+than `decoder changes`: the new run shows that the decoder can train at
+`96^3`, but binary extraction and repeated validity remain unsolved.
