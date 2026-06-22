@@ -73,6 +73,7 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     occupied = float(grid.sum().item())
     total = float(grid.numel())
     occupancy_ratio = occupied / max(total, 1.0)
+    occupied_indices = torch.nonzero(grid > 0.5, as_tuple=False)
 
     flipped = torch.flip(grid, dims=[1])
     voxel_asymmetry = torch.abs(grid - flipped).sum().item() / max(occupied, 1.0)
@@ -97,6 +98,8 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     right_band = grid[:, right_start:right_end, :]
     low_end_band = grid[:, :, low_end_start:low_end_end]
     high_end_band = grid[:, :, high_end_start:high_end_end]
+    center_low_end_band = center_band[:, :, low_end_start:low_end_end]
+    center_high_end_band = center_band[:, :, high_end_start:high_end_end]
 
     center_fraction = float(center_band.sum().item() / max(occupied, 1.0))
     left_fraction = float(left_band.sum().item() / max(occupied, 1.0))
@@ -104,6 +107,9 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     low_end_fraction = float(low_end_band.sum().item() / max(occupied, 1.0))
     high_end_fraction = float(high_end_band.sum().item() / max(occupied, 1.0))
     tail_fraction = min(low_end_fraction, high_end_fraction)
+    center_band_occupied = float(center_band.sum().item())
+    center_low_end_fraction = float(center_low_end_band.sum().item() / max(center_band_occupied, 1.0))
+    center_high_end_fraction = float(center_high_end_band.sum().item() / max(center_band_occupied, 1.0))
 
     center_density = float(center_band.mean().item()) if center_band.numel() else 0.0
     left_density = float(left_band.mean().item()) if left_band.numel() else 0.0
@@ -116,6 +122,40 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
         longitudinal_profile_cv = float(
             occupied_profile.float().std(unbiased=False).item()
             / max(occupied_profile.float().mean().item(), 1e-6)
+        )
+
+    occupied_bbox_fill_ratio = 0.0
+    planform_fill_ratio = 0.0
+    side_projection_fill_ratio = 0.0
+    mean_longitudinal_slice_fill_ratio = 0.0
+    max_longitudinal_slice_fill_ratio = 0.0
+    center_spine_coverage = 0.0
+    if occupied_indices.numel() > 0:
+        mins = occupied_indices.min(dim=0).values
+        maxs = occupied_indices.max(dim=0).values + 1
+        bbox_shape = (maxs - mins).float()
+        bbox_volume = float(torch.prod(bbox_shape).item())
+        occupied_bbox_fill_ratio = occupied / max(bbox_volume, 1.0)
+        crop = grid[
+            mins[0]:maxs[0],
+            mins[1]:maxs[1],
+            mins[2]:maxs[2],
+        ] > 0.5
+        planform_fill_ratio = float(crop.any(dim=0).float().mean().item())
+        side_projection_fill_ratio = float(crop.any(dim=1).float().mean().item())
+        longitudinal_slice_fills: List[float] = []
+        for x_idx in range(crop.shape[2]):
+            slice_grid = crop[:, :, x_idx]
+            if bool(slice_grid.any().item()):
+                longitudinal_slice_fills.append(float(slice_grid.float().mean().item()))
+        if longitudinal_slice_fills:
+            mean_longitudinal_slice_fill_ratio = float(np.mean(longitudinal_slice_fills))
+            max_longitudinal_slice_fill_ratio = float(np.max(longitudinal_slice_fills))
+        occupied_x_profile = grid.sum(dim=(0, 1)) > 0
+        center_x_profile = center_band.sum(dim=(0, 1)) > 0
+        center_spine_coverage = float(
+            torch.logical_and(occupied_x_profile, center_x_profile).sum().item()
+            / max(float(occupied_x_profile.sum().item()), 1.0)
         )
 
     return {
@@ -133,6 +173,14 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
         "right_wing_density": right_density,
         "center_body_density_ratio": center_density / wing_density,
         "longitudinal_profile_cv": longitudinal_profile_cv,
+        "occupied_bbox_fill_ratio": occupied_bbox_fill_ratio,
+        "planform_fill_ratio": planform_fill_ratio,
+        "side_projection_fill_ratio": side_projection_fill_ratio,
+        "mean_longitudinal_slice_fill_ratio": mean_longitudinal_slice_fill_ratio,
+        "max_longitudinal_slice_fill_ratio": max_longitudinal_slice_fill_ratio,
+        "center_low_end_fraction": center_low_end_fraction,
+        "center_high_end_fraction": center_high_end_fraction,
+        "center_spine_coverage": center_spine_coverage,
         "low_end_fraction": low_end_fraction,
         "high_end_fraction": high_end_fraction,
         "tail_fraction": tail_fraction,
@@ -193,7 +241,7 @@ def evaluate_aircraft_validity(voxels: Any) -> Dict[str, Any]:
     metrics = canonicalization.get("metrics") or _heuristic_metrics(grid)
 
     checks = {
-        "nonempty_occupancy": 0.005 <= metrics["occupancy_ratio"] <= 0.50,
+        "nonempty_occupancy": 0.002 <= metrics["occupancy_ratio"] <= 0.50,
         "symmetry": metrics["symmetry_score"] >= 0.55,
         "span_sanity": (
             metrics["span_fraction_y"] >= 0.35
@@ -207,6 +255,14 @@ def evaluate_aircraft_validity(voxels: Any) -> Dict[str, Any]:
         ),
         "body_centerline_dominance": metrics["center_body_density_ratio"] >= 1.15,
         "longitudinal_profile_variation": metrics["longitudinal_profile_cv"] >= 0.18,
+        "planform_sparsity": (
+            metrics["planform_fill_ratio"] <= 0.75
+            and metrics["occupied_bbox_fill_ratio"] <= 0.65
+        ),
+        "fuselage_end_presence": (
+            min(metrics["center_low_end_fraction"], metrics["center_high_end_fraction"]) >= 0.015
+            and metrics["center_spine_coverage"] >= 0.70
+        ),
         "tail_body_plausibility": (
             metrics["tail_fraction"] <= 0.20
             and max(metrics["low_end_fraction"], metrics["high_end_fraction"]) <= 0.50

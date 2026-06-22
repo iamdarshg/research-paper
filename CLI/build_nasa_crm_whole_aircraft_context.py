@@ -270,13 +270,25 @@ def build_full_stl(source_stl_path: Path, full_stl_path: Path, *, requires_mirro
     }
 
 
-def run_local_analysis(full_stl_path: Path, voxel_path: Path) -> Dict[str, Any]:
-    dataset = AircraftDesignDataset(num_samples=0, grid_size=GRID_SIZE)
-    voxels = dataset._voxelize_stl(str(full_stl_path), GRID_SIZE)
+def run_local_analysis(
+    full_stl_path: Path,
+    voxel_path: Path,
+    *,
+    grid_size: int = GRID_SIZE,
+    simulation_steps: int = SIMULATION_STEPS,
+    analysis_device: str = "cpu",
+) -> Dict[str, Any]:
+    dataset = AircraftDesignDataset(num_samples=0, grid_size=grid_size)
+    voxels = dataset._voxelize_stl(str(full_stl_path), grid_size)
+    voxel_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(voxel_path, voxels.detach().cpu().numpy())
 
-    simulator = AdvancedCFDSimulator(CFDConfig(base_grid_resolution=GRID_SIZE), torch.device("cpu"))
-    cfd = simulator.simulate_aerodynamics(voxels, steps=SIMULATION_STEPS)
+    if analysis_device == "auto":
+        analysis_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if analysis_device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("analysis_device='cuda' requested, but CUDA is not available")
+    simulator = AdvancedCFDSimulator(CFDConfig(base_grid_resolution=grid_size), torch.device(analysis_device))
+    cfd = simulator.simulate_aerodynamics(voxels, steps=simulation_steps)
     validity = evaluate_aircraft_validity(voxels)
 
     return {
@@ -457,7 +469,14 @@ def design_spec_provenance(asset: AssetSpec) -> Dict[str, str]:
     }
 
 
-def write_analysis_report(report_path: Path, record: Dict[str, Any]) -> None:
+def write_analysis_report(
+    report_path: Path,
+    record: Dict[str, Any],
+    *,
+    grid_size: int = GRID_SIZE,
+    simulation_steps: int = SIMULATION_STEPS,
+    analysis_device: str = "cpu",
+) -> None:
     payload = {
         "sample_id": record["sample_id"],
         "source_id": record["source_id"],
@@ -477,10 +496,10 @@ def write_analysis_report(report_path: Path, record: Dict[str, Any]) -> None:
         "represented_dimensions_m": record["represented_dimensions_m"],
         "geometry_scale_note": record.get("geometry_scale_note"),
         "solver_config": {
-            "grid_size": GRID_SIZE,
-            "steps": SIMULATION_STEPS,
+            "grid_size": grid_size,
+            "steps": simulation_steps,
             "solver_type": "D3Q27",
-            "device": "cpu",
+            "device": analysis_device,
         },
         "local_cfd": record["analysis"]["cfd"],
         "local_validity": record["analysis"]["validity"],
@@ -639,6 +658,8 @@ def build_report(
     provenance_path: Path,
     records: List[Dict[str, Any]],
     refinement_path: Path,
+    grid_size: int = GRID_SIZE,
+    simulation_steps: int = SIMULATION_STEPS,
 ) -> None:
     counts: Dict[str, int] = {}
     families: Dict[str, int] = {}
@@ -681,8 +702,8 @@ def build_report(
         "- Intake is driven by the checked-in `docs/dataset/nasa_crm_source_catalog.json` source catalog so new ready entries can be added without modifying builder code.",
         "- Official STEP files were downloaded from NASA CRM pages, hashed, and extracted locally from zip archives.",
         "- CAD triangulation used CadQuery/OpenCascade with fixed STL export tolerances.",
-        "- Full-aircraft STL artifacts were voxelized at `32^3` with `AircraftDesignDataset._voxelize_stl`.",
-        "- Local analysis reports used the repo internal `D3Q27` solver on CPU with fixed settings.",
+        f"- Full-aircraft STL artifacts were voxelized at `{grid_size}^3` with `AircraftDesignDataset._voxelize_stl`.",
+        f"- Local analysis reports used the repo internal `D3Q27` solver for `{simulation_steps}` steps with fixed settings.",
         "",
         "## Validation",
         "",
@@ -764,11 +785,33 @@ def main() -> int:
         help="Reuse existing manifest records by source_id instead of rebuilding them.",
     )
     parser.add_argument(
+        "--grid-size",
+        type=int,
+        default=GRID_SIZE,
+        help="Voxel grid edge length for generated NASA CRM records.",
+    )
+    parser.add_argument(
+        "--simulation-steps",
+        type=int,
+        default=SIMULATION_STEPS,
+        help="Internal D3Q27 solver steps for per-record local analysis.",
+    )
+    parser.add_argument(
+        "--analysis-device",
+        choices=["cpu", "cuda", "auto"],
+        default="cpu",
+        help="Device used for per-record internal solver analysis.",
+    )
+    parser.add_argument(
         "--skip-refinement",
         action="store_true",
         help="Skip the representative grid-refinement study refresh.",
     )
     args = parser.parse_args()
+    if args.grid_size <= 0:
+        raise SystemExit("--grid-size must be positive")
+    if args.simulation_steps <= 0:
+        raise SystemExit("--simulation-steps must be positive")
 
     source_catalog_path = Path(args.source_catalog).resolve()
     output_root = Path(args.output_root).resolve()
@@ -787,16 +830,18 @@ def main() -> int:
     step_root = output_root / "step"
     stl_source_root = output_root / "stl_source"
     stl_full_root = output_root / "stl_full"
-    voxel_root = output_root / "voxels"
-    analysis_root = output_root / "reports" / "analysis"
+    voxel_subdir = "voxels" if int(args.grid_size) == GRID_SIZE else f"voxels_g{int(args.grid_size)}"
+    analysis_subdir = "analysis" if int(args.grid_size) == GRID_SIZE else f"analysis_g{int(args.grid_size)}"
+    voxel_root = output_root / voxel_subdir
+    analysis_root = output_root / "reports" / analysis_subdir
     refinement_root = output_root / "reports" / "refinement"
     for path in (raw_root, step_root, stl_source_root, stl_full_root, voxel_root, analysis_root, refinement_root):
         path.mkdir(parents=True, exist_ok=True)
 
     preprocessing_payload = {
         "preprocessing_version": PREPROCESSING_VERSION,
-        "grid_size": GRID_SIZE,
-        "simulation_steps": SIMULATION_STEPS,
+        "grid_size": int(args.grid_size),
+        "simulation_steps": int(args.simulation_steps),
         "voxelizer": "AircraftDesignDataset._voxelize_stl",
         "solver": "AdvancedCFDSimulator(D3Q27)",
         "cad_export_tolerance": 0.5,
@@ -837,7 +882,13 @@ def main() -> int:
                 full_stl_path,
                 requires_mirror=asset.requires_mirror,
             )
-            analysis = run_local_analysis(full_stl_path, voxel_path)
+            analysis = run_local_analysis(
+                full_stl_path,
+                voxel_path,
+                grid_size=int(args.grid_size),
+                simulation_steps=int(args.simulation_steps),
+                analysis_device=str(args.analysis_device),
+            )
             represented_dims = represented_dimensions_m(
                 mirror_info["full_extents"],
                 scale_model_fraction=asset.scale_model_fraction,
@@ -856,7 +907,13 @@ def main() -> int:
                 analysis=analysis,
                 represented_dims=represented_dims,
             )
-            write_analysis_report(analysis_report_path, record)
+            write_analysis_report(
+                analysis_report_path,
+                record,
+                grid_size=int(args.grid_size),
+                simulation_steps=int(args.simulation_steps),
+                analysis_device=str(args.analysis_device),
+            )
             records.append(record)
             built_count += 1
         except Exception as exc:  # pragma: no cover - defensive packaging path
@@ -924,6 +981,8 @@ def main() -> int:
         provenance_path=provenance_path,
         records=records,
         refinement_path=refinement_path,
+        grid_size=int(args.grid_size),
+        simulation_steps=int(args.simulation_steps),
     )
 
     status = "pass" if len(records) == len(assets) else "partial"

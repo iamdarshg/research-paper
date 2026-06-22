@@ -11,10 +11,19 @@ connectivity. It is a claim gate, not a claim by itself.
 - bilateral symmetry
 - span and length sanity
 - center-body plus left/right wing occupancy balance
+- center-body density dominance over wing bands
+- longitudinal occupancy variation
+- planform sparsity and occupied-bounding-box fill checks
+- centerline fuselage presence near both longitudinal ends
 - tail/body plausibility proxy
 
 The output JSON uses `status: pass` or `status: fail`, with per-check booleans,
 failed check names, and metrics.
+
+The lower occupancy floor is intentionally permissive (`0.002`) because thin
+public transport-aircraft CAD at `96^3` can occupy less than 0.5% of the lattice.
+Blob and slab rejection is handled by the planform/fuselage checks rather than
+by raising this occupancy floor.
 
 ## Current Boundary
 
