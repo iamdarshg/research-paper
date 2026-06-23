@@ -1,0 +1,52 @@
+{
+  "created_at": "2026-06-23",
+  "claim_boundary": "Official public military aircraft envelope seed. Values are published maximum or cruise specs, not observed operational flight distributions.",
+  "records": [
+    {
+      "icao_code": "A10",
+      "source_label": "USAF A-10C Thunderbolt II fact sheet",
+      "source_url": "https://www.af.mil/About-Us/Fact-Sheets/Display/Article/104490/a-10c-thunderbolt-ii/",
+      "max_speed_mps": 187.7568,
+      "cruise_speed_mps": 150.20544,
+      "service_ceiling_m": 13636.0,
+      "range_km": 1287.0
+    },
+    {
+      "icao_code": "B52",
+      "source_label": "National Museum of the USAF B-52D Stratofortress fact sheet",
+      "source_url": "https://www.nationalmuseum.af.mil/Visit/Museum-Exhibits/Fact-Sheets/Display/Article/195815/boeing-b-52d-stratofortress/",
+      "max_speed_mps": 285.21152,
+      "cruise_speed_mps": 228.169216,
+      "service_ceiling_m": 15057.12,
+      "range_km": 13418.0
+    },
+    {
+      "icao_code": "C30J",
+      "source_label": "USAF C-130 Hercules fact sheet",
+      "source_url": "https://www.af.mil/About-Us/Fact-Sheets/Display/Article/1555054/c-130-hercules/",
+      "max_speed_mps": 186.41568,
+      "cruise_speed_mps": 186.227,
+      "service_ceiling_m": 8615.0
+    },
+    {
+      "icao_code": "F16",
+      "source_label": "National Museum of the USAF F-16A Fighting Falcon fact sheet",
+      "source_url": "https://www.nationalmuseum.af.mil/Visit/Museum-Exhibits/Fact-Sheets/Display/Article/196735/general-dynamics-f-16a-fighting-falcon/",
+      "max_speed_mps": 601.2688,
+      "cruise_speed_mps": 257.94208,
+      "service_ceiling_m": 16764.0,
+      "range_km": 2264.0
+    },
+    {
+      "icao_code": "F18H",
+      "source_label": "NAVAIR F/A-18 A-D Hornet product page",
+      "source_url": "https://www.navair.navy.mil/product/FA-18-D-Hornet",
+      "max_speed_mps": 578.0,
+      "cruise_speed_mps": 240.0,
+      "service_ceiling_m": 15240.0,
+      "combat_radius_km": 2003.0,
+      "range_km": 2844.0,
+      "conversion_note": "NAVAIR publishes Mach 1.7+; max_speed_mps uses an approximate high-altitude Mach conversion and should be treated as an envelope cap."
+    }
+  ]
+}
