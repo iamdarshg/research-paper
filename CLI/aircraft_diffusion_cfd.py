@@ -25,7 +25,7 @@ import threading
 import multiprocessing as mp
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -194,9 +194,99 @@ class TrainingConfig:
     direct_solver_target_occupancy: Optional[float] = None
     connectivity_monitor_interval: int = 1
     aerodynamic_monitor_interval: int = 10
+    overfit_stop_enabled: bool = False
+    overfit_stop_metric: str = "optimization_loss"
+    overfit_min_epochs: int = 3
+    overfit_loss_floor: float = 1.0e-3
+    overfit_patience: int = 8
+    overfit_min_delta: float = 1.0e-4
+    overfit_relative_delta: float = 1.0e-3
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
+
+
+def _finite_history_metric(
+    history: Sequence[Mapping[str, Any]],
+    metric_name: str,
+) -> List[Tuple[int, float]]:
+    values: List[Tuple[int, float]] = []
+    for index, record in enumerate(history, start=1):
+        raw_value = record.get(metric_name)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(value):
+            continue
+        try:
+            epoch = int(record.get("epoch", index))
+        except (TypeError, ValueError):
+            epoch = index
+        values.append((epoch, value))
+    return values
+
+
+def evaluate_overfit_stop(
+    history: Sequence[Mapping[str, Any]],
+    training_config: TrainingConfig,
+) -> Optional[Dict[str, Any]]:
+    """Return a stop decision when train loss has memorized or stopped improving."""
+    if not training_config.overfit_stop_enabled:
+        return None
+
+    metric_name = str(training_config.overfit_stop_metric or "optimization_loss")
+    values = _finite_history_metric(history, metric_name)
+    min_epochs = max(1, int(training_config.overfit_min_epochs))
+    if len(values) < min_epochs:
+        return None
+
+    current_epoch, current_value = values[-1]
+    loss_floor = max(0.0, float(training_config.overfit_loss_floor))
+    if current_value <= loss_floor:
+        return {
+            "reason": "loss_floor",
+            "metric": metric_name,
+            "metric_value": current_value,
+            "epoch": current_epoch,
+            "threshold": loss_floor,
+        }
+
+    patience = max(0, int(training_config.overfit_patience))
+    if patience <= 0:
+        return None
+
+    meaningful_best_epoch, meaningful_best_value = values[0]
+    absolute_best_epoch, absolute_best_value = values[0]
+    min_delta = max(0.0, float(training_config.overfit_min_delta))
+    relative_delta = max(0.0, float(training_config.overfit_relative_delta))
+    for epoch, value in values[1:]:
+        threshold = max(min_delta, abs(meaningful_best_value) * relative_delta)
+        if value <= meaningful_best_value - threshold:
+            meaningful_best_epoch = epoch
+            meaningful_best_value = value
+        if value < absolute_best_value:
+            absolute_best_epoch = epoch
+            absolute_best_value = value
+
+    epochs_since_improvement = current_epoch - meaningful_best_epoch
+    if len(values) >= min_epochs and epochs_since_improvement >= patience:
+        return {
+            "reason": "plateau",
+            "metric": metric_name,
+            "metric_value": current_value,
+            "epoch": current_epoch,
+            "best_epoch": meaningful_best_epoch,
+            "best_metric_value": meaningful_best_value,
+            "absolute_best_epoch": absolute_best_epoch,
+            "absolute_best_metric_value": absolute_best_value,
+            "epochs_since_improvement": epochs_since_improvement,
+            "patience": patience,
+            "min_delta": min_delta,
+            "relative_delta": relative_delta,
+        }
+
+    return None
 
 
 def restore_resume_learning_rate_if_zero(optimizer: torch.optim.Optimizer, learning_rate: float) -> bool:
@@ -2844,6 +2934,7 @@ class OptimizedDiffusionTrainer:
         self.writer = SummaryWriter(log_dir='./runs')
         self.global_step = 0
         self.training_history: List[Dict[str, Any]] = []
+        self.stop_decision: Optional[Dict[str, Any]] = None
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
         """Create an independent copy of the model"""
@@ -3232,33 +3323,47 @@ class OptimizedDiffusionTrainer:
 
             torch.cuda.empty_cache()
 
-            epochs = self.training_config.num_epochs
-
-            for epoch in range(epochs):
-                print(f"\nGrid {grid_size} - Epoch {epoch + 1}/{epochs}")
+            epochs = max(0, int(self.training_config.num_epochs))
+            train_until_overfit = bool(self.training_config.overfit_stop_enabled)
+            epoch = 0
+            while train_until_overfit or epoch < epochs:
+                epoch += 1
+                epoch_limit_label = "until-overfit" if train_until_overfit else str(epochs)
+                print(f"\nGrid {grid_size} - Epoch {epoch}/{epoch_limit_label}")
 
                 # Progressive distillation
-                if epoch % 10 == 0 and epoch > 0:
+                if (epoch - 1) % 10 == 0 and epoch > 1:
                     print("Running progressive distillation...")
                     self._run_progressive_distillation(train_loader)
 
                 metrics = self.train_epoch(train_loader, grid_size=grid_size)
                 epoch_record = {
                     "grid_size": int(grid_size),
-                    "epoch": int(epoch + 1),
+                    "epoch": int(epoch),
                     "decoder_mode": getattr(self.converter, "decoder_mode", "dense"),
                     **{key: float(value) for key, value in metrics.items()},
                 }
                 history.append(epoch_record)
                 self.training_history.append(epoch_record)
 
-                print(f"Epoch {epoch + 1} Metrics: {metrics}")
+                print(f"Epoch {epoch} Metrics: {metrics}")
 
-                if val_loader and (epoch + 1) % self.training_config.val_interval == 0:
+                stop_decision = evaluate_overfit_stop(history, self.training_config)
+                if stop_decision is not None:
+                    epoch_record["stop_decision"] = stop_decision
+                    self.stop_decision = stop_decision
+                    print(
+                        "Stopping training via overfit policy: "
+                        f"{stop_decision['reason']} at epoch {stop_decision['epoch']} "
+                        f"({stop_decision['metric']}={stop_decision['metric_value']:.6g})"
+                    )
+                    break
+
+                if val_loader and epoch % self.training_config.val_interval == 0:
                     self.validate_epoch(val_loader, grid_size=grid_size)
 
-                if (epoch + 1) % self.training_config.save_interval == 0:
-                    self.save_checkpoint(f'checkpoint_optimized_grid{grid_size}_ep{epoch+1}.pt')
+                if epoch % self.training_config.save_interval == 0:
+                    self.save_checkpoint(f'checkpoint_optimized_grid{grid_size}_ep{epoch}.pt')
 
             self.scheduler.step()
         return history
@@ -4100,12 +4205,20 @@ def cli():
 @click.option('--direct-solver-target-occupancy', default=None, type=float, help='Optional top-k occupancy fraction for direct solver binarization.')
 @click.option('--connectivity-monitor-interval', default=1, help='Exact connected-component monitor interval; 0 disables it.')
 @click.option('--aerodynamic-monitor-interval', default=10, help='Raw internal CFD monitor interval; 0 disables it.')
+@click.option('--train-until-overfit/--fixed-epoch-count', default=False, help='Ignore the epoch count as a stop condition and stop only when the configured overfit policy triggers.')
+@click.option('--overfit-stop-metric', default='optimization_loss', help='History metric used by --train-until-overfit.')
+@click.option('--overfit-min-epochs', default=3, type=int, help='Minimum epochs before overfit-stop checks may stop training.')
+@click.option('--overfit-loss-floor', default=1.0e-3, type=float, help='Stop when the selected training metric reaches this low memorization floor.')
+@click.option('--overfit-patience', default=8, type=int, help='Stop after this many epochs without a meaningful new best metric.')
+@click.option('--overfit-min-delta', default=1.0e-4, type=float, help='Minimum absolute metric improvement that resets overfit-stop patience.')
+@click.option('--overfit-relative-delta', default=1.0e-3, type=float, help='Minimum relative metric improvement that resets overfit-stop patience.')
 def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
           num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
           enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, coordinate_decoder_threshold,
           full_diagnostic_interval, direct_solver_loss_weight, direct_solver_interval, direct_solver_steps, direct_solver_perturbation,
           direct_solver_perturbation_grid_size, direct_solver_gradient_clip, direct_connectivity_weight, direct_solver_target_occupancy,
-          connectivity_monitor_interval, aerodynamic_monitor_interval):
+          connectivity_monitor_interval, aerodynamic_monitor_interval, train_until_overfit, overfit_stop_metric, overfit_min_epochs,
+          overfit_loss_floor, overfit_patience, overfit_min_delta, overfit_relative_delta):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
@@ -4218,6 +4331,13 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         direct_solver_target_occupancy=direct_solver_target_occupancy,
         connectivity_monitor_interval=connectivity_monitor_interval,
         aerodynamic_monitor_interval=aerodynamic_monitor_interval,
+        overfit_stop_enabled=train_until_overfit,
+        overfit_stop_metric=overfit_stop_metric,
+        overfit_min_epochs=overfit_min_epochs,
+        overfit_loss_floor=overfit_loss_floor,
+        overfit_patience=overfit_patience,
+        overfit_min_delta=overfit_min_delta,
+        overfit_relative_delta=overfit_relative_delta,
     )
 
     cfd_config = CFDConfig(
@@ -4255,6 +4375,12 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     print(f"Pipeline parallelism enabled: {enable_pipeline}")
     print(f"Gradient checkpointing enabled: {enable_checkpointing}")
     print(f"torch.compile enabled: {enable_compile}")
+    if train_until_overfit:
+        print(
+            "Overfit-stop mode enabled: no wall-clock timeout; training stops when "
+            f"{overfit_stop_metric} <= {overfit_loss_floor} or when patience "
+            f"{overfit_patience} is exhausted after epoch {overfit_min_epochs}."
+        )
     if run_class == RUN_CLASS_SMOKE:
         print("Smoke-run mode: local sanity evidence only, not a final evaluation.")
     else:
@@ -4263,12 +4389,16 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
 
     # Train with optimizations
     history = trainer.train(train_loader)
+    stop_decision = getattr(trainer, "stop_decision", None)
+    if not isinstance(stop_decision, dict):
+        stop_decision = None
     metrics_path = Path(save_dir) / "training_metrics.json"
     metrics_payload = {
         "model_config": asdict(model_config),
         "training_config": asdict(training_config),
         "cfd_config": asdict(cfd_config),
         "history": history,
+        "stop_decision": stop_decision,
         "claim_boundary": (
             "optimization_loss is the backpropagated scalar. Exact connectivity and raw CFD scores "
             "are measured monitors unless included through direct_solver_loss with a nonzero "
