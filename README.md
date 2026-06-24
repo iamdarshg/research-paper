@@ -201,7 +201,8 @@ The current repo does not ship a publication-grade aircraft training corpus. It 
 - a procedural/synthetic training path
 - checked-in densification artifacts for smoke workflows
 - a minimal manifest-backed grounded wiring artifact at [`docs/dataset/minimal_grounded_manifest.jsonl`](docs/dataset/minimal_grounded_manifest.jsonl)
-- a larger grounded aircraft manifest and corpus artifacts used by the guarded final protocol
+- public-source whole-aircraft corpus builders and generated Airshow/NASA geometry manifests
+- a generated 5,000-record FAA/OpenSky geometry-case manifest used by the guarded final protocol
 
 Those artifacts validate dataset wiring, provenance, and protocol guardrails. They do not by themselves prove aircraft-design performance.
 
@@ -213,7 +214,8 @@ Those artifacts validate dataset wiring, provenance, and protocol guardrails. Th
 - [`CLI/run_protocols/smoke_8gb.yaml`](CLI/run_protocols/smoke_8gb.yaml)
 - [`CLI/run_protocols/final_cloud.yaml`](CLI/run_protocols/final_cloud.yaml)
 - [`docs/dataset/minimal_grounded_manifest.jsonl`](docs/dataset/minimal_grounded_manifest.jsonl)
-- [`docs/dataset/grounded_aircraft_manifest.jsonl`](docs/dataset/grounded_aircraft_manifest.jsonl)
+- [`docs/dataset/nasa_crm_whole_aircraft_manifest.jsonl`](docs/dataset/nasa_crm_whole_aircraft_manifest.jsonl)
+- [`docs/dataset/faa_opensky_flight_regime_corpus_20260623.md`](docs/dataset/faa_opensky_flight_regime_corpus_20260623.md)
 - [`paper/FINAL_RUN_GATES.md`](paper/FINAL_RUN_GATES.md)
 - [`paper/CITATION_AUDIT.md`](paper/CITATION_AUDIT.md)
 - [`paper/CLAIMS_EVIDENCE_MATRIX.md`](paper/CLAIMS_EVIDENCE_MATRIX.md)

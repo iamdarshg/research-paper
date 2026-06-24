@@ -54,20 +54,30 @@ Current expected behavior:
 See `docs/dataset/GROUNDED_CORPUS_SPEC.md` for the stricter claim-bearing contract and
 `docs/dataset/manifest_schema.example.json` for a machine-readable example record shape.
 
-## Claim-Bearing Corpus Artifacts
+## Active Geometry Corpus Artifacts
 
-The repository now also contains a claim-bearing grounded corpus package built
-from public NACA source geometry code plus local preprocessing and analysis:
+The old checked-in NACA airfoil-section corpus has been removed from the active
+dataset package because it was not whole-aircraft geometry and was easy to
+misread as aircraft-level evidence.
 
-- `docs/dataset/grounded_aircraft_manifest.jsonl`
-- `docs/dataset/grounded_aircraft_provenance.json`
-- `docs/dataset/GROUNDED_AIRCRAFT_CORPUS_REPORT.md`
-- `docs/dataset/grounded_aircraft/`
+The active whole-aircraft geometry sources are now:
 
-This package is intentionally narrower than a full-aircraft dataset. It is
-airfoil-section-heavy, uses explicit local response-metric proxies, and should
-be treated as grounded manifest evidence for the current protocol contracts, not
-as whole-aircraft flight-validation evidence.
+- `docs/dataset/nasa_crm_whole_aircraft_manifest.jsonl`
+- `docs/dataset/nasa_crm_whole_aircraft_provenance.json`
+- `docs/dataset/NASA_CRM_WHOLE_AIRCRAFT_REPORT.md`
+- generated Airshow/NASA expanded geometry corpus:
+  `build/expanded_aircraft_corpus_20260622/manifest.jsonl`
+
+The FAA/OpenSky flight-regime path now has a generated geometry-bearing case
+manifest:
+
+- `build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl`
+- `build/faa_geometry_case_corpus_20260624/geometry_case_report_5k.json`
+
+This 5,000-record manifest assigns each FAA/OpenSky observed flight case a
+whole-aircraft geometry proxy from the 370-record Airshow+NASA `96^3` geometry
+pool. It is suitable for geometry-bearing conditioning experiments. It is not a
+claim that every FAA/OpenSky row has exact aircraft-type CAD.
 
 ## Public Whole-Aircraft Package
 

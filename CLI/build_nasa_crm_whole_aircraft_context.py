@@ -942,8 +942,7 @@ def main() -> int:
         "generated": ACCESS_DATE,
         "claim_boundary": (
             "This ledger documents a public NASA CRM whole-aircraft evidence package with local proxy metrics. "
-            "It is stronger whole-aircraft evidence than the airfoil-section corpus, but it is still bounded by "
-            "public geometry availability and internal-solver validation limits."
+            "It is bounded by public geometry availability and internal-solver validation limits."
         ),
         "build_environment": {
             "python": sys.version,

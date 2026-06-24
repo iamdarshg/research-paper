@@ -1,6 +1,6 @@
 validate_manifest:
   enabled: true
-  manifest: ../../docs/dataset/grounded_aircraft_manifest.jsonl
+  manifest: ../../build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl
   level: claim-bearing
   output: ../../build/protocol_final/manifest_validation.json
 
@@ -16,7 +16,7 @@ train:
   save_dir: ../../checkpoints_protocol_final
   run_class: final
   solver: D3Q27
-  dataset_manifest: ../../docs/dataset/grounded_aircraft_manifest.jsonl
+  dataset_manifest: ../../build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl
   baseline_config: ../baseline_config.yaml
   claim_gates: ../../paper/FINAL_RUN_GATES.md
   enable_consistency: true
@@ -39,14 +39,14 @@ validate_conditions:
 
 condition_benchmark:
   enabled: true
-  manifest: ../../docs/dataset/grounded_aircraft_manifest.jsonl
+  manifest: ../../build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl
   num_seeds: 8
   min_grounded_records: 20
   output: ../../build/protocol_final/condition_benchmark.json
 
 manufacturing_constraints:
   enabled: true
-  manifest: ../../docs/dataset/grounded_aircraft_manifest.jsonl
+  manifest: ../../build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl
   output: ../../build/protocol_final/manufacturing_constraints.json
 
 prepare_aircraft_validity_inputs:

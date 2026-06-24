@@ -171,7 +171,7 @@ class TestProtocolRunner(unittest.TestCase):
         train_command = final_commands[1]
 
         self.assertIn(
-            str((repo_root / "docs" / "dataset" / "grounded_aircraft_manifest.jsonl").resolve()),
+            str((repo_root / "build" / "faa_geometry_case_corpus_20260624" / "geometry_case_manifest_5k.jsonl").resolve()),
             train_command,
         )
         self.assertIn("--grid-size", train_command)

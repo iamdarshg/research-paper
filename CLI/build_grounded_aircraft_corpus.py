@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Build a claim-bearing grounded aircraft-like corpus from public NACA sources.
+"""Build a legacy airfoil-section corpus from public NACA sources.
 
-This builder intentionally produces an airfoil-section-heavy corpus. It supports
-manifest, manufacturing, and grounded response-metric workflows, but it does not
-upgrade the repo to whole-aircraft validity or publication-grade aerodynamic
-claims on its own.
+This utility intentionally produces an airfoil-section-heavy corpus. It is kept
+for reproducibility experiments only and no longer writes into the active
+checked-in dataset package by default.
 """
 
 from __future__ import annotations
@@ -555,17 +554,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build a grounded aircraft-like corpus and provenance ledger.")
     parser.add_argument(
         "--manifest",
-        default=str(REPO_ROOT / "docs" / "dataset" / "grounded_aircraft_manifest.jsonl"),
+        default=str(REPO_ROOT / "build" / "legacy_airfoil_corpus" / "grounded_aircraft_manifest.jsonl"),
         help="Output manifest path.",
     )
     parser.add_argument(
         "--provenance",
-        default=str(REPO_ROOT / "docs" / "dataset" / "grounded_aircraft_provenance.json"),
+        default=str(REPO_ROOT / "build" / "legacy_airfoil_corpus" / "grounded_aircraft_provenance.json"),
         help="Output provenance ledger path.",
     )
     parser.add_argument(
         "--report",
-        default=str(REPO_ROOT / "docs" / "dataset" / "GROUNDED_AIRCRAFT_CORPUS_REPORT.md"),
+        default=str(REPO_ROOT / "build" / "legacy_airfoil_corpus" / "GROUNDED_AIRCRAFT_CORPUS_REPORT.md"),
         help="Output markdown report path.",
     )
     args = parser.parse_args()

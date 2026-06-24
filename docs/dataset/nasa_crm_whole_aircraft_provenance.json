@@ -7,7 +7,7 @@
     "trimesh": "4.10.0"
   },
   "built_record_count": 0,
-  "claim_boundary": "This ledger documents a public NASA CRM whole-aircraft evidence package with local proxy metrics. It is stronger whole-aircraft evidence than the airfoil-section corpus, but it is still bounded by public geometry availability and internal-solver validation limits.",
+  "claim_boundary": "This ledger documents a public NASA CRM whole-aircraft evidence package with local proxy metrics. It is bounded by public geometry availability and internal-solver validation limits.",
   "errors": [],
   "generated": "2026-06-05",
   "preprocessing": {

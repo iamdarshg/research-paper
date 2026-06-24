@@ -237,7 +237,7 @@ Validate a manifest directly:
 ```bash
 python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level basic
 python validate_manifest.py --manifest ../docs/dataset/minimal_grounded_manifest.jsonl --level claim-bearing
-python validate_manifest.py --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl --level claim-bearing
+python validate_manifest.py --manifest ../build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl --level claim-bearing
 ```
 
 Run the grounded condition-response gate directly:
@@ -245,7 +245,7 @@ Run the grounded condition-response gate directly:
 ```bash
 python run_condition_benchmark.py \
   --checkpoint ../checkpoints_protocol_final/final_optimized_model.pt \
-  --manifest ../docs/dataset/grounded_aircraft_manifest.jsonl \
+  --manifest ../build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl \
   --output ../build/protocol_final/condition_benchmark.json
 ```
 

@@ -91,6 +91,17 @@ operational distributions.
 The 50,000-case manifest reaches the requested scale for flight-regime
 conditioning cases. It does not add 50,000 unique aircraft geometries.
 
+## Geometry-Bearing Follow-Up
+
+The follow-up geometry-case corpus assigns whole-aircraft geometry proxies to
+5,000 FAA/OpenSky observed flight cases:
+
+- Report: `docs/dataset/faa_geometry_case_corpus_20260624.md`
+- Manifest: `build/faa_geometry_case_corpus_20260624/geometry_case_manifest_5k.jsonl`
+
+That follow-up removes the old checked-in airfoil-section corpus from active
+dataset evidence and uses only whole-aircraft geometry references.
+
 ## Next Data Step
 
 To replace route-average cases with true trajectory-derived regimes, use
