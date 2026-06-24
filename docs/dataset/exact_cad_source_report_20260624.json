@@ -1,0 +1,145 @@
+{
+  "catalog_path": "docs\\dataset\\exact_cad_source_catalog_20260624.json",
+  "generated_at": "2026-06-24T02:20:54.515689+00:00",
+  "machine_report_path": "docs\\dataset\\exact_cad_source_report_20260624.json",
+  "source_metadata": {
+    "airshow": {
+      "all_public_model_documents": 382,
+      "exact_vsp_url_documents": 382,
+      "firestore_project_id": "openvas-0",
+      "license_counts": {
+        "1": 210,
+        "2": 19,
+        "3": 130,
+        "4": 10,
+        "5": 13
+      },
+      "license_qualified_exact_vsp_records": 359,
+      "storage_bucket": "openvas-0.appspot.com"
+    },
+    "hiliftaeroml": {
+      "canonical_aoa_deg": 4,
+      "geometry_variant_count": 180,
+      "source_page": "https://huggingface.co/datasets/nvidia/HiLiftAeroML"
+    },
+    "local_nasa_crm": {
+      "record_count": 15,
+      "source_path": "docs/dataset/nasa_crm_source_catalog.json"
+    },
+    "nasa_crm_candidate_sweep": {
+      "apparent_record_count": 1873,
+      "candidate_group_count": 41,
+      "ready_apparent_record_count": 1835,
+      "ready_group_count": 31,
+      "source_path": "docs\\dataset\\nasa_crm_source_candidates.json"
+    },
+    "nasa_uam": {
+      "archive_count": 7,
+      "archive_failure_count": 1,
+      "archives": [
+        {
+          "vehicle": "Tiltduct",
+          "vsp3_members": [
+            "NASA_Tiltduct_CrossShafted_NoVanes.vsp3",
+            "NASA_Tiltduct_DirectDrive_5Vanes.vsp3"
+          ],
+          "zip_sha256": "19e995b2bc367d0e64febf816a34d822aee674f8a6c4aa80ab3880cde9f90e01",
+          "zip_size_bytes": 525649,
+          "zip_url": "https://www.nasa.gov/wp-content/uploads/2026/03/6-pax-tiltduct-vsp.zip?emrc=3e9bd5"
+        },
+        {
+          "vehicle": "Tiltwing",
+          "vsp3_members": [
+            "NASA_Tiltwing_6pax.vsp3"
+          ],
+          "zip_sha256": "3d9edd58c16dd86bf6974ae1d2757d599294d9c6163fc64012c4650387e88418",
+          "zip_size_bytes": 444234,
+          "zip_url": "https://www.nasa.gov/wp-content/uploads/2026/03/nasa-tiltwing-6pax-vsp.zip?emrc=cf6844"
+        },
+        {
+          "vehicle": "Multi-Tiltrotor",
+          "vsp3_members": [
+            "NASA_Multi-tiltrotor.vsp3"
+          ],
+          "zip_sha256": "3464d75d3e10887b6184f83a211bff719988defac431b6044386bf068b55435e",
+          "zip_size_bytes": 296600,
+          "zip_url": "https://www.nasa.gov/wp-content/uploads/2026/03/nasa-multi-tiltrotor.zip?emrc=f98326"
+        },
+        {
+          "vehicle": "Quadrotor",
+          "vsp3_members": [
+            "quadcollflap.vsp3",
+            "quadstiffrpm.vsp3"
+          ],
+          "zip_sha256": "fde6075e88c9706c7f46882a9fe9e05414c35929fe39218f61d72602b9fa0a4b",
+          "zip_size_bytes": 426012,
+          "zip_url": "https://www.nasa.gov/wp-content/uploads/2026/03/quadrotor-vsp.zip?emrc=847667"
+        },
+        {
+          "vehicle": "Lift + Cruise",
+          "vsp3_members": [
+            "liftpcruise.vsp3"
+          ],
+          "zip_sha256": "823f2af6da3e71f1c2ac21114131231fab83890513bfb6875ffd29a43db8b312",
+          "zip_size_bytes": 460086,
+          "zip_url": "https://www.nasa.gov/wp-content/uploads/2026/03/liftpcruisevsp.zip?emrc=ce58ad"
+        },
+        {
+          "vehicle": "Side-by-Side",
+          "vsp3_members": [
+            "sbs.vsp3"
+          ],
+          "zip_sha256": "fdb099e87c433300798fd78e5c37b97e1ad95e06e0508edcfbef3734694beb2e",
+          "zip_size_bytes": 122665,
+          "zip_url": "https://www.nasa.gov/wp-content/uploads/2026/03/sbs-vsp.zip?emrc=5abdc2"
+        },
+        {
+          "vehicle": "Quiet Single Main Rotor",
+          "vsp3_members": [
+            "QEU2023-SMR-6pax-turbo-notar_450fps.vsp3"
+          ],
+          "zip_sha256": "c9909b05206bcf04193c99eeb74ae1ffa6521db4955b4b1b86da8fc89617a13a",
+          "zip_size_bytes": 151969,
+          "zip_url": "https://www.nasa.gov/wp-content/uploads/2026/03/qsmr-vsp.zip?emrc=c332aa"
+        }
+      ],
+      "failures": [
+        {
+          "error": "File is not a zip file",
+          "error_type": "BadZipFile",
+          "vehicle": "Lift + Cruise Legacy",
+          "zip_url": "https://sites-e.larc.nasa.gov/sacd/wp-content/uploads/sites/167/2022/02/LiftPCruiseVSP.zip"
+        }
+      ],
+      "vsp3_member_count": 9
+    }
+  },
+  "summary": {
+    "candidate_status_counts": {
+      "ready_exact_cad_archive": 9,
+      "ready_exact_cad_url": 359,
+      "ready_exact_cad_url_large_payload": 180,
+      "ready_local_catalog_record": 15
+    },
+    "file_format_counts": {
+      "step_zip": 15,
+      "stp": 180,
+      "vsp3": 368
+    },
+    "license_counts": {
+      "Attribution (CC BY)": 19,
+      "Attribution Share Alike (CC BY-SA)": 130,
+      "CC-BY-4.0": 180,
+      "NASA public reference vehicle release": 9,
+      "No Rights Reserved (CC0)": 210,
+      "not_stated_public_nasa_download_bounded_by_nasa_data_use_policy": 15
+    },
+    "record_count": 563,
+    "source_collection_counts": {
+      "hiliftaeroml_crm_hl_variants": 180,
+      "local_nasa_crm_ready_catalog": 15,
+      "nasa_uam_reference_vehicles": 9,
+      "vsp_airshow_public_models": 359
+    }
+  }
+}

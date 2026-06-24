@@ -109,6 +109,16 @@ The broader discovery lane now also has dedicated artifacts:
 - `docs/dataset/NASA_CRM_SOURCE_SWEEP.md`
 - `docs/dataset/nasa_crm_source_candidates.json`
 
+The exact-CAD discovery lane now has a separate catalog and report:
+
+- `docs/dataset/exact_cad_source_catalog_20260624.json`
+- `docs/dataset/exact_cad_source_sweep_20260624.md`
+
+This catalog records exact OpenVSP/STEP source URLs from VSP Airshow, NASA UAM
+reference vehicles, HiLiftAeroML, and the existing local NASA CRM ready catalog.
+It is a source catalog, not a binary CAD mirror or proof that every discovered
+model is a validated aircraft.
+
 These files are intentionally wider than the ready catalog. They can include
 format-conversion-needed, reference-only, or not-yet-promoted candidates that
 still need an honest ingestion decision before they are fed into the builder.
