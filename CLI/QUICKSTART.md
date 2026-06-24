@@ -40,7 +40,7 @@ python aircraft_diffusion_cfd.py train \
 What to expect from the current implementation:
 
 - The final checkpoint should be written to `./checkpoints_smoke/final_optimized_model.pt`.
-- The trainer may also emit periodic files named like `checkpoint_optimized_grid16_ep5.pt` relative to the working directory when the epoch count reaches the save interval.
+- The trainer may also emit periodic files named like `./checkpoints_smoke/checkpoint_optimized_grid16_ep5.pt` when the epoch count reaches the save interval.
 - With the default solver `D3Q27`, the current CLI chooses a base grid resolution of `16`.
 
 ## 5. Generate One STL from That Checkpoint

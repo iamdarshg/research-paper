@@ -177,6 +177,7 @@ class TrainingConfig:
     disconnection_penalty: float = 50.0
     precision: str = 'float32'
     save_interval: int = 5
+    checkpoint_dir: str = "checkpoints"
     val_interval: int = 2
     geometry_reconstruction_weight: float = 1.0
     generation_reconstruction_weight: float = 1.0
@@ -3363,7 +3364,11 @@ class OptimizedDiffusionTrainer:
                     self.validate_epoch(val_loader, grid_size=grid_size)
 
                 if epoch % self.training_config.save_interval == 0:
-                    self.save_checkpoint(f'checkpoint_optimized_grid{grid_size}_ep{epoch}.pt')
+                    checkpoint_path = (
+                        Path(self.training_config.checkpoint_dir)
+                        / f'checkpoint_optimized_grid{grid_size}_ep{epoch}.pt'
+                    )
+                    self.save_checkpoint(str(checkpoint_path))
 
             self.scheduler.step()
         return history
@@ -3375,6 +3380,8 @@ class OptimizedDiffusionTrainer:
 
     def save_checkpoint(self, path: str):
         """Save training checkpoint with all models"""
+        checkpoint_path = Path(path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
             'diffusion_model': self.diffusion_model.state_dict(),
             'consistency_model': self.consistency_model.state_dict(),
@@ -3389,8 +3396,8 @@ class OptimizedDiffusionTrainer:
             'training_config': asdict(self.training_config),
             'cfd_config': asdict(self.cfd_config),
         }
-        torch.save(checkpoint, path)
-        print(f"Optimized checkpoint saved to {path}")
+        torch.save(checkpoint, str(checkpoint_path))
+        print(f"Optimized checkpoint saved to {checkpoint_path}")
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint"""
@@ -4316,6 +4323,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         learning_rate=learning_rate,
         disconnection_penalty=disconnection_penalty,
         precision=precision,
+        checkpoint_dir=save_dir,
         enable_pipeline_parallelism=enable_pipeline,
         coordinate_training_samples=coordinate_training_samples,
         coordinate_positive_fraction=coordinate_positive_fraction,

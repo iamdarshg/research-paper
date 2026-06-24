@@ -104,6 +104,49 @@ Resource monitor summary for the completed 4-epoch run:
 
 The global GPU memory/utilization fields are usable. Per-process GPU memory remained unavailable from the local monitor on this run and is recorded as zero in the JSON summary.
 
+## Until-Overfit Resume Run
+
+After the CI dependency fix, the 96^3 trainer was resumed from the 4-epoch checkpoint and allowed to run without a wall-clock timeout. The run used the automatic overfit stop policy instead:
+
+- Resume checkpoint: `build/expanded_aircraft_hilift_training_20260624/g96_ep4_direct_nestedcachefix/checkpoints/final_optimized_model.pt`
+- Final checkpoint: `build/expanded_aircraft_hilift_training_20260624/g96_until_overfit_direct_resume_ep4/checkpoints/final_optimized_model.pt`
+- Metrics: `build/expanded_aircraft_hilift_training_20260624/g96_until_overfit_direct_resume_ep4/checkpoints/training_metrics.json`
+- Stop metric: `optimization_loss`
+- Stop rule: floor `0.05`, patience `8`, min delta `0.005`, relative delta `0.005`, minimum epochs `6`
+- Completed epochs: `51`
+- Stop reason: `plateau`
+- Best epoch: `43`
+- Best optimization loss: `0.6016768323891657`
+
+Selected metrics from the until-overfit run:
+
+| Epoch | Optimization loss | MSE | Geometry recon | Generation recon | Direct solver loss | Direct solver eval loss |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.824035 | 0.838670 | 0.197788 | 0.030142 | 4.507814 | 282.489695 |
+| 4 | 1.535463 | 0.739497 | 0.083493 | 0.030623 | 4.193069 | 262.765632 |
+| 10 | 0.935444 | 0.612218 | 0.043603 | 0.029112 | 5.005249 | 313.662253 |
+| 21 | 0.703885 | 0.423739 | 0.030035 | 0.027482 | 4.448443 | 278.769109 |
+| 28 | 0.687821 | 0.321475 | 0.027891 | 0.027462 | 6.216626 | 389.575211 |
+| 36 | 0.608816 | 0.219779 | 0.027904 | 0.027305 | 6.673722 | 418.219908 |
+| 43 | 0.601677 | 0.175277 | 0.027761 | 0.027422 | 7.421395 | 465.074089 |
+| 50 | 0.607701 | 0.149456 | 0.027675 | 0.027230 | 8.063823 | 505.332916 |
+| 51 | 0.704903 | 0.162576 | 0.027725 | 0.027233 | 7.535568 | 472.228902 |
+
+Resource monitor summary for the until-overfit run:
+
+| Metric | Value |
+| --- | ---: |
+| Elapsed wall time | `11752.938 s` |
+| Return code | `0` |
+| Peak GPU memory used | `7941 MB` |
+| Mean GPU memory used | `4976.22 MB` |
+| Peak GPU utilization | `100%` |
+| Mean GPU utilization | `28.86%` |
+| Peak process RSS | `4545.05 MB` |
+| Mean process CPU | `541.39%` |
+
+The until-overfit run reduced the backpropagated scalar from `1.824035` at resumed epoch 1 to a best observed value of `0.601677` at epoch 43, then stopped after eight epochs without a meaningful improvement. The MSE term continued to shrink through epoch 50, but the direct solver eval loss worsened relative to earlier epochs. That is not claim-bearing aircraft quality evidence; it is overfit/objective-alignment evidence showing that reconstruction specialization can outpace the solver diagnostic even when the solver term is present in the scalar.
+
 ## Replication Commands
 
 Catalog regeneration:
@@ -166,9 +209,51 @@ python CLI/run_with_resource_monitor.py \
   --aerodynamic-monitor-interval 0
 ```
 
+Until-overfit resume:
+
+```bash
+python CLI/run_with_resource_monitor.py \
+  --output-dir build/expanded_aircraft_hilift_training_20260624/g96_until_overfit_direct_resume_ep4/resources \
+  --interval 10 \
+  --cwd . \
+  -- python CLI/aircraft_diffusion_cfd.py train \
+  --num-epochs 10000 \
+  --batch-size 1 \
+  --learning-rate 5e-6 \
+  --latent-dim 16 \
+  --grid-size 96 \
+  --dataset-manifest build/expanded_aircraft_hilift_corpus_20260624/manifest.jsonl \
+  --resume-from build/expanded_aircraft_hilift_training_20260624/g96_ep4_direct_nestedcachefix/checkpoints/final_optimized_model.pt \
+  --save-dir build/expanded_aircraft_hilift_training_20260624/g96_until_overfit_direct_resume_ep4/checkpoints \
+  --disable-pipeline \
+  --enable-checkpointing \
+  --solver D3Q27 \
+  --coordinate-training-samples 4096 \
+  --coordinate-positive-fraction 0.5 \
+  --coordinate-decoder-threshold 96 \
+  --full-diagnostic-interval 0 \
+  --direct-solver-loss-weight 0.05 \
+  --direct-solver-interval 64 \
+  --direct-solver-steps 5 \
+  --direct-solver-perturbation 0.15 \
+  --direct-solver-perturbation-grid-size 8 \
+  --direct-solver-gradient-clip 1.0 \
+  --direct-connectivity-weight 1.0 \
+  --direct-solver-target-occupancy 0.004 \
+  --connectivity-monitor-interval 0 \
+  --aerodynamic-monitor-interval 0 \
+  --train-until-overfit \
+  --overfit-stop-metric optimization_loss \
+  --overfit-min-epochs 6 \
+  --overfit-loss-floor 0.05 \
+  --overfit-patience 8 \
+  --overfit-min-delta 0.005 \
+  --overfit-relative-delta 0.005
+```
+
 ## Claim Boundary
 
-This run proves that the code can build a 752-record local 96^3 manifest, train across it with the direct solver loss enabled, and complete without the previous direct-solver OOM. It does not prove that the generated outputs are valid aircraft. The direct solver trend says the opposite: the final epochs improve reconstruction while degrading the measured solver objective.
+This run proves that the code can build a 752-record local 96^3 manifest, train across it with the direct solver loss enabled, complete without the previous direct-solver OOM, and stop automatically on a plateau. It does not prove that the generated outputs are valid aircraft. The direct solver trend says the opposite: later epochs improve reconstruction while degrading the measured solver diagnostic.
 
 ## Source References
 

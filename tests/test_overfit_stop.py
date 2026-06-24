@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from aircraft_diffusion_cfd import (
     OptimizedDiffusionTrainer,
     TrainingConfig,
@@ -105,3 +107,45 @@ def test_trainer_loop_stops_when_overfit_policy_triggers():
     assert len(history) == 2
     assert trainer.stop_decision["reason"] == "loss_floor"
     assert history[-1]["stop_decision"]["reason"] == "loss_floor"
+
+
+def test_trainer_loop_saves_periodic_checkpoints_under_configured_dir():
+    trainer = OptimizedDiffusionTrainer.__new__(OptimizedDiffusionTrainer)
+    trainer.model_config = type("Config", (), {"grid_resolution": 8})()
+    trainer.training_config = TrainingConfig(
+        num_epochs=1,
+        save_interval=1,
+        checkpoint_dir="checkpoints/run-a",
+    )
+    trainer.converter = type("Converter", (), {"decoder_mode": "dense"})()
+    trainer.training_history = []
+    trainer.stop_decision = None
+    trainer.scheduler = type("Scheduler", (), {"step": lambda self: None})()
+
+    def fake_train_epoch(train_loader, grid_size):
+        return {
+            "loss": 0.5,
+            "optimization_loss": 0.5,
+            "diagnostic_total": 0.5,
+            "mse": 0.5,
+            "geometry_reconstruction": 0.0,
+            "generation_reconstruction": 0.0,
+            "consistency": 0.0,
+            "direct_solver_loss": 0.0,
+            "direct_solver_eval_loss": 0.0,
+            "direct_solver_eval_count": 0.0,
+            "connectivity": 0.0,
+            "aerodynamic": 0.0,
+        }
+
+    saved_paths = []
+    trainer.train_epoch = fake_train_epoch
+    trainer.validate_epoch = lambda *args, **kwargs: None
+    trainer.save_checkpoint = lambda path: saved_paths.append(path)
+    trainer._run_progressive_distillation = lambda *args, **kwargs: None
+
+    OptimizedDiffusionTrainer.train(trainer, train_loader=[object()])
+
+    assert saved_paths == [
+        str(Path("checkpoints/run-a") / "checkpoint_optimized_grid8_ep1.pt")
+    ]

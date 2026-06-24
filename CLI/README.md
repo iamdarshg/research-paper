@@ -87,7 +87,7 @@ Current training options:
 Checkpoint behavior in the current code:
 
 - The final checkpoint is saved to `<save-dir>/final_optimized_model.pt`.
-- Periodic checkpoints are currently written by the trainer as `checkpoint_optimized_grid<grid>_ep<epoch>.pt` relative to the working directory, not under `--save-dir`.
+- Periodic checkpoints are saved under `<save-dir>/checkpoint_optimized_grid<grid>_ep<epoch>.pt`.
 
 Resolution behavior in the current code:
 
