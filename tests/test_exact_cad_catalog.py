@@ -6,6 +6,7 @@ import zipfile
 from CLI.build_exact_cad_catalog import (
     build_airshow_exact_cad_records,
     build_hiliftaeroml_records,
+    build_hiliftaeroml_surface_records,
     build_nasa_uam_records,
     collect_nasa_uam_archive_metadata,
     render_markdown_report,
@@ -87,6 +88,23 @@ def test_hiliftaeroml_catalog_generates_one_canonical_stp_per_geometry_variant()
     )
     assert records[2]["geometry_variant_id"] == "geo_LHC003"
     assert records[2]["available_flow_solution_count"] == 10
+
+
+def test_hiliftaeroml_surface_catalog_generates_per_aoa_stl_records_with_duplicate_boundary():
+    records = build_hiliftaeroml_surface_records(
+        geometry_count=2,
+        aoa_degrees=[4, 8],
+    )
+
+    assert len(records) == 4
+    assert records[0]["source_id"] == "hiliftaeroml_surface_geo_LHC001_AoA_4"
+    assert records[0]["file_format"] == "stl"
+    assert records[0]["exact_cad_url"].endswith(
+        "/geo_LHC001_AoA_4/geo_LHC001_AoA_4.stl"
+    )
+    assert records[1]["geometry_variant_id"] == "geo_LHC001"
+    assert records[1]["angle_of_attack_deg"] == 8
+    assert records[1]["geometry_uniqueness"] == "repeated_geometry_variant_across_aoa"
 
 
 def test_catalog_script_help_runs_from_repo_root():

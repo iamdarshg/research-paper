@@ -1,6 +1,6 @@
 # Dataset Status And Requirements
 
-This repository does not yet ship a grounded aircraft-like training corpus. The current data path is procedural and synthetic: generated voxel geometries, synthetic `DesignSpec` samples, and offline densification artifacts used to exercise the conditioning seam and training pipeline.
+This repository now contains partial public-source and generated local geometry corpora, but it still does not ship a publication-grade, split-controlled aircraft training corpus. The older procedural/synthetic path remains useful for wiring tests; the newer Airshow, NASA CRM, NASA UAM, and HiLiftAeroML lanes add exact-geometry provenance but still need leakage control, validation splits, and external solver checks before paper-level claims.
 
 ## What The Current Data Supports
 
@@ -67,6 +67,14 @@ The active whole-aircraft geometry sources are now:
 - `docs/dataset/NASA_CRM_WHOLE_AIRCRAFT_REPORT.md`
 - generated Airshow/NASA expanded geometry corpus:
   `build/expanded_aircraft_corpus_20260622/manifest.jsonl`
+- generated Airshow/NASA/HiLift expanded geometry corpus:
+  `build/expanded_aircraft_hilift_corpus_20260624/manifest.jsonl`
+
+The Airshow/NASA/HiLift local manifest contains `752` 96^3 records after the
+HiLiftAeroML STL streaming pass. The HiLift slice contributes AoA-labeled exact
+STL records with force/moment labels, but repeated AoA files for the same
+`geometry_variant_id` share geometry. Treat them as flow-labeled repeated
+geometry records, not as hundreds of independent aircraft designs.
 
 The FAA/OpenSky flight-regime path now has a generated geometry-bearing case
 manifest:
@@ -113,11 +121,12 @@ The exact-CAD discovery lane now has a separate catalog and report:
 
 - `docs/dataset/exact_cad_source_catalog_20260624.json`
 - `docs/dataset/exact_cad_source_sweep_20260624.md`
+- `docs/benchmarks/hiliftaeroml_96_training_20260624.md`
 
 This catalog records exact OpenVSP/STEP source URLs from VSP Airshow, NASA UAM
-reference vehicles, HiLiftAeroML, and the existing local NASA CRM ready catalog.
-It is a source catalog, not a binary CAD mirror or proof that every discovered
-model is a validated aircraft.
+reference vehicles, HiLiftAeroML, HiLiftAeroML exact STL surface-run URLs, and
+the existing local NASA CRM ready catalog. It is a source catalog, not a binary
+CAD mirror or proof that every discovered model is a validated aircraft.
 
 These files are intentionally wider than the ready catalog. They can include
 format-conversion-needed, reference-only, or not-yet-promoted candidates that

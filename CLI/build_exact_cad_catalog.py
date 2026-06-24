@@ -29,6 +29,7 @@ from CLI.build_airshow_corpus import (
 ALLOWED_AIRSHOW_LICENSES = ("1", "2", "3")
 HILIFTAEROML_BASE_URL = "https://huggingface.co/datasets/nvidia/HiLiftAeroML/resolve/main"
 HILIFTAEROML_SOURCE_PAGE = "https://huggingface.co/datasets/nvidia/HiLiftAeroML"
+HILIFTAEROML_AOA_DEGREES = (4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
 NASA_UAM_SOURCE_PAGE = "https://www.nasa.gov/reference/uam-refs/"
 
 NASA_UAM_OPENVSP_ARCHIVES: Sequence[Dict[str, str]] = (
@@ -197,8 +198,8 @@ def build_hiliftaeroml_records(
                 "geometry_kind": "crm_hl_parametric_variant",
                 "geometry_variant_id": variant,
                 "canonical_aoa_deg": canonical_aoa,
-                "available_aoa_degrees": [4, 6, 8, 10, 12, 14, 16, 18, 20, 22],
-                "available_flow_solution_count": 10,
+                "available_aoa_degrees": list(HILIFTAEROML_AOA_DEGREES),
+                "available_flow_solution_count": len(HILIFTAEROML_AOA_DEGREES),
                 "source_license": "CC-BY-4.0",
                 "license_training_status": "permissive_attribution_required",
                 "candidate_status": "ready_exact_cad_url_large_payload",
@@ -209,6 +210,46 @@ def build_hiliftaeroml_records(
                 ),
             }
         )
+    return records
+
+
+def build_hiliftaeroml_surface_records(
+    *,
+    geometry_count: int = 180,
+    aoa_degrees: Sequence[int] = HILIFTAEROML_AOA_DEGREES,
+    base_url: str = HILIFTAEROML_BASE_URL,
+) -> List[Dict[str, Any]]:
+    """Build exact STL surface records for every HiLiftAeroML geometry/AoA run."""
+    records: List[Dict[str, Any]] = []
+    for index in range(1, geometry_count + 1):
+        variant = f"geo_LHC{index:03d}"
+        for aoa in aoa_degrees:
+            run_id = f"{variant}_AoA_{int(aoa)}"
+            records.append(
+                {
+                    "source_id": f"hiliftaeroml_surface_{run_id}",
+                    "source_collection": "hiliftaeroml_crm_hl_surface_runs",
+                    "source_page": HILIFTAEROML_SOURCE_PAGE,
+                    "exact_cad_url": f"{base_url}/{run_id}/{run_id}.stl",
+                    "step_cad_url": f"{base_url}/{run_id}/{run_id}.stp",
+                    "force_moment_url": f"{base_url}/{run_id}/force_mom_{run_id}.csv",
+                    "geometry_values_url": f"{base_url}/{run_id}/geo_values_{run_id}.csv",
+                    "file_format": "stl",
+                    "cad_system": "STL surface mesh exported with HiLiftAeroML run",
+                    "geometry_kind": "crm_hl_parametric_variant_surface_run",
+                    "geometry_variant_id": variant,
+                    "angle_of_attack_deg": int(aoa),
+                    "geometry_uniqueness": "repeated_geometry_variant_across_aoa",
+                    "source_license": "CC-BY-4.0",
+                    "license_training_status": "permissive_attribution_required",
+                    "candidate_status": "ready_exact_stl_url_large_payload",
+                    "claim_boundary": (
+                        "Exact STL surface URL for a HiLiftAeroML run. Multiple AoA records for "
+                        "the same geometry_variant_id should be treated as repeated geometry with "
+                        "different flow-condition labels, not distinct aircraft designs."
+                    ),
+                }
+            )
     return records
 
 
@@ -439,6 +480,7 @@ def render_markdown_report(report: Dict[str, Any], records: Sequence[Dict[str, A
         "also provides STL surfaces and force/moment CSVs for ten angles of attack per variant.",
         "",
         f"- Geometry variants cataloged: `{report['source_metadata']['hiliftaeroml'].get('geometry_variant_count', 0)}`",
+        f"- Exact STL surface run records: `{report['source_metadata']['hiliftaeroml'].get('surface_run_count', 0)}`",
         f"- Canonical AoA used for CAD URLs: `{report['source_metadata']['hiliftaeroml'].get('canonical_aoa_deg', 0)} deg`",
         "",
         "### NASA CRM Local And Candidate Sources",
@@ -519,9 +561,18 @@ def build_catalog(args: argparse.Namespace) -> Dict[str, Any]:
         canonical_aoa=args.hiliftaeroml_canonical_aoa,
     )
     records.extend(hilift_records)
+    hilift_surface_records: List[Dict[str, Any]] = []
+    if not args.skip_hiliftaeroml_surfaces:
+        hilift_surface_records = build_hiliftaeroml_surface_records(
+            geometry_count=args.hiliftaeroml_geometry_count,
+            aoa_degrees=HILIFTAEROML_AOA_DEGREES,
+        )
+        records.extend(hilift_surface_records)
     source_metadata["hiliftaeroml"] = {
         "geometry_variant_count": len(hilift_records),
+        "surface_run_count": len(hilift_surface_records),
         "canonical_aoa_deg": args.hiliftaeroml_canonical_aoa,
+        "aoa_degrees": list(HILIFTAEROML_AOA_DEGREES),
         "source_page": HILIFTAEROML_SOURCE_PAGE,
     }
     source_metadata["nasa_crm_candidate_sweep"] = summarize_crm_candidate_sweep(
@@ -580,6 +631,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--allowed-airshow-licenses", nargs="+", default=list(ALLOWED_AIRSHOW_LICENSES))
     parser.add_argument("--hiliftaeroml-geometry-count", type=_positive_int, default=180)
     parser.add_argument("--hiliftaeroml-canonical-aoa", type=int, default=4)
+    parser.add_argument("--skip-hiliftaeroml-surfaces", action="store_true")
     parser.add_argument("--skip-airshow", action="store_true")
     parser.add_argument("--skip-nasa-uam", action="store_true")
     parser.add_argument(

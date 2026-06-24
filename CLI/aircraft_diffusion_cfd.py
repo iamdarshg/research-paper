@@ -2567,6 +2567,26 @@ def _direct_measured_objective_for_single(
     return float(np.nan_to_num(total_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6))
 
 
+def _clear_direct_solver_geometry_caches(cfd_simulator: "AdvancedCFDSimulator") -> None:
+    """Drop per-geometry LBM caches after SPSA probes to avoid 96^3 cache growth."""
+    solvers = []
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    if root_solver is not None:
+        solvers.append(root_solver)
+        nested_solver = getattr(root_solver, "_solver", None)
+        if nested_solver is not None:
+            solvers.append(nested_solver)
+
+    for solver in solvers:
+        q_cache = getattr(solver, "_q_cache", None)
+        if isinstance(q_cache, dict):
+            q_cache.clear()
+        if hasattr(solver, "_boundary_cache_key"):
+            solver._boundary_cache_key = None
+        if hasattr(solver, "_boundary_link_cache"):
+            solver._boundary_link_cache = None
+
+
 class DirectSolverSPSAFunction(torch.autograd.Function):
     """Black-box direct solver loss with a two-sided SPSA gradient estimate."""
 
@@ -2664,6 +2684,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 sample_grad = sample_grad * (clip_value / grad_norm.clamp_min(1.0e-12))
             grad_estimate[batch_idx] = sample_grad / max(batch_size, 1)
             base_losses.append(base_loss)
+            _clear_direct_solver_geometry_caches(cfd_simulator)
 
         if original_ndim == 3:
             grad_estimate = grad_estimate[0]

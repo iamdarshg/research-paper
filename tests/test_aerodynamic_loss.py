@@ -42,6 +42,29 @@ class _GeometrySensitiveSimulator:
         }
 
 
+class _GeometryCacheSimulator(_GeometrySensitiveSimulator):
+    def __init__(self):
+        super().__init__()
+        self.lbm_solver = type("FakeLBMSolver", (), {})()
+        self.lbm_solver._q_cache = {}
+        self.lbm_solver._boundary_cache_key = "initial"
+        self.lbm_solver._boundary_link_cache = torch.ones(1)
+        self.lbm_solver._solver = type("FakeNestedSolver", (), {})()
+        self.lbm_solver._solver._q_cache = {}
+        self.lbm_solver._solver._boundary_cache_key = "nested-initial"
+        self.lbm_solver._solver._boundary_link_cache = torch.ones(1)
+
+    def simulate_aerodynamics(self, geometry, steps=100):
+        result = super().simulate_aerodynamics(geometry, steps=steps)
+        self.lbm_solver._q_cache[f"geometry-{len(self.calls)}"] = torch.ones(1)
+        self.lbm_solver._boundary_cache_key = f"geometry-{len(self.calls)}"
+        self.lbm_solver._boundary_link_cache = torch.ones(1)
+        self.lbm_solver._solver._q_cache[f"nested-geometry-{len(self.calls)}"] = torch.ones(1)
+        self.lbm_solver._solver._boundary_cache_key = f"nested-geometry-{len(self.calls)}"
+        self.lbm_solver._solver._boundary_link_cache = torch.ones(1)
+        return result
+
+
 class TestAerodynamicLoss(unittest.TestCase):
     def test_prefers_training_drag_coefficient_over_raw_drag(self):
         loss_fn = AerodynamicLoss()
@@ -139,6 +162,28 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertTrue(loss.requires_grad)
         self.assertIsNotNone(voxels.grad)
         self.assertGreater(float(voxels.grad.abs().sum()), 0.0)
+
+    def test_direct_solver_spsa_clears_geometry_caches_after_solver_calls(self):
+        voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
+        simulator = _GeometryCacheSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=3,
+            perturbation=0.35,
+            gradient_clip=10.0,
+            connectivity_weight=0.0,
+            seed=123,
+        )
+
+        loss = loss_fn(voxels, DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0), simulator, seed=123)
+        loss.backward()
+
+        self.assertEqual(len(simulator.calls), 3)
+        self.assertEqual(simulator.lbm_solver._q_cache, {})
+        self.assertIsNone(simulator.lbm_solver._boundary_cache_key)
+        self.assertIsNone(simulator.lbm_solver._boundary_link_cache)
+        self.assertEqual(simulator.lbm_solver._solver._q_cache, {})
+        self.assertIsNone(simulator.lbm_solver._solver._boundary_cache_key)
+        self.assertIsNone(simulator.lbm_solver._solver._boundary_link_cache)
 
     def test_training_loss_includes_direct_solver_term_when_weighted(self):
         parameter = torch.tensor(2.0, requires_grad=True)

@@ -1,6 +1,6 @@
 {
   "catalog_path": "docs\\dataset\\exact_cad_source_catalog_20260624.json",
-  "generated_at": "2026-06-24T02:20:54.515689+00:00",
+  "generated_at": "2026-06-24T10:18:16.156081+00:00",
   "machine_report_path": "docs\\dataset\\exact_cad_source_report_20260624.json",
   "source_metadata": {
     "airshow": {
@@ -18,9 +18,22 @@
       "storage_bucket": "openvas-0.appspot.com"
     },
     "hiliftaeroml": {
+      "aoa_degrees": [
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20,
+        22
+      ],
       "canonical_aoa_deg": 4,
       "geometry_variant_count": 180,
-      "source_page": "https://huggingface.co/datasets/nvidia/HiLiftAeroML"
+      "source_page": "https://huggingface.co/datasets/nvidia/HiLiftAeroML",
+      "surface_run_count": 1800
     },
     "local_nasa_crm": {
       "record_count": 15,
@@ -119,23 +132,26 @@
       "ready_exact_cad_archive": 9,
       "ready_exact_cad_url": 359,
       "ready_exact_cad_url_large_payload": 180,
+      "ready_exact_stl_url_large_payload": 1800,
       "ready_local_catalog_record": 15
     },
     "file_format_counts": {
       "step_zip": 15,
+      "stl": 1800,
       "stp": 180,
       "vsp3": 368
     },
     "license_counts": {
       "Attribution (CC BY)": 19,
       "Attribution Share Alike (CC BY-SA)": 130,
-      "CC-BY-4.0": 180,
+      "CC-BY-4.0": 1980,
       "NASA public reference vehicle release": 9,
       "No Rights Reserved (CC0)": 210,
       "not_stated_public_nasa_download_bounded_by_nasa_data_use_policy": 15
     },
-    "record_count": 563,
+    "record_count": 2363,
     "source_collection_counts": {
+      "hiliftaeroml_crm_hl_surface_runs": 1800,
       "hiliftaeroml_crm_hl_variants": 180,
       "local_nasa_crm_ready_catalog": 15,
       "nasa_uam_reference_vehicles": 9,

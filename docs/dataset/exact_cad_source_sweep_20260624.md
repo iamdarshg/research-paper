@@ -1,16 +1,17 @@
 # Exact CAD Source Sweep
 
-Generated: `2026-06-24T02:20:54.515689+00:00`
+Generated: `2026-06-24T10:18:16.156081+00:00`
 
 ## Summary
 
-- Exact CAD catalog records: `563`
+- Exact CAD catalog records: `2363`
 - This is a source catalog, not a checked-in binary CAD mirror.
 - Large assets, especially HiLiftAeroML STEP/STL/flow fields, are intentionally referenced by URL.
 - Third-party generic CAD marketplaces are excluded from the claim-bearing lane until license and provenance review.
 
 | Source collection | Records |
 | --- | ---: |
+| `hiliftaeroml_crm_hl_surface_runs` | 1800 |
 | `hiliftaeroml_crm_hl_variants` | 180 |
 | `local_nasa_crm_ready_catalog` | 15 |
 | `nasa_uam_reference_vehicles` | 9 |
@@ -19,6 +20,7 @@ Generated: `2026-06-24T02:20:54.515689+00:00`
 | CAD format | Records |
 | --- | ---: |
 | `step_zip` | 15 |
+| `stl` | 1800 |
 | `stp` | 180 |
 | `vsp3` | 368 |
 
@@ -45,6 +47,7 @@ The NASA UAM lane inspects official NASA OpenVSP ZIP archives and records each `
 The HiLiftAeroML lane catalogs one canonical STEP URL per CRM-HL geometry variant. The dataset also provides STL surfaces and force/moment CSVs for ten angles of attack per variant.
 
 - Geometry variants cataloged: `180`
+- Exact STL surface run records: `1800`
 - Canonical AoA used for CAD URLs: `4 deg`
 
 ### NASA CRM Local And Candidate Sources
@@ -84,8 +87,8 @@ This catalog can support exact geometry provenance. It does not by itself prove 
 
 ## First Records
 
-- `hiliftaeroml_geo_LHC001` `stp` from `hiliftaeroml_crm_hl_variants`
-- `hiliftaeroml_geo_LHC002` `stp` from `hiliftaeroml_crm_hl_variants`
-- `hiliftaeroml_geo_LHC003` `stp` from `hiliftaeroml_crm_hl_variants`
-- `hiliftaeroml_geo_LHC004` `stp` from `hiliftaeroml_crm_hl_variants`
-- `hiliftaeroml_geo_LHC005` `stp` from `hiliftaeroml_crm_hl_variants`
+- `hiliftaeroml_surface_geo_LHC001_AoA_10` `stl` from `hiliftaeroml_crm_hl_surface_runs`
+- `hiliftaeroml_surface_geo_LHC001_AoA_12` `stl` from `hiliftaeroml_crm_hl_surface_runs`
+- `hiliftaeroml_surface_geo_LHC001_AoA_14` `stl` from `hiliftaeroml_crm_hl_surface_runs`
+- `hiliftaeroml_surface_geo_LHC001_AoA_16` `stl` from `hiliftaeroml_crm_hl_surface_runs`
+- `hiliftaeroml_surface_geo_LHC001_AoA_18` `stl` from `hiliftaeroml_crm_hl_surface_runs`
