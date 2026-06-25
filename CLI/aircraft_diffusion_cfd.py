@@ -330,6 +330,27 @@ def combine_training_loss_terms(
     return optimization_loss, diagnostic_total
 
 
+def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """BCE for sparse voxel grids that gives occupied and empty classes equal voice."""
+    target = target.to(device=logits.device, dtype=torch.float32)
+    losses = F.binary_cross_entropy_with_logits(
+        logits.float(),
+        target,
+        reduction="none",
+    ).nan_to_num(0.0)
+    positive_mask = target > 0.5
+    negative_mask = ~positive_mask
+
+    class_terms: List[torch.Tensor] = []
+    if bool(positive_mask.any().item()):
+        class_terms.append(losses[positive_mask].mean())
+    if bool(negative_mask.any().item()):
+        class_terms.append(losses[negative_mask].mean())
+    if not class_terms:
+        return losses.mean()
+    return torch.stack(class_terms).mean()
+
+
 @dataclass
 class LBMPhysicsConfig:
     """Easy-to-update configuration for LBM physics constants"""
@@ -2936,11 +2957,23 @@ class OptimizedDiffusionTrainer:
         self.global_step = 0
         self.training_history: List[Dict[str, Any]] = []
         self.stop_decision: Optional[Dict[str, Any]] = None
+        self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
         """Create an independent copy of the model"""
         import copy
         return copy.deepcopy(model)
+
+    def _sync_consistency_teacher(self) -> None:
+        """Keep the consistency teacher aligned with the trained diffusion model."""
+        teacher_model = getattr(self.consistency_model, "teacher_model", None)
+        if teacher_model is None or not hasattr(teacher_model, "load_state_dict"):
+            return
+        teacher_model.load_state_dict(self.diffusion_model.state_dict())
+        teacher_model.to(self.device).to(self.dtype)
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
 
     def _update_ema(self):
         """Update exponential moving average model"""
@@ -3089,22 +3122,6 @@ class OptimizedDiffusionTrainer:
                     )
                 flat_indices = torch.cat(sampled_parts, dim=0)
                 target_sample = flat_target.index_select(1, flat_indices)
-                positive_sample_fraction = float(sampled_positive_count) / float(flat_indices.numel())
-                uniform_sample_fraction = float(remaining_count) / float(flat_indices.numel())
-                sample_prob = torch.full(
-                    (flat_indices.numel(),),
-                    uniform_sample_fraction / float(total_voxels),
-                    device=self.device,
-                    dtype=target_sample.dtype,
-                )
-                if positive_sample_fraction > 0.0:
-                    sampled_positive_mask = positive_target.index_select(0, flat_indices).to(dtype=target_sample.dtype)
-                    sample_prob = sample_prob + sampled_positive_mask * (
-                        positive_sample_fraction / float(positive_indices.numel())
-                    )
-                importance_weights = (1.0 / float(total_voxels)) / sample_prob.clamp_min(1.0e-12)
-                importance_weights = importance_weights / importance_weights.mean().clamp_min(1.0e-12)
-                importance_weights = importance_weights.unsqueeze(0).expand_as(target_sample)
                 geom_logits_sample = self.converter.forward_flat_indices(
                     x0_pred,
                     flat_indices,
@@ -3113,17 +3130,13 @@ class OptimizedDiffusionTrainer:
                     generation_latent,
                     flat_indices,
                 ).nan_to_num(0.0)
-                geometry_loss_val = F.binary_cross_entropy_with_logits(
-                    geom_logits_sample.float(),
-                    target_sample.float(),
-                    weight=importance_weights.float(),
-                    reduction="mean",
+                geometry_loss_val = balanced_voxel_bce_with_logits(
+                    geom_logits_sample,
+                    target_sample,
                 ).nan_to_num(0.0)
-                generation_geometry_loss_val = F.binary_cross_entropy_with_logits(
-                    generation_geom_logits_sample.float(),
-                    target_sample.float(),
-                    weight=importance_weights.float(),
-                    reduction="mean",
+                generation_geometry_loss_val = balanced_voxel_bce_with_logits(
+                    generation_geom_logits_sample,
+                    target_sample,
                 ).nan_to_num(0.0)
                 direct_solver_interval = max(1, int(self.training_config.direct_solver_interval))
                 run_optimizer_grid_loss = (
@@ -3147,11 +3160,11 @@ class OptimizedDiffusionTrainer:
                 geom_logits = self.converter(x0_pred).nan_to_num(0.0)
                 voxel_grid = torch.sigmoid(geom_logits).nan_to_num(0.0)
                 generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
-                geometry_loss_val = self.geometry_loss(
+                geometry_loss_val = balanced_voxel_bce_with_logits(
                     geom_logits.float(),
                     geometry_target.float(),
                 ).nan_to_num(0.0)
-                generation_geometry_loss_val = self.geometry_loss(
+                generation_geometry_loss_val = balanced_voxel_bce_with_logits(
                     generation_geom_logits.float(),
                     geometry_target.float(),
                 ).nan_to_num(0.0)
@@ -3294,6 +3307,7 @@ class OptimizedDiffusionTrainer:
         condition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute consistency loss for progressive distillation"""
+        self._sync_consistency_teacher()
         batch_size = latent.shape[0]
         device = latent.device
 
@@ -3375,11 +3389,13 @@ class OptimizedDiffusionTrainer:
 
     def _run_progressive_distillation(self, train_loader: DataLoader):
         """Run progressive distillation through step counts"""
+        self._sync_consistency_teacher()
         distillation_results = self.consistency_model.progressive_distillation(train_loader)
         print(f"Progressive distillation completed: {distillation_results}")
 
     def save_checkpoint(self, path: str):
         """Save training checkpoint with all models"""
+        self._sync_consistency_teacher()
         checkpoint_path = Path(path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
@@ -3404,6 +3420,7 @@ class OptimizedDiffusionTrainer:
         checkpoint = torch.load(path, map_location=self.device)
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
+        self._sync_consistency_teacher()
         self.converter.load_state_dict(checkpoint['converter'])
         self.ema_model.load_state_dict(checkpoint['ema_model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
