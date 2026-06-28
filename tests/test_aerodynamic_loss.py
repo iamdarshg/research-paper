@@ -209,6 +209,7 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertEqual(len(simulator.calls), 3)
         self.assertGreater(float(loss.item()), 0.0)
         self.assertIsNotNone(voxels.grad)
+        self.assertGreater(float(voxels.grad.abs().sum()), 0.0)
 
     def test_training_loss_includes_direct_solver_term_when_weighted(self):
         parameter = torch.tensor(2.0, requires_grad=True)
