@@ -185,6 +185,31 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertIsNone(simulator.lbm_solver._solver._boundary_cache_key)
         self.assertIsNone(simulator.lbm_solver._solver._boundary_link_cache)
 
+    def test_direct_solver_spsa_adds_aircraft_validity_regression_to_loss(self):
+        voxels = torch.full((1, 8, 8, 8), 0.5, dtype=torch.float32, requires_grad=True)
+        simulator = _GeometrySensitiveSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=1,
+            perturbation=0.35,
+            gradient_clip=10.0,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=4.0,
+            target_occupancy=0.1,
+            seed=123,
+        )
+
+        loss = loss_fn(
+            voxels,
+            DesignSpec(space_weight=0.0, drag_weight=0.0, lift_weight=0.0),
+            simulator,
+            seed=123,
+        )
+        loss.backward()
+
+        self.assertEqual(len(simulator.calls), 3)
+        self.assertGreater(float(loss.item()), 0.0)
+        self.assertIsNotNone(voxels.grad)
+
     def test_training_loss_includes_direct_solver_term_when_weighted(self):
         parameter = torch.tensor(2.0, requires_grad=True)
         config = TrainingConfig(

@@ -48,6 +48,7 @@ from scipy.stats import pearsonr
 from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
+from aircraft_validity import evaluate_aircraft_validity
 from condition_feasibility import validate_condition_feasibility
 
 warnings.filterwarnings('ignore')
@@ -192,7 +193,9 @@ class TrainingConfig:
     direct_solver_perturbation_grid_size: int = 0
     direct_solver_gradient_clip: float = 1.0
     direct_connectivity_weight: float = 0.0
+    direct_aircraft_validity_weight: float = 0.0
     direct_solver_target_occupancy: Optional[float] = None
+    require_direct_solver_every_iteration: bool = False
     connectivity_monitor_interval: int = 1
     aerodynamic_monitor_interval: int = 10
     overfit_stop_enabled: bool = False
@@ -202,9 +205,85 @@ class TrainingConfig:
     overfit_patience: int = 8
     overfit_min_delta: float = 1.0e-4
     overfit_relative_delta: float = 1.0e-3
+    overfit_geometry_gate_enabled: bool = True
+    overfit_geometry_gate_samples: int = 8
+    overfit_min_reconstruction_topk_recall: float = 0.2
+    overfit_min_generated_aircraft_valid_fraction: float = 0.125
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
+
+
+def validate_solver_integrated_training_config(training_config: TrainingConfig) -> None:
+    """Fail closed when a run claims solver integration but can skip measured terms."""
+    if not training_config.require_direct_solver_every_iteration:
+        return
+
+    errors: List[str] = []
+    if float(training_config.direct_solver_loss_weight) <= 0.0:
+        errors.append("direct_solver_loss_weight must be greater than 0")
+    if int(training_config.direct_solver_interval) != 1:
+        errors.append("direct_solver_interval must be 1")
+    if int(training_config.direct_solver_steps) <= 0:
+        errors.append("direct_solver_steps must be greater than 0")
+    if float(training_config.direct_connectivity_weight) <= 0.0:
+        errors.append("direct_connectivity_weight must be greater than 0")
+    if float(training_config.direct_aircraft_validity_weight) <= 0.0:
+        errors.append("direct_aircraft_validity_weight must be greater than 0")
+    if errors:
+        raise ValueError(
+            "Solver-integrated training safeguard failed: " + "; ".join(errors)
+        )
+
+
+def validate_direct_solver_iteration_coverage(
+    evaluated_iterations: int,
+    optimizer_iterations: int,
+    training_config: TrainingConfig,
+) -> None:
+    """Require a measured direct-solver loss for every optimizer iteration."""
+    if not training_config.require_direct_solver_every_iteration:
+        return
+    evaluated = int(evaluated_iterations)
+    expected = int(optimizer_iterations)
+    if expected <= 0 or evaluated != expected:
+        raise RuntimeError(
+            "Direct CFD/connectivity/validity loss did not run on every optimizer "
+            f"iteration: {evaluated}/{expected} iterations evaluated."
+        )
+
+
+def evaluate_geometry_promotion_gate(
+    metrics: Mapping[str, Any],
+    training_config: TrainingConfig,
+) -> Dict[str, Any]:
+    """Decide whether geometry quality is sufficient to promote a checkpoint."""
+    recall = float(metrics.get("reconstruction_topk_recall", 0.0))
+    valid_fraction = float(metrics.get("generated_aircraft_valid_fraction", 0.0))
+    checks = {
+        "reconstruction_topk_recall": (
+            recall >= float(training_config.overfit_min_reconstruction_topk_recall)
+        ),
+        "generated_aircraft_valid_fraction": (
+            valid_fraction
+            >= float(training_config.overfit_min_generated_aircraft_valid_fraction)
+        ),
+    }
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    return {
+        **dict(metrics),
+        "status": "pass" if not failed_checks else "fail",
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "thresholds": {
+            "reconstruction_topk_recall": float(
+                training_config.overfit_min_reconstruction_topk_recall
+            ),
+            "generated_aircraft_valid_fraction": float(
+                training_config.overfit_min_generated_aircraft_valid_fraction
+            ),
+        },
+    }
 
 
 def _finite_history_metric(
@@ -2648,6 +2727,7 @@ def _direct_measured_objective_for_single(
     cfd_simulator: "AdvancedCFDSimulator",
     cfd_steps: int,
     connectivity_weight: float,
+    aircraft_validity_weight: float,
     threshold: float,
     target_occupancy: Optional[float],
 ) -> float:
@@ -2670,12 +2750,28 @@ def _direct_measured_objective_for_single(
         + float(design_spec.drag_weight) * float(drag_coefficient)
         + float(design_spec.lift_weight) * lift_term
     )
-    if connectivity_weight <= 0.0:
-        return float(np.nan_to_num(aero_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6))
+    geometry_np = geometry.detach().cpu().numpy()
+    connectivity_loss = 0.0
+    if connectivity_weight > 0.0:
+        connected_fraction = _largest_component_fraction_from_binary(geometry_np)
+        connectivity_loss = 1.0 - connected_fraction
 
-    connected_fraction = _largest_component_fraction_from_binary(geometry.detach().cpu().numpy())
-    connectivity_loss = 1.0 - connected_fraction
-    total_loss = aero_loss + float(connectivity_weight) * connectivity_loss
+    validity_loss = 0.0
+    if aircraft_validity_weight > 0.0:
+        validity_report = evaluate_aircraft_validity(geometry_np)
+        checks = validity_report.get("checks", {})
+        if isinstance(checks, Mapping) and checks:
+            validity_loss = float(
+                sum(not bool(passed) for passed in checks.values()) / len(checks)
+            )
+        else:
+            validity_loss = 1.0
+
+    total_loss = (
+        aero_loss
+        + float(connectivity_weight) * connectivity_loss
+        + float(aircraft_validity_weight) * validity_loss
+    )
     return float(np.nan_to_num(total_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6))
 
 
@@ -2712,6 +2808,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         perturbation: float,
         gradient_clip: float,
         connectivity_weight: float,
+        aircraft_validity_weight: float,
         threshold: float,
         target_occupancy: Optional[float],
         perturbation_grid_size: int,
@@ -2739,6 +2836,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 cfd_simulator,
                 cfd_steps,
                 connectivity_weight,
+                aircraft_validity_weight,
                 threshold,
                 target_occupancy,
             )
@@ -2777,6 +2875,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 cfd_simulator,
                 cfd_steps,
                 connectivity_weight,
+                aircraft_validity_weight,
                 threshold,
                 target_occupancy,
             )
@@ -2786,6 +2885,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 cfd_simulator,
                 cfd_steps,
                 connectivity_weight,
+                aircraft_validity_weight,
                 threshold,
                 target_occupancy,
             )
@@ -2809,7 +2909,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (grad_estimate,) = ctx.saved_tensors
         grad = grad_output.to(dtype=grad_estimate.dtype) * grad_estimate
-        return grad, None, None, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None, None, None, None
 
 
 class DirectSolverSPSALoss(nn.Module):
@@ -2827,6 +2927,7 @@ class DirectSolverSPSALoss(nn.Module):
         perturbation_grid_size: int = 0,
         gradient_clip: float = 1.0,
         connectivity_weight: float = 0.0,
+        aircraft_validity_weight: float = 0.0,
         threshold: float = 0.5,
         target_occupancy: Optional[float] = None,
         seed: int = 0,
@@ -2837,6 +2938,7 @@ class DirectSolverSPSALoss(nn.Module):
         self.perturbation_grid_size = int(perturbation_grid_size)
         self.gradient_clip = float(gradient_clip)
         self.connectivity_weight = float(connectivity_weight)
+        self.aircraft_validity_weight = float(aircraft_validity_weight)
         self.threshold = float(threshold)
         self.target_occupancy = target_occupancy
         self.seed = int(seed)
@@ -2857,6 +2959,7 @@ class DirectSolverSPSALoss(nn.Module):
             self.perturbation,
             self.gradient_clip,
             self.connectivity_weight,
+            self.aircraft_validity_weight,
             self.threshold,
             self.target_occupancy,
             self.perturbation_grid_size,
@@ -2884,6 +2987,7 @@ class OptimizedDiffusionTrainer:
         self.diffusion_config = diffusion_config
         self.training_config = training_config
         self.cfd_config = cfd_config
+        validate_solver_integrated_training_config(training_config)
 
         # Precision handling for mixed precision training
         self.precision_dtypes = {
@@ -2936,6 +3040,7 @@ class OptimizedDiffusionTrainer:
             perturbation_grid_size=training_config.direct_solver_perturbation_grid_size,
             gradient_clip=training_config.direct_solver_gradient_clip,
             connectivity_weight=training_config.direct_connectivity_weight,
+            aircraft_validity_weight=training_config.direct_aircraft_validity_weight,
             target_occupancy=training_config.direct_solver_target_occupancy,
         )
 
@@ -2957,6 +3062,7 @@ class OptimizedDiffusionTrainer:
         self.global_step = 0
         self.training_history: List[Dict[str, Any]] = []
         self.stop_decision: Optional[Dict[str, Any]] = None
+        self.geometry_promotion_gate: Optional[Dict[str, Any]] = None
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -3285,6 +3391,12 @@ class OptimizedDiffusionTrainer:
             if direct_solver_eval_count > 0
             else 0.0
         )
+        optimizer_iterations = len(train_loader)
+        validate_direct_solver_iteration_coverage(
+            direct_solver_eval_count,
+            optimizer_iterations,
+            self.training_config,
+        )
 
         return {
             'loss': avg_optimization_loss,
@@ -3297,6 +3409,9 @@ class OptimizedDiffusionTrainer:
             'direct_solver_loss': total_direct_solver / len(train_loader),
             'direct_solver_eval_loss': avg_direct_solver_eval,
             'direct_solver_eval_count': direct_solver_eval_count,
+            'direct_solver_iteration_coverage': (
+                direct_solver_eval_count / max(optimizer_iterations, 1)
+            ),
             'connectivity': total_connectivity / len(train_loader),
             'aerodynamic': total_aero / len(train_loader)
         }
@@ -3322,6 +3437,83 @@ class OptimizedDiffusionTrainer:
             t_teacher,
             condition=condition,
         )
+
+    def evaluate_geometry_promotion_gate(
+        self,
+        train_loader: DataLoader,
+    ) -> Dict[str, Any]:
+        """Measure reconstruction overlap and generated-aircraft validity."""
+        max_samples = max(1, int(self.training_config.overfit_geometry_gate_samples))
+        recall_values: List[float] = []
+        valid_count = 0
+        sample_count = 0
+        converter_was_training = self.converter.training
+        student_was_training = self.consistency_model.student_model.training
+        self.converter.eval()
+        self.consistency_model.student_model.eval()
+
+        cuda_devices = []
+        if self.device.type == "cuda":
+            cuda_devices = [self.device.index or 0]
+        with torch.no_grad(), torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(0)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed_all(0)
+            for batch in train_loader:
+                latent = batch["latent"].to(self.device, dtype=self.dtype)
+                target_batch = batch["geometry"].to(self.device, dtype=self.dtype)
+                condition = batch.get("condition_vector")
+                if condition is not None:
+                    condition = condition.to(self.device, dtype=self.dtype)
+
+                reconstruction_probs = torch.sigmoid(
+                    self.converter(latent).nan_to_num(0.0)
+                )
+                generated_latent = self.consistency_model.fast_inference(
+                    latent.shape,
+                    num_steps=self.diffusion_config.student_steps,
+                    condition=condition,
+                ).nan_to_num(0.0)
+                generated_probs = torch.sigmoid(
+                    self.converter(generated_latent).nan_to_num(0.0)
+                )
+
+                for index in range(latent.shape[0]):
+                    target = target_batch[index] > 0.5
+                    target_occupied = int(target.sum().item())
+                    target_fraction = target_occupied / max(int(target.numel()), 1)
+                    reconstruction = _binarize_probability_grid_for_solver(
+                        reconstruction_probs[index],
+                        target_occupancy=target_fraction,
+                    ) > 0.5
+                    overlap = int(torch.logical_and(reconstruction, target).sum().item())
+                    recall_values.append(overlap / max(target_occupied, 1))
+
+                    generated = _binarize_probability_grid_for_solver(
+                        generated_probs[index],
+                        target_occupancy=target_fraction,
+                    )
+                    validity = evaluate_aircraft_validity(generated)
+                    valid_count += int(validity.get("status") == "pass")
+                    sample_count += 1
+                    if sample_count >= max_samples:
+                        break
+                if sample_count >= max_samples:
+                    break
+
+        self.converter.train(converter_was_training)
+        self.consistency_model.student_model.train(student_was_training)
+        metrics = {
+            "sample_count": sample_count,
+            "reconstruction_topk_recall": (
+                float(np.mean(recall_values)) if recall_values else 0.0
+            ),
+            "generated_aircraft_valid_count": valid_count,
+            "generated_aircraft_valid_fraction": (
+                valid_count / max(sample_count, 1)
+            ),
+        }
+        return evaluate_geometry_promotion_gate(metrics, self.training_config)
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader = None) -> List[Dict[str, Any]]:
         """Train at the model's configured voxel resolution."""
@@ -3365,6 +3557,23 @@ class OptimizedDiffusionTrainer:
 
                 stop_decision = evaluate_overfit_stop(history, self.training_config)
                 if stop_decision is not None:
+                    if self.training_config.overfit_geometry_gate_enabled:
+                        promotion_gate = self.evaluate_geometry_promotion_gate(train_loader)
+                        epoch_record["geometry_promotion_gate"] = promotion_gate
+                        self.geometry_promotion_gate = promotion_gate
+                        print(
+                            "Geometry promotion gate: "
+                            f"{promotion_gate['status']} "
+                            f"(top-k recall={promotion_gate['reconstruction_topk_recall']:.6g}, "
+                            "generated validity="
+                            f"{promotion_gate['generated_aircraft_valid_fraction']:.6g})"
+                        )
+                        if promotion_gate["status"] != "pass":
+                            print(
+                                "Scalar stop condition rejected; measured geometry "
+                                "quality has not passed. Continuing training."
+                            )
+                            continue
                     epoch_record["stop_decision"] = stop_decision
                     self.stop_decision = stop_decision
                     print(
@@ -4226,7 +4435,9 @@ def cli():
 @click.option('--direct-solver-perturbation-grid-size', default=0, help='Optional low-frequency SPSA perturbation grid edge length; 0 uses per-voxel noise.')
 @click.option('--direct-solver-gradient-clip', default=1.0, help='L2 clip applied to the estimated direct solver gradient.')
 @click.option('--direct-connectivity-weight', default=0.0, help='Weight for exact connected-component loss inside the direct measured objective.')
+@click.option('--direct-aircraft-validity-weight', default=0.0, help='Weight for aircraft-shape regression failures inside the direct measured SPSA objective.')
 @click.option('--direct-solver-target-occupancy', default=None, type=float, help='Optional top-k occupancy fraction for direct solver binarization.')
+@click.option('--require-direct-solver-every-iteration', is_flag=True, default=False, help='Fail unless CFD, connectivity, and aircraft-validity losses run on every optimizer iteration.')
 @click.option('--connectivity-monitor-interval', default=1, help='Exact connected-component monitor interval; 0 disables it.')
 @click.option('--aerodynamic-monitor-interval', default=10, help='Raw internal CFD monitor interval; 0 disables it.')
 @click.option('--train-until-overfit/--fixed-epoch-count', default=False, help='Ignore the epoch count as a stop condition and stop only when the configured overfit policy triggers.')
@@ -4236,13 +4447,18 @@ def cli():
 @click.option('--overfit-patience', default=8, type=int, help='Stop after this many epochs without a meaningful new best metric.')
 @click.option('--overfit-min-delta', default=1.0e-4, type=float, help='Minimum absolute metric improvement that resets overfit-stop patience.')
 @click.option('--overfit-relative-delta', default=1.0e-3, type=float, help='Minimum relative metric improvement that resets overfit-stop patience.')
+@click.option('--overfit-geometry-gate-samples', default=8, type=int, help='Fixed sample count for reconstruction and generated-validity promotion checks.')
+@click.option('--overfit-min-reconstruction-topk-recall', default=0.2, type=float, help='Minimum mean target-occupancy top-k recall required to promote the final checkpoint.')
+@click.option('--overfit-min-generated-aircraft-valid-fraction', default=0.125, type=float, help='Minimum generated aircraft-validity pass fraction required to promote the final checkpoint.')
 def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
           num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
           enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, coordinate_decoder_threshold,
           full_diagnostic_interval, direct_solver_loss_weight, direct_solver_interval, direct_solver_steps, direct_solver_perturbation,
-          direct_solver_perturbation_grid_size, direct_solver_gradient_clip, direct_connectivity_weight, direct_solver_target_occupancy,
-          connectivity_monitor_interval, aerodynamic_monitor_interval, train_until_overfit, overfit_stop_metric, overfit_min_epochs,
-          overfit_loss_floor, overfit_patience, overfit_min_delta, overfit_relative_delta):
+          direct_solver_perturbation_grid_size, direct_solver_gradient_clip, direct_connectivity_weight, direct_aircraft_validity_weight,
+          direct_solver_target_occupancy, require_direct_solver_every_iteration, connectivity_monitor_interval, aerodynamic_monitor_interval,
+          train_until_overfit, overfit_stop_metric, overfit_min_epochs, overfit_loss_floor, overfit_patience, overfit_min_delta,
+          overfit_relative_delta, overfit_geometry_gate_samples, overfit_min_reconstruction_topk_recall,
+          overfit_min_generated_aircraft_valid_fraction):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
@@ -4353,7 +4569,9 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         direct_solver_perturbation_grid_size=direct_solver_perturbation_grid_size,
         direct_solver_gradient_clip=direct_solver_gradient_clip,
         direct_connectivity_weight=direct_connectivity_weight,
+        direct_aircraft_validity_weight=direct_aircraft_validity_weight,
         direct_solver_target_occupancy=direct_solver_target_occupancy,
+        require_direct_solver_every_iteration=require_direct_solver_every_iteration,
         connectivity_monitor_interval=connectivity_monitor_interval,
         aerodynamic_monitor_interval=aerodynamic_monitor_interval,
         overfit_stop_enabled=train_until_overfit,
@@ -4363,6 +4581,9 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         overfit_patience=overfit_patience,
         overfit_min_delta=overfit_min_delta,
         overfit_relative_delta=overfit_relative_delta,
+        overfit_geometry_gate_samples=overfit_geometry_gate_samples,
+        overfit_min_reconstruction_topk_recall=overfit_min_reconstruction_topk_recall,
+        overfit_min_generated_aircraft_valid_fraction=overfit_min_generated_aircraft_valid_fraction,
     )
 
     cfd_config = CFDConfig(
@@ -4400,6 +4621,11 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     print(f"Pipeline parallelism enabled: {enable_pipeline}")
     print(f"Gradient checkpointing enabled: {enable_checkpointing}")
     print(f"torch.compile enabled: {enable_compile}")
+    if require_direct_solver_every_iteration:
+        print(
+            "Per-iteration solver safeguard enabled: every optimizer iteration "
+            "must include measured CFD, connectivity, and aircraft-validity SPSA loss."
+        )
     if train_until_overfit:
         print(
             "Overfit-stop mode enabled: no wall-clock timeout; training stops when "
@@ -4428,13 +4654,21 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
             "optimization_loss is the backpropagated scalar. Exact connectivity and raw CFD scores "
             "are measured monitors unless included through direct_solver_loss with a nonzero "
             "direct_solver_loss_weight. direct_solver_loss calls the solver on thresholded geometry "
-            "and uses a two-sided SPSA finite-difference gradient estimate; it is not a surrogate."
+            "and uses a two-sided SPSA finite-difference gradient estimate; it is not a surrogate. "
+            "When configured, exact connectivity and aircraft-validity regression penalties are "
+            "part of that same measured SPSA objective."
         ),
     }
     metrics_path.write_text(json.dumps(metrics_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Training metrics written to {metrics_path}")
 
     # Save final model
+    if train_until_overfit and training_config.overfit_geometry_gate_enabled:
+        promotion_gate = getattr(trainer, "geometry_promotion_gate", None)
+        if not isinstance(promotion_gate, dict) or promotion_gate.get("status") != "pass":
+            raise RuntimeError(
+                "Refusing to promote final checkpoint because the geometry quality gate did not pass."
+            )
     final_checkpoint = os.path.join(save_dir, 'final_optimized_model.pt')
     trainer.save_checkpoint(final_checkpoint)
     print(f"\nTraining complete. Final checkpoint saved to {final_checkpoint}")
