@@ -2611,6 +2611,18 @@ def aircraft_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     return collated
 
 
+def build_train_loader(dataset: Dataset, batch_size: int) -> DataLoader:
+    """Build the Windows-safe training loader without pinning the host corpus."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=aircraft_collate_fn,
+    )
+
+
 def transfer_training_batch_to_device(
     batch: Dict[str, Any],
     device: torch.device,
@@ -4633,13 +4645,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     model_config.base_grid_resolution = base_resolution
     model_config.grid_resolution = base_resolution
 
-    train_loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=aircraft_collate_fn,
-    )
+    train_loader = build_train_loader(dataset, batch_size)
 
     # Optimized trainer
     trainer = OptimizedDiffusionTrainer(

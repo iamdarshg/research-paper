@@ -11,6 +11,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI"))
 from aircraft_diffusion_cfd import (  # noqa: E402
     AircraftDesignDataset,
     aircraft_collate_fn,
+    build_train_loader,
     transfer_training_batch_to_device,
 )
 from geometry_store import CompactGeometryStore  # noqa: E402
@@ -19,12 +20,13 @@ from geometry_store import CompactGeometryStore  # noqa: E402
 def test_store_deduplicates_content_and_keeps_canonical_uint8_tensor():
     geometry = torch.zeros((8, 8, 8))
     geometry[2:6, 3:5, 1:7] = 1
-    noncontiguous = geometry.transpose(0, 1)
+    equal_geometry = geometry.clone()
     store = CompactGeometryStore()
 
-    first = store.add("a", noncontiguous, content_hash="same")
-    second = store.add("b", geometry.clone(), content_hash="same")
+    first = store.add("a", geometry)
+    second = store.add("b", equal_geometry)
 
+    assert torch.equal(geometry, equal_geometry)
     assert first == second
     assert store.unique_count == 1
     assert store.materialize(first).dtype == torch.uint8
@@ -44,13 +46,11 @@ def test_manifest_records_reference_shared_geometry_and_preserve_getitem(tmp_pat
             "source_id": "a",
             "geometry_path": "geometry.npy",
             "latent_path": "latent-a.npy",
-            "voxel_sha256": "shared-content",
         },
         {
             "source_id": "b",
             "geometry_path": "geometry.npy",
             "latent_path": "latent-b.npy",
-            "voxel_sha256": "shared-content",
         },
     ]
     manifest_path = tmp_path / "manifest.json"
@@ -92,6 +92,20 @@ def test_collate_keeps_geometry_uint8():
 
     assert collated["geometry"].dtype == torch.uint8
     assert collated["geometry"].shape == (2, 4, 4, 4)
+
+
+def test_training_loader_uses_main_process_without_corpus_pinning():
+    dataset = [
+        {
+            "geometry": torch.zeros((4, 4, 4), dtype=torch.uint8),
+        }
+    ]
+
+    loader = build_train_loader(dataset, batch_size=1)
+
+    assert loader.num_workers == 0
+    assert loader.pin_memory is False
+    assert loader.collate_fn is aircraft_collate_fn
 
 
 class _TransferSpy:
