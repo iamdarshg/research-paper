@@ -3,6 +3,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -32,7 +33,27 @@ def test_store_deduplicates_content_and_keeps_canonical_uint8_tensor():
     assert store.materialize(first).dtype == torch.uint8
     assert store.materialize(first).device.type == "cpu"
     assert store.materialize(first).is_contiguous()
-    assert store.materialize(first).data_ptr() == store.materialize(second).data_ptr()
+    first_read = store.materialize(first)
+    second_read = store.materialize(second)
+    assert first_read.data_ptr() != second_read.data_ptr()
+    first_read.zero_()
+    assert torch.equal(store.get(second), (geometry > 0.5).to(torch.uint8))
+
+
+def test_store_rejects_supplied_hash_hit_with_different_content():
+    store = CompactGeometryStore()
+    store.add("a", torch.zeros((4, 4, 4)), content_hash="declared")
+
+    with pytest.raises(ValueError, match="declared"):
+        store.add("b", torch.ones((4, 4, 4)), content_hash="declared")
+
+
+def test_store_rejects_supplied_hash_hit_with_different_shape():
+    store = CompactGeometryStore()
+    store.add("a", torch.zeros((2, 2, 2)), content_hash="declared")
+
+    with pytest.raises(ValueError, match="declared"):
+        store.add("b", torch.zeros((1, 2, 4)), content_hash="declared")
 
 
 def test_manifest_records_reference_shared_geometry_and_preserve_getitem(tmp_path):
@@ -62,11 +83,13 @@ def test_manifest_records_reference_shared_geometry_and_preserve_getitem(tmp_pat
 
     assert dataset.geometry_indices == [0, 0]
     assert dataset.geometry_store.unique_count == 1
-    assert first["geometry"].data_ptr() == second["geometry"].data_ptr()
+    assert first["geometry"].data_ptr() != second["geometry"].data_ptr()
     assert first["geometry"].dtype == torch.uint8
     assert first["geometry"].shape == (4, 4, 4)
     assert first["latent"].shape == (8,)
     assert first["condition_vector"].ndim == 1
+    first["geometry"].zero_()
+    assert int(dataset[1]["geometry"].sum()) == int(np.count_nonzero(geometry))
 
 
 def test_manifest_npy_loader_does_not_eagerly_expand_uint8_geometry(tmp_path):
