@@ -50,6 +50,7 @@ import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
 from aircraft_validity import evaluate_aircraft_validity
 from condition_feasibility import validate_condition_feasibility
+from geometry_store import CompactGeometryStore
 
 warnings.filterwarnings('ignore')
 
@@ -2404,7 +2405,8 @@ class AircraftDesignDataset(Dataset):
             raise ValueError(f"Dataset manifest {manifest_path} contains no samples")
 
         base_dir = manifest_path.parent
-        geometries: List[torch.Tensor] = []
+        self.geometry_store = CompactGeometryStore()
+        self.geometry_indices: List[int] = []
         design_specs: List[DesignSpec] = []
         condition_vectors: List[torch.Tensor] = []
         latent_codes: List[torch.Tensor] = []
@@ -2416,14 +2418,25 @@ class AircraftDesignDataset(Dataset):
             else:
                 design_spec = sample_design_spec(self.rng)
 
-            geometry = self._load_manifest_geometry(record, base_dir)
-            resolved_grid_size = int(geometry.shape[-1])
+            loaded_geometry = self._load_manifest_geometry(record, base_dir)
+            resolved_grid_size = int(loaded_geometry.shape[-1])
             if idx == 0:
                 self.grid_size = resolved_grid_size
             elif resolved_grid_size != self.grid_size:
                 raise ValueError(
                     f"Dataset manifest {manifest_path} mixes grid sizes {self.grid_size} and {resolved_grid_size}"
                 )
+
+            content_hash = record.get("voxel_sha256")
+            if content_hash is None and isinstance(record.get("hashes"), dict):
+                content_hash = record["hashes"].get("voxel_sha256")
+            geometry_index = self.geometry_store.add(
+                str(record.get("source_id", record.get("sample_id", idx))),
+                loaded_geometry,
+                content_hash=str(content_hash) if content_hash else None,
+            )
+            self.geometry_indices.append(geometry_index)
+            geometry = self.geometry_store.materialize(geometry_index)
 
             if "condition_vector" in record:
                 condition_vector = torch.as_tensor(
@@ -2447,14 +2460,12 @@ class AircraftDesignDataset(Dataset):
                     condition_vector,
                 )
             )
-            geometries.append(geometry)
             design_specs.append(design_spec)
             condition_vectors.append(condition_vector.float())
             if "split" in record:
                 explicit_splits.append(str(record["split"]))
 
-        self.num_samples = len(geometries)
-        self.geometries = geometries
+        self.num_samples = len(self.geometry_indices)
         self.design_specs = design_specs
         self.condition_vectors = torch.stack(condition_vectors)
         self.latent_codes = torch.stack(latent_codes)
@@ -2466,6 +2477,7 @@ class AircraftDesignDataset(Dataset):
             seed=self.seed,
         )
         self.metadata["manifest_path"] = str(manifest_path)
+        self.metadata["unique_geometry_count"] = self.geometry_store.unique_count
         if len(explicit_splits) == self.num_samples:
             self.metadata["split_assignments"] = explicit_splits
 
@@ -2475,7 +2487,7 @@ class AircraftDesignDataset(Dataset):
         if geometry_path:
             path = (base_dir / str(geometry_path)).resolve()
             geometry_np = np.load(path)
-            geometry = torch.from_numpy(geometry_np).float()
+            geometry = torch.from_numpy(geometry_np)
             if geometry.ndim > 3:
                 geometry = geometry.squeeze()
             if geometry.ndim != 3:
@@ -2571,9 +2583,13 @@ class AircraftDesignDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         design_spec = self.design_specs[idx]
+        if hasattr(self, "geometry_store"):
+            geometry = self.geometry_store.materialize(self.geometry_indices[idx])
+        else:
+            geometry = self.geometries[idx]
         return {
             'latent': self.latent_codes[idx],
-            'geometry': self.geometries[idx],
+            'geometry': geometry,
             'target_speed': torch.tensor(float(design_spec.target_speed), dtype=torch.float32),
             'condition_vector': self.condition_vectors[idx],
             'design_spec': design_spec,
@@ -2593,6 +2609,24 @@ def aircraft_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             collated[key] = default_collate(values)
     return collated
+
+
+def transfer_training_batch_to_device(
+    batch: Dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, Any]:
+    """Move training tensors once, converting compact geometry at the destination."""
+    transferred = dict(batch)
+    for key in ("latent", "geometry", "condition_vector"):
+        tensor = batch.get(key)
+        if tensor is not None:
+            transferred[key] = tensor.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=True,
+            )
+    return transferred
 
 # ============================================================================
 # LOSS FUNCTIONS
@@ -3149,11 +3183,14 @@ class OptimizedDiffusionTrainer:
         pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
 
         for batch_idx, batch in enumerate(pbar):
-            latent = batch['latent'].to(self.device, dtype=self.dtype)
-            geometry_target = batch['geometry'].to(self.device, dtype=self.dtype)
+            batch = transfer_training_batch_to_device(
+                batch,
+                self.device,
+                self.dtype,
+            )
+            latent = batch['latent']
+            geometry_target = batch['geometry']
             condition = batch.get('condition_vector')
-            if condition is not None:
-                condition = condition.to(self.device, dtype=self.dtype)
             design_spec = batch.get('design_spec', DesignSpec(target_speed=50.0))
             if isinstance(design_spec, list):
                 design_spec = design_spec[0]
