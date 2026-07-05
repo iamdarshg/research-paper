@@ -38,11 +38,22 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_jsonl_count(path: Optional[Path]) -> int:
+def _load_jsonl_records(path: Optional[Path]) -> List[Dict[str, Any]]:
     if path is None or not path.exists():
-        return 0
+        return []
+    records: List[Dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
-        return sum(1 for line in handle if line.strip())
+        for line in handle:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                records.append(payload)
+    return records
+
+
+def _load_jsonl_count(path: Optional[Path]) -> int:
+    return len(_load_jsonl_records(path))
 
 
 def load_exact_catalog_records(path: Path) -> List[Dict[str, Any]]:
@@ -80,6 +91,57 @@ def select_hilift_surface_records(
     if needed <= 0:
         return []
     return candidates[:needed]
+
+
+def select_unique_hilift_variants(
+    catalog_records: Sequence[Dict[str, Any]],
+    *,
+    existing_variant_ids: Optional[set[str]] = None,
+    existing_content_hashes: Optional[set[str]] = None,
+    target_unique_geometries: int = 600,
+    max_records: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    existing_variants = {str(value) for value in (existing_variant_ids or set()) if value}
+    seen_hashes = {str(value) for value in (existing_content_hashes or set()) if value}
+    needed = max(0, int(target_unique_geometries) - len(existing_variants))
+    if max_records is not None and max_records > 0:
+        needed = min(needed, int(max_records))
+    if needed <= 0:
+        return []
+
+    candidates = [
+        record
+        for record in catalog_records
+        if record.get("source_collection") == HILIFT_COLLECTION
+        and record.get("exact_cad_url")
+        and record.get("file_format") == "stl"
+        and record.get("geometry_variant_id")
+    ]
+    candidates.sort(
+        key=lambda record: (
+            str(record["geometry_variant_id"]),
+            0 if int(record.get("angle_of_attack_deg", 0)) == 4 else 1,
+            int(record.get("angle_of_attack_deg", 0)),
+            str(record.get("source_id", "")),
+        )
+    )
+
+    selected: List[Dict[str, Any]] = []
+    selected_variants: set[str] = set()
+    for record in candidates:
+        variant_id = str(record["geometry_variant_id"])
+        if variant_id in existing_variants or variant_id in selected_variants:
+            continue
+        content_hash = record.get("geometry_sha256")
+        if content_hash and str(content_hash) in seen_hashes:
+            continue
+        selected.append(record)
+        selected_variants.add(variant_id)
+        if content_hash:
+            seen_hashes.add(str(content_hash))
+        if len(selected) >= needed:
+            break
+    return selected
 
 
 def parse_force_moment_csv(text: str) -> Dict[str, float]:
@@ -158,6 +220,7 @@ def build_manifest_record(
         "sample_id": str(source_record["source_id"]),
         "source_id": str(source_record["source_id"]),
         "source": "HiLiftAeroML exact STL surface run",
+        "source_collection": source_record.get("source_collection"),
         "source_page": source_record.get("source_page"),
         "source_url": source_record.get("exact_cad_url"),
         "step_cad_url": source_record.get("step_cad_url"),
@@ -167,6 +230,8 @@ def build_manifest_record(
         "angle_of_attack_deg": angle,
         "geometry_uniqueness": source_record.get("geometry_uniqueness"),
         "source_license": source_record.get("source_license"),
+        "license_training_status": source_record.get("license_training_status"),
+        "geometry_kind": source_record.get("geometry_kind"),
         "split": _split_for_id(variant_id),
         "design_family": "hiliftaeroml_crm_hl",
         "units": "source_stl_units_not_declared_normalized_to_voxel_lattice",
@@ -225,12 +290,26 @@ def build_hilift_manifest(args: argparse.Namespace) -> Dict[str, Any]:
     raw_dir.mkdir(parents=True, exist_ok=True)
     voxel_dir.mkdir(parents=True, exist_ok=True)
 
-    existing_count = _load_jsonl_count(Path(args.existing_manifest).resolve() if args.existing_manifest else None)
+    existing_records = _load_jsonl_records(
+        Path(args.existing_manifest).resolve() if args.existing_manifest else None
+    )
+    existing_count = len(existing_records)
+    existing_variant_ids = {
+        str(record.get("geometry_variant_id") or record.get("source_id"))
+        for record in existing_records
+        if record.get("geometry_variant_id") or record.get("source_id")
+    }
+    existing_content_hashes = {
+        str(record["geometry_sha256"])
+        for record in existing_records
+        if record.get("geometry_sha256")
+    }
     catalog_records = load_exact_catalog_records(Path(args.catalog).resolve())
-    selected = select_hilift_surface_records(
-        catalog_records,
-        existing_manifest_count=existing_count,
-        target_total_records=args.target_total_records,
+    selected = select_unique_hilift_variants(
+        catalog_records=catalog_records,
+        existing_variant_ids=existing_variant_ids,
+        existing_content_hashes=existing_content_hashes,
+        target_unique_geometries=args.target_unique_geometries,
         max_records=args.max_records,
     )
 
@@ -311,12 +390,22 @@ def build_hilift_manifest(args: argparse.Namespace) -> Dict[str, Any]:
         )
         merged_manifest = str(Path(args.combined_manifest).resolve())
 
+    produced_variant_ids = {
+        str(record["geometry_variant_id"])
+        for record in records
+        if record.get("geometry_variant_id")
+    }
+    combined_unique_geometry_count = len(existing_variant_ids | produced_variant_ids)
     report = {
         "run_id": args.run_id,
         "catalog": str(Path(args.catalog).resolve()),
         "existing_manifest": str(Path(args.existing_manifest).resolve()) if args.existing_manifest else None,
         "existing_manifest_count": existing_count,
         "target_total_records": args.target_total_records,
+        "target_unique_geometries": args.target_unique_geometries,
+        "existing_unique_geometry_count": len(existing_variant_ids),
+        "combined_unique_geometry_count": combined_unique_geometry_count,
+        "unique_geometry_target_met": combined_unique_geometry_count >= args.target_unique_geometries,
         "selected_count": len(selected),
         "record_count": len(records),
         "failure_count": len(failures),
@@ -357,6 +446,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--combined-report", default="build/expanded_aircraft_hilift_corpus_20260624/flight_path_manifest_report.json")
     parser.add_argument("--run-id", default="hiliftaeroml-g96-stream-20260624")
     parser.add_argument("--target-total-records", type=_positive_int, default=752)
+    parser.add_argument("--target-unique-geometries", type=_positive_int, default=600)
     parser.add_argument("--max-records", type=int, default=0)
     parser.add_argument("--grid-size", type=_positive_int, default=96)
     parser.add_argument("--timeout-seconds", type=_positive_int, default=300)

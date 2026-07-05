@@ -34,7 +34,11 @@ class TestReferenceEvidenceBundle(unittest.TestCase):
             self.assertTrue(records_path.exists())
             self.assertTrue(metadata_path.exists())
 
-            manifest_report = validate_manifest_file(str(manifest_path), level="claim-bearing")
+            manifest_report = validate_manifest_file(
+                str(manifest_path),
+                level="claim-bearing",
+                unique_geometry_target=20,
+            )
             self.assertEqual(manifest_report["status"], "pass")
             self.assertEqual(manifest_report["record_count"], 20)
 

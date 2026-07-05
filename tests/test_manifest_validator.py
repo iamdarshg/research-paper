@@ -66,7 +66,11 @@ class TestManifestValidator(unittest.TestCase):
             }
             manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
-            report = validate_manifest.validate_manifest_file(str(manifest_path), level="claim-bearing")
+            report = validate_manifest.validate_manifest_file(
+                str(manifest_path),
+                level="claim-bearing",
+                unique_geometry_target=1,
+            )
 
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["record_count"], 1)
@@ -101,7 +105,11 @@ class TestManifestValidator(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[1]
         manifest_path = repo_root / "docs" / "dataset" / "nasa_crm_whole_aircraft_manifest.jsonl"
 
-        report = validate_manifest.validate_manifest_file(str(manifest_path), level="claim-bearing")
+        report = validate_manifest.validate_manifest_file(
+            str(manifest_path),
+            level="claim-bearing",
+            unique_geometry_target=1,
+        )
 
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["errors"], [])

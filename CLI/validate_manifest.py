@@ -21,6 +21,7 @@ from report_metadata import apply_report_metadata
 
 ALLOWED_LEVELS = {"basic", "claim-bearing"}
 ALLOWED_SPLITS = {"train", "val", "validation", "holdout", "test"}
+DEFAULT_UNIQUE_GEOMETRY_TARGET = 600
 SCHEMA_PATH = Path(__file__).resolve().parent / "conditioning_schema.yaml"
 
 
@@ -70,6 +71,7 @@ def validate_manifest_records(
     *,
     manifest_path: str,
     level: str = "basic",
+    unique_geometry_target: int = DEFAULT_UNIQUE_GEOMETRY_TARGET,
 ) -> Dict[str, Any]:
     if level not in ALLOWED_LEVELS:
         raise ValueError(f"level must be one of {sorted(ALLOWED_LEVELS)}")
@@ -115,12 +117,37 @@ def validate_manifest_records(
             if field_name not in design_spec:
                 errors.append(f"{record_prefix}: design_spec missing required field {field_name}")
 
-    status = "pass" if not errors else "blocked"
+    geometry_identities = {
+        str(
+            record.get("geometry_sha256")
+            or record.get("voxel_sha256")
+            or record.get("geometry_variant_id")
+            or record.get("geometry_path")
+            or record.get("stl_path")
+            or record.get("source_id")
+            or f"record-{idx}"
+        )
+        for idx, record in enumerate(records)
+    }
+    unique_geometry_count = len(geometry_identities)
+    duplicate_geometry_record_count = len(records) - unique_geometry_count
+    unique_geometry_target_met = unique_geometry_count >= unique_geometry_target
+
+    if errors:
+        status = "blocked"
+    elif level == "claim-bearing" and not unique_geometry_target_met:
+        status = "fail"
+    else:
+        status = "pass"
     return {
         "manifest_path": str(Path(manifest_path).resolve()),
         "level": level,
         "status": status,
         "record_count": len(records),
+        "unique_geometry_count": unique_geometry_count,
+        "duplicate_geometry_record_count": duplicate_geometry_record_count,
+        "unique_geometry_target": unique_geometry_target,
+        "unique_geometry_target_met": unique_geometry_target_met,
         "errors": errors,
         "warnings": warnings,
         "required_design_spec_fields": required_design_fields,
@@ -128,12 +155,22 @@ def validate_manifest_records(
     }
 
 
-def validate_manifest_file(manifest_path: str, *, level: str = "basic") -> Dict[str, Any]:
+def validate_manifest_file(
+    manifest_path: str,
+    *,
+    level: str = "basic",
+    unique_geometry_target: int = DEFAULT_UNIQUE_GEOMETRY_TARGET,
+) -> Dict[str, Any]:
     path = Path(manifest_path)
     if not path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
     records = _load_structured_records(path)
-    return validate_manifest_records(records, manifest_path=str(path), level=level)
+    return validate_manifest_records(
+        records,
+        manifest_path=str(path),
+        level=level,
+        unique_geometry_target=unique_geometry_target,
+    )
 
 
 def main() -> int:
@@ -146,12 +183,22 @@ def main() -> int:
         help="Validation level: basic wiring checks or stricter claim-bearing checks.",
     )
     parser.add_argument("--output", default=None, help="Optional JSON report output path.")
+    parser.add_argument(
+        "--unique-geometry-target",
+        type=int,
+        default=DEFAULT_UNIQUE_GEOMETRY_TARGET,
+        help="Minimum distinct geometries required for claim-bearing validation.",
+    )
     parser.add_argument("--run-id", default=None, help="Optional run identifier shared across report artifacts.")
     parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path for evidence lineage metadata.")
     parser.add_argument("--protocol-config", default=None, help="Optional protocol config path for evidence lineage metadata.")
     args = parser.parse_args()
 
-    report = validate_manifest_file(args.manifest, level=args.level)
+    report = validate_manifest_file(
+        args.manifest,
+        level=args.level,
+        unique_geometry_target=args.unique_geometry_target,
+    )
     apply_report_metadata(
         report,
         run_id=args.run_id,
