@@ -11,9 +11,6 @@ name: Build paper PDF
       - 'paper/**'
       - '.github/workflows/build-paper-pdf.yml'
   pull_request:
-    paths:
-      - 'paper/**'
-      - '.github/workflows/build-paper-pdf.yml'
   workflow_dispatch:
 
 permissions:

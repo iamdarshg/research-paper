@@ -191,8 +191,10 @@ Voxelizes and evaluates the bundled grounded STL examples. This is runnable repo
 Runs a multi-seed condition-response sweep and writes correlation summaries for the current checkpoint. Treat the result as checkpoint-level evidence only, not grounded aircraft validation.
 
 ### `performance-benchmark`
-
 Prints the smoke-run feature status summary. It is intentionally phrased as status output, not a benchmark claim.
+
+<!-- BENCHMARK_START -->
+<!-- BENCHMARK_END -->
 
 ## Data Status
 
