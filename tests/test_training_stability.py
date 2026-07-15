@@ -10,11 +10,26 @@ CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
 if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
-from run_monitored_training import _build_epoch_dataset
+from run_monitored_training import _build_epoch_dataset, _geometry_promotion_metrics
 from training_stability import compute_core_loss, summarize_stability
 
 
 class TestTrainingStability(unittest.TestCase):
+    def test_geometry_promotion_rank_prefers_validity_then_worst_seed_recall(self):
+        metrics, rank = _geometry_promotion_metrics(
+            {
+                "status": "fail",
+                "reconstruction_topk_recall": 0.9,
+                "generated_topk_recall": 0.7,
+                "generated_worst_topk_recall": 0.6,
+                "generated_aircraft_valid_fraction": 1.0 / 3.0,
+            }
+        )
+
+        self.assertEqual(rank, (1.0 / 3.0, 0.6, 0.7, 0.9))
+        self.assertAlmostEqual(metrics["geometry_selection_metric"], 0.3)
+        self.assertEqual(metrics["promotion_gate_passed"], 0.0)
+
     def test_build_epoch_dataset_uses_deterministic_subset(self):
         dataset = TensorDataset(torch.arange(10))
 
@@ -81,6 +96,32 @@ class TestTrainingStability(unittest.TestCase):
 
         self.assertTrue(report["converged"])
         self.assertEqual(report["status"], "converged")
+
+    def test_stable_random_guess_geometry_is_not_called_converged(self):
+        history = [
+            {
+                "epoch": epoch,
+                "loss": 5.0,
+                "optimization_loss": 5.0,
+                "clean_geometry_reconstruction": 0.693,
+                "generation_reconstruction": 0.693,
+                "direct_aero_loss": 0.5,
+                "direct_connectivity_loss": 0.4,
+            }
+            for epoch in range(1, 6)
+        ]
+
+        report = summarize_stability(
+            history,
+            metric="optimization_loss",
+            window=5,
+            convergence_target=20.0,
+            required_geometry_loss_max=0.2,
+        )
+
+        self.assertFalse(report["converged"])
+        self.assertEqual(report["status"], "stable_not_learned")
+        self.assertFalse(report["geometry_learning_ready"])
 
     def test_summarize_stability_flags_aerodynamic_dominance(self):
         history = []

@@ -16,6 +16,7 @@ from config import ModelConfig, DiffusionConfig, TrainingConfig, CFDConfig, Desi
 from models import LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel, NoiseSchedule, MissionEncoder, AeroSurrogate
 from data_utils import ConnectivityLoss, AerodynamicLoss, GroundTruthExporter
 from cfd_simulator import AdvancedCFDSimulator
+from aircraft_diffusion_cfd import LatentTo3DConverter as ScalableLatentTo3DConverter
 
 
 def _make_grad_scaler(device_type: str):
@@ -50,7 +51,10 @@ class OptimizedDiffusionTrainer:
 
         self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device, self.dtype)
         self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
-        self.converter = LatentTo3DConverter(model_config.latent_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
+        self.converter = ScalableLatentTo3DConverter(
+            model_config.latent_dim,
+            model_config.grid_resolution,
+        ).to(self.device).to(self.dtype)
         self.mission_encoder = MissionEncoder(model_config.condition_dim).to(self.device).to(self.dtype)
         self.surrogate = AeroSurrogate(model_config.condition_dim, model_config.grid_resolution).to(self.device).to(self.dtype)
 

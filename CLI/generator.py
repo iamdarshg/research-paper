@@ -58,7 +58,20 @@ class OptimizedAircraftGenerator:
     def __init__(self, checkpoint_path: str, device: torch.device = None):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model_config = ModelConfig(**checkpoint['model_config'])
+        model_payload = dict(checkpoint['model_config'])
+        if 'grid_resolution' not in model_payload and 'base_grid_resolution' not in model_payload:
+            converter_state = checkpoint.get('converter', {})
+            output_bias = converter_state.get('decoder.4.bias')
+            if output_bias is not None:
+                voxel_count = int(output_bias.numel())
+                inferred_side = int(round(voxel_count ** (1.0 / 3.0)))
+                if inferred_side ** 3 != voxel_count:
+                    raise ValueError(
+                        "Legacy dense checkpoint converter output is not a cubic voxel lattice"
+                    )
+                model_payload['base_grid_resolution'] = inferred_side
+                model_payload['grid_resolution'] = inferred_side
+        self.model_config = ModelConfig(**model_payload)
         self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
 
         self.diffusion_model = LatentDiffusionUNet(self.model_config, self.diffusion_config).to(self.device)

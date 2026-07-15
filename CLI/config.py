@@ -6,6 +6,8 @@ from typing import List, Tuple, Optional, Dict, Any
 from enum import Enum
 from datetime import datetime
 
+from experiment_config import config_value
+
 class LabelTier(str, Enum):
     LBM_RAW = "lbm_raw"
     LBM_CALIBRATED = "lbm_calibrated"
@@ -31,7 +33,7 @@ class DiffusionConfig:
 @dataclass
 class ModelConfig:
     """Model architecture parameters with grouped-query attention"""
-    latent_dim: int = 16
+    latent_dim: int = int(config_value("model", "latent_dim", 192))
     condition_dim: int = 32
     xyz_dim: int = 3
     encoder_channels: List[int] = None
@@ -41,7 +43,7 @@ class ModelConfig:
     attention_kv_groups: int = 8  # Groups for key/value
     num_attention_layers: int = 4
     # Grid resolution - configurable for different lattice sizes
-    base_grid_resolution: int = 32  # Consistent grid resolution for voxel, CFD, etc.
+    base_grid_resolution: int = int(config_value("model", "grid_resolution", 96))
     grid_resolution: int = None  # Working grid resolution (defaults to base_grid_resolution if not set)
     target_grid_resolution: int = 1024 # Final high-res target for geometry
     # Memory optimization
@@ -261,9 +263,9 @@ class MissionProfile:
 class DesignSpec:
     """Aircraft design specification (Deprecated adapter)"""
     target_speed: float = 7.0  # m/s
-    space_weight: float = 0.33*100
-    drag_weight: float = 0.33*100
-    lift_weight: float = 0.34*100
+    space_weight: float = 0.33
+    drag_weight: float = 0.33
+    lift_weight: float = 0.34
     bounding_box: Tuple[int, int, int] = (64, 64, 64)
     vital_components: Optional[List] = None
 

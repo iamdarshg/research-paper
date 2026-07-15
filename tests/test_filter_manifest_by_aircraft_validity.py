@@ -13,6 +13,7 @@ if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
 from filter_manifest_by_aircraft_validity import filter_manifest_by_aircraft_validity
+from aircraft_validity import evaluate_aircraft_validity
 
 
 def _minimally_plausible_aircraft(res=32):
@@ -66,3 +67,59 @@ def test_filter_manifest_by_aircraft_validity_writes_passing_records_only():
             }
         ]
         assert report["samples"][1]["failed_checks"]
+
+
+def test_filter_manifest_persists_canonical_geometry_and_content_hash():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        voxel_dir = root / "voxels"
+        voxel_dir.mkdir()
+        rotated = np.transpose(_minimally_plausible_aircraft(), (1, 2, 0))
+        np.save(voxel_dir / "rotated.npy", rotated)
+        manifest = root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps({"sample_id": "rotated", "source_id": "s1", "geometry_path": "voxels/rotated.npy", "split": "train"}) + "\n",
+            encoding="utf-8",
+        )
+
+        report = filter_manifest_by_aircraft_validity(
+            manifest,
+            root / "filtered" / "manifest.jsonl",
+            root / "filtered" / "report.json",
+            root / "filtered" / "canonical_voxels",
+        )
+
+        output_record = json.loads((root / "filtered" / "manifest.jsonl").read_text(encoding="utf-8"))
+        persisted = np.load(root / "filtered" / "canonical_voxels" / "rotated.npy")
+        assert report["kept_record_count"] == 1
+        assert output_record["geometry_path"] == "canonical_voxels/rotated.npy"
+        assert len(output_record["voxel_sha256"]) == 64
+        assert output_record["canonicalization"]["permutation"] != [0, 1, 2]
+        assert evaluate_aircraft_validity(persisted)["canonicalization"]["permutation"] == [0, 1, 2]
+
+
+def test_filter_manifest_drops_duplicate_canonical_content():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        voxel_dir = root / "voxels"
+        voxel_dir.mkdir()
+        np.save(voxel_dir / "original.npy", _minimally_plausible_aircraft())
+        np.save(voxel_dir / "rotated.npy", np.transpose(_minimally_plausible_aircraft(), (1, 2, 0)))
+        manifest = root / "manifest.jsonl"
+        records = [
+            {"sample_id": "original", "source_id": "s1", "geometry_path": "voxels/original.npy", "split": "train"},
+            {"sample_id": "rotated", "source_id": "s2", "geometry_path": "voxels/rotated.npy", "split": "train"},
+        ]
+        manifest.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+        report = filter_manifest_by_aircraft_validity(
+            manifest,
+            root / "filtered" / "manifest.jsonl",
+            root / "filtered" / "report.json",
+            root / "filtered" / "canonical_voxels",
+        )
+
+        kept = (root / "filtered" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        assert report["kept_record_count"] == 1
+        assert report["duplicate_canonical_geometry_count"] == 1
+        assert len(kept) == 1

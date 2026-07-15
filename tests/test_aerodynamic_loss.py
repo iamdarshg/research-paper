@@ -42,6 +42,15 @@ class _GeometrySensitiveSimulator:
         }
 
 
+class _OccupancyRecordingSimulator:
+    def __init__(self):
+        self.occupancies = []
+
+    def simulate_aerodynamics(self, geometry, steps=100):
+        self.occupancies.append(float(geometry.float().mean().item()))
+        return {"training_drag_coefficient": 0.0, "lift_coefficient": 1.0}
+
+
 class _GeometryCacheSimulator(_GeometrySensitiveSimulator):
     def __init__(self):
         super().__init__()
@@ -66,6 +75,16 @@ class _GeometryCacheSimulator(_GeometrySensitiveSimulator):
 
 
 class TestAerodynamicLoss(unittest.TestCase):
+    def test_default_loss_weights_are_fractional(self):
+        spec = DesignSpec()
+        self.assertAlmostEqual(spec.space_weight, 0.33)
+        self.assertAlmostEqual(spec.drag_weight, 0.33)
+        self.assertAlmostEqual(spec.lift_weight, 0.34)
+
+    def test_percentage_style_loss_weight_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "fractional weight"):
+            DesignSpec(drag_weight=33.0)
+
     def test_prefers_training_drag_coefficient_over_raw_drag(self):
         loss_fn = AerodynamicLoss()
         spec = DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0)
@@ -121,27 +140,74 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertFalse(ConnectivityLoss()(voxels).requires_grad)
         self.assertFalse(AerodynamicLoss()(voxels, spec, simulator).requires_grad)
 
-    def test_training_loss_backpropagates_only_differentiable_terms(self):
+    def test_training_loss_contains_only_optimizer_terms(self):
         parameter = torch.tensor(2.0, requires_grad=True)
         config = TrainingConfig(
             geometry_reconstruction_weight=3.0,
             generation_reconstruction_weight=5.0,
         )
 
-        optimization_loss, diagnostic_total = combine_training_loss_terms(
+        optimization_loss = combine_training_loss_terms(
             mse_loss_val=parameter,
             geometry_loss_val=parameter * 2.0,
             generation_geometry_loss_val=parameter * 3.0,
             consistency_loss=parameter * 4.0,
-            connectivity_loss_val=torch.tensor(100.0),
-            aero_loss_val=torch.tensor(1000.0),
             training_config=config,
         )
 
         optimization_loss.backward()
 
         self.assertAlmostEqual(float(parameter.grad), 26.0, places=6)
-        self.assertAlmostEqual(float(diagnostic_total), float(optimization_loss.detach()) + 1100.0, places=6)
+
+    def test_training_loss_includes_clean_latent_geometry_reconstruction(self):
+        parameter = torch.tensor(2.0, requires_grad=True)
+        config = TrainingConfig(clean_geometry_reconstruction_weight=3.0)
+
+        optimization_loss = combine_training_loss_terms(
+            mse_loss_val=parameter * 0.0,
+            geometry_loss_val=parameter * 0.0,
+            generation_geometry_loss_val=parameter * 0.0,
+            consistency_loss=parameter * 0.0,
+            training_config=config,
+            clean_geometry_loss_val=parameter,
+        )
+        optimization_loss.backward()
+
+        self.assertAlmostEqual(float(parameter.grad), 3.0, places=6)
+
+    def test_training_loss_snr_weights_only_noisy_geometry_branches(self):
+        parameter = torch.tensor(2.0, requires_grad=True)
+        config = TrainingConfig(clean_geometry_reconstruction_weight=2.0)
+
+        optimization_loss = combine_training_loss_terms(
+            mse_loss_val=parameter * 0.0,
+            geometry_loss_val=parameter,
+            generation_geometry_loss_val=parameter,
+            consistency_loss=parameter * 0.0,
+            training_config=config,
+            clean_geometry_loss_val=parameter,
+            direct_solver_loss_val=parameter,
+            denoising_geometry_confidence=parameter.new_tensor(0.25),
+        )
+        optimization_loss.backward()
+
+        self.assertAlmostEqual(float(parameter.grad), 3.5, places=6)
+
+    def test_training_loss_includes_direct_denoised_latent_reconstruction(self):
+        parameter = torch.tensor(2.0, requires_grad=True)
+        config = TrainingConfig(latent_reconstruction_weight=3.0)
+
+        optimization_loss = combine_training_loss_terms(
+            mse_loss_val=parameter * 0.0,
+            geometry_loss_val=parameter * 0.0,
+            generation_geometry_loss_val=parameter * 0.0,
+            consistency_loss=parameter * 0.0,
+            training_config=config,
+            latent_reconstruction_loss_val=parameter,
+        )
+        optimization_loss.backward()
+
+        self.assertAlmostEqual(float(parameter.grad), 3.0, places=6)
 
     def test_direct_solver_spsa_loss_runs_solver_and_backpropagates(self):
         voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
@@ -185,6 +251,81 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertIsNone(simulator.lbm_solver._solver._boundary_cache_key)
         self.assertIsNone(simulator.lbm_solver._solver._boundary_link_cache)
 
+    def test_direct_solver_averages_multiple_antithetic_directions_sequentially(self):
+        voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
+        simulator = _GeometrySensitiveSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=1,
+            perturbation=0.2,
+            gradient_clip=10.0,
+            connectivity_weight=0.0,
+            directions=2,
+            seed=9,
+        )
+
+        loss_fn(
+            voxels,
+            DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0),
+            simulator,
+            seed=9,
+        ).backward()
+
+        self.assertEqual(len(simulator.calls), 5)
+        self.assertIsNotNone(voxels.grad)
+
+    def test_direct_solver_can_estimate_rank_invariant_gradient_in_logit_space(self):
+        logits = torch.linspace(-3.0, 3.0, 64).reshape(1, 4, 4, 4).requires_grad_(True)
+        simulator = _OccupancyRecordingSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=1,
+            perturbation=0.2,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+            directions=1,
+            seed=9,
+            input_is_logits=True,
+        )
+
+        loss_fn(
+            logits,
+            DesignSpec(),
+            simulator,
+            reference_occupancy=torch.tensor([0.25]),
+        ).backward()
+
+        self.assertEqual(len(simulator.occupancies), 3)
+        self.assertTrue(all(abs(value - 0.25) < 1.0e-7 for value in simulator.occupancies))
+        self.assertIsNotNone(logits.grad)
+
+    def test_direct_solver_reports_components_and_applies_configured_gradient_limit(self):
+        voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
+        simulator = _GeometrySensitiveSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=1,
+            perturbation=0.2,
+            gradient_clip=1.0,
+            connectivity_weight=1.0,
+            aircraft_validity_weight=1.0,
+            directions=2,
+            seed=9,
+        )
+
+        loss_fn(voxels, DesignSpec(), simulator, seed=9).backward()
+
+        expected_limit = 1.0
+        self.assertAlmostEqual(
+            loss_fn.last_components["spsa_gradient_norm_limit"],
+            expected_limit,
+            places=7,
+        )
+        self.assertLessEqual(
+            loss_fn.last_components["spsa_gradient_norm"],
+            expected_limit + 1e-7,
+        )
+        self.assertIn("aero_loss", loss_fn.last_components)
+        self.assertIn("connectivity_loss", loss_fn.last_components)
+        self.assertIn("aircraft_validity_loss", loss_fn.last_components)
+
     def test_direct_solver_spsa_adds_aircraft_validity_regression_to_loss(self):
         voxels = torch.full((1, 8, 8, 8), 0.5, dtype=torch.float32, requires_grad=True)
         simulator = _GeometrySensitiveSimulator()
@@ -211,19 +352,42 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertIsNotNone(voxels.grad)
         self.assertGreater(float(voxels.grad.abs().sum()), 0.0)
 
+    def test_direct_solver_uses_each_source_geometry_occupancy_not_empty_threshold_output(self):
+        voxels = torch.zeros((1, 4, 4, 4), dtype=torch.float32, requires_grad=True)
+        simulator = _GeometrySensitiveSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=1,
+            perturbation=0.1,
+            gradient_clip=10.0,
+            connectivity_weight=0.0,
+            target_occupancy=None,
+            seed=7,
+        )
+
+        loss = loss_fn(
+            voxels,
+            DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0),
+            simulator,
+            seed=7,
+            reference_occupancy=torch.tensor([0.25]),
+        )
+        loss.backward()
+
+        self.assertEqual(len(simulator.calls), 3)
+        self.assertTrue(all(abs(call["weighted_occupancy"]) > 0.0 for call in simulator.calls))
+        self.assertGreater(float(voxels.grad.abs().sum()), 0.0)
+
     def test_training_loss_includes_direct_solver_term_when_weighted(self):
         parameter = torch.tensor(2.0, requires_grad=True)
         config = TrainingConfig(
             direct_solver_loss_weight=7.0,
         )
 
-        optimization_loss, _ = combine_training_loss_terms(
+        optimization_loss = combine_training_loss_terms(
             mse_loss_val=parameter,
             geometry_loss_val=parameter,
             generation_geometry_loss_val=parameter,
             consistency_loss=parameter,
-            connectivity_loss_val=torch.tensor(100.0),
-            aero_loss_val=torch.tensor(1000.0),
             training_config=config,
             direct_solver_loss_val=parameter * 2.0,
         )

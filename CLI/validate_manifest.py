@@ -210,7 +210,9 @@ def main() -> int:
     print(rendered)
 
     if args.output:
-        Path(args.output).write_text(rendered + "\n", encoding="utf-8")
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered + "\n", encoding="utf-8")
 
     return 0 if report["status"] == "pass" else 2
 

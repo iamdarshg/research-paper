@@ -1,19 +1,15 @@
-name: Internal Benchmark and README Update
+name: Global config and README capacity report
 
 permissions:
   contents: write   # grants push access to github-actions[bot]
   
-on:
+"on":
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
-      - openfoam-benchmark-compare
-      - jules-*
+  pull_request:
 
 jobs:
-  benchmark:
+  capacity-report:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -24,43 +20,21 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
-        run: |
-          pip install torch numpy scipy scikit-image trimesh pyyaml tqdm click tensorboard
+      - name: Install report dependencies
+        run: pip install torch numpy scipy scikit-image trimesh pyyaml tqdm click tensorboard
 
-      - name: Run Benchmarks
-        id: benchmark
-        run: |
-          # We'll run the benchmark script.
-          # It will try to run OpenFOAM but will fail gracefully if not found.
-          # We export GITHUB_ACTIONS=true so it outputs single-line JSON.
-          export GITHUB_ACTIONS=true
-          python3 run_internal_benchmark.py > benchmark_results.json || echo "{}" > benchmark_results.json
+      - name: Regenerate capacity report
+        run: python CLI/update_model_capacity_report.py
 
-          # Extract values from JSON (using python for simplicity)
-          ERROR=$(python3 -c "import json, sys; data=json.load(open('benchmark_results.json')); print(data.get('error_percentage', 'N/A'))")
-          SPEED=$(python3 -c "import json, sys; data=json.load(open('benchmark_results.json')); print(data.get('execution_speed', 'N/A'))")
-
-          echo "error=$ERROR" >> $GITHUB_OUTPUT
-          echo "speed=$SPEED" >> $GITHUB_OUTPUT
-
-      - name: Update README.md
-        run: |
-          ERROR_VALUE="${{ steps.benchmark.outputs.error }}"
-          if [ "$ERROR_VALUE" != "N/A" ]; then ERROR_VALUE="${ERROR_VALUE}%"; fi
-
-          SPEED_VALUE="${{ steps.benchmark.outputs.speed }}"
-          if [ "$SPEED_VALUE" != "N/A" ]; then SPEED_VALUE="${SPEED_VALUE} it/s"; fi
-
-          DATE_VALUE=$(date +%Y-%m-%d)
-
-          # Use sed to replace the benchmark block
-          sed -i "/<!-- BENCHMARK_START -->/,/<!-- BENCHMARK_END -->/c\<!-- BENCHMARK_START -->\n- **Error Percentage:** ${ERROR_VALUE}\n- **Execution Speed:** ${SPEED_VALUE}\n- **Last Updated:** ${DATE_VALUE}\n<!-- BENCHMARK_END -->" README.md
+      - name: Verify pull request report
+        if: github.event_name == 'pull_request'
+        run: git diff --exit-code -- README.md
 
       - name: Commit Results
+        if: github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
-          git commit -m "docs: update benchmark results [skip ci]" || echo "No changes to commit"
+          git commit -m "docs: update model capacity report [skip ci]" || echo "No changes to commit"
           git push origin ${{ github.ref_name }}

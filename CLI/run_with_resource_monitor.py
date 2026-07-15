@@ -26,6 +26,7 @@ GPU_QUERY = [
     "utilization.gpu",
     "utilization.memory",
     "power.draw",
+    "power.max_limit",
 ]
 
 
@@ -71,6 +72,14 @@ def _query_gpu() -> List[Dict[str, Any]]:
         parts = _split_csv_row(line)
         if len(parts) < len(GPU_QUERY):
             continue
+        power_draw = _parse_float(parts[6])
+        power_max_limit = _parse_float(parts[7])
+        if (
+            power_draw is not None
+            and power_max_limit is not None
+            and power_draw > power_max_limit * 1.10
+        ):
+            power_draw = None
         rows.append(
             {
                 "timestamp": parts[0],
@@ -79,7 +88,8 @@ def _query_gpu() -> List[Dict[str, Any]]:
                 "memory_used_mb": _parse_float(parts[3]),
                 "utilization_gpu_percent": _parse_float(parts[4]),
                 "utilization_memory_percent": _parse_float(parts[5]),
-                "power_draw_w": _parse_float(parts[6]),
+                "power_draw_w": power_draw,
+                "power_max_limit_w": power_max_limit,
             }
         )
     return rows
@@ -117,14 +127,14 @@ def _process_tree(root: psutil.Process) -> List[psutil.Process]:
     processes = [root]
     try:
         processes.extend(root.children(recursive=True))
-    except psutil.Error:
+    except (psutil.Error, OSError):
         pass
     alive: List[psutil.Process] = []
     for process in processes:
         try:
             if process.is_running():
                 alive.append(process)
-        except psutil.Error:
+        except (psutil.Error, OSError):
             continue
     return alive
 
@@ -133,7 +143,7 @@ def _prime_cpu_counters(processes: Iterable[psutil.Process]) -> None:
     for process in processes:
         try:
             process.cpu_percent(interval=None)
-        except psutil.Error:
+        except (psutil.Error, OSError):
             continue
 
 
@@ -158,17 +168,19 @@ def _sample_processes(root: psutil.Process) -> Dict[str, Any]:
                 "vms_mb": float(memory.vms / (1024 * 1024)),
                 "gpu_memory_mb": gpu_process_memory.get(process.pid),
             }
-        except psutil.Error:
+        except (psutil.Error, OSError):
             continue
         rss_total += int(memory.rss)
         vms_total += int(memory.vms)
         cpu_percent += float(cpu)
         process_rows.append(row)
 
-    gpu_memory_total = sum(
-        float(row["gpu_memory_mb"] or 0.0)
+    reported_gpu_memory = [
+        float(row["gpu_memory_mb"])
         for row in process_rows
-    )
+        if row["gpu_memory_mb"] is not None
+    ]
+    gpu_memory_total = sum(reported_gpu_memory) if reported_gpu_memory else None
     return {
         "process_count": len(process_rows),
         "cpu_percent": cpu_percent,

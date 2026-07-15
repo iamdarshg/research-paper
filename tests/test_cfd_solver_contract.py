@@ -34,12 +34,13 @@ class _FakeLBMSolver:
 
 
 class TestCFDSolverContract(unittest.TestCase):
-    def _simulator(self):
+    def _simulator(self, *, enable_external_validation=False):
         simulator = object.__new__(AdvancedCFDSimulator)
         simulator.config = SimpleNamespace(
             solver_type="D3Q27",
             base_grid_resolution=8,
             use_amr=False,
+            enable_external_validation=enable_external_validation,
             lbm_config=SimpleNamespace(physical_length_scale=2.0, grid_spacing=0.25),
         )
         simulator.device = torch.device("cpu")
@@ -49,7 +50,7 @@ class TestCFDSolverContract(unittest.TestCase):
         return simulator
 
     def test_heuristic_fluidx3d_proxy_is_reported_but_not_blended_into_primary_coefficients(self):
-        simulator = self._simulator()
+        simulator = self._simulator(enable_external_validation=True)
         geometry = torch.zeros((8, 8, 8))
         geometry[2:6, 3:5, 3:5] = 1.0
 
@@ -74,6 +75,17 @@ class TestCFDSolverContract(unittest.TestCase):
         self.assertIn("lift_to_drag", results)
         self.assertTrue(results["solver_quality_checks"]["finite_coefficients"])
         self.assertGreater(results["reference_area"], 0.0)
+
+    def test_training_solver_skips_external_placeholder_by_default(self):
+        simulator = self._simulator()
+        geometry = torch.zeros((8, 8, 8))
+        geometry[2:6, 3:5, 3:5] = 1.0
+
+        with mock.patch.object(simulator, "_run_fluidx3d_validation") as external:
+            results = simulator.simulate_aerodynamics(geometry, steps=7)
+
+        external.assert_not_called()
+        self.assertEqual(results["external_validation"]["status"], "not_run")
 
     def test_solver_result_exposes_gate_support_for_twelve_of_thirteen_gates(self):
         simulator = self._simulator()

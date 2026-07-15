@@ -16,7 +16,16 @@ from aircraft_diffusion_cfd import (
     OptimizedDiffusionTrainer,
     TrainingConfig,
     balanced_voxel_bce_with_logits,
+    bound_latent_to_corpus_support,
+    soft_dice_loss_with_logits,
+    sparse_voxel_reconstruction_loss,
+    apply_configured_optimizer_learning_rates,
+    select_training_timesteps,
     restore_resume_learning_rate_if_zero,
+    LatentDiffusionUNet,
+    LatentTo3DConverter,
+    load_width_expanded_state_dict,
+    move_optimizer_state,
 )
 
 
@@ -38,6 +47,95 @@ def test_consistency_add_noise_preserves_latent_shape():
     assert noised.shape == latent.shape
 
 
+def test_consistency_add_noise_matches_primary_noise_schedule():
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    diffusion = DiffusionConfig(timesteps=8)
+    model = ConsistencyModel(config, diffusion)
+    latent = torch.tensor([[0.0, 0.25, 0.5, 0.75]])
+    noise = torch.tensor([[1.0, -1.0, 0.5, -0.5]])
+    timesteps = torch.tensor([6])
+
+    consistency_noised = model._add_noise(latent, timesteps, noise)
+    primary_noised = model.noise_schedule.q_sample(latent, timesteps, noise)
+
+    assert torch.allclose(consistency_noised, primary_noised)
+
+
+def test_corpus_support_bound_uses_bounded_forward_and_straight_through_gradient():
+    latent = torch.tensor([[-2.0, 0.25, 3.0]], requires_grad=True)
+
+    bounded = bound_latent_to_corpus_support(latent, 0.0, 1.0)
+    bounded.sum().backward()
+
+    assert torch.equal(bounded.detach(), torch.tensor([[0.0, 0.25, 1.0]]))
+    assert torch.equal(latent.grad, torch.ones_like(latent))
+
+
+def test_fast_inference_respects_corpus_latent_support():
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    model = ConsistencyModel(config, DiffusionConfig(timesteps=8, student_steps=2))
+
+    generated = model.fast_inference((2, 4), num_steps=2)
+
+    assert torch.isfinite(generated).all()
+    assert float(generated.detach().min()) >= 0.0
+    assert float(generated.detach().max()) <= 1.0
+
+
+def test_training_timesteps_cycle_over_exact_inference_schedule():
+    observed = [
+        int(
+            select_training_timesteps(
+                global_step=step,
+                batch_size=1,
+                diffusion_timesteps=1000,
+                inference_steps=4,
+                device=torch.device("cpu"),
+                mode="inference_stratified",
+            ).item()
+        )
+        for step in range(8)
+    ]
+
+    assert observed == [999, 666, 333, 0, 999, 666, 333, 0]
+
+
+
+
+def test_consistency_rejects_mismatched_teacher_student_timesteps():
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    model = ConsistencyModel(config, DiffusionConfig(timesteps=8))
+
+    try:
+        model.consistency_loss(
+            torch.zeros((1, 4)),
+            torch.tensor([2]),
+            torch.tensor([3]),
+        )
+    except ValueError as exc:
+        assert "same diffusion timestep" in str(exc)
+    else:
+        raise AssertionError("mismatched consistency timesteps must fail closed")
+
+
 def test_training_config_weights_generation_reconstruction_by_default():
     config = TrainingConfig()
 
@@ -57,6 +155,165 @@ def test_balanced_voxel_bce_penalizes_sparse_empty_prior():
     assert float(perfect_loss) < 0.001
 
 
+def test_sparse_reconstruction_loss_penalizes_wrong_shape_overlap():
+    target = torch.zeros((1, 64), dtype=torch.float32)
+    target[0, 8:16] = 1.0
+    perfect_logits = torch.where(
+        target > 0.5,
+        torch.full_like(target, 8.0),
+        torch.full_like(target, -8.0),
+    )
+    shifted_target = torch.zeros_like(target)
+    shifted_target[0, 40:48] = 1.0
+    shifted_logits = torch.where(
+        shifted_target > 0.5,
+        torch.full_like(target, 8.0),
+        torch.full_like(target, -8.0),
+    )
+
+    perfect_dice = soft_dice_loss_with_logits(perfect_logits, target)
+    shifted_dice = soft_dice_loss_with_logits(shifted_logits, target)
+    perfect_total = sparse_voxel_reconstruction_loss(
+        perfect_logits, target, dice_weight=1.0
+    )
+    shifted_total = sparse_voxel_reconstruction_loss(
+        shifted_logits, target, dice_weight=1.0
+    )
+
+    assert float(perfect_dice) < 0.01
+    assert float(shifted_dice) > 0.9
+    assert float(perfect_total) < float(shifted_total)
+
+
+def test_population_weighted_sampled_dice_preserves_sparse_lattice_prevalence():
+    target = torch.tensor([[1.0, 0.0]])
+    logits = torch.tensor([[2.1972246, 0.0]])  # probabilities 0.9 and 0.5
+
+    balanced_sample_loss = sparse_voxel_reconstruction_loss(
+        logits,
+        target,
+        dice_weight=1.0,
+    )
+    sparse_population_loss = sparse_voxel_reconstruction_loss(
+        logits,
+        target,
+        dice_weight=1.0,
+        population_positive_counts=torch.tensor([1.0]),
+        population_negative_counts=torch.tensor([999.0]),
+    )
+
+    assert float(sparse_population_loss) > float(balanced_sample_loss) + 0.7
+
+
+def test_population_weighted_sampled_dice_matches_full_loss_when_sample_is_full_population():
+    target = torch.tensor([[1.0, 0.0, 1.0, 0.0]])
+    logits = torch.tensor([[3.0, -2.0, 1.0, -4.0]])
+
+    full_loss = sparse_voxel_reconstruction_loss(logits, target, dice_weight=1.0)
+    weighted_loss = sparse_voxel_reconstruction_loss(
+        logits,
+        target,
+        dice_weight=1.0,
+        population_positive_counts=torch.tensor([2.0]),
+        population_negative_counts=torch.tensor([2.0]),
+    )
+
+    assert torch.allclose(weighted_loss, full_loss, atol=1.0e-6)
+
+
+def test_chunked_full_grounding_matches_direct_full_lattice_gradient():
+    model_config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        coordinate_chunk_size=7,
+        coordinate_decoder_width=16,
+        coordinate_decoder_depth=2,
+        coordinate_fourier_bands=2,
+        use_torch_compile=False,
+    )
+    training_config = TrainingConfig(
+        num_epochs=1,
+        coordinate_decoder_threshold=1,
+        clean_geometry_reconstruction_weight=1.7,
+        geometry_dice_weight=0.8,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        model_config,
+        DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=2),
+        training_config,
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    latent = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+    target = torch.zeros((1, 4, 4, 4))
+    target[:, 1:3, 1:3, :] = 1.0
+
+    direct_logits = trainer.converter(latent)
+    direct_loss = sparse_voxel_reconstruction_loss(
+        direct_logits,
+        target,
+        dice_weight=training_config.geometry_dice_weight,
+    )
+    (training_config.clean_geometry_reconstruction_weight * direct_loss).backward()
+    expected = [
+        parameter.grad.detach().clone() if parameter.grad is not None else None
+        for parameter in trainer.converter.parameters()
+    ]
+    for parameter in trainer.converter.parameters():
+        parameter.grad = None
+
+    chunked_loss = trainer._backward_full_grounded_coordinate_loss(latent, target)
+    actual = [parameter.grad for parameter in trainer.converter.parameters()]
+
+    assert torch.allclose(chunked_loss, direct_loss.detach(), atol=1.0e-6)
+    for expected_gradient, actual_gradient in zip(expected, actual):
+        if expected_gradient is None:
+            assert actual_gradient is None
+        else:
+            assert actual_gradient is not None
+            assert torch.allclose(actual_gradient, expected_gradient, atol=2.0e-5, rtol=2.0e-4)
+
+
+def test_width_expansion_preserves_overlap_and_initializes_new_channels_softly():
+    source = torch.nn.Linear(3, 4)
+    target = torch.nn.Linear(3, 6)
+    with torch.no_grad():
+        source.weight.copy_(torch.arange(12, dtype=torch.float32).reshape(4, 3))
+        source.bias.copy_(torch.arange(4, dtype=torch.float32))
+
+    report = load_width_expanded_state_dict(
+        target,
+        source.state_dict(),
+        expansion_scale=0.01,
+    )
+
+    assert report == {"exact": 0, "expanded": 2, "skipped": 0}
+    assert torch.equal(target.weight[:4], source.weight)
+    assert torch.equal(target.bias[:4], source.bias)
+    assert float(target.weight[4:].detach().abs().max()) < 0.01
+    assert float(target.bias[4:].detach().abs().max()) < 0.01
+
+
+def test_optimizer_state_offload_moves_adam_moments():
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+
+    moved_bytes = move_optimizer_state(optimizer, "cpu")
+
+    assert moved_bytes == 0
+    assert all(
+        not isinstance(value, torch.Tensor) or value.device.type == "cpu"
+        for state in optimizer.state.values()
+        for value in state.values()
+    )
+
+
 def test_trainer_syncs_consistency_teacher_from_diffusion_model():
     model_config = ModelConfig(
         latent_dim=4,
@@ -73,6 +330,16 @@ def test_trainer_syncs_consistency_teacher_from_diffusion_model():
         TrainingConfig(num_epochs=1),
         CFDConfig(base_grid_resolution=4),
         device=torch.device("cpu"),
+    )
+    assert trainer.val_cfd_simulator is None
+    assert [group["name"] for group in trainer.optimizer.param_groups] == [
+        "diffusion",
+        "coordinate_converter",
+        "consistency_student",
+    ]
+    assert (
+        trainer.optimizer.param_groups[1]["lr"]
+        == trainer.training_config.converter_learning_rate
     )
     with torch.no_grad():
         for index, parameter in enumerate(trainer.diffusion_model.parameters(), start=1):
@@ -107,3 +374,101 @@ def test_restore_resume_learning_rate_if_zero_preserves_active_lr():
 
     assert restored is False
     assert [group["lr"] for group in optimizer.param_groups] == [1e-4]
+
+
+def test_resume_reapplies_global_optimizer_group_learning_rates():
+    modules = [torch.nn.Linear(2, 2) for _ in range(3)]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": modules[0].parameters(), "lr": 9e-3, "name": "diffusion"},
+            {"params": modules[1].parameters(), "lr": 9e-3, "name": "coordinate_converter"},
+            {"params": modules[2].parameters(), "lr": 9e-3, "name": "consistency_student"},
+        ]
+    )
+    config = TrainingConfig(
+        learning_rate=2e-4,
+        converter_learning_rate=1e-3,
+        consistency_student_learning_rate=5e-5,
+    )
+
+    applied = apply_configured_optimizer_learning_rates(optimizer, config)
+
+    assert applied == {
+        "diffusion": 2e-4,
+        "coordinate_converter": 1e-3,
+        "consistency_student": 5e-5,
+    }
+    assert [group["lr"] for group in optimizer.param_groups] == [2e-4, 1e-3, 5e-5]
+
+
+def test_corpus_scaling_law_increases_capacity_only_with_distinct_geometries():
+    small = ModelConfig.scaled_for_corpus(185, 96)
+    target = ModelConfig.scaled_for_corpus(600, 96)
+    large = ModelConfig.scaled_for_corpus(5000, 96)
+
+    assert small.latent_dim == target.latent_dim == large.latent_dim == 192
+    assert small.coordinate_decoder_width < target.coordinate_decoder_width <= large.coordinate_decoder_width
+    assert target.coordinate_fourier_bands == 6
+    assert target.grid_resolution == 96
+
+
+def test_six_hundred_geometry_configuration_uses_global_latent_width():
+    config = ModelConfig.scaled_for_corpus(600, 96)
+    diffusion_config = DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=2)
+    diffusion = LatentDiffusionUNet(config, diffusion_config)
+    student = ConsistencyModel(config, diffusion_config).student_model
+    converter = LatentTo3DConverter(
+        config.latent_dim,
+        config.grid_resolution,
+        coordinate_decoder_threshold=96,
+        coordinate_chunk_size=config.coordinate_chunk_size,
+        coordinate_decoder_width=config.coordinate_decoder_width,
+        coordinate_decoder_depth=config.coordinate_decoder_depth,
+        coordinate_fourier_bands=config.coordinate_fourier_bands,
+    )
+    parameter_count = sum(
+        parameter.numel()
+        for parameter in list(diffusion.parameters()) + list(student.parameters()) + list(converter.parameters())
+    )
+
+    assert parameter_count > 7_000_000
+    assert config.latent_dim == 192
+
+
+def test_coordinate_decoder_uses_fourier_positions_at_96_cubed_without_full_grid_allocation():
+    config = ModelConfig.scaled_for_corpus(600, 96)
+    converter = LatentTo3DConverter(
+        config.latent_dim,
+        96,
+        coordinate_decoder_threshold=96,
+        coordinate_chunk_size=32,
+        coordinate_decoder_width=config.coordinate_decoder_width,
+        coordinate_decoder_depth=config.coordinate_decoder_depth,
+        coordinate_fourier_bands=config.coordinate_fourier_bands,
+    )
+    latent = torch.zeros((1, config.latent_dim))
+    logits = converter.forward_flat_indices(latent, torch.tensor([0, 42, 1_024, 10_000]))
+
+    assert logits.shape == (1, 4)
+    assert converter.decoder_mode == "coordinate"
+
+
+def test_coordinate_decoder_checkpointed_chunks_backpropagate_to_latent():
+    converter = LatentTo3DConverter(
+        latent_dim=8,
+        grid_resolution=4,
+        coordinate_decoder_threshold=1,
+        coordinate_chunk_size=7,
+        coordinate_decoder_width=16,
+        coordinate_decoder_depth=2,
+        coordinate_fourier_bands=2,
+        enable_coordinate_gradient_checkpointing=True,
+    )
+    converter.train()
+    latent = torch.randn((1, 8), requires_grad=True)
+
+    converter(latent).mean().backward()
+
+    assert latent.grad is not None
+    assert torch.isfinite(latent.grad).all()
+    assert float(latent.grad.abs().sum()) > 0.0

@@ -68,7 +68,7 @@ Admission is fail-closed. A design is accepted only when every gate passes.
 
 ### Source Performance
 
-- `Interferences` is exactly zero.
+- `Interferences` must be present and exactly zero.
 - `Mass`, `Max_Distance`, `Hover_Time`, `Max_Speed`, `Power_MFD`,
   `Power_MxSpd`, and `Speed_MFD` are finite and strictly positive.
 - Battery-current, motor-current, motor-power, and control-utilization ratios

@@ -2,6 +2,32 @@ import torch
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 from typing import Tuple
+from threading import Lock
+
+
+_EDT_WORKSPACES = {}
+_EDT_WORKSPACE_LOCK = Lock()
+
+
+def _edt_workspace(shape):
+    workspace = _EDT_WORKSPACES.get(tuple(shape))
+    if workspace is None:
+        workspace = (
+            np.empty(shape, dtype=np.float64),
+            np.empty(shape, dtype=np.float64),
+            np.empty((len(shape), *shape), dtype=np.int32),
+        )
+        _EDT_WORKSPACES[tuple(shape)] = workspace
+    return workspace
+
+
+def prepare_edt_workspace(shape) -> None:
+    """Reserve exact EDT output storage before high-memory model construction."""
+    normalized_shape = tuple(int(dimension) for dimension in shape)
+    if len(normalized_shape) != 3 or any(dimension <= 0 for dimension in normalized_shape):
+        raise ValueError("EDT workspace shape must contain three positive dimensions")
+    with _EDT_WORKSPACE_LOCK:
+        _edt_workspace(normalized_shape)
 
 def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
     """
@@ -12,20 +38,30 @@ def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
     # Ensure binary mask
     mask = (voxel_grid > 0.5).cpu().numpy()
 
-    # Distance to nearest solid (for fluid cells)
-    # distance_transform_edt(input) calculates the distance to the closest zero-value
-    # so we pass ~mask to find distance to solid (1s in mask)
-    dist_outside = distance_transform_edt(~mask)
+    # SciPy otherwise allocates a feature-index field internally for every EDT.
+    # Reusing caller-owned arrays avoids allocator spikes across the 33 sequential
+    # direct-solver evaluations in one optimizer update.
+    with _EDT_WORKSPACE_LOCK:
+        dist_outside, dist_inside, feature_indices = _edt_workspace(mask.shape)
+        distance_transform_edt(
+            ~mask,
+            return_distances=True,
+            return_indices=True,
+            distances=dist_outside,
+            indices=feature_indices,
+        )
+        distance_transform_edt(
+            mask,
+            return_distances=True,
+            return_indices=True,
+            distances=dist_inside,
+            indices=feature_indices,
+        )
+        np.subtract(dist_outside, dist_inside, out=dist_outside)
+        # The dtype conversion makes an owning copy before the workspace is reused.
+        sdf = torch.from_numpy(dist_outside).to(voxel_grid.device, dtype=torch.float32)
 
-    # Distance to nearest fluid (for solid cells)
-    dist_inside = distance_transform_edt(mask)
-
-    # Combined SDF: fluid is positive, solid is negative
-    # Subtracting 0.5 to place the zero-crossing at the voxel boundary interface
-    # Using 0.5 ensures that voxel centers [0, 1, 2...] are at +/- 0.5 from the interface
-    sdf = dist_outside - dist_inside
-
-    return torch.from_numpy(sdf).to(voxel_grid.device, dtype=torch.float32)
+    return sdf
 
 def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor) -> torch.Tensor:
     """

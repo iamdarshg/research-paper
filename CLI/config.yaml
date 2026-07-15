@@ -1,13 +1,42 @@
-# Configuration Template for Aircraft Diffusion Model
-# Copy this file and modify as needed, then load in your training script
+# Repository-wide experiment configuration.
+#
+# This is the single source of truth for default architecture, training,
+# solver, and generated README capacity-report values. CLI flags may override
+# a value for a one-off run, but changing this file changes the checked-in
+# defaults used by the primary and monitored trainers.
+
+schema_version: 1
 
 model:
-  latent_dim: 128
+  latent_dim: 192
+  # Structured corpus latents are normalized geometry/condition features.
+  latent_value_min: 0.0
+  latent_value_max: 1.0
+  grid_resolution: 96
   xyz_dim: 3
-  encoder_channels: [64, 128, 256]
-  decoder_channels: [256, 128, 64]
-  attention_heads: 8
+  attention_groups: 8
+  attention_kv_groups: 8
   num_attention_layers: 4
+  coordinate_decoder_threshold: 96
+  coordinate_chunk_size: 16384
+  coordinate_fourier_bands: 6
+  coordinate_gradient_checkpointing: true
+  enable_gradient_checkpointing: true
+  use_torch_compile: false
+
+scaling:
+  # This count selects the reported network widths. It is a capacity-planning
+  # input, not a claim that these geometries ship in the repository.
+  capacity_basis_unique_geometries: 349
+  reference_unique_geometries: 600
+  width_exponent: 0.20
+  minimum_scale: 0.75
+  maximum_scale: 1.75
+  high_resolution_channel_base: 56
+  high_resolution_decoder_width: 576
+  high_resolution_decoder_depth: 4
+  high_resolution_decoder_depth_large_corpus: 5
+  large_corpus_threshold: 4096
 
 diffusion:
   timesteps: 1000
@@ -17,25 +46,69 @@ diffusion:
   guidance_scale: 7.5
 
 training:
-  batch_size: 4
+  batch_size: 1
   learning_rate: 0.0002
+  converter_learning_rate: 0.0002
+  consistency_student_learning_rate: 0.0002
   weight_decay: 0.0001
-  num_epochs: 100
+  offload_optimizer_state_between_steps: true
+  num_epochs: 200
   warmup_steps: 1000
   gradient_clip: 1.0
   ema_decay: 0.999
-  disconnection_penalty: 10.0
-  use_mixed_precision: true
-  save_interval: 5
+  disconnection_penalty: 30.0
+  clean_geometry_reconstruction_weight: 2.0
+  geometry_dice_weight: 1.0
+  # High-noise x0 estimates still contribute, but cannot overpower the exact
+  # clean-latent geometry anchor before the denoiser has learned that regime.
+  minimum_denoising_geometry_confidence: 0.05
+  latent_reconstruction_weight: 10.0
+  # Cycle over the exact four DDIM inference levels instead of drawing sparse,
+  # irreproducible random timesteps.
+  timestep_sampling: inference_stratified
+  # Generated geometry and measured CFD losses backpropagate through the
+  # decoder into denoisers. Decoder parameters are anchored by the exact
+  # grounded full-lattice objective in a sequential second backward pass.
+  freeze_decoder_for_generated_paths: true
+  required_geometry_loss_max: 0.20
+  promotion_generation_seeds: 3
+  precision: float32
+  save_interval: 25
   val_interval: 1
+  coordinate_training_samples: 32768
+  coordinate_positive_fraction: 0.5
+  direct_solver_loss_weight: 1.0
+  direct_solver_interval: 1
+  direct_solver_steps: 5
+  # 1 base solve + 16 antithetic plus/minus pairs = 33 sequential solves/loss.
+  direct_solver_directions: 16
+  direct_solver_perturbation: 0.15
+  direct_solver_perturbation_grid_size: 12
+  # Maximum norm of the measured SPSA voxel gradient. The model-level gradient
+  # clip independently bounds the combined neural update after backpropagation.
+  direct_solver_gradient_clip: 1.0
+  direct_connectivity_weight: 1.0
+  direct_aircraft_validity_weight: 1.0
+  require_direct_solver_every_iteration: true
 
 cfd:
-  resolution: 32
+  solver: D3Q27
+  resolution: 96
+  # External PDE validation is a separate evidence run. The non-claim-bearing
+  # local placeholder is never executed inside the optimizer.
+  enable_external_validation: false
   mach_number: 0.3
   reynolds_number: 1000000.0
   simulation_steps: 500
   output_interval: 50
   device_id: 0
+
+report:
+  readme_path: ../README.md
+  bytes_per_parameter: 4
+  optimizer: AdamW
+  optimizer_state_tensors_per_parameter: 2
+  include_gradient_storage: true
 
 # Experimental conditioning schema for the condition-vector seam.
 # The detailed categorical vocabulary and scalar constraint layout now live in

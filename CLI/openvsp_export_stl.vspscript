@@ -1,0 +1,7 @@
+void main()
+{
+    ClearVSPModel();
+    ReadVSPFile( "input.vsp3" );
+    Update();
+    ExportFile( "output.stl", SET_ALL, EXPORT_STL );
+}

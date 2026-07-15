@@ -11,11 +11,13 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import numpy as np
 import torch
+from scipy.ndimage import label as connected_component_labels
 
 from report_metadata import apply_report_metadata
 
@@ -74,6 +76,16 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     total = float(grid.numel())
     occupancy_ratio = occupied / max(total, 1.0)
     occupied_indices = torch.nonzero(grid > 0.5, as_tuple=False)
+    largest_component_fraction = 0.0
+    if occupied > 0.0:
+        occupied_mask = grid.numpy() > 0.5
+        labeled, component_count = connected_component_labels(occupied_mask)
+        if component_count > 0:
+            # np.bincount coerces its complete input to int64. Counting only
+            # foreground labels keeps the temporary proportional to aircraft
+            # occupancy instead of the full 96^3 lattice.
+            component_sizes = np.bincount(labeled[occupied_mask])[1:]
+            largest_component_fraction = float(component_sizes.max() / occupied)
 
     flipped = torch.flip(grid, dims=[1])
     voxel_asymmetry = torch.abs(grid - flipped).sum().item() / max(occupied, 1.0)
@@ -130,6 +142,7 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     mean_longitudinal_slice_fill_ratio = 0.0
     max_longitudinal_slice_fill_ratio = 0.0
     center_spine_coverage = 0.0
+    normalization_boundary_fraction = 0.0
     if occupied_indices.numel() > 0:
         mins = occupied_indices.min(dim=0).values
         maxs = occupied_indices.max(dim=0).values + 1
@@ -157,9 +170,24 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
             torch.logical_and(occupied_x_profile, center_x_profile).sum().item()
             / max(float(occupied_x_profile.sum().item()), 1.0)
         )
+        z_low, z_high = _band_bounds(res_z, 0.30, 0.70)
+        y_low, y_high = _band_bounds(res_y, 0.05, 0.95)
+        x_low, x_high = _band_bounds(res_x, 0.05, 0.95)
+        boundary_occupied = (
+            (occupied_indices[:, 0] < z_low)
+            | (occupied_indices[:, 0] >= z_high)
+            | (occupied_indices[:, 1] < y_low)
+            | (occupied_indices[:, 1] >= y_high)
+            | (occupied_indices[:, 2] < x_low)
+            | (occupied_indices[:, 2] >= x_high)
+        )
+        normalization_boundary_fraction = float(
+            boundary_occupied.sum().item() / max(occupied, 1.0)
+        )
 
     return {
         "occupancy_ratio": occupancy_ratio,
+        "largest_component_fraction": largest_component_fraction,
         "symmetry_score": symmetry_score,
         "voxel_symmetry_score": voxel_symmetry_score,
         "thickness_fraction_z": thickness_fraction,
@@ -181,6 +209,7 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
         "center_low_end_fraction": center_low_end_fraction,
         "center_high_end_fraction": center_high_end_fraction,
         "center_spine_coverage": center_spine_coverage,
+        "normalization_boundary_fraction": normalization_boundary_fraction,
         "low_end_fraction": low_end_fraction,
         "high_end_fraction": high_end_fraction,
         "tail_fraction": tail_fraction,
@@ -202,6 +231,88 @@ def _orientation_score(metrics: Dict[str, float]) -> float:
         - 2.0 * metrics["thickness_fraction_z"]
         + missing_wing_penalty
     )
+
+
+def _lower_bound_violation(value: float, lower_bound: float) -> float:
+    return float(np.clip((lower_bound - value) / max(abs(lower_bound), 1.0e-6), 0.0, 1.0))
+
+
+def _upper_bound_violation(
+    value: float,
+    upper_bound: float,
+    natural_ceiling: float = 1.0,
+) -> float:
+    scale = max(natural_ceiling - upper_bound, 1.0e-6)
+    return float(np.clip((value - upper_bound) / scale, 0.0, 1.0))
+
+
+def _validity_violation_scores(
+    metrics: Dict[str, float],
+    occupancy_upper_bound: float,
+) -> Dict[str, float]:
+    """Return continuous distances to the same gates used for pass/fail."""
+    strict_normalization_violation = max(
+        _upper_bound_violation(metrics["span_fraction_y"], 0.90),
+        _upper_bound_violation(metrics["length_fraction_x"], 0.90),
+        _upper_bound_violation(metrics["thickness_fraction_z"], 0.40),
+    )
+    normalization_violation = 0.0
+    if strict_normalization_violation > 0.0:
+        normalization_violation = float(
+            np.clip(
+                0.10 * strict_normalization_violation
+                + math.sqrt(max(metrics["normalization_boundary_fraction"], 0.0)),
+                0.0,
+                1.0,
+            )
+        )
+
+    return {
+        "nonempty_occupancy": max(
+            _lower_bound_violation(metrics["occupancy_ratio"], 0.002),
+            _upper_bound_violation(metrics["occupancy_ratio"], 0.50),
+        ),
+        "grounded_occupancy_envelope": _upper_bound_violation(
+            metrics["occupancy_ratio"], occupancy_upper_bound
+        ),
+        "dominant_connected_airframe": _lower_bound_violation(
+            metrics["largest_component_fraction"], 0.70
+        ),
+        "symmetry": _lower_bound_violation(metrics["symmetry_score"], 0.55),
+        "span_sanity": max(
+            _lower_bound_violation(metrics["span_fraction_y"], 0.35),
+            _lower_bound_violation(metrics["length_fraction_x"], 0.35),
+            _upper_bound_violation(metrics["thickness_fraction_z"], 0.35),
+        ),
+        "wing_body_balance": max(
+            _lower_bound_violation(metrics["center_body_fraction"], 0.10),
+            _lower_bound_violation(metrics["left_wing_fraction"], 0.05),
+            _lower_bound_violation(metrics["right_wing_fraction"], 0.05),
+        ),
+        "body_centerline_dominance": _lower_bound_violation(
+            metrics["center_body_density_ratio"], 1.15
+        ),
+        "longitudinal_profile_variation": _lower_bound_violation(
+            metrics["longitudinal_profile_cv"], 0.18
+        ),
+        "planform_sparsity": max(
+            _upper_bound_violation(metrics["planform_fill_ratio"], 0.75),
+            _upper_bound_violation(metrics["occupied_bbox_fill_ratio"], 0.65),
+        ),
+        "normalization_margin": normalization_violation,
+        "fuselage_end_presence": max(
+            _lower_bound_violation(metrics["center_low_end_fraction"], 0.015),
+            _lower_bound_violation(metrics["center_high_end_fraction"], 0.015),
+            _lower_bound_violation(metrics["center_spine_coverage"], 0.70),
+        ),
+        "tail_body_plausibility": max(
+            _upper_bound_violation(metrics["tail_fraction"], 0.20),
+            _upper_bound_violation(
+                max(metrics["low_end_fraction"], metrics["high_end_fraction"]),
+                0.50,
+            ),
+        ),
+    }
 
 
 def _canonicalize_aircraft_grid(grid: torch.Tensor) -> tuple[torch.Tensor, Dict[str, Any]]:
@@ -232,16 +343,43 @@ def _canonicalize_aircraft_grid(grid: torch.Tensor) -> tuple[torch.Tensor, Dict[
     }
 
 
-def evaluate_aircraft_validity(voxels: Any) -> Dict[str, Any]:
+def canonicalize_aircraft_voxels(voxels: Any) -> tuple[torch.Tensor, Dict[str, Any]]:
+    """Return the binary, centered canonical orientation used by validity checks.
+
+    The caller must persist this returned grid when it intends to train on a
+    canonicalized corpus.  Merely recording the selected permutation while
+    retaining the original array leaves a mixed-orientation training signal.
+    """
+    raw_grid = _as_tensor(voxels)
+    return _canonicalize_aircraft_grid(raw_grid)
+
+
+def evaluate_aircraft_validity(
+    voxels: Any,
+    *,
+    canonicalize: bool = True,
+) -> Dict[str, Any]:
     # Heuristic shape checks are intentionally separated from claim evidence.
     # NASA-STD-7009B treats model/simulation credibility as a lifecycle product,
     # not a single geometric proxy: https://standards.nasa.gov/standard/nasa/nasa-std-7009
-    raw_grid = _as_tensor(voxels)
-    grid, canonicalization = _canonicalize_aircraft_grid(raw_grid)
-    metrics = canonicalization.get("metrics") or _heuristic_metrics(grid)
+    if canonicalize:
+        grid, canonicalization = canonicalize_aircraft_voxels(voxels)
+        metrics = canonicalization.get("metrics") or _heuristic_metrics(grid)
+    else:
+        grid = _as_tensor(voxels)
+        metrics = _heuristic_metrics(grid)
+        canonicalization = {
+            "permutation": [0, 1, 2],
+            "score": float(_orientation_score(metrics)),
+            "metrics": metrics,
+            "status": "preserved_input_frame",
+        }
+    occupancy_upper_bound = 0.04 if min(grid.shape) < 64 else 0.02
 
     checks = {
         "nonempty_occupancy": 0.002 <= metrics["occupancy_ratio"] <= 0.50,
+        "grounded_occupancy_envelope": metrics["occupancy_ratio"] <= occupancy_upper_bound,
+        "dominant_connected_airframe": metrics["largest_component_fraction"] >= 0.70,
         "symmetry": metrics["symmetry_score"] >= 0.55,
         "span_sanity": (
             metrics["span_fraction_y"] >= 0.35
@@ -259,6 +397,11 @@ def evaluate_aircraft_validity(voxels: Any) -> Dict[str, Any]:
             metrics["planform_fill_ratio"] <= 0.75
             and metrics["occupied_bbox_fill_ratio"] <= 0.65
         ),
+        "normalization_margin": (
+            metrics["span_fraction_y"] <= 0.90
+            and metrics["length_fraction_x"] <= 0.90
+            and metrics["thickness_fraction_z"] <= 0.40
+        ),
         "fuselage_end_presence": (
             min(metrics["center_low_end_fraction"], metrics["center_high_end_fraction"]) >= 0.015
             and metrics["center_spine_coverage"] >= 0.70
@@ -268,11 +411,13 @@ def evaluate_aircraft_validity(voxels: Any) -> Dict[str, Any]:
             and max(metrics["low_end_fraction"], metrics["high_end_fraction"]) <= 0.50
         ),
     }
+    violation_scores = _validity_violation_scores(metrics, occupancy_upper_bound)
     failed = [name for name, passed in checks.items() if not passed]
     return {
         "status": "pass" if not failed else "fail",
         "checks": checks,
         "failed_checks": failed,
+        "violation_scores": violation_scores,
         "metrics": metrics,
         "canonicalization": canonicalization,
         "claim_boundary": "First-pass aircraft-specific heuristic validity, not structural or aerodynamic proof.",

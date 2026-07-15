@@ -289,6 +289,16 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIsInstance(generator.config.lbm_config, LBMPhysicsConfig)
         self.assertEqual(generator.config.lbm_config.grid_spacing, 0.125)
 
+    def test_generator_refuses_invalid_voxel_export_before_meshing(self):
+        generator = object.__new__(cli_module.OptimizedAircraftGenerator)
+
+        with self.assertRaisesRegex(ValueError, "aircraft-invalid"):
+            generator.voxels_to_stl(
+                torch.zeros((16, 16, 16)),
+                "invalid.stl",
+                use_marching_cubes=True,
+            )
+
     def test_generate_uses_generated_voxel_resolution_for_final_cfd(self):
         fake_generator = mock.Mock()
         fake_generator.generate.return_value = torch.ones((12, 12, 12))
@@ -434,7 +444,7 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertIn("baseline", result.output.lower())
         self.assertIn("claim", result.output.lower())
 
-    def test_final_run_class_accepts_manifest_instead_of_artifact(self):
+    def test_final_run_class_rejects_manifest_that_has_not_passed_grounded_claim_gates(self):
         with self.runner.isolated_filesystem():
             manifest_path = "manifest.jsonl"
             baseline_config_path = "baseline_config.yaml"
@@ -446,13 +456,14 @@ class TestCLISmokePipeline(unittest.TestCase):
             with open(claim_gates_path, "w", encoding="utf-8") as handle:
                 handle.write("# Gates\n")
 
-            cli_module._validate_run_class_inputs(
-                cli_module.RUN_CLASS_FINAL,
-                dataset_artifact=None,
-                dataset_manifest=manifest_path,
-                baseline_config=baseline_config_path,
-                claim_gates=claim_gates_path,
-            )
+            with self.assertRaises(cli_module.click.UsageError):
+                cli_module._validate_run_class_inputs(
+                    cli_module.RUN_CLASS_FINAL,
+                    dataset_artifact=None,
+                    dataset_manifest=manifest_path,
+                    baseline_config=baseline_config_path,
+                    claim_gates=claim_gates_path,
+                )
 
     def test_advanced_cfd_simulator_resets_flow_field_per_geometry(self):
         class FakeSolver:

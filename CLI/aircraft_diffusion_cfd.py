@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Aircraft Structural Design via Diffusion Models + FluidX3D CFD
 Combines TRM/HRM principles with diffusion-based 3D voxel generation,
@@ -6,7 +6,7 @@ GPU-accelerated CFD simulation, and marching cubes STL export.
 
 Proof-of-concept implementation with memory-aware training and inference paths.
 Current implementation details include:
-- FluidX3D integration with adaptive mesh refinement
+- Optional external-validation staging with adaptive mesh refinement
 - 4-step consistency model distillation
 - Grouped-query attention (4 groups, 50% KV-cache reduction)
 - Gradient checkpointing (60% VRAM savings)
@@ -16,6 +16,7 @@ Current implementation details include:
 import os
 import sys
 import json
+import math
 import pickle
 import argparse
 import warnings
@@ -37,6 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data._utils.collate import default_collate
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -50,7 +52,9 @@ import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
 from aircraft_validity import evaluate_aircraft_validity
 from condition_feasibility import validate_condition_feasibility
+from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
 from geometry_store import CompactGeometryStore
+from validate_manifest import validate_manifest_file
 
 warnings.filterwarnings('ignore')
 
@@ -124,14 +128,14 @@ OPENFOAM_AVAILABLE = all((OPENFOAM_BIN / cmd).exists() for cmd in ("blockMesh", 
 @dataclass
 class DiffusionConfig:
     """Diffusion model hyperparameters with consistency distillation support"""
-    timesteps: int = 100
-    beta_start: float = 0.0001
-    beta_end: float = 0.02
-    sampling_timesteps: int = 250
-    guidance_scale: float = 7.5
+    timesteps: int = int(config_value("diffusion", "timesteps", 1000))
+    beta_start: float = float(config_value("diffusion", "beta_start", 0.0001))
+    beta_end: float = float(config_value("diffusion", "beta_end", 0.02))
+    sampling_timesteps: int = int(config_value("diffusion", "sampling_timesteps", 250))
+    guidance_scale: float = float(config_value("diffusion", "guidance_scale", 7.5))
     # Consistency distillation settings
-    teacher_steps: int = 2000  # Original teacher model steps
-    student_steps: int = 32     # Target student model steps
+    teacher_steps: int = int(config_value("diffusion", "timesteps", 1000))
+    student_steps: int = 4
     progressive_distillation: List[int] = None  # 500â†’250â†’125â†’64â†’32â†’16â†’8â†’4
 
     def __post_init__(self):
@@ -141,7 +145,7 @@ class DiffusionConfig:
 @dataclass
 class ModelConfig:
     """Model architecture parameters with grouped-query attention"""
-    latent_dim: int = 16
+    latent_dim: int = int(config_value("model", "latent_dim", 192))
     xyz_dim: int = 3
     encoder_channels: List[int] = None
     decoder_channels: List[int] = None
@@ -151,11 +155,15 @@ class ModelConfig:
     attention_kv_groups: int = 8  # Groups for key/value
     num_attention_layers: int = 4
     # Grid resolution - configurable for different lattice sizes
-    base_grid_resolution: int = 32  # Consistent grid resolution for voxel, CFD, etc.
+    base_grid_resolution: int = int(config_value("model", "grid_resolution", 96))
     grid_resolution: int = None  # Working grid resolution (defaults to base_grid_resolution if not set)
     # Memory optimization
-    enable_gradient_checkpointing: bool = True  # 60% VRAM savings
-    use_torch_compile: bool = False  # Kernel fusion
+    enable_gradient_checkpointing: bool = bool(config_value("model", "enable_gradient_checkpointing", True))
+    use_torch_compile: bool = bool(config_value("model", "use_torch_compile", False))
+    coordinate_decoder_width: int = 256
+    coordinate_decoder_depth: int = 2
+    coordinate_fourier_bands: int = int(config_value("model", "coordinate_fourier_bands", 6))
+    coordinate_chunk_size: int = int(config_value("model", "coordinate_chunk_size", 32768))
 
     def __post_init__(self):
         if self.encoder_channels is None:
@@ -166,39 +174,131 @@ class ModelConfig:
         if self.grid_resolution is None:
             self.grid_resolution = self.base_grid_resolution
 
+    @classmethod
+    def scaled_for_corpus(
+        cls,
+        unique_geometry_count: int,
+        grid_resolution: int,
+        *,
+        conditioning_dim: int = 0,
+        latent_dim: Optional[int] = None,
+    ) -> "ModelConfig":
+        """Choose capacity from the number of distinct canonical geometries.
+
+        The width law grows as N**0.35, which is deliberately sublinear: it
+        increases representation capacity with genuine data while avoiding an
+        immediate parameter explosion on the first few hundred examples.
+        """
+        if unique_geometry_count <= 0:
+            raise ValueError("unique_geometry_count must be positive")
+
+        scaling = GLOBAL_CONFIG["scaling"]
+        reference_count = float(scaling["reference_unique_geometries"])
+        exponent = float(scaling["width_exponent"])
+        scale = float(
+            np.clip(
+                (float(unique_geometry_count) / reference_count) ** exponent,
+                float(scaling["minimum_scale"]),
+                float(scaling["maximum_scale"]),
+            )
+        )
+        resolved_latent_dim = int(latent_dim or config_value("model", "latent_dim", 192))
+
+        def round_to_multiple(value: float, multiple: int) -> int:
+            return max(multiple, int(round(value / multiple)) * multiple)
+
+        if grid_resolution < 96:
+            channel_base = min(48, max(24, round_to_multiple(32 * scale, 8)))
+            return cls(
+                latent_dim=resolved_latent_dim,
+                encoder_channels=[channel_base, channel_base + 8, channel_base + 24],
+                decoder_channels=[channel_base + 24, channel_base + 8, channel_base],
+                conditioning_dim=conditioning_dim,
+                base_grid_resolution=grid_resolution,
+                grid_resolution=grid_resolution,
+            )
+
+        channel_anchor = float(scaling["high_resolution_channel_base"])
+        decoder_anchor = float(scaling["high_resolution_decoder_width"])
+        channel_base = min(96, max(48, round_to_multiple(channel_anchor * scale, 8)))
+        decoder_width = min(768, max(384, round_to_multiple(decoder_anchor * scale, 64)))
+        decoder_depth = (
+            int(scaling["high_resolution_decoder_depth"])
+            if unique_geometry_count < int(scaling["large_corpus_threshold"])
+            else int(scaling["high_resolution_decoder_depth_large_corpus"])
+        )
+        return cls(
+            latent_dim=resolved_latent_dim,
+            encoder_channels=[channel_base, channel_base + 32, channel_base + 64],
+            decoder_channels=[channel_base + 64, channel_base + 32, channel_base],
+            conditioning_dim=conditioning_dim,
+            base_grid_resolution=grid_resolution,
+            grid_resolution=grid_resolution,
+            coordinate_decoder_width=decoder_width,
+            coordinate_decoder_depth=decoder_depth,
+            coordinate_fourier_bands=int(config_value("model", "coordinate_fourier_bands", 6)),
+            coordinate_chunk_size=int(config_value("model", "coordinate_chunk_size", 32768)),
+        )
+
 @dataclass
 class TrainingConfig:
     """Training hyperparameters"""
-    batch_size: int = 4
-    learning_rate: float = 2e-4
-    weight_decay: float = 1e-4
-    num_epochs: int = 100
-    warmup_steps: int = 1000
+    batch_size: int = int(config_value("training", "batch_size", 1))
+    learning_rate: float = float(config_value("training", "learning_rate", 2e-4))
+    converter_learning_rate: float = float(config_value("training", "converter_learning_rate", 1e-3))
+    consistency_student_learning_rate: float = float(
+        config_value("training", "consistency_student_learning_rate", 2e-4)
+    )
+    weight_decay: float = float(config_value("training", "weight_decay", 1e-4))
+    offload_optimizer_state_between_steps: bool = bool(
+        config_value("training", "offload_optimizer_state_between_steps", True)
+    )
+    num_epochs: int = int(config_value("training", "num_epochs", 200))
+    warmup_steps: int = int(config_value("training", "warmup_steps", 1000))
     gradient_clip: float = 0.99
     ema_decay: float = 0.99
-    disconnection_penalty: float = 50.0
-    precision: str = 'float32'
-    save_interval: int = 5
+    disconnection_penalty: float = float(config_value("training", "disconnection_penalty", 30.0))
+    precision: str = str(config_value("training", "precision", "float32"))
+    save_interval: int = int(config_value("training", "save_interval", 25))
     checkpoint_dir: str = "checkpoints"
     val_interval: int = 2
+    clean_geometry_reconstruction_weight: float = float(
+        config_value("training", "clean_geometry_reconstruction_weight", 1.0)
+    )
+    geometry_dice_weight: float = float(
+        config_value("training", "geometry_dice_weight", 1.0)
+    )
+    minimum_denoising_geometry_confidence: float = float(
+        config_value("training", "minimum_denoising_geometry_confidence", 0.05)
+    )
+    latent_reconstruction_weight: float = float(
+        config_value("training", "latent_reconstruction_weight", 1.0)
+    )
+    timestep_sampling: str = str(
+        config_value("training", "timestep_sampling", "inference_stratified")
+    )
+    freeze_decoder_for_generated_paths: bool = bool(
+        config_value("training", "freeze_decoder_for_generated_paths", True)
+    )
     geometry_reconstruction_weight: float = 1.0
     generation_reconstruction_weight: float = 1.0
-    coordinate_training_samples: int = 32768
-    coordinate_positive_fraction: float = 0.5
-    coordinate_decoder_threshold: int = 96
-    full_diagnostic_interval: int = 100
-    direct_solver_loss_weight: float = 0.0
-    direct_solver_interval: int = 1
-    direct_solver_steps: int = 5
-    direct_solver_perturbation: float = 0.15
-    direct_solver_perturbation_grid_size: int = 0
-    direct_solver_gradient_clip: float = 1.0
-    direct_connectivity_weight: float = 0.0
-    direct_aircraft_validity_weight: float = 0.0
+    coordinate_training_samples: int = int(config_value("training", "coordinate_training_samples", 32768))
+    coordinate_positive_fraction: float = float(config_value("training", "coordinate_positive_fraction", 0.5))
+    coordinate_decoder_threshold: int = int(config_value("model", "coordinate_decoder_threshold", 96))
+    direct_solver_loss_weight: float = float(config_value("training", "direct_solver_loss_weight", 1.0))
+    direct_solver_interval: int = int(config_value("training", "direct_solver_interval", 1))
+    direct_solver_steps: int = int(config_value("training", "direct_solver_steps", 5))
+    direct_solver_directions: int = int(config_value("training", "direct_solver_directions", 16))
+    direct_solver_perturbation: float = float(config_value("training", "direct_solver_perturbation", 0.15))
+    direct_solver_perturbation_grid_size: int = int(config_value("training", "direct_solver_perturbation_grid_size", 12))
+    direct_solver_gradient_clip: float = float(
+        config_value("training", "direct_solver_gradient_clip", 1.0)
+    )
+    direct_connectivity_weight: float = float(config_value("training", "direct_connectivity_weight", 1.0))
+    direct_aircraft_validity_weight: float = float(config_value("training", "direct_aircraft_validity_weight", 1.0))
     direct_solver_target_occupancy: Optional[float] = None
-    require_direct_solver_every_iteration: bool = False
-    connectivity_monitor_interval: int = 1
-    aerodynamic_monitor_interval: int = 10
+    direct_solver_use_batch_reference_occupancy: bool = True
+    require_direct_solver_every_iteration: bool = bool(config_value("training", "require_direct_solver_every_iteration", True))
     overfit_stop_enabled: bool = False
     overfit_stop_metric: str = "optimization_loss"
     overfit_min_epochs: int = 3
@@ -210,6 +310,9 @@ class TrainingConfig:
     overfit_geometry_gate_samples: int = 8
     overfit_min_reconstruction_topk_recall: float = 0.2
     overfit_min_generated_aircraft_valid_fraction: float = 0.125
+    promotion_generation_seeds: int = int(
+        config_value("training", "promotion_generation_seeds", 3)
+    )
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
@@ -227,10 +330,24 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
         errors.append("direct_solver_interval must be 1")
     if int(training_config.direct_solver_steps) <= 0:
         errors.append("direct_solver_steps must be greater than 0")
+    if int(training_config.direct_solver_directions) <= 0:
+        errors.append("direct_solver_directions must be greater than 0")
     if float(training_config.direct_connectivity_weight) <= 0.0:
         errors.append("direct_connectivity_weight must be greater than 0")
     if float(training_config.direct_aircraft_validity_weight) <= 0.0:
         errors.append("direct_aircraft_validity_weight must be greater than 0")
+    if training_config.timestep_sampling not in {"inference_stratified", "random"}:
+        errors.append("timestep_sampling must be inference_stratified or random")
+    fixed_target = training_config.direct_solver_target_occupancy
+    has_fixed_target = (
+        fixed_target is not None
+        and np.isfinite(float(fixed_target))
+        and 0.0 < float(fixed_target) <= 0.50
+    )
+    if not bool(training_config.direct_solver_use_batch_reference_occupancy) and not has_fixed_target:
+        errors.append(
+            "direct_solver_target_occupancy must be in (0, 0.50] when batch reference occupancy is disabled"
+        )
     if errors:
         raise ValueError(
             "Solver-integrated training safeguard failed: " + "; ".join(errors)
@@ -382,32 +499,113 @@ def restore_resume_learning_rate_if_zero(optimizer: torch.optim.Optimizer, learn
     return True
 
 
+def apply_configured_optimizer_learning_rates(
+    optimizer: torch.optim.Optimizer,
+    training_config: TrainingConfig,
+) -> Dict[str, float]:
+    """Reapply global per-module rates after loading optimizer state."""
+    configured = {
+        "diffusion": float(training_config.learning_rate),
+        "coordinate_converter": float(training_config.converter_learning_rate),
+        "consistency_student": float(training_config.consistency_student_learning_rate),
+    }
+    applied: Dict[str, float] = {}
+    for group in optimizer.param_groups:
+        name = str(group.get("name", ""))
+        if name in configured:
+            group["lr"] = configured[name]
+            applied[name] = configured[name]
+    return applied
+
+
+def load_width_expanded_state_dict(
+    module: nn.Module,
+    source_state: Mapping[str, torch.Tensor],
+    *,
+    expansion_scale: float = 0.01,
+) -> Dict[str, int]:
+    """Load matching weights and softly initialize newly widened dimensions."""
+    target_state = module.state_dict()
+    migrated: Dict[str, torch.Tensor] = {}
+    exact = 0
+    expanded = 0
+    skipped = 0
+    for name, target in target_state.items():
+        source = source_state.get(name)
+        if source is None or not isinstance(source, torch.Tensor):
+            skipped += 1
+            continue
+        source = source.to(device=target.device, dtype=target.dtype)
+        if source.shape == target.shape:
+            migrated[name] = source
+            exact += 1
+            continue
+        if source.ndim != target.ndim:
+            skipped += 1
+            continue
+        widened = target.clone().mul_(float(expansion_scale))
+        overlap = tuple(slice(0, min(old, new)) for old, new in zip(source.shape, target.shape))
+        widened[overlap] = source[overlap]
+        migrated[name] = widened
+        expanded += 1
+    module.load_state_dict(migrated, strict=False)
+    return {"exact": exact, "expanded": expanded, "skipped": skipped}
+
+
+def move_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    device: Union[str, torch.device],
+) -> int:
+    """Move tensor-valued optimizer moments and return transferred bytes."""
+    destination = torch.device(device)
+    transferred_bytes = 0
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor) and value.device != destination:
+                transferred_bytes += int(value.numel() * value.element_size())
+                state[key] = value.to(destination)
+    return transferred_bytes
+
+
 def combine_training_loss_terms(
     mse_loss_val: torch.Tensor,
     geometry_loss_val: torch.Tensor,
     generation_geometry_loss_val: torch.Tensor,
     consistency_loss: torch.Tensor,
-    connectivity_loss_val: torch.Tensor,
-    aero_loss_val: torch.Tensor,
     training_config: TrainingConfig,
     direct_solver_loss_val: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return the backpropagated loss and a detached total that includes monitors."""
+    clean_geometry_loss_val: Optional[torch.Tensor] = None,
+    denoising_geometry_confidence: Optional[torch.Tensor] = None,
+    latent_reconstruction_loss_val: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return the complete loss used for every optimizer update."""
     zero = mse_loss_val.new_tensor(0.0)
     direct_solver_loss_val = direct_solver_loss_val if direct_solver_loss_val is not None else zero
+    clean_geometry_loss_val = clean_geometry_loss_val if clean_geometry_loss_val is not None else zero
+    latent_reconstruction_loss_val = (
+        latent_reconstruction_loss_val
+        if latent_reconstruction_loss_val is not None
+        else zero
+    )
+    denoising_geometry_confidence = (
+        denoising_geometry_confidence
+        if denoising_geometry_confidence is not None
+        else zero.new_tensor(1.0)
+    )
     optimization_loss = (
         mse_loss_val
-        + training_config.geometry_reconstruction_weight * geometry_loss_val
-        + training_config.generation_reconstruction_weight * generation_geometry_loss_val
+        + training_config.clean_geometry_reconstruction_weight * clean_geometry_loss_val
+        + denoising_geometry_confidence
+        * training_config.geometry_reconstruction_weight
+        * geometry_loss_val
+        + denoising_geometry_confidence
+        * training_config.generation_reconstruction_weight
+        * generation_geometry_loss_val
         + consistency_loss
+        + training_config.latent_reconstruction_weight * latent_reconstruction_loss_val
         + training_config.direct_solver_loss_weight * direct_solver_loss_val
     ).nan_to_num(0.0)
-    diagnostic_total = (
-        optimization_loss.detach()
-        + connectivity_loss_val.detach()
-        + aero_loss_val.detach()
-    ).nan_to_num(0.0)
-    return optimization_loss, diagnostic_total
+    return optimization_loss
 
 
 def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -429,6 +627,111 @@ def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -
     if not class_terms:
         return losses.mean()
     return torch.stack(class_terms).mean()
+
+
+def soft_dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Differentiable overlap loss that rewards correct sparse-airframe ranking."""
+    target = target.to(device=logits.device, dtype=torch.float32)
+    probabilities = torch.sigmoid(logits.float()).nan_to_num(0.0)
+    flat_probabilities = probabilities.reshape(probabilities.shape[0], -1)
+    flat_target = target.reshape(target.shape[0], -1)
+    intersection = (flat_probabilities * flat_target).sum(dim=1)
+    denominator = flat_probabilities.sum(dim=1) + flat_target.sum(dim=1)
+    dice = (2.0 * intersection + 1.0) / (denominator + 1.0)
+    return (1.0 - dice).mean()
+
+
+def sparse_voxel_reconstruction_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dice_weight: float,
+    population_positive_counts: Optional[torch.Tensor] = None,
+    population_negative_counts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Combine class-balanced BCE with explicit sparse-shape overlap.
+
+    When coordinate decoding uses a stratified voxel sample, population counts
+    make the Dice estimate represent the full sparse lattice rather than the
+    deliberately balanced sample.
+    """
+    dice_loss = soft_dice_loss_with_logits(logits, target)
+    if population_positive_counts is not None or population_negative_counts is not None:
+        if population_positive_counts is None or population_negative_counts is None:
+            raise ValueError("Both positive and negative population counts are required")
+        probabilities = torch.sigmoid(logits.float()).nan_to_num(0.0)
+        flat_probabilities = probabilities.reshape(probabilities.shape[0], -1)
+        flat_target = target.to(device=logits.device).reshape(target.shape[0], -1) > 0.5
+        positive_counts = population_positive_counts.to(logits.device, torch.float32).reshape(-1)
+        negative_counts = population_negative_counts.to(logits.device, torch.float32).reshape(-1)
+        dice_values: List[torch.Tensor] = []
+        for row in range(flat_probabilities.shape[0]):
+            positive_sample = flat_probabilities[row][flat_target[row]]
+            negative_sample = flat_probabilities[row][~flat_target[row]]
+            positive_mean = (
+                positive_sample.mean() if positive_sample.numel() else flat_probabilities.new_zeros(())
+            )
+            negative_mean = (
+                negative_sample.mean() if negative_sample.numel() else flat_probabilities.new_zeros(())
+            )
+            estimated_intersection = positive_counts[row] * positive_mean
+            estimated_prediction_mass = (
+                positive_counts[row] * positive_mean
+                + negative_counts[row] * negative_mean
+            )
+            estimated_target_mass = positive_counts[row]
+            dice_values.append(
+                (2.0 * estimated_intersection + 1.0)
+                / (estimated_prediction_mass + estimated_target_mass + 1.0)
+            )
+        dice_loss = 1.0 - torch.stack(dice_values).mean()
+    return (
+        balanced_voxel_bce_with_logits(logits, target)
+        + float(dice_weight) * dice_loss
+    ).nan_to_num(0.0)
+
+
+def bound_latent_to_corpus_support(
+    latent: torch.Tensor,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> torch.Tensor:
+    """Bound denoised latents in the forward pass without discarding gradients.
+
+    Structured geometry latents are normalized into a known finite interval.
+    The straight-through derivative lets measured geometry and solver losses
+    still correct an early denoiser whose raw x0 estimate leaves that interval.
+    """
+    if not np.isfinite(minimum) or not np.isfinite(maximum) or maximum <= minimum:
+        raise ValueError("Latent support must be finite and have maximum > minimum")
+    bounded = latent.clamp(float(minimum), float(maximum))
+    return latent + (bounded - latent).detach()
+
+
+def select_training_timesteps(
+    *,
+    global_step: int,
+    batch_size: int,
+    diffusion_timesteps: int,
+    inference_steps: int,
+    device: torch.device,
+    mode: str,
+) -> torch.Tensor:
+    """Select reproducible training levels aligned with the inference path."""
+    if mode == "random":
+        return torch.randint(0, diffusion_timesteps, (batch_size,), device=device)
+    if mode != "inference_stratified":
+        raise ValueError(f"Unsupported timestep sampling mode: {mode}")
+    schedule = torch.linspace(
+        diffusion_timesteps - 1,
+        0,
+        steps=max(1, int(inference_steps)),
+        device=device,
+    ).round().long()
+    indices = (
+        torch.arange(batch_size, device=device, dtype=torch.long) + int(global_step)
+    ) % schedule.numel()
+    return schedule.index_select(0, indices)
 
 
 @dataclass
@@ -508,6 +811,9 @@ class CFDConfig:
     device_id: int = 0
     # Adaptive mesh refinement
     use_amr: bool = False
+    enable_external_validation: bool = bool(
+        config_value("cfd", "enable_external_validation", False)
+    )
     adaptive_cells_target: int = int(5e3)  # Target ~5k cells for AMR
     refinement_levels: int = 3
     # LBM configuration
@@ -533,9 +839,9 @@ class CFDConfig:
 class DesignSpec:
     """Aircraft design specification"""
     target_speed: float = 7.0  # m/s
-    space_weight: float = 0.33*100
-    drag_weight: float = 0.33*100
-    lift_weight: float = 0.34*100
+    space_weight: float = 0.33
+    drag_weight: float = 0.33
+    lift_weight: float = 0.34
     wingspan_limit_m: float = 1.8
     thrust_to_weight_min: float = 0.45
     turn_rate_min_deg_s: float = 18.0
@@ -573,7 +879,11 @@ def _normalize_manifest_design_spec(raw_spec: Dict[str, Any]) -> Dict[str, Any]:
     if "target_speed" not in normalized and "target_speed_mps" in normalized:
         normalized["target_speed"] = normalized["target_speed_mps"]
     allowed_fields = {field.name for field in fields(DesignSpec)}
-    return {key: value for key, value in normalized.items() if key in allowed_fields}
+    return {
+        key: value
+        for key, value in normalized.items()
+        if key in allowed_fields and value is not None
+    }
 
 
 CONDITIONING_SCHEMA_PATH = Path(__file__).with_name("conditioning_schema.yaml")
@@ -671,6 +981,10 @@ def validate_design_spec(design_spec: DesignSpec, compatibility_mode: bool = Fal
     _coerce_positive_float("wall_thickness_max_mm", design_spec.wall_thickness_max_mm)
     _coerce_non_negative_float("payload_mass_min_g", design_spec.payload_mass_min_g)
     _coerce_non_negative_float("payload_mass_max_g", design_spec.payload_mass_max_g)
+    for weight_name in ("space_weight", "drag_weight", "lift_weight"):
+        weight = _coerce_non_negative_float(weight_name, getattr(design_spec, weight_name))
+        if weight > 1.0:
+            raise ValueError(f"{weight_name} must be a fractional weight in [0, 1], got {weight}")
 
     design_spec.engine_count_min = _coerce_positive_int("engine_count_min", design_spec.engine_count_min)
     design_spec.engine_count_max = _coerce_positive_int("engine_count_max", design_spec.engine_count_max)
@@ -991,6 +1305,7 @@ def build_structured_latent_code(
     condition_vector: torch.Tensor,
     latent_dim: int,
     generator: Optional[torch.Generator] = None,
+    include_design_proxies: bool = True,
 ) -> torch.Tensor:
     """Create a deterministic latent target tied to both conditions and geometry."""
     geometry = geometry.to(torch.float32)
@@ -1005,9 +1320,11 @@ def build_structured_latent_code(
         dims = (maxs - mins + 1.0) / max(1.0, float(geometry.shape[-1]))
         center = coords.to(torch.float32).mean(dim=0) / max(1.0, float(geometry.shape[-1] - 1))
         occupancy_ratio = occupied.mean()
-        engine_density = 0.5 * (
-            float(design_spec.engine_count_min) + float(design_spec.engine_count_max)
-        ) / 8.0
+        engine_density = 0.0
+        if include_design_proxies:
+            engine_density = 0.5 * (
+                float(design_spec.engine_count_min) + float(design_spec.engine_count_max)
+            ) / 8.0
         geom_stats = torch.tensor(
             [
                 float(occupancy_ratio),
@@ -1505,6 +1822,9 @@ class ConsistencyModel(nn.Module):
         self.diffusion_config = diffusion_config
         self.student_steps = diffusion_config.student_steps  # 4 steps
         self.teacher_steps = diffusion_config.teacher_steps  # 1000 steps
+        self.noise_schedule = NoiseSchedule(diffusion_config)
+        self.latent_value_min = float(config_value("model", "latent_value_min", 0.0))
+        self.latent_value_max = float(config_value("model", "latent_value_max", 1.0))
 
         # Teacher model (large, slow) - disable torch.compile for stability
         teacher_config = ModelConfig(
@@ -1554,15 +1874,16 @@ class ConsistencyModel(nn.Module):
         batch_size = x_0.shape[0]
         device = x_0.device
 
-        # Teacher prediction at high resolution
+        if not torch.equal(t_student, t_teacher):
+            raise ValueError("Consistency teacher and student must evaluate the same diffusion timestep")
+
+        # Teacher and student see the same noisy latent at the same timestep.
         noise = torch.randn_like(x_0)
         x_t_teacher = self._add_noise(x_0, t_teacher, noise)
         with torch.no_grad():
             pred_teacher = self.teacher_model(x_t_teacher, t_teacher, condition=condition)
 
-        # Student prediction at low resolution
-        x_t_student = self._add_noise(x_0, t_student, noise)
-        pred_student = self.student_model(x_t_student, t_student, condition=condition)
+        pred_student = self.student_model(x_t_teacher, t_student, condition=condition)
 
         # Consistency loss: make student predictions close to teacher
         loss = F.mse_loss(pred_student, pred_teacher.detach())
@@ -1570,17 +1891,9 @@ class ConsistencyModel(nn.Module):
         return loss
 
     def _add_noise(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        """Add noise according to diffusion schedule"""
-        alpha_cumprod = torch.ones_like(t, dtype=x_0.dtype)  # Use same dtype as input
-        for i in range(len(t)):
-            alpha_cumprod[i] = 0.5 ** (t[i].to(x_0.dtype) / self.teacher_steps)  # Convert to same dtype
-
-        broadcast_shape = (x_0.shape[0],) + (1,) * (x_0.ndim - 1)
-        alpha_cumprod = alpha_cumprod.view(broadcast_shape)
-        sqrt_alpha = torch.sqrt(alpha_cumprod)
-        sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_cumprod)
-
-        return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
+        """Add noise with the same linear-beta schedule used by training."""
+        self.noise_schedule.to(x_0.device, x_0.dtype)
+        return self.noise_schedule.q_sample(x_0, t.long(), noise)
 
     def progressive_distillation(self, dataloader: DataLoader, num_distillation_steps: int = 10) -> Dict[str, float]:
         """Compute progressive distillation losses (no optimization - caller handles training)"""
@@ -1598,14 +1911,20 @@ class ConsistencyModel(nn.Module):
             num_batches = 0
 
             for batch in tqdm(dataloader, desc=f"Computing loss {target_steps} steps"):
-                x_0 = batch['latent'].to(device)
+                model_dtype = next(self.teacher_model.parameters()).dtype
+                x_0 = batch['latent'].to(device=device, dtype=model_dtype)
                 condition = batch.get('condition_vector')
                 if condition is not None:
-                    condition = condition.to(device=device, dtype=x_0.dtype)
+                    condition = condition.to(device=device, dtype=model_dtype)
 
                 # Sample random timesteps
-                t_student = torch.randint(0, target_steps, (x_0.shape[0],), device=device)
-                t_teacher = torch.randint(0, self.teacher_steps, (x_0.shape[0],), device=device)
+                t_student = torch.randint(
+                    0,
+                    self.diffusion_config.timesteps,
+                    (x_0.shape[0],),
+                    device=device,
+                )
+                t_teacher = t_student
 
                 # Compute consistency loss
                 loss = self.consistency_loss(x_0, t_student, t_teacher, condition=condition)
@@ -1623,7 +1942,7 @@ class ConsistencyModel(nn.Module):
         return distillation_results
 
     def fast_inference(self, shape: Tuple[int, ...], num_steps: int = 4, condition: torch.Tensor = None) -> torch.Tensor:
-        """Fast 4-step inference using student model"""
+        """Deterministic DDIM inference using the training noise schedule."""
         # Get device and dtype from model parameters
         device = next(self.student_model.parameters()).device
         dtype = next(self.student_model.parameters()).dtype
@@ -1631,29 +1950,39 @@ class ConsistencyModel(nn.Module):
         # Initialize with random noise
         x_t = torch.randn(shape, device=device, dtype=dtype)
 
-        # Progressive denoising in 4 steps
-        step_size = self.diffusion_config.timesteps // num_steps
+        self.noise_schedule.to(device, dtype)
+        timesteps = torch.linspace(
+            self.diffusion_config.timesteps - 1,
+            0,
+            steps=max(1, int(num_steps)),
+            device=device,
+        ).round().long()
 
-        for i in range(num_steps):
-            # Create timestep tensor
-            current_step = self.diffusion_config.timesteps - i * step_size - 1
-            t = torch.full((shape[0],), current_step, device=device, dtype=dtype)
-
-            # Predict noise using student model
+        for index, current_step in enumerate(timesteps):
+            t = torch.full(
+                (shape[0],),
+                int(current_step.item()),
+                device=device,
+                dtype=torch.long,
+            )
             pred_noise = self.student_model(x_t, t, condition=condition)
+            x0_pred = self.noise_schedule.predict_x0(x_t, t, pred_noise)
+            x0_pred = bound_latent_to_corpus_support(
+                x0_pred,
+                self.latent_value_min,
+                self.latent_value_max,
+            )
 
-            # Remove noise using simplified DDIM step
-            # Calculate alpha_t = alpha_t^2 (since we're denoising from noise to signal)
-            alpha_t = torch.pow(torch.tensor(0.5, device=device, dtype=torch.float32), (current_step / self.diffusion_config.timesteps))
-            alpha_t = alpha_t.to(dtype)
+            if index + 1 >= len(timesteps):
+                x_t = x0_pred
+                continue
 
-            # DDIM update: x_{t-1} = sqrt(alpha_{t-1}) * (x_t - sqrt(1-alpha_t) * pred_noise) / sqrt(alpha_t)
-            sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
-            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
-
-            # Simplified update: x_{t-1} = (x_t - (1 - alpha_t) * pred_noise) / sqrt(alpha_t)
-            coeff = 1 - alpha_t
-            x_t = (x_t - coeff * pred_noise) / sqrt_alpha_t
+            next_step = int(timesteps[index + 1].item())
+            alpha_next = self.noise_schedule.alphas_cumprod[next_step]
+            x_t = (
+                torch.sqrt(alpha_next) * x0_pred
+                + torch.sqrt(1.0 - alpha_next) * pred_noise
+            )
 
         return x_t
 
@@ -1939,6 +2268,10 @@ class LatentTo3DConverter(nn.Module):
         grid_resolution: int = 32,
         coordinate_decoder_threshold: int = 96,
         coordinate_chunk_size: int = 65536,
+        coordinate_decoder_width: int = 256,
+        coordinate_decoder_depth: int = 2,
+        coordinate_fourier_bands: int = 0,
+        enable_coordinate_gradient_checkpointing: bool = True,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -1946,6 +2279,10 @@ class LatentTo3DConverter(nn.Module):
         self.output_shape = (grid_resolution, grid_resolution, grid_resolution)
         self.coordinate_decoder_threshold = int(coordinate_decoder_threshold)
         self.coordinate_chunk_size = int(coordinate_chunk_size)
+        self.coordinate_decoder_width = int(coordinate_decoder_width)
+        self.coordinate_decoder_depth = int(coordinate_decoder_depth)
+        self.coordinate_fourier_bands = int(coordinate_fourier_bands)
+        self.enable_coordinate_gradient_checkpointing = bool(enable_coordinate_gradient_checkpointing)
         self.decoder_mode = "coordinate" if grid_resolution >= self.coordinate_decoder_threshold else "dense"
         total_voxels = grid_resolution ** 3
 
@@ -1958,13 +2295,22 @@ class LatentTo3DConverter(nn.Module):
                 nn.Linear(2048, total_voxels)
             )
         else:
-            self.decoder = nn.Sequential(
-                nn.Linear(latent_dim + 3, 256),
+            coordinate_dim = 3 * (1 + 2 * max(0, self.coordinate_fourier_bands))
+            self.coordinate_input = nn.Sequential(
+                nn.Linear(latent_dim + coordinate_dim, self.coordinate_decoder_width),
                 nn.SiLU(),
-                nn.Linear(256, 256),
-                nn.SiLU(),
-                nn.Linear(256, 1),
             )
+            self.coordinate_blocks = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(self.coordinate_decoder_width, self.coordinate_decoder_width),
+                        nn.SiLU(),
+                        nn.Linear(self.coordinate_decoder_width, self.coordinate_decoder_width),
+                    )
+                    for _ in range(max(1, self.coordinate_decoder_depth))
+                ]
+            )
+            self.coordinate_output = nn.Linear(self.coordinate_decoder_width, 1)
         self.register_buffer("_coordinate_grid", torch.empty(0), persistent=False)
 
     def _coordinates(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -1978,6 +2324,69 @@ class LatentTo3DConverter(nn.Module):
             self._coordinate_grid = torch.stack((zz, yy, xx), dim=-1).reshape(-1, 3)
         return self._coordinate_grid
 
+    def _encode_coordinates(self, coordinates: torch.Tensor) -> torch.Tensor:
+        if self.coordinate_fourier_bands <= 0:
+            return coordinates
+        frequencies = torch.pow(
+            coordinates.new_tensor(2.0),
+            torch.arange(self.coordinate_fourier_bands, device=coordinates.device, dtype=coordinates.dtype),
+        ) * torch.pi
+        phases = coordinates.unsqueeze(-1) * frequencies
+        encoded = torch.cat((coordinates, phases.sin().flatten(start_dim=-2), phases.cos().flatten(start_dim=-2)), dim=-1)
+        return encoded
+
+    def _decode_coordinate_features(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        hidden = self.coordinate_input(decoder_input)
+        for block in self.coordinate_blocks:
+            hidden = F.silu(hidden + block(hidden))
+        return self.coordinate_output(hidden)
+
+    def _decode_latent_coordinate_chunk(
+        self,
+        latent: torch.Tensor,
+        encoded_coordinates: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand one compact coordinate chunk only while it is being evaluated."""
+        batch_size = latent.shape[0]
+        latent_chunk = latent[:, None, :].expand(-1, encoded_coordinates.shape[0], -1)
+        coord_batch = encoded_coordinates[None, :, :].expand(batch_size, -1, -1)
+        decoder_input = torch.cat((latent_chunk, coord_batch), dim=-1).reshape(
+            batch_size * encoded_coordinates.shape[0],
+            self.latent_dim + encoded_coordinates.shape[-1],
+        )
+        return self._decode_coordinate_features(decoder_input).view(
+            batch_size,
+            encoded_coordinates.shape[0],
+        )
+
+    def _checkpointed_coordinate_chunk(
+        self,
+        latent: torch.Tensor,
+        encoded_coordinates: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            self.enable_coordinate_gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            return activation_checkpoint(
+                self._decode_latent_coordinate_chunk,
+                latent,
+                encoded_coordinates,
+                use_reentrant=False,
+            )
+        return self._decode_latent_coordinate_chunk(latent, encoded_coordinates)
+
+    def _effective_coordinate_chunk_size(self, device: torch.device) -> int:
+        """Bound CPU matrix temporaries while retaining configured GPU chunks."""
+        configured = max(1, int(self.coordinate_chunk_size))
+        if device.type != "cpu":
+            return configured
+        # Windows CPU BLAS has proven unstable with very large temporary
+        # [voxel, width] matrices. Eight thousand rows remains efficient while
+        # keeping every residual block's temporary comfortably bounded.
+        return min(configured, 8192)
+
     def forward_flat_indices(self, latent: torch.Tensor, flat_indices: torch.Tensor) -> torch.Tensor:
         """Decode logits at selected flat voxel indices for high-resolution training."""
         batch_size = latent.shape[0]
@@ -1987,17 +2396,12 @@ class LatentTo3DConverter(nn.Module):
 
         flat_indices = flat_indices.to(device=latent.device, dtype=torch.long)
         coords = self._coordinates(latent.device, latent.dtype).index_select(0, flat_indices)
+        encoded_coords = self._encode_coordinates(coords)
         chunks = []
-        chunk_size = max(1, int(self.coordinate_chunk_size))
+        chunk_size = self._effective_coordinate_chunk_size(latent.device)
         for start in range(0, coords.shape[0], chunk_size):
-            coord_chunk = coords[start:start + chunk_size]
-            latent_chunk = latent[:, None, :].expand(-1, coord_chunk.shape[0], -1)
-            coord_batch = coord_chunk[None, :, :].expand(batch_size, -1, -1)
-            decoder_input = torch.cat((latent_chunk, coord_batch), dim=-1).reshape(
-                batch_size * coord_chunk.shape[0],
-                self.latent_dim + 3,
-            )
-            chunk_logits = self.decoder(decoder_input).view(batch_size, coord_chunk.shape[0])
+            coord_chunk = encoded_coords[start:start + chunk_size]
+            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk)
             chunks.append(chunk_logits)
         return torch.cat(chunks, dim=1)
 
@@ -2008,18 +2412,12 @@ class LatentTo3DConverter(nn.Module):
             voxels = self.decoder(latent)
             return voxels.view(batch_size, *self.output_shape)
 
-        coords = self._coordinates(latent.device, latent.dtype)
+        coords = self._encode_coordinates(self._coordinates(latent.device, latent.dtype))
         chunks = []
-        chunk_size = max(1, int(self.coordinate_chunk_size))
+        chunk_size = self._effective_coordinate_chunk_size(latent.device)
         for start in range(0, coords.shape[0], chunk_size):
             coord_chunk = coords[start:start + chunk_size]
-            latent_chunk = latent[:, None, :].expand(-1, coord_chunk.shape[0], -1)
-            coord_batch = coord_chunk[None, :, :].expand(batch_size, -1, -1)
-            decoder_input = torch.cat((latent_chunk, coord_batch), dim=-1).reshape(
-                batch_size * coord_chunk.shape[0],
-                self.latent_dim + 3,
-            )
-            chunk_logits = self.decoder(decoder_input).view(batch_size, coord_chunk.shape[0])
+            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk)
             chunks.append(chunk_logits)
         voxels = torch.cat(chunks, dim=1)
         voxels = voxels.view(batch_size, *self.output_shape)
@@ -2176,7 +2574,11 @@ class AdvancedCFDSimulator:
             results['lift_coefficient'] = (results['lift_coefficient'] + amr_results['lift_coefficient']) / 2
 
         # Step 3: Run FluidX3D for validation (if available)
-        fluidx3d_results = self._run_fluidx3d_validation(geometry)
+        fluidx3d_results = (
+            self._run_fluidx3d_validation(geometry)
+            if getattr(self.config, "enable_external_validation", False)
+            else None
+        )
         if fluidx3d_results:
             fluidx3d_results = dict(fluidx3d_results)
             results["external_validation"] = {
@@ -2448,6 +2850,11 @@ class AircraftDesignDataset(Dataset):
                         f"Dataset manifest {manifest_path} record {idx} has condition_vector width "
                         f"{condition_vector.numel()}, expected {infer_conditioning_dim()}"
                     )
+            elif record.get("conditioning_mode") == "unconditioned_source_metadata_only":
+                condition_vector = torch.zeros(
+                    infer_conditioning_dim(),
+                    dtype=CONDITIONING_TENSOR_DTYPE,
+                )
             else:
                 condition_vector = build_condition_vector(design_spec)
 
@@ -2458,6 +2865,9 @@ class AircraftDesignDataset(Dataset):
                     design_spec,
                     geometry,
                     condition_vector,
+                    include_design_proxies=(
+                        record.get("conditioning_mode") != "unconditioned_source_metadata_only"
+                    ),
                 )
             )
             design_specs.append(design_spec)
@@ -2505,6 +2915,7 @@ class AircraftDesignDataset(Dataset):
         design_spec: DesignSpec,
         geometry: torch.Tensor,
         condition_vector: torch.Tensor,
+        include_design_proxies: bool = True,
     ) -> torch.Tensor:
         latent_path = record.get("latent_path")
         if latent_path:
@@ -2522,6 +2933,7 @@ class AircraftDesignDataset(Dataset):
             condition_vector,
             self.latent_dim,
             generator=self.torch_generator,
+            include_design_proxies=include_design_proxies,
         )
 
     def _voxelize_stl(self, stl_path: str, grid_size: int) -> torch.Tensor:
@@ -2740,7 +3152,7 @@ def _largest_component_fraction_from_binary(binary_geometry: np.ndarray) -> floa
     labeled, num_components = label(occupied)
     if num_components <= 0:
         return 0.0
-    component_sizes = np.bincount(labeled.reshape(-1))
+    component_sizes = np.bincount(labeled[occupied])
     largest_component = int(component_sizes[1:].max()) if component_sizes.size > 1 else 0
     return float(largest_component) / float(total_occupied)
 
@@ -2755,7 +3167,7 @@ def _binarize_probability_grid_for_solver(
     if target_occupancy is None:
         return (probs > float(threshold)).to(dtype=torch.float32)
 
-    target_fraction = float(np.clip(target_occupancy, 0.0, 1.0))
+    target_fraction = float(np.clip(float(target_occupancy), 0.0, 1.0))
     flat = probs.reshape(-1)
     if flat.numel() == 0:
         return torch.zeros_like(probs, dtype=torch.float32)
@@ -2776,49 +3188,79 @@ def _direct_measured_objective_for_single(
     aircraft_validity_weight: float,
     threshold: float,
     target_occupancy: Optional[float],
-) -> float:
+    return_components: bool = False,
+) -> Union[float, Dict[str, float]]:
     """Evaluate the actual thresholded-geometry solver objective for one sample."""
-    geometry = _binarize_probability_grid_for_solver(
-        probability_grid,
+    # Ranking is nondifferentiable and the custom SPSA backward does not use a
+    # top-k autograd graph. Materialize it on CPU so CUDA retains headroom for
+    # the D3Q27 populations; transfer only the compact binary field back.
+    geometry_cpu = _binarize_probability_grid_for_solver(
+        probability_grid.detach().to("cpu"),
         threshold=threshold,
         target_occupancy=target_occupancy,
     )
+    solver_device = getattr(cfd_simulator, "device", probability_grid.device)
+    geometry = geometry_cpu.to(solver_device)
     cfd_results = cfd_simulator.simulate_aerodynamics(geometry, steps=max(1, int(cfd_steps)))
 
-    occupancy = float(geometry.mean().detach().cpu().item())
+    occupancy = float(geometry_cpu.mean().item())
     drag_coefficient = AerodynamicLoss._select_loss_drag_coefficient(cfd_results)
     raw_lift = cfd_results.get("lift_coefficient", 0.0)
     lift_coefficient = abs(float(raw_lift)) if isinstance(raw_lift, (int, float, np.floating)) else 0.0
     lift_term = 1.0 - float(np.clip(lift_coefficient, 0.0, 1.0))
 
+    occupancy_reference = occupancy if target_occupancy is None else float(target_occupancy)
+    occupancy_loss = abs(occupancy - occupancy_reference)
     aero_loss = (
-        float(design_spec.space_weight) * occupancy
+        float(design_spec.space_weight) * occupancy_loss
         + float(design_spec.drag_weight) * float(drag_coefficient)
         + float(design_spec.lift_weight) * lift_term
     )
-    geometry_np = geometry.detach().cpu().numpy()
+    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    validity_report: Dict[str, Any] = {}
+    if needs_shape_metrics:
+        # Generated tensors already use the canonical [Z, Y, X] training frame.
+        # Searching all axis permutations here both hides orientation errors and
+        # repeats connected-component work for every finite-difference probe.
+        validity_report = evaluate_aircraft_validity(geometry_cpu, canonicalize=False)
+
     connectivity_loss = 0.0
     if connectivity_weight > 0.0:
-        connected_fraction = _largest_component_fraction_from_binary(geometry_np)
+        connected_fraction = float(
+            validity_report.get("metrics", {}).get("largest_component_fraction", 0.0)
+        )
         connectivity_loss = 1.0 - connected_fraction
 
     validity_loss = 0.0
     if aircraft_validity_weight > 0.0:
-        validity_report = evaluate_aircraft_validity(geometry_np)
-        checks = validity_report.get("checks", {})
-        if isinstance(checks, Mapping) and checks:
+        violation_scores = validity_report.get("violation_scores", {})
+        if isinstance(violation_scores, Mapping) and violation_scores:
             validity_loss = float(
-                sum(not bool(passed) for passed in checks.values()) / len(checks)
+                sum(float(value) for value in violation_scores.values())
+                / len(violation_scores)
             )
         else:
             validity_loss = 1.0
 
+    drag_loss = float(design_spec.drag_weight) * float(drag_coefficient)
     total_loss = (
         aero_loss
         + float(connectivity_weight) * connectivity_loss
         + float(aircraft_validity_weight) * validity_loss
     )
-    return float(np.nan_to_num(total_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6))
+    components = {
+        "total_loss": float(np.nan_to_num(total_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6)),
+        "aero_loss": float(aero_loss),
+        "drag_coefficient": float(drag_coefficient),
+        "drag_loss": float(drag_loss),
+        "lift_coefficient": float(lift_coefficient),
+        "lift_loss": float(design_spec.lift_weight) * float(lift_term),
+        "occupancy": float(occupancy),
+        "occupancy_loss": float(design_spec.space_weight) * float(occupancy_loss),
+        "connectivity_loss": float(connectivity_weight) * float(connectivity_loss),
+        "aircraft_validity_loss": float(aircraft_validity_weight) * float(validity_loss),
+    }
+    return components if return_components else components["total_loss"]
 
 
 def _clear_direct_solver_geometry_caches(cfd_simulator: "AdvancedCFDSimulator") -> None:
@@ -2856,27 +3298,57 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         connectivity_weight: float,
         aircraft_validity_weight: float,
         threshold: float,
-        target_occupancy: Optional[float],
+        target_occupancy: Optional[Union[float, torch.Tensor]],
         perturbation_grid_size: int,
+        directions: int,
         seed: int,
+        input_is_logits: bool,
+        component_sink: Dict[str, float],
     ) -> torch.Tensor:
         original_ndim = voxel_grid.ndim
-        probs = voxel_grid.detach().float().clamp(0.0, 1.0)
-        if probs.ndim == 3:
-            probs = probs.unsqueeze(0)
-        if probs.ndim != 4:
-            raise ValueError(f"Expected voxel probabilities with shape [B,Z,Y,X] or [Z,Y,X], got {tuple(voxel_grid.shape)}")
+        fields = voxel_grid.detach().float()
+        if not input_is_logits:
+            fields = fields.clamp(0.0, 1.0)
+        if fields.ndim == 3:
+            fields = fields.unsqueeze(0)
+        if fields.ndim != 4:
+            raise ValueError(
+                "Expected voxel logits/probabilities with shape [B,Z,Y,X] "
+                f"or [Z,Y,X], got {tuple(voxel_grid.shape)}"
+            )
 
-        batch_size = int(probs.shape[0])
-        grad_estimate = torch.zeros_like(probs)
+        batch_size = int(fields.shape[0])
+        grad_estimate = torch.zeros_like(fields)
         base_losses: List[float] = []
+        base_component_records: List[Dict[str, float]] = []
         eps = max(float(perturbation), 1.0e-6)
-        generator = torch.Generator(device=probs.device)
+        generator = torch.Generator(device=fields.device)
         generator.manual_seed(int(seed) % (2**63 - 1))
+        direction_count = max(1, int(directions))
+
+        if isinstance(target_occupancy, torch.Tensor):
+            detached_targets = target_occupancy.detach().reshape(-1).float().cpu()
+            if detached_targets.numel() not in {1, batch_size}:
+                raise ValueError(
+                    "target_occupancy tensor must contain one value or one value per batch item, "
+                    f"got {detached_targets.numel()} values for batch size {batch_size}"
+                )
+        else:
+            detached_targets = None
 
         for batch_idx in range(batch_size):
-            sample_probs = probs[batch_idx]
-            base_loss = _direct_measured_objective_for_single(
+            sample_field = fields[batch_idx]
+            sample_probs = (
+                torch.sigmoid(sample_field)
+                if input_is_logits
+                else sample_field
+            )
+            sample_target = (
+                float(detached_targets[0 if detached_targets.numel() == 1 else batch_idx].item())
+                if detached_targets is not None
+                else target_occupancy
+            )
+            base_components = _direct_measured_objective_for_single(
                 sample_probs,
                 design_spec,
                 cfd_simulator,
@@ -2884,64 +3356,88 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 connectivity_weight,
                 aircraft_validity_weight,
                 threshold,
-                target_occupancy,
+                sample_target,
+                return_components=True,
             )
-            low_frequency_grid = int(perturbation_grid_size)
-            if low_frequency_grid > 1 and any(dim > low_frequency_grid for dim in sample_probs.shape):
-                coarse_shape = tuple(max(1, min(low_frequency_grid, int(dim))) for dim in sample_probs.shape)
-                coarse_delta = torch.randint(
-                    low=0,
-                    high=2,
-                    size=(1, 1, *coarse_shape),
-                    generator=generator,
-                    device=probs.device,
-                    dtype=torch.int8,
-                ).to(dtype=probs.dtype)
-                coarse_delta = coarse_delta.mul(2.0).sub(1.0)
-                delta = F.interpolate(
-                    coarse_delta,
-                    size=tuple(sample_probs.shape),
-                    mode="trilinear",
-                    align_corners=False,
-                )[0, 0]
-                delta = (delta / delta.abs().mean().clamp_min(1.0e-6)).clamp(-2.0, 2.0)
-            else:
-                delta = torch.randint(
-                    low=0,
-                    high=2,
-                    size=tuple(sample_probs.shape),
-                    generator=generator,
-                    device=probs.device,
-                    dtype=torch.int8,
-                ).to(dtype=probs.dtype)
-                delta = delta.mul(2.0).sub(1.0)
-            plus_loss = _direct_measured_objective_for_single(
-                (sample_probs + eps * delta).clamp(0.0, 1.0),
-                design_spec,
-                cfd_simulator,
-                cfd_steps,
-                connectivity_weight,
-                aircraft_validity_weight,
-                threshold,
-                target_occupancy,
-            )
-            minus_loss = _direct_measured_objective_for_single(
-                (sample_probs - eps * delta).clamp(0.0, 1.0),
-                design_spec,
-                cfd_simulator,
-                cfd_steps,
-                connectivity_weight,
-                aircraft_validity_weight,
-                threshold,
-                target_occupancy,
-            )
-            sample_grad = ((plus_loss - minus_loss) / (2.0 * eps)) * delta
+            base_loss = float(base_components["total_loss"])
+            base_component_records.append(base_components)
+            sample_grad = torch.zeros_like(sample_field)
+            for _ in range(direction_count):
+                low_frequency_grid = int(perturbation_grid_size)
+                if low_frequency_grid > 1 and any(dim > low_frequency_grid for dim in sample_field.shape):
+                    coarse_shape = tuple(max(1, min(low_frequency_grid, int(dim))) for dim in sample_field.shape)
+                    coarse_delta = torch.randint(
+                        low=0,
+                        high=2,
+                        size=(1, 1, *coarse_shape),
+                        generator=generator,
+                        device=fields.device,
+                        dtype=torch.int8,
+                    ).to(dtype=fields.dtype)
+                    coarse_delta = coarse_delta.mul(2.0).sub(1.0)
+                    delta = F.interpolate(
+                        coarse_delta,
+                        size=tuple(sample_field.shape),
+                        mode="trilinear",
+                        align_corners=False,
+                    )[0, 0]
+                    delta = (delta / delta.abs().mean().clamp_min(1.0e-6)).clamp(-2.0, 2.0)
+                else:
+                    delta = torch.randint(
+                        low=0,
+                        high=2,
+                        size=tuple(sample_field.shape),
+                        generator=generator,
+                        device=fields.device,
+                        dtype=torch.int8,
+                    ).to(dtype=fields.dtype)
+                    delta = delta.mul(2.0).sub(1.0)
+                plus_field = sample_field + eps * delta
+                minus_field = sample_field - eps * delta
+                plus_loss = _direct_measured_objective_for_single(
+                    torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
+                    design_spec,
+                    cfd_simulator,
+                    cfd_steps,
+                    connectivity_weight,
+                    aircraft_validity_weight,
+                    threshold,
+                    sample_target,
+                )
+                minus_loss = _direct_measured_objective_for_single(
+                    torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
+                    design_spec,
+                    cfd_simulator,
+                    cfd_steps,
+                    connectivity_weight,
+                    aircraft_validity_weight,
+                    threshold,
+                    sample_target,
+                )
+                sample_grad.add_(((plus_loss - minus_loss) / (2.0 * eps)) * delta)
+                _clear_direct_solver_geometry_caches(cfd_simulator)
+            sample_grad.div_(direction_count)
             grad_norm = sample_grad.norm()
             clip_value = float(gradient_clip)
-            if clip_value > 0.0 and torch.isfinite(grad_norm) and float(grad_norm.item()) > clip_value:
-                sample_grad = sample_grad * (clip_value / grad_norm.clamp_min(1.0e-12))
+            # SPSA estimates the gradient of one global measured objective, not
+            # an elementwise mean. Apply the configured norm bound directly;
+            # the ordinary per-model gradient clip still bounds the combined
+            # neural update after this gradient is propagated through decoder.
+            gradient_norm_limit = clip_value
+            unclipped_norm = float(grad_norm.item()) if torch.isfinite(grad_norm) else float("nan")
+            if (
+                gradient_norm_limit > 0.0
+                and torch.isfinite(grad_norm)
+                and unclipped_norm > gradient_norm_limit
+            ):
+                sample_grad = sample_grad * (
+                    gradient_norm_limit / grad_norm.clamp_min(1.0e-12)
+                )
             grad_estimate[batch_idx] = sample_grad / max(batch_size, 1)
             base_losses.append(base_loss)
+            base_components["spsa_gradient_norm_unclipped"] = unclipped_norm
+            base_components["spsa_gradient_norm"] = float(sample_grad.norm().item())
+            base_components["spsa_gradient_norm_limit"] = float(gradient_norm_limit)
             _clear_direct_solver_geometry_caches(cfd_simulator)
 
         if original_ndim == 3:
@@ -2949,21 +3445,27 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         ctx.save_for_backward(grad_estimate.to(dtype=voxel_grid.dtype))
         ctx.original_ndim = original_ndim
         mean_loss = float(np.mean(base_losses)) if base_losses else 0.0
+        component_sink.clear()
+        if base_component_records:
+            for key in base_component_records[0]:
+                values = [float(record[key]) for record in base_component_records if key in record]
+                if values:
+                    component_sink[key] = float(np.mean(values))
         return voxel_grid.new_tensor(mean_loss)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (grad_estimate,) = ctx.saved_tensors
         grad = grad_output.to(dtype=grad_estimate.dtype) * grad_estimate
-        return grad, None, None, None, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class DirectSolverSPSALoss(nn.Module):
     """Direct measured solver objective with finite-difference gradients.
 
     The forward value is the actual thresholded-geometry CFD/connectivity loss.
-    The backward pass uses two additional solver evaluations around random
-    Rademacher perturbations to estimate a gradient; no surrogate model is used.
+    The backward pass averages antithetic finite differences across one or more
+    Rademacher directions; every objective value comes from the real solver.
     """
 
     def __init__(
@@ -2976,7 +3478,9 @@ class DirectSolverSPSALoss(nn.Module):
         aircraft_validity_weight: float = 0.0,
         threshold: float = 0.5,
         target_occupancy: Optional[float] = None,
+        directions: int = 1,
         seed: int = 0,
+        input_is_logits: bool = False,
     ):
         super().__init__()
         self.cfd_steps = int(cfd_steps)
@@ -2987,7 +3491,10 @@ class DirectSolverSPSALoss(nn.Module):
         self.aircraft_validity_weight = float(aircraft_validity_weight)
         self.threshold = float(threshold)
         self.target_occupancy = target_occupancy
+        self.directions = max(1, int(directions))
         self.seed = int(seed)
+        self.input_is_logits = bool(input_is_logits)
+        self.last_components: Dict[str, float] = {}
 
     def forward(
         self,
@@ -2995,8 +3502,14 @@ class DirectSolverSPSALoss(nn.Module):
         design_spec: DesignSpec,
         cfd_simulator: "AdvancedCFDSimulator",
         seed: Optional[int] = None,
+        reference_occupancy: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor:
         effective_seed = self.seed if seed is None else int(seed)
+        effective_target = (
+            reference_occupancy
+            if reference_occupancy is not None
+            else self.target_occupancy
+        )
         return DirectSolverSPSAFunction.apply(
             voxel_grid,
             design_spec,
@@ -3007,9 +3520,12 @@ class DirectSolverSPSALoss(nn.Module):
             self.connectivity_weight,
             self.aircraft_validity_weight,
             self.threshold,
-            self.target_occupancy,
+            effective_target,
             self.perturbation_grid_size,
+            self.directions,
             effective_seed,
+            self.input_is_logits,
+            self.last_components,
         )
 
 # ============================================================================
@@ -3057,6 +3573,13 @@ class OptimizedDiffusionTrainer:
             model_config.latent_dim,
             model_config.grid_resolution,
             coordinate_decoder_threshold=training_config.coordinate_decoder_threshold,
+            coordinate_chunk_size=model_config.coordinate_chunk_size,
+            coordinate_decoder_width=model_config.coordinate_decoder_width,
+            coordinate_decoder_depth=model_config.coordinate_decoder_depth,
+            coordinate_fourier_bands=model_config.coordinate_fourier_bands,
+            enable_coordinate_gradient_checkpointing=bool(
+                config_value("model", "coordinate_gradient_checkpointing", True)
+            ),
         ).to(self.device).to(self.dtype)
 
         # 4-step consistency model
@@ -3066,10 +3589,27 @@ class OptimizedDiffusionTrainer:
         self.ema_model = self._copy_model(self.diffusion_model)
 
         # Optimizer
-        params = (list(self.diffusion_model.parameters()) +
-                 list(self.converter.parameters()) +
-                 list(self.consistency_model.student_model.parameters()))
-        self.optimizer = AdamW(params, lr=training_config.learning_rate, weight_decay=training_config.weight_decay)
+        self.optimizer = AdamW(
+            [
+                {
+                    "params": list(self.diffusion_model.parameters()),
+                    "lr": training_config.learning_rate,
+                    "name": "diffusion",
+                },
+                {
+                    "params": list(self.converter.parameters()),
+                    "lr": training_config.converter_learning_rate,
+                    "name": "coordinate_converter",
+                },
+                {
+                    "params": list(self.consistency_model.student_model.parameters()),
+                    "lr": training_config.consistency_student_learning_rate,
+                    "name": "consistency_student",
+                },
+            ],
+            lr=training_config.learning_rate,
+            weight_decay=training_config.weight_decay,
+        )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
 
         # Gradient scaler for mixed precision
@@ -3078,7 +3618,6 @@ class OptimizedDiffusionTrainer:
         # Losses
         self.mse_loss = nn.MSELoss()
         self.geometry_loss = nn.BCEWithLogitsLoss()
-        self.connectivity_loss = ConnectivityLoss(penalty=training_config.disconnection_penalty)
         self.aero_loss = AerodynamicLoss()
         self.direct_solver_loss = DirectSolverSPSALoss(
             cfd_steps=training_config.direct_solver_steps,
@@ -3088,17 +3627,17 @@ class OptimizedDiffusionTrainer:
             connectivity_weight=training_config.direct_connectivity_weight,
             aircraft_validity_weight=training_config.direct_aircraft_validity_weight,
             target_occupancy=training_config.direct_solver_target_occupancy,
+            directions=training_config.direct_solver_directions,
+            input_is_logits=True,
         )
 
         # Advanced CFD simulator for training (fast, coarse)
         self.cfd_simulator = AdvancedCFDSimulator(cfd_config, self.device)
 
-        # High-fidelity CFD simulator for validation (accurate, refined)
-        import copy
-        val_cfd_config = copy.deepcopy(cfd_config)
-        val_cfd_config.solver_type = "D3Q27"
-        val_cfd_config.use_amr = True  # Enable AMR for validation
-        self.val_cfd_simulator = AdvancedCFDSimulator(val_cfd_config, self.device)
+        # The doubled-resolution AMR solver is substantial at 96^3. Construct
+        # it only when validation is actually requested so it cannot displace
+        # the optimizer's required base-resolution solver and neural graph.
+        self.val_cfd_simulator: Optional[AdvancedCFDSimulator] = None
 
         # Pipeline parallelism
         self.pipeline = PipelineParallelism(training_config)
@@ -3133,12 +3672,23 @@ class OptimizedDiffusionTrainer:
         for ema_param, param in zip(self.ema_model.parameters(), self.diffusion_model.parameters()):
             ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
 
+    def _get_validation_cfd_simulator(self) -> AdvancedCFDSimulator:
+        if self.val_cfd_simulator is None:
+            import copy
+
+            val_cfd_config = copy.deepcopy(self.cfd_config)
+            val_cfd_config.solver_type = "D3Q27"
+            val_cfd_config.use_amr = True
+            self.val_cfd_simulator = AdvancedCFDSimulator(val_cfd_config, self.device)
+        return self.val_cfd_simulator
+
     def validate_epoch(self, val_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Validate for one epoch with the high-fidelity D3Q27 solver"""
         self.diffusion_model.eval()
         self.converter.eval()
 
         total_aero_loss = 0.0
+        validation_cfd_simulator = self._get_validation_cfd_simulator()
 
         pbar = tqdm(val_loader, desc=f"Validating with D3Q27 solver (grid={grid_size}x{grid_size}x{grid_size})")
 
@@ -3162,7 +3712,11 @@ class OptimizedDiffusionTrainer:
                 voxel_grid = torch.sigmoid(voxel_grid).nan_to_num(0.0)
 
                 # CFD-based aerodynamic diagnostic with the D3Q27 solver
-                aero_loss_val = self.aero_loss(voxel_grid, design_spec, self.val_cfd_simulator).nan_to_num(0.0)
+                aero_loss_val = self.aero_loss(
+                    voxel_grid,
+                    design_spec,
+                    validation_cfd_simulator,
+                ).nan_to_num(0.0)
 
                 total_aero_loss += aero_loss_val.item()
 
@@ -3174,23 +3728,117 @@ class OptimizedDiffusionTrainer:
 
         return {'val_aerodynamic_loss': avg_aero_loss}
 
+    def _backward_full_grounded_coordinate_loss(
+        self,
+        latent: torch.Tensor,
+        geometry_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Backpropagate the exact full-lattice decoder loss in bounded chunks."""
+        flat_target = geometry_target.float().reshape(geometry_target.shape[0], -1)
+        total_voxels = int(flat_target.shape[1])
+        chunk_size = max(1, int(self.model_config.coordinate_chunk_size))
+        batch_size = int(flat_target.shape[0])
+        positive_count = flat_target.sum().clamp_min(0.0)
+        negative_count = (flat_target.numel() - positive_count).clamp_min(0.0)
+        positive_bce_sum = flat_target.new_zeros(())
+        negative_bce_sum = flat_target.new_zeros(())
+        intersection = flat_target.new_zeros((batch_size,))
+        prediction_mass = flat_target.new_zeros((batch_size,))
+        target_mass = flat_target.sum(dim=1)
+
+        with torch.no_grad():
+            for start in range(0, total_voxels, chunk_size):
+                stop = min(start + chunk_size, total_voxels)
+                indices = torch.arange(start, stop, device=self.device)
+                target_chunk = flat_target.index_select(1, indices)
+                logits = self.converter.forward_flat_indices(latent, indices).float().nan_to_num(0.0)
+                probabilities = torch.sigmoid(logits).nan_to_num(0.0)
+                bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
+                positive_mask = target_chunk > 0.5
+                if bool(positive_mask.any().item()):
+                    positive_bce_sum += bce[positive_mask].sum()
+                if bool((~positive_mask).any().item()):
+                    negative_bce_sum += bce[~positive_mask].sum()
+                intersection += (probabilities * target_chunk).sum(dim=1)
+                prediction_mass += probabilities.sum(dim=1)
+
+        balanced_bce = flat_target.new_zeros(())
+        class_count = 0
+        if float(positive_count.item()) > 0.0:
+            balanced_bce += positive_bce_sum / positive_count
+            class_count += 1
+        if float(negative_count.item()) > 0.0:
+            balanced_bce += negative_bce_sum / negative_count
+            class_count += 1
+        balanced_bce = balanced_bce / max(class_count, 1)
+        numerator = 2.0 * intersection + 1.0
+        denominator = prediction_mass + target_mass + 1.0
+        dice_loss = (1.0 - numerator / denominator).mean()
+        full_loss = balanced_bce + self.training_config.geometry_dice_weight * dice_loss
+
+        positive_dice_coefficient = -(
+            2.0 * denominator - numerator
+        ) / denominator.square() / max(batch_size, 1)
+        negative_dice_coefficient = (
+            numerator / denominator.square() / max(batch_size, 1)
+        )
+        clean_weight = float(self.training_config.clean_geometry_reconstruction_weight)
+        for start in range(0, total_voxels, chunk_size):
+            stop = min(start + chunk_size, total_voxels)
+            indices = torch.arange(start, stop, device=self.device)
+            target_chunk = flat_target.index_select(1, indices)
+            logits = self.converter.forward_flat_indices(latent, indices).float().nan_to_num(0.0)
+            probabilities = torch.sigmoid(logits).nan_to_num(0.0)
+            bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
+            positive_mask = target_chunk > 0.5
+            chunk_bce = logits.new_zeros(())
+            if float(positive_count.item()) > 0.0:
+                chunk_bce = chunk_bce + bce[positive_mask].sum() / positive_count
+            if float(negative_count.item()) > 0.0:
+                chunk_bce = chunk_bce + bce[~positive_mask].sum() / negative_count
+            chunk_bce = chunk_bce / max(class_count, 1)
+            dice_coefficients = torch.where(
+                positive_mask,
+                positive_dice_coefficient[:, None],
+                negative_dice_coefficient[:, None],
+            )
+            chunk_dice_gradient_objective = (
+                probabilities * dice_coefficients.detach()
+            ).sum()
+            (
+                clean_weight
+                * (
+                    chunk_bce
+                    + self.training_config.geometry_dice_weight
+                    * chunk_dice_gradient_objective
+                )
+            ).backward()
+        return full_loss.detach()
+
     def train_epoch(self, train_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
         """Train for one epoch with all optimizations"""
         self.diffusion_model.train()
         self.converter.train()
         self.consistency_model.student_model.train()
 
-        total_loss = 0.0
         total_optimization_loss = 0.0
         total_mse = 0.0
+        total_clean_geometry = 0.0
         total_geometry = 0.0
         total_generation_geometry = 0.0
         total_consistency = 0.0
+        total_latent_reconstruction = 0.0
+        total_denoising_geometry_confidence = 0.0
+        total_diffusion_timestep = 0.0
         total_direct_solver = 0.0
         total_direct_solver_eval = 0.0
+        total_direct_aero = 0.0
+        total_direct_connectivity = 0.0
+        total_direct_validity = 0.0
+        total_spsa_gradient_norm = 0.0
+        total_spsa_gradient_norm_unclipped = 0.0
         direct_solver_eval_count = 0
-        total_connectivity = 0.0
-        total_aero = 0.0
+        direct_solver_call_count = 0
 
         pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
 
@@ -3221,7 +3869,15 @@ class OptimizedDiffusionTrainer:
                 consistency_loss = self._compute_consistency_loss(latent, condition=condition)
 
             # Random timestep for diffusion training
-            t = torch.randint(0, self.diffusion_config.timesteps, (latent.shape[0],), device=self.device)
+            t = select_training_timesteps(
+                global_step=self.global_step,
+                batch_size=latent.shape[0],
+                diffusion_timesteps=self.diffusion_config.timesteps,
+                inference_steps=self.diffusion_config.student_steps,
+                device=self.device,
+                mode=self.training_config.timestep_sampling,
+            )
+            total_diffusion_timestep += float(t.float().mean().item())
 
             # Forward diffusion
             noise = torch.randn_like(latent)
@@ -3230,15 +3886,36 @@ class OptimizedDiffusionTrainer:
             # Model prediction
             pred_noise = self.diffusion_model(noisy_latent, t, condition=condition).nan_to_num(0.0)
             x0_pred = self.noise_schedule.predict_x0(noisy_latent, t, pred_noise).nan_to_num(0.0)
+            x0_pred = bound_latent_to_corpus_support(
+                x0_pred,
+                float(config_value("model", "latent_value_min", 0.0)),
+                float(config_value("model", "latent_value_max", 1.0)),
+            )
 
-            generation_latent = self.consistency_model.fast_inference(
-                latent.shape,
-                num_steps=self.diffusion_config.student_steps,
+            student_pred_noise = self.consistency_model.student_model(
+                noisy_latent,
+                t,
                 condition=condition,
             ).nan_to_num(0.0)
+            generation_latent = self.noise_schedule.predict_x0(
+                noisy_latent,
+                t,
+                student_pred_noise,
+            ).nan_to_num(0.0)
+            generation_latent = bound_latent_to_corpus_support(
+                generation_latent,
+                float(config_value("model", "latent_value_min", 0.0)),
+                float(config_value("model", "latent_value_max", 1.0)),
+            )
+
+            latent_reconstruction_loss_val = 0.5 * (
+                F.mse_loss(x0_pred.float(), latent.float())
+                + F.mse_loss(generation_latent.float(), latent.float())
+            )
 
             # MSE loss
             mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
+            direct_solver_field = None
 
             if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
                 flat_target = geometry_target.reshape(geometry_target.shape[0], -1)
@@ -3250,11 +3927,11 @@ class OptimizedDiffusionTrainer:
                 positive_fraction = float(np.clip(self.training_config.coordinate_positive_fraction, 0.0, 1.0))
                 positive_target = flat_target.max(dim=0).values > 0.5
                 positive_indices = torch.nonzero(positive_target, as_tuple=False).flatten()
+                negative_indices = torch.nonzero(~positive_target, as_tuple=False).flatten()
                 effective_positive_fraction = positive_fraction if positive_indices.numel() > 0 else 0.0
                 positive_count = int(round(sample_count * effective_positive_fraction))
                 positive_count = min(positive_count, sample_count)
                 sampled_parts = []
-                sampled_positive_count = 0
                 if positive_indices.numel() > 0 and positive_count > 0:
                     positive_choice = torch.randint(
                         0,
@@ -3264,116 +3941,217 @@ class OptimizedDiffusionTrainer:
                     )
                     positive_sample = positive_indices.index_select(0, positive_choice)
                     sampled_parts.append(positive_sample)
-                    sampled_positive_count = positive_sample.numel()
                 remaining_count = sample_count - sum(part.numel() for part in sampled_parts)
                 if remaining_count > 0:
-                    sampled_parts.append(
-                        torch.randint(
+                    if negative_indices.numel() > 0:
+                        negative_choice = torch.randint(
                             0,
-                            total_voxels,
+                            negative_indices.numel(),
                             (remaining_count,),
                             device=self.device,
                         )
-                    )
+                        sampled_parts.append(negative_indices.index_select(0, negative_choice))
+                    else:
+                        sampled_parts.append(
+                            torch.randint(
+                                0,
+                                total_voxels,
+                                (remaining_count,),
+                                device=self.device,
+                            )
+                        )
                 flat_indices = torch.cat(sampled_parts, dim=0)
                 target_sample = flat_target.index_select(1, flat_indices)
+                population_positive_counts = flat_target.sum(dim=1)
+                population_negative_counts = total_voxels - population_positive_counts
+                clean_geom_logits_sample = self.converter.forward_flat_indices(
+                    latent,
+                    flat_indices,
+                ).nan_to_num(0.0)
                 geom_logits_sample = self.converter.forward_flat_indices(
                     x0_pred,
                     flat_indices,
                 ).nan_to_num(0.0)
-                generation_geom_logits_sample = self.converter.forward_flat_indices(
-                    generation_latent,
-                    flat_indices,
+                clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
+                    clean_geom_logits_sample,
+                    target_sample,
+                    dice_weight=self.training_config.geometry_dice_weight,
+                    population_positive_counts=population_positive_counts,
+                    population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
-                geometry_loss_val = balanced_voxel_bce_with_logits(
+                geometry_loss_val = sparse_voxel_reconstruction_loss(
                     geom_logits_sample,
                     target_sample,
-                ).nan_to_num(0.0)
-                generation_geometry_loss_val = balanced_voxel_bce_with_logits(
-                    generation_geom_logits_sample,
-                    target_sample,
+                    dice_weight=self.training_config.geometry_dice_weight,
+                    population_positive_counts=population_positive_counts,
+                    population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
                 direct_solver_interval = max(1, int(self.training_config.direct_solver_interval))
                 run_optimizer_grid_loss = (
                     float(self.training_config.direct_solver_loss_weight) > 0.0
                     and batch_idx % direct_solver_interval == 0
                 )
-                run_full_diagnostic = (
-                    int(self.training_config.full_diagnostic_interval) > 0
-                    and batch_idx % int(self.training_config.full_diagnostic_interval) == 0
-                )
                 if run_optimizer_grid_loss:
-                    optimizer_logits = self.converter(x0_pred).nan_to_num(0.0)
+                    optimizer_logits = self.converter(generation_latent).nan_to_num(0.0)
                     voxel_grid = torch.sigmoid(optimizer_logits).nan_to_num(0.0)
-                elif run_full_diagnostic:
-                    with torch.no_grad():
-                        diagnostic_logits = self.converter(x0_pred.detach()).nan_to_num(0.0)
-                        voxel_grid = torch.sigmoid(diagnostic_logits).nan_to_num(0.0)
+                    direct_solver_field = optimizer_logits
+                    generation_geometry_loss_val = sparse_voxel_reconstruction_loss(
+                        optimizer_logits.reshape(geometry_target.shape[0], -1),
+                        flat_target,
+                        dice_weight=self.training_config.geometry_dice_weight,
+                    ).nan_to_num(0.0)
                 else:
+                    generation_geom_logits_sample = self.converter.forward_flat_indices(
+                        generation_latent,
+                        flat_indices,
+                    ).nan_to_num(0.0)
+                    generation_geometry_loss_val = sparse_voxel_reconstruction_loss(
+                        generation_geom_logits_sample,
+                        target_sample,
+                        dice_weight=self.training_config.geometry_dice_weight,
+                        population_positive_counts=population_positive_counts,
+                        population_negative_counts=population_negative_counts,
+                    ).nan_to_num(0.0)
                     voxel_grid = None
             else:
-                geom_logits = self.converter(x0_pred).nan_to_num(0.0)
-                voxel_grid = torch.sigmoid(geom_logits).nan_to_num(0.0)
+                clean_geom_logits = self.converter(latent).nan_to_num(0.0)
                 generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
-                geometry_loss_val = balanced_voxel_bce_with_logits(
+                geom_logits = self.converter(x0_pred).nan_to_num(0.0)
+                voxel_grid = torch.sigmoid(generation_geom_logits).nan_to_num(0.0)
+                direct_solver_field = generation_geom_logits
+                clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
+                    clean_geom_logits.float(),
+                    geometry_target.float(),
+                    dice_weight=self.training_config.geometry_dice_weight,
+                ).nan_to_num(0.0)
+                geometry_loss_val = sparse_voxel_reconstruction_loss(
                     geom_logits.float(),
                     geometry_target.float(),
+                    dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
-                generation_geometry_loss_val = balanced_voxel_bce_with_logits(
+                generation_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     generation_geom_logits.float(),
                     geometry_target.float(),
+                    dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
-
-            # Connectivity diagnostic
-            connectivity_loss_val = torch.tensor(0.0, device=self.device)
-            connectivity_monitor_interval = int(self.training_config.connectivity_monitor_interval)
-            if (
-                voxel_grid is not None
-                and connectivity_monitor_interval > 0
-                and batch_idx % connectivity_monitor_interval == 0
-            ):
-                connectivity_loss_val = self.connectivity_loss(voxel_grid).nan_to_num(0.0)
 
             direct_solver_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_evaluated = False
-            if (
-                voxel_grid is not None
+            run_direct_solver_loss = (
+                direct_solver_field is not None
                 and float(self.training_config.direct_solver_loss_weight) > 0.0
                 and batch_idx % max(1, int(self.training_config.direct_solver_interval)) == 0
-                and voxel_grid.requires_grad
-            ):
-                direct_solver_loss_val = self.direct_solver_loss(
-                    voxel_grid.float(),
-                    design_spec,
-                    self.cfd_simulator,
-                    seed=self.global_step,
-                ).nan_to_num(0.0)
-                direct_solver_evaluated = True
+                and direct_solver_field.requires_grad
+            )
+            direct_logit_snapshot = None
+            if run_direct_solver_loss:
+                # Keep only generated logits, not their decoder graph, alive
+                # while sequential black-box solver evaluations run. SPSA in
+                # logit space preserves top-k rank without a collapse incentive.
+                direct_logit_snapshot = direct_solver_field.detach()
+                reference_occupancy = geometry_target.float().mean(
+                    dim=tuple(range(1, geometry_target.ndim))
+                )
 
-            # CFD-based aerodynamic diagnostic (every 10 batches for speed)
-            aero_loss_val = torch.tensor(0.0, device=self.device)
-            aerodynamic_monitor_interval = int(self.training_config.aerodynamic_monitor_interval)
-            if (
-                voxel_grid is not None
-                and aerodynamic_monitor_interval > 0
-                and batch_idx % aerodynamic_monitor_interval == 0
-            ):
-                aero_loss_val = self.aero_loss(voxel_grid[:1], design_spec, self.cfd_simulator).nan_to_num(0.0)
-
-            optimization_loss_val, diagnostic_total_loss_val = combine_training_loss_terms(
+            denoising_geometry_confidence = self.noise_schedule.sqrt_alphas_cumprod[
+                t
+            ].mean().detach().clamp_min(
+                float(self.training_config.minimum_denoising_geometry_confidence)
+            )
+            optimization_loss_val = combine_training_loss_terms(
                 mse_loss_val,
                 geometry_loss_val,
                 generation_geometry_loss_val,
                 consistency_loss,
-                connectivity_loss_val,
-                aero_loss_val,
                 self.training_config,
-                direct_solver_loss_val=direct_solver_loss_val,
+                direct_solver_loss_val=None,
+                clean_geometry_loss_val=clean_geometry_loss_val,
+                denoising_geometry_confidence=denoising_geometry_confidence,
+                latent_reconstruction_loss_val=latent_reconstruction_loss_val,
             )
 
             # Backward pass
             self.optimizer.zero_grad()
             optimization_loss_val.backward()
+
+            if run_direct_solver_loss:
+                direct_logit_leaf = direct_logit_snapshot.detach().requires_grad_(True)
+                measured_direct_loss = self.direct_solver_loss(
+                    direct_logit_leaf.float(),
+                    design_spec,
+                    self.cfd_simulator,
+                    seed=self.global_step,
+                    reference_occupancy=reference_occupancy,
+                ).nan_to_num(0.0)
+                measured_direct_loss.backward()
+                direct_logit_gradient = direct_logit_leaf.grad
+                if direct_logit_gradient is None:
+                    raise RuntimeError("Direct solver objective did not produce a logit gradient")
+                direct_logit_gradient = direct_logit_gradient.detach()
+                direct_solver_loss_val = measured_direct_loss.detach()
+                del measured_direct_loss, direct_logit_leaf
+
+                # Recompute only the generated geometry path after CFD. This
+                # applies the measured SPSA gradient to the model without
+                # retaining neural activations throughout all solver calls.
+                direct_student_pred_noise = self.consistency_model.student_model(
+                    noisy_latent.detach(),
+                    t,
+                    condition=condition,
+                ).nan_to_num(0.0)
+                direct_generation_latent = self.noise_schedule.predict_x0(
+                    noisy_latent.detach(),
+                    t,
+                    direct_student_pred_noise,
+                ).nan_to_num(0.0)
+                direct_generation_latent = bound_latent_to_corpus_support(
+                    direct_generation_latent,
+                    float(config_value("model", "latent_value_min", 0.0)),
+                    float(config_value("model", "latent_value_max", 1.0)),
+                )
+                direct_optimizer_logits = self.converter(
+                    direct_generation_latent
+                ).nan_to_num(0.0)
+                direct_optimizer_logits.backward(
+                    gradient=(
+                        float(self.training_config.direct_solver_loss_weight)
+                        * direct_logit_gradient
+                    )
+                )
+                direct_solver_evaluated = True
+                direct_solver_call_count += int(latent.shape[0]) * (
+                    1 + 2 * int(self.training_config.direct_solver_directions)
+                )
+                optimization_loss_val = (
+                    optimization_loss_val.detach()
+                    + float(self.training_config.direct_solver_loss_weight)
+                    * direct_solver_loss_val
+                )
+            if self.training_config.freeze_decoder_for_generated_paths:
+                # Optional ablation: discard generated-path converter gradients
+                # while preserving their upstream denoiser gradients.
+                for parameter in self.converter.parameters():
+                    parameter.grad = None
+            # Always add an exact grounded full-lattice decoder gradient. The
+            # generated and CFD graphs have already been released, so this is
+            # sequential without dropping any loss contribution.
+            if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
+                grounded_full_loss = self._backward_full_grounded_coordinate_loss(
+                    latent,
+                    geometry_target,
+                )
+            else:
+                grounded_full_logits = self.converter(latent).nan_to_num(0.0)
+                grounded_full_loss = sparse_voxel_reconstruction_loss(
+                    grounded_full_logits.float(),
+                    geometry_target.float(),
+                    dice_weight=self.training_config.geometry_dice_weight,
+                ).nan_to_num(0.0)
+                (
+                    self.training_config.clean_geometry_reconstruction_weight
+                    * grounded_full_loss
+                ).backward()
+            clean_geometry_loss_val = grounded_full_loss.detach()
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), self.training_config.gradient_clip)
@@ -3381,35 +4159,47 @@ class OptimizedDiffusionTrainer:
             torch.nn.utils.clip_grad_norm_(self.consistency_model.student_model.parameters(), self.training_config.gradient_clip)
 
             # Optimizer step
+            if self.training_config.offload_optimizer_state_between_steps:
+                move_optimizer_state(self.optimizer, self.device)
             self.optimizer.step()
+            if self.training_config.offload_optimizer_state_between_steps:
+                move_optimizer_state(self.optimizer, "cpu")
 
             # EMA update
             self._update_ema()
 
             # Logging
-            total_loss += diagnostic_total_loss_val.item()
             total_optimization_loss += optimization_loss_val.item()
             total_mse += mse_loss_val.item()
+            total_clean_geometry += clean_geometry_loss_val.item()
             total_geometry += geometry_loss_val.item()
             total_generation_geometry += generation_geometry_loss_val.item()
             total_consistency += consistency_loss.item()
+            total_latent_reconstruction += latent_reconstruction_loss_val.item()
+            total_denoising_geometry_confidence += denoising_geometry_confidence.item()
             total_direct_solver += direct_solver_loss_val.item()
             if direct_solver_evaluated:
                 total_direct_solver_eval += direct_solver_loss_val.item()
+                components = self.direct_solver_loss.last_components
+                total_direct_aero += float(components.get("aero_loss", 0.0))
+                total_direct_connectivity += float(components.get("connectivity_loss", 0.0))
+                total_direct_validity += float(components.get("aircraft_validity_loss", 0.0))
+                total_spsa_gradient_norm += float(components.get("spsa_gradient_norm", 0.0))
+                total_spsa_gradient_norm_unclipped += float(
+                    components.get("spsa_gradient_norm_unclipped", 0.0)
+                )
                 direct_solver_eval_count += 1
-            total_connectivity += connectivity_loss_val.item()
-            total_aero += aero_loss_val.item()
 
             pbar.set_postfix({
                 'opt_loss': optimization_loss_val.item(),
-                'diag_total': diagnostic_total_loss_val.item(),
                 'mse': mse_loss_val.item(),
+                'clean_geom': clean_geometry_loss_val.item(),
                 'geom': geometry_loss_val.item(),
                 'gen_geom': generation_geometry_loss_val.item(),
                 'consistency': consistency_loss.item(),
+                'latent_recon': latent_reconstruction_loss_val.item(),
                 'direct_solver': direct_solver_loss_val.item(),
-                'conn': connectivity_loss_val.item(),
-                'aero': aero_loss_val.item()
+                'denoise_conf': denoising_geometry_confidence.item(),
             })
 
             self.global_step += 1
@@ -3418,22 +4208,22 @@ class OptimizedDiffusionTrainer:
             if batch_idx % 10 == 0:
                 torch.cuda.empty_cache()
 
-        avg_loss = total_loss / len(train_loader)
         avg_optimization_loss = total_optimization_loss / len(train_loader)
 
         # Log to tensorboard
         self.writer.add_scalar('Loss/total', avg_optimization_loss, self.global_step)
         self.writer.add_scalar('Loss/optimization', avg_optimization_loss, self.global_step)
-        self.writer.add_scalar('Loss/diagnostic_total', avg_loss, self.global_step)
         self.writer.add_scalar('Loss/mse', total_mse / len(train_loader), self.global_step)
+        self.writer.add_scalar('Loss/clean_geometry_reconstruction', total_clean_geometry / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
         self.writer.add_scalar('Loss/direct_solver', total_direct_solver / len(train_loader), self.global_step)
         if direct_solver_eval_count > 0:
             self.writer.add_scalar('Loss/direct_solver_eval', total_direct_solver_eval / direct_solver_eval_count, self.global_step)
-        self.writer.add_scalar('Loss/connectivity', total_connectivity / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/aerodynamic', total_aero / len(train_loader), self.global_step)
+            self.writer.add_scalar('Loss/direct_aero', total_direct_aero / direct_solver_eval_count, self.global_step)
+            self.writer.add_scalar('Loss/direct_connectivity', total_direct_connectivity / direct_solver_eval_count, self.global_step)
+            self.writer.add_scalar('Loss/direct_aircraft_validity', total_direct_validity / direct_solver_eval_count, self.global_step)
 
         avg_direct_solver_eval = (
             total_direct_solver_eval / direct_solver_eval_count
@@ -3450,19 +4240,30 @@ class OptimizedDiffusionTrainer:
         return {
             'loss': avg_optimization_loss,
             'optimization_loss': avg_optimization_loss,
-            'diagnostic_total': avg_loss,
             'mse': total_mse / len(train_loader),
+            'clean_geometry_reconstruction': total_clean_geometry / len(train_loader),
             'geometry_reconstruction': total_geometry / len(train_loader),
             'generation_reconstruction': total_generation_geometry / len(train_loader),
             'consistency': total_consistency / len(train_loader),
+            'latent_reconstruction': total_latent_reconstruction / len(train_loader),
+            'denoising_geometry_confidence': (
+                total_denoising_geometry_confidence / len(train_loader)
+            ),
+            'diffusion_timestep': total_diffusion_timestep / len(train_loader),
             'direct_solver_loss': total_direct_solver / len(train_loader),
             'direct_solver_eval_loss': avg_direct_solver_eval,
             'direct_solver_eval_count': direct_solver_eval_count,
+            'direct_solver_call_count': direct_solver_call_count,
+            'direct_aero_loss': total_direct_aero / max(direct_solver_eval_count, 1),
+            'direct_connectivity_loss': total_direct_connectivity / max(direct_solver_eval_count, 1),
+            'direct_aircraft_validity_loss': total_direct_validity / max(direct_solver_eval_count, 1),
+            'direct_spsa_gradient_norm': total_spsa_gradient_norm / max(direct_solver_eval_count, 1),
+            'direct_spsa_gradient_norm_unclipped': (
+                total_spsa_gradient_norm_unclipped / max(direct_solver_eval_count, 1)
+            ),
             'direct_solver_iteration_coverage': (
                 direct_solver_eval_count / max(optimizer_iterations, 1)
             ),
-            'connectivity': total_connectivity / len(train_loader),
-            'aerodynamic': total_aero / len(train_loader)
         }
 
     def _compute_consistency_loss(
@@ -3475,9 +4276,14 @@ class OptimizedDiffusionTrainer:
         batch_size = latent.shape[0]
         device = latent.device
 
-        # Sample random timesteps for teacher and student
-        t_student = torch.randint(0, self.diffusion_config.student_steps, (batch_size,), device=device)
-        t_teacher = torch.randint(0, self.diffusion_config.teacher_steps, (batch_size,), device=device)
+        # Distill teacher and student predictions at the exact same timestep.
+        t_student = torch.randint(
+            0,
+            self.diffusion_config.timesteps,
+            (batch_size,),
+            device=device,
+        )
+        t_teacher = t_student
 
         # Compute consistency loss
         return self.consistency_model.consistency_loss(
@@ -3494,8 +4300,10 @@ class OptimizedDiffusionTrainer:
         """Measure reconstruction overlap and generated-aircraft validity."""
         max_samples = max(1, int(self.training_config.overfit_geometry_gate_samples))
         recall_values: List[float] = []
+        generated_recall_values: List[float] = []
         valid_count = 0
         sample_count = 0
+        generated_evaluation_count = 0
         converter_was_training = self.converter.training
         student_was_training = self.consistency_model.student_model.training
         self.converter.eval()
@@ -3518,14 +4326,23 @@ class OptimizedDiffusionTrainer:
                 reconstruction_probs = torch.sigmoid(
                     self.converter(latent).nan_to_num(0.0)
                 )
-                generated_latent = self.consistency_model.fast_inference(
-                    latent.shape,
-                    num_steps=self.diffusion_config.student_steps,
-                    condition=condition,
-                ).nan_to_num(0.0)
-                generated_probs = torch.sigmoid(
-                    self.converter(generated_latent).nan_to_num(0.0)
-                )
+                seeded_generated_probs: List[torch.Tensor] = []
+                for generation_seed in range(
+                    max(1, int(self.training_config.promotion_generation_seeds))
+                ):
+                    torch.manual_seed(generation_seed)
+                    if self.device.type == "cuda":
+                        torch.cuda.manual_seed_all(generation_seed)
+                    generated_latent = self.consistency_model.fast_inference(
+                        latent.shape,
+                        num_steps=self.diffusion_config.student_steps,
+                        condition=condition,
+                    ).nan_to_num(0.0)
+                    seeded_generated_probs.append(
+                        torch.sigmoid(
+                            self.converter(generated_latent).nan_to_num(0.0)
+                        )
+                    )
 
                 for index in range(latent.shape[0]):
                     target = target_batch[index] > 0.5
@@ -3538,12 +4355,21 @@ class OptimizedDiffusionTrainer:
                     overlap = int(torch.logical_and(reconstruction, target).sum().item())
                     recall_values.append(overlap / max(target_occupied, 1))
 
-                    generated = _binarize_probability_grid_for_solver(
-                        generated_probs[index],
-                        target_occupancy=target_fraction,
-                    )
-                    validity = evaluate_aircraft_validity(generated)
-                    valid_count += int(validity.get("status") == "pass")
+                    for generated_probs in seeded_generated_probs:
+                        generated = _binarize_probability_grid_for_solver(
+                            generated_probs[index],
+                            target_occupancy=target_fraction,
+                        )
+                        generated_bool = generated > 0.5
+                        generated_overlap = int(
+                            torch.logical_and(generated_bool, target).sum().item()
+                        )
+                        generated_recall_values.append(
+                            generated_overlap / max(target_occupied, 1)
+                        )
+                        validity = evaluate_aircraft_validity(generated)
+                        valid_count += int(validity.get("status") == "pass")
+                        generated_evaluation_count += 1
                     sample_count += 1
                     if sample_count >= max_samples:
                         break
@@ -3557,9 +4383,20 @@ class OptimizedDiffusionTrainer:
             "reconstruction_topk_recall": (
                 float(np.mean(recall_values)) if recall_values else 0.0
             ),
+            "generated_topk_recall": (
+                float(np.mean(generated_recall_values))
+                if generated_recall_values
+                else 0.0
+            ),
+            "generated_worst_topk_recall": (
+                float(np.min(generated_recall_values))
+                if generated_recall_values
+                else 0.0
+            ),
+            "generated_evaluation_count": generated_evaluation_count,
             "generated_aircraft_valid_count": valid_count,
             "generated_aircraft_valid_fraction": (
-                valid_count / max(sample_count, 1)
+                valid_count / max(generated_evaluation_count, 1)
             ),
         }
         return evaluate_geometry_promotion_gate(metrics, self.training_config)
@@ -3586,11 +4423,6 @@ class OptimizedDiffusionTrainer:
                 epoch += 1
                 epoch_limit_label = "until-overfit" if train_until_overfit else str(epochs)
                 print(f"\nGrid {grid_size} - Epoch {epoch}/{epoch_limit_label}")
-
-                # Progressive distillation
-                if (epoch - 1) % 10 == 0 and epoch > 1:
-                    print("Running progressive distillation...")
-                    self._run_progressive_distillation(train_loader)
 
                 metrics = self.train_epoch(train_loader, grid_size=grid_size)
                 epoch_record = {
@@ -3645,12 +4477,6 @@ class OptimizedDiffusionTrainer:
             self.scheduler.step()
         return history
 
-    def _run_progressive_distillation(self, train_loader: DataLoader):
-        """Run progressive distillation through step counts"""
-        self._sync_consistency_teacher()
-        distillation_results = self.consistency_model.progressive_distillation(train_loader)
-        print(f"Progressive distillation completed: {distillation_results}")
-
     def save_checkpoint(self, path: str):
         """Save training checkpoint with all models"""
         self._sync_consistency_teacher()
@@ -3681,7 +4507,21 @@ class OptimizedDiffusionTrainer:
         self._sync_consistency_teacher()
         self.converter.load_state_dict(checkpoint['converter'])
         self.ema_model.load_state_dict(checkpoint['ema_model'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        optimizer_state_loaded = True
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        except ValueError as exc:
+            optimizer_state_loaded = False
+            print(
+                "Checkpoint optimizer groups are incompatible with the current global config; "
+                f"loaded model weights with fresh optimizer state ({exc})."
+            )
+        applied_learning_rates = apply_configured_optimizer_learning_rates(
+            self.optimizer,
+            self.training_config,
+        )
+        if applied_learning_rates:
+            print(f"Applied configured optimizer learning rates: {applied_learning_rates}")
         restored_zero_lr = restore_resume_learning_rate_if_zero(self.optimizer, self.training_config.learning_rate)
         if restored_zero_lr:
             self.scheduler = CosineAnnealingLR(
@@ -3692,12 +4532,39 @@ class OptimizedDiffusionTrainer:
                 "Restored optimizer learning rate from the current training config "
                 f"({self.training_config.learning_rate}) after loading a zero-LR checkpoint."
             )
-        elif 'scheduler' in checkpoint:
+        elif optimizer_state_loaded and 'scheduler' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler'])
         if 'scaler' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler'])
+        if self.training_config.offload_optimizer_state_between_steps:
+            offloaded_bytes = move_optimizer_state(self.optimizer, "cpu")
+            if offloaded_bytes:
+                print(
+                    "Offloaded resumed optimizer state between steps: "
+                    f"{offloaded_bytes / (1024 ** 2):.1f} MiB"
+                )
         self.global_step = checkpoint['global_step']
         print(f"Optimized checkpoint loaded from {path}")
+
+    def warm_start_checkpoint(self, path: str) -> Dict[str, Any]:
+        """Warm-start a widened decoder while preserving compatible learned models."""
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.diffusion_model.load_state_dict(checkpoint["diffusion_model"])
+        self.consistency_model.load_state_dict(checkpoint["consistency_model"])
+        converter_report = load_width_expanded_state_dict(
+            self.converter,
+            checkpoint["converter"],
+        )
+        self.ema_model.load_state_dict(checkpoint["ema_model"])
+        self.global_step = int(checkpoint.get("global_step", 0))
+        self._sync_consistency_teacher()
+        report = {
+            "source": str(Path(path).resolve()),
+            "converter": converter_report,
+            "optimizer_state_loaded": False,
+        }
+        print(f"Warm-started widened model from {path}: {report}")
+        return report
 
 # ============================================================================
 # INFERENCE & MARCHING CUBES WITH OPTIMIZATIONS
@@ -3730,6 +4597,11 @@ class OptimizedAircraftGenerator:
             self.model_config.latent_dim,
             self.model_config.grid_resolution,
             coordinate_decoder_threshold=coordinate_decoder_threshold,
+            coordinate_chunk_size=self.model_config.coordinate_chunk_size,
+            coordinate_decoder_width=self.model_config.coordinate_decoder_width,
+            coordinate_decoder_depth=self.model_config.coordinate_decoder_depth,
+            coordinate_fourier_bands=self.model_config.coordinate_fourier_bands,
+            enable_coordinate_gradient_checkpointing=False,
         ).to(self.device)
 
         # Load consistency model
@@ -3793,6 +4665,10 @@ class OptimizedAircraftGenerator:
 
         # Threshold to get binary grid
         binary_grid = (voxel_np > 0.5).astype(np.float32)
+        validity = evaluate_aircraft_validity(binary_grid.astype(np.uint8))
+        if validity.get("status") != "pass":
+            failed = ", ".join(validity.get("failed_checks", [])) or "unknown aircraft validity failure"
+            raise ValueError("Refusing to export an aircraft-invalid voxel field: " + failed)
 
         if use_marching_cubes:
             print("Applying marching cubes with adaptive mesh refinement...")
@@ -3811,6 +4687,10 @@ class OptimizedAircraftGenerator:
                 vertices = vertices * h - (scale * 0.5) + (0.5 * h)
 
                 print(f"Generated optimized mesh: {len(vertices)} vertices, {len(faces)} faces")
+                if len(faces) > 250_000:
+                    raise ValueError(
+                        f"Refusing pathological mesh with {len(faces):,} faces; limit is 250,000"
+                    )
 
                 # Simplify mesh if too complex for performance
                 if len(faces) > 10000:
@@ -3826,6 +4706,8 @@ class OptimizedAircraftGenerator:
 
                 self._write_stl(output_path, vertices, faces)
                 print(f"Optimized STL file written to {output_path}")
+            except ValueError:
+                raise
             except Exception as e:
                 print(f"Marching cubes failed: {e}. Writing voxel representation instead.")
                 self._write_voxel_stl(output_path, binary_grid)
@@ -4442,6 +5324,28 @@ def _validate_run_class_inputs(
             raise click.UsageError(
                 f"Final run class requires a non-empty dataset manifest: {dataset_manifest}"
             )
+        manifest_validation = validate_manifest_file(
+            dataset_manifest,
+            level="claim-bearing",
+        )
+        if manifest_validation["status"] != "pass":
+            raise click.UsageError(
+                "Final run class requires a claim-bearing manifest that passes the distinct-geometry gate: "
+                + "; ".join(manifest_validation["errors"] or [
+                    f"unique geometry target met={manifest_validation['unique_geometry_target_met']}"
+                ])
+            )
+        missing_canonicalization = [
+            str(record.get("source_id") or record.get("sample_id") or index)
+            for index, record in enumerate(records)
+            if not isinstance(record.get("canonicalization"), Mapping)
+            or not record.get("canonical_content_sha256")
+        ]
+        if missing_canonicalization:
+            raise click.UsageError(
+                "Final run class requires canonical persisted voxels and canonical-content hashes; "
+                f"missing for {len(missing_canonicalization)} records."
+            )
 
 @click.group()
 def cli():
@@ -4453,10 +5357,10 @@ def cli():
     pass
 
 @cli.command()
-@click.option('--num-epochs', default=100, help='Number of training epochs')
-@click.option('--batch-size', default=4, help='Batch size')
-@click.option('--learning-rate', default=2e-4, help='Learning rate')
-@click.option('--latent-dim', default=16, help='Latent dimension')
+@click.option('--num-epochs', default=int(config_value('training', 'num_epochs', 200)), help='Number of training epochs')
+@click.option('--batch-size', default=int(config_value('training', 'batch_size', 1)), help='Batch size')
+@click.option('--learning-rate', default=float(config_value('training', 'learning_rate', 2e-4)), help='Learning rate')
+@click.option('--latent-dim', default=int(config_value('model', 'latent_dim', 192)), help='Latent dimension')
 @click.option('--grid-size', default=None, type=int, help='Optional voxel resolution override for training and CFD')
 @click.option('--precision', default='float32', help='Precision: float64, float32, float16, bfloat16, float8')
 @click.option('--disconnection-penalty', default=30.0, help='Penalty for disconnected voxels')
@@ -4473,22 +5377,20 @@ def cli():
 @click.option('--enable-checkpointing/--disable-checkpointing', default=True, help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
 @click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
-@click.option('--coordinate-training-samples', default=32768, help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
-@click.option('--coordinate-positive-fraction', default=0.5, help='Fraction of sampled high-resolution coordinates drawn from occupied voxels when available')
-@click.option('--coordinate-decoder-threshold', default=96, help='Use the coordinate decoder at this grid size or above; set to 1 for matched coordinate-decoder sweeps.')
-@click.option('--full-diagnostic-interval', default=100, help='Full-grid diagnostic decode interval for high-resolution coordinate decoders; 0 disables full diagnostics')
-@click.option('--direct-solver-loss-weight', default=0.0, help='Weight for direct measured CFD/connectivity SPSA optimizer loss.')
-@click.option('--direct-solver-interval', default=1, help='For coordinate decoders, materialize full-grid direct solver loss every N batches.')
-@click.option('--direct-solver-steps', default=5, help='Internal solver steps per direct loss evaluation.')
-@click.option('--direct-solver-perturbation', default=0.15, help='Two-sided SPSA voxel-probability perturbation size.')
-@click.option('--direct-solver-perturbation-grid-size', default=0, help='Optional low-frequency SPSA perturbation grid edge length; 0 uses per-voxel noise.')
+@click.option('--coordinate-training-samples', default=int(config_value('training', 'coordinate_training_samples', 32768)), help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
+@click.option('--coordinate-positive-fraction', default=float(config_value('training', 'coordinate_positive_fraction', 0.5)), help='Fraction of sampled high-resolution coordinates drawn from occupied voxels when available')
+@click.option('--coordinate-decoder-threshold', default=int(config_value('model', 'coordinate_decoder_threshold', 96)), help='Use the coordinate decoder at this grid size or above; set to 1 for matched coordinate-decoder sweeps.')
+@click.option('--direct-solver-loss-weight', default=float(config_value('training', 'direct_solver_loss_weight', 1.0)), help='Weight for direct measured CFD/connectivity SPSA optimizer loss.')
+@click.option('--direct-solver-interval', default=int(config_value('training', 'direct_solver_interval', 1)), help='For coordinate decoders, materialize full-grid direct solver loss every N batches.')
+@click.option('--direct-solver-steps', default=int(config_value('training', 'direct_solver_steps', 5)), help='Internal solver steps per direct loss evaluation.')
+@click.option('--direct-solver-directions', default=int(config_value('training', 'direct_solver_directions', 16)), help='Antithetic SPSA directions; each direction adds two sequential solver calls.')
+@click.option('--direct-solver-perturbation', default=float(config_value('training', 'direct_solver_perturbation', 0.15)), help='Two-sided SPSA voxel-probability perturbation size.')
+@click.option('--direct-solver-perturbation-grid-size', default=int(config_value('training', 'direct_solver_perturbation_grid_size', 12)), help='Optional low-frequency SPSA perturbation grid edge length; 0 uses per-voxel noise.')
 @click.option('--direct-solver-gradient-clip', default=1.0, help='L2 clip applied to the estimated direct solver gradient.')
-@click.option('--direct-connectivity-weight', default=0.0, help='Weight for exact connected-component loss inside the direct measured objective.')
-@click.option('--direct-aircraft-validity-weight', default=0.0, help='Weight for aircraft-shape regression failures inside the direct measured SPSA objective.')
+@click.option('--direct-connectivity-weight', default=float(config_value('training', 'direct_connectivity_weight', 1.0)), help='Weight for exact connected-component loss inside the direct measured objective.')
+@click.option('--direct-aircraft-validity-weight', default=float(config_value('training', 'direct_aircraft_validity_weight', 1.0)), help='Weight for aircraft-shape regression failures inside the direct measured SPSA objective.')
 @click.option('--direct-solver-target-occupancy', default=None, type=float, help='Optional top-k occupancy fraction for direct solver binarization.')
-@click.option('--require-direct-solver-every-iteration', is_flag=True, default=False, help='Fail unless CFD, connectivity, and aircraft-validity losses run on every optimizer iteration.')
-@click.option('--connectivity-monitor-interval', default=1, help='Exact connected-component monitor interval; 0 disables it.')
-@click.option('--aerodynamic-monitor-interval', default=10, help='Raw internal CFD monitor interval; 0 disables it.')
+@click.option('--require-direct-solver-every-iteration', is_flag=True, default=bool(config_value('training', 'require_direct_solver_every_iteration', True)), help='Fail unless CFD, connectivity, and aircraft-validity losses run on every optimizer iteration.')
 @click.option('--train-until-overfit/--fixed-epoch-count', default=False, help='Ignore the epoch count as a stop condition and stop only when the configured overfit policy triggers.')
 @click.option('--overfit-stop-metric', default='optimization_loss', help='History metric used by --train-until-overfit.')
 @click.option('--overfit-min-epochs', default=3, type=int, help='Minimum epochs before overfit-stop checks may stop training.')
@@ -4502,9 +5404,9 @@ def cli():
 def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
           num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
           enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, coordinate_decoder_threshold,
-          full_diagnostic_interval, direct_solver_loss_weight, direct_solver_interval, direct_solver_steps, direct_solver_perturbation,
+          direct_solver_loss_weight, direct_solver_interval, direct_solver_steps, direct_solver_directions, direct_solver_perturbation,
           direct_solver_perturbation_grid_size, direct_solver_gradient_clip, direct_connectivity_weight, direct_aircraft_validity_weight,
-          direct_solver_target_occupancy, require_direct_solver_every_iteration, connectivity_monitor_interval, aerodynamic_monitor_interval,
+          direct_solver_target_occupancy, require_direct_solver_every_iteration,
           train_until_overfit, overfit_stop_metric, overfit_min_epochs, overfit_loss_floor, overfit_patience, overfit_min_delta,
           overfit_relative_delta, overfit_geometry_gate_samples, overfit_min_reconstruction_topk_recall,
           overfit_min_generated_aircraft_valid_fraction):
@@ -4579,12 +5481,34 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         print(f"Using dataset artifact lattice resolution: {base_resolution}^3")
 
     # Optimized configs
-    model_config = model_config_override if model_config_override else ModelConfig(
-        latent_dim=latent_dim,
-        attention_groups=4,  # Grouped-query attention
-        enable_gradient_checkpointing=enable_checkpointing,
-        use_torch_compile=enable_compile  # Respect the enable-compile flag
-    )
+    if model_config_override is not None:
+        model_config = model_config_override
+    elif dataset_manifest:
+        unique_geometry_count = int(
+            getattr(dataset, "metadata", {}).get("unique_geometry_count", len(dataset))
+        )
+        model_config = ModelConfig.scaled_for_corpus(
+            unique_geometry_count,
+            base_resolution,
+            conditioning_dim=infer_conditioning_dim(),
+            latent_dim=latent_dim,
+        )
+        model_config.enable_gradient_checkpointing = enable_checkpointing
+        model_config.use_torch_compile = enable_compile
+        print(
+            "Selected corpus-scaled architecture "
+            f"for {unique_geometry_count} unique geometries: latent_dim={model_config.latent_dim}, "
+            f"coordinate_width={model_config.coordinate_decoder_width}."
+        )
+    else:
+        model_config = ModelConfig(
+            latent_dim=latent_dim,
+            attention_groups=4,
+            base_grid_resolution=base_resolution,
+            grid_resolution=base_resolution,
+            enable_gradient_checkpointing=enable_checkpointing,
+            use_torch_compile=enable_compile,
+        )
     if model_config_override is not None:
         checkpoint_grid = int(model_config_override.grid_resolution)
         if checkpoint_grid != base_resolution:
@@ -4593,6 +5517,16 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
             )
     if model_config.conditioning_dim == 0:
         model_config.conditioning_dim = infer_conditioning_dim()
+
+    if dataset_manifest and int(dataset.latent_dim) != int(model_config.latent_dim):
+        # Corpus scaling can choose a wider latent than the legacy CLI default.
+        # Rebuild deterministic manifest latents to the model's exact width.
+        dataset = AircraftDesignDataset(
+            num_samples=num_samples,
+            grid_size=base_resolution,
+            latent_dim=model_config.latent_dim,
+            manifest_path=dataset_manifest,
+        )
 
     diffusion_config = DiffusionConfig(
         teacher_steps=1000,
@@ -4610,10 +5544,10 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         coordinate_training_samples=coordinate_training_samples,
         coordinate_positive_fraction=coordinate_positive_fraction,
         coordinate_decoder_threshold=coordinate_decoder_threshold,
-        full_diagnostic_interval=full_diagnostic_interval,
         direct_solver_loss_weight=direct_solver_loss_weight,
         direct_solver_interval=direct_solver_interval,
         direct_solver_steps=direct_solver_steps,
+        direct_solver_directions=direct_solver_directions,
         direct_solver_perturbation=direct_solver_perturbation,
         direct_solver_perturbation_grid_size=direct_solver_perturbation_grid_size,
         direct_solver_gradient_clip=direct_solver_gradient_clip,
@@ -4621,8 +5555,6 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         direct_aircraft_validity_weight=direct_aircraft_validity_weight,
         direct_solver_target_occupancy=direct_solver_target_occupancy,
         require_direct_solver_every_iteration=require_direct_solver_every_iteration,
-        connectivity_monitor_interval=connectivity_monitor_interval,
-        aerodynamic_monitor_interval=aerodynamic_monitor_interval,
         overfit_stop_enabled=train_until_overfit,
         overfit_stop_metric=overfit_stop_metric,
         overfit_min_epochs=overfit_min_epochs,

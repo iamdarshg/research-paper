@@ -1,0 +1,41 @@
+from pathlib import Path
+
+import yaml
+
+from aircraft_diffusion_cfd import ModelConfig
+from experiment_config import GLOBAL_CONFIG_PATH, load_global_config
+from update_model_capacity_report import END_MARKER, START_MARKER, _config_digest, build_report
+
+
+def test_global_config_drives_default_and_scaled_latent_width():
+    config = load_global_config()
+    assert GLOBAL_CONFIG_PATH.name == "config.yaml"
+    assert int(config["model"]["latent_dim"]) == 192
+    assert ModelConfig().latent_dim == 192
+    assert ModelConfig.scaled_for_corpus(349, 96).latent_dim == 192
+
+
+def test_global_config_rejects_missing_required_sections(tmp_path: Path):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"model": {"latent_dim": 192}}), encoding="utf-8")
+    try:
+        load_global_config(path)
+    except ValueError as exc:
+        assert "missing mapping sections" in str(exc)
+    else:
+        raise AssertionError("incomplete config should fail closed")
+
+
+def test_capacity_report_is_explicit_about_memory_limitations():
+    report = build_report()
+    assert report.startswith(START_MARKER)
+    assert report.endswith(END_MARKER)
+    assert "Trainable parameters" in report
+    assert "not measured peak VRAM" in report
+
+
+def test_config_digest_is_independent_of_mapping_order():
+    first = {"model": {"latent_dim": 192, "grid_resolution": 96}, "training": {"batch_size": 1}}
+    reordered = {"training": {"batch_size": 1}, "model": {"grid_resolution": 96, "latent_dim": 192}}
+
+    assert _config_digest(first) == _config_digest(reordered)

@@ -46,6 +46,7 @@ def summarize_stability(
     convergence_cv_threshold: float = 0.08,
     convergence_drift_threshold: float = 0.35,
     oscillation_cv_threshold: float = 0.30,
+    required_geometry_loss_max: float | None = None,
 ) -> Dict[str, Any]:
     if not history:
         return {
@@ -70,8 +71,26 @@ def summarize_stability(
 
     metric_stats = _rolling_stats(item.get(metric, 0.0) for item in recent)
     total_stats = _rolling_stats(item.get("loss", 0.0) for item in recent)
-    aero_stats = _rolling_stats(item.get("aerodynamic", 0.0) for item in recent)
-    connectivity_stats = _rolling_stats(item.get("connectivity", 0.0) for item in recent)
+    aero_stats = _rolling_stats(
+        item.get("direct_aero_loss", item.get("aerodynamic", 0.0))
+        for item in recent
+    )
+    connectivity_stats = _rolling_stats(
+        item.get("direct_connectivity_loss", item.get("connectivity", 0.0))
+        for item in recent
+    )
+
+    geometry_checks: Dict[str, bool] = {}
+    if required_geometry_loss_max is not None:
+        for geometry_metric in (
+            "clean_geometry_reconstruction",
+            "generation_reconstruction",
+        ):
+            if geometry_metric in recent[-1]:
+                geometry_checks[geometry_metric] = (
+                    float(recent[-1][geometry_metric]) <= float(required_geometry_loss_max)
+                )
+    geometry_ready = all(geometry_checks.values()) if geometry_checks else True
 
     converged = (
         metric_stats["cv"] <= convergence_cv_threshold
@@ -80,6 +99,7 @@ def summarize_stability(
             convergence_target is None
             or metric_stats["mean"] <= convergence_target
         )
+        and geometry_ready
     )
     oscillating = total_stats["cv"] >= oscillation_cv_threshold
     aerodynamic_diverging = (
@@ -109,7 +129,11 @@ def summarize_stability(
         suspected_root_cause = "aerodynamic_objective_drift"
 
     return {
-        "status": "converged" if converged else ("oscillating" if oscillating else "stable"),
+        "status": (
+            "converged"
+            if converged
+            else ("oscillating" if oscillating else ("stable" if geometry_ready else "stable_not_learned"))
+        ),
         "metric": metric,
         "window": window,
         "converged": converged,
@@ -123,5 +147,8 @@ def summarize_stability(
         "total_loss_stats": total_stats,
         "aerodynamic_stats": aero_stats,
         "connectivity_stats": connectivity_stats,
+        "geometry_learning_ready": geometry_ready,
+        "geometry_learning_checks": geometry_checks,
+        "required_geometry_loss_max": required_geometry_loss_max,
         "suspected_root_cause": suspected_root_cause,
     }

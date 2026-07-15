@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from collections import Counter
@@ -12,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import numpy as np
 
-from aircraft_validity import evaluate_aircraft_validity
+from aircraft_validity import canonicalize_aircraft_voxels, evaluate_aircraft_validity
 
 
 def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -46,10 +47,18 @@ def _geometry_path(record: Dict[str, Any], base_dir: Path) -> Path:
 def _record_for_output_manifest(record: Dict[str, Any], geometry_path: Path, output_manifest: Path) -> Dict[str, Any]:
     output_record = dict(record)
     output_record["geometry_path"] = os.path.relpath(
-        geometry_path,
+        geometry_path.resolve(),
         output_manifest.resolve().parent,
     ).replace("\\", "/")
     return output_record
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _metric_stats(sample_reports: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
@@ -86,6 +95,7 @@ def filter_manifest_by_aircraft_validity(
     manifest_path: Path,
     output_manifest: Path,
     output_report: Path,
+    canonical_geometry_dir: Path | None = None,
 ) -> Dict[str, Any]:
     records = _load_jsonl(manifest_path)
     base_dir = manifest_path.resolve().parent
@@ -94,11 +104,15 @@ def filter_manifest_by_aircraft_validity(
     failed_checks: Counter[str] = Counter()
     split_counts: Counter[str] = Counter()
     kept_split_counts: Counter[str] = Counter()
+    accepted_canonical_hashes: set[str] = set()
+    duplicate_canonical_geometry_count = 0
 
     for idx, record in enumerate(records):
         split_counts[str(record.get("split", ""))] += 1
         path = _geometry_path(record, base_dir)
-        validity = evaluate_aircraft_validity(np.load(path))
+        raw_voxels = np.load(path)
+        canonical_voxels, canonicalization = canonicalize_aircraft_voxels(raw_voxels)
+        validity = evaluate_aircraft_validity(canonical_voxels)
         status = str(validity["status"])
         for check_name in validity["failed_checks"]:
             failed_checks[str(check_name)] += 1
@@ -117,7 +131,26 @@ def filter_manifest_by_aircraft_validity(
         sample_reports.append(sample_report)
 
         if status == "pass":
-            kept_records.append(_record_for_output_manifest(record, path, output_manifest))
+            if canonical_geometry_dir is None:
+                output_record = _record_for_output_manifest(record, path, output_manifest)
+            else:
+                canonical_geometry_dir.mkdir(parents=True, exist_ok=True)
+                sample_id = str(record.get("sample_id") or record.get("source_id") or idx)
+                destination = canonical_geometry_dir / f"{sample_id}.npy"
+                np.save(destination, canonical_voxels.numpy().astype(np.uint8))
+                output_record = _record_for_output_manifest(record, destination, output_manifest)
+                output_record["voxel_sha256"] = _sha256_file(destination)
+                output_record["canonicalization"] = canonicalization
+            canonical_hash = hashlib.sha256(
+                canonical_voxels.numpy().astype(np.uint8).tobytes()
+            ).hexdigest()
+            if canonical_hash in accepted_canonical_hashes:
+                duplicate_canonical_geometry_count += 1
+                sample_report["status"] = "duplicate"
+                sample_report["duplicate_canonical_geometry"] = True
+                continue
+            accepted_canonical_hashes.add(canonical_hash)
+            kept_records.append(output_record)
             kept_split_counts[str(record.get("split", ""))] += 1
 
     _write_jsonl(output_manifest, kept_records)
@@ -125,9 +158,13 @@ def filter_manifest_by_aircraft_validity(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_manifest": str(manifest_path.resolve()),
         "output_manifest": str(output_manifest.resolve()),
+        "canonical_geometry_dir": (
+            str(canonical_geometry_dir.resolve()) if canonical_geometry_dir is not None else None
+        ),
         "source_record_count": len(records),
         "kept_record_count": len(kept_records),
         "rejected_record_count": len(records) - len(kept_records),
+        "duplicate_canonical_geometry_count": duplicate_canonical_geometry_count,
         "source_split_counts": dict(split_counts),
         "kept_split_counts": dict(kept_split_counts),
         "failed_check_counts": dict(failed_checks),
@@ -149,12 +186,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--manifest", required=True, help="Input grounded JSONL manifest.")
     parser.add_argument("--output-manifest", required=True, help="Filtered manifest path.")
     parser.add_argument("--output-report", required=True, help="JSON report path.")
+    parser.add_argument(
+        "--canonical-geometry-dir",
+        default=None,
+        help="Optional directory where passing grids are persisted in canonical orientation.",
+    )
     args = parser.parse_args(argv)
 
     report = filter_manifest_by_aircraft_validity(
         Path(args.manifest),
         Path(args.output_manifest),
         Path(args.output_report),
+        Path(args.canonical_geometry_dir) if args.canonical_geometry_dir else None,
     )
     print(json.dumps({key: report[key] for key in (
         "source_record_count",
