@@ -151,9 +151,9 @@ class ModelConfig:
     decoder_channels: List[int] = None
     conditioning_dim: int = 0
     # Grouped-query attention instead of multi-head
-    attention_groups: int = 8  # 4 groups instead of 8 heads (50% KV-cache reduction)
-    attention_kv_groups: int = 8  # Groups for key/value
-    num_attention_layers: int = 4
+    attention_groups: int = int(config_value("model", "attention_groups", 8))
+    attention_kv_groups: int = int(config_value("model", "attention_kv_groups", 4))
+    num_attention_layers: int = int(config_value("model", "num_attention_layers", 4))
     # Grid resolution - configurable for different lattice sizes
     base_grid_resolution: int = int(config_value("model", "grid_resolution", 96))
     grid_resolution: int = None  # Working grid resolution (defaults to base_grid_resolution if not set)
@@ -173,6 +173,15 @@ class ModelConfig:
         # Set working grid resolution if not specified
         if self.grid_resolution is None:
             self.grid_resolution = self.base_grid_resolution
+        if self.attention_groups <= 0 or self.attention_kv_groups <= 0:
+            raise ValueError("attention group counts must be positive")
+        if self.attention_groups % self.attention_kv_groups != 0:
+            raise ValueError("attention_groups must be divisible by attention_kv_groups")
+        for channels in self.encoder_channels + self.decoder_channels:
+            if channels % self.attention_groups != 0:
+                raise ValueError(
+                    f"channel width {channels} must be divisible by {self.attention_groups} attention groups"
+                )
 
     @classmethod
     def scaled_for_corpus(
@@ -220,8 +229,15 @@ class ModelConfig:
 
         channel_anchor = float(scaling["high_resolution_channel_base"])
         decoder_anchor = float(scaling["high_resolution_decoder_width"])
-        channel_base = min(96, max(48, round_to_multiple(channel_anchor * scale, 8)))
-        decoder_width = min(768, max(384, round_to_multiple(decoder_anchor * scale, 64)))
+        channel_base = min(
+            int(scaling.get("maximum_high_resolution_channel_base", 128)),
+            max(48, round_to_multiple(channel_anchor * scale, 8)),
+        )
+        channel_step = int(scaling.get("high_resolution_channel_step", 48))
+        decoder_width = min(
+            int(scaling.get("maximum_high_resolution_decoder_width", 1024)),
+            max(384, round_to_multiple(decoder_anchor * scale, 64)),
+        )
         decoder_depth = (
             int(scaling["high_resolution_decoder_depth"])
             if unique_geometry_count < int(scaling["large_corpus_threshold"])
@@ -229,8 +245,8 @@ class ModelConfig:
         )
         return cls(
             latent_dim=resolved_latent_dim,
-            encoder_channels=[channel_base, channel_base + 32, channel_base + 64],
-            decoder_channels=[channel_base + 64, channel_base + 32, channel_base],
+            encoder_channels=[channel_base, channel_base + channel_step, channel_base + 2 * channel_step],
+            decoder_channels=[channel_base + 2 * channel_step, channel_base + channel_step, channel_base],
             conditioning_dim=conditioning_dim,
             base_grid_resolution=grid_resolution,
             grid_resolution=grid_resolution,
@@ -307,9 +323,16 @@ class TrainingConfig:
     overfit_min_delta: float = 1.0e-4
     overfit_relative_delta: float = 1.0e-3
     overfit_geometry_gate_enabled: bool = True
-    overfit_geometry_gate_samples: int = 8
+    overfit_geometry_gate_samples: int = int(
+        config_value("training", "overfit_geometry_gate_samples", 16)
+    )
     overfit_min_reconstruction_topk_recall: float = 0.2
-    overfit_min_generated_aircraft_valid_fraction: float = 0.125
+    overfit_min_generated_aircraft_valid_fraction: float = float(
+        config_value("training", "overfit_min_generated_aircraft_valid_fraction", 0.125)
+    )
+    promotion_interval_epochs: int = int(
+        config_value("training", "promotion_interval_epochs", 1)
+    )
     promotion_generation_seeds: int = int(
         config_value("training", "promotion_generation_seeds", 3)
     )
@@ -942,6 +965,7 @@ CONDITIONING_SCALAR_NORMALIZATION = {
 }
 MANUFACTURING_METHOD_VOCAB = CONDITIONING_CATEGORICAL_FEATURES["manufacturing_method"]
 DATASET_ARTIFACT_SCHEMA_VERSION = 2
+LATENT_SCHEMA_VERSION = "multiscale-geometry-v2"
 RUN_CLASS_SMOKE = "smoke"
 RUN_CLASS_FINAL = "final"
 
@@ -1033,6 +1057,7 @@ def _legacy_dataset_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "artifact_schema_version": 1,
         "condition_schema_version": CONDITIONING_SCHEMA_VERSION,
+        "latent_schema_version": "legacy-coarse-v1",
         "condition_vector_layout": condition_vector_layout(),
         "data_source": "legacy_unknown",
         "legacy_compatibility_mode": True,
@@ -1071,6 +1096,7 @@ def build_dataset_artifact_metadata(
     return {
         "artifact_schema_version": DATASET_ARTIFACT_SCHEMA_VERSION,
         "condition_schema_version": CONDITIONING_SCHEMA_VERSION,
+        "latent_schema_version": LATENT_SCHEMA_VERSION,
         "condition_schema_path": CONDITIONING_SCHEMA_PATH.name,
         "condition_vector_layout": condition_vector_layout(),
         "num_samples": int(num_samples),
@@ -1307,7 +1333,14 @@ def build_structured_latent_code(
     generator: Optional[torch.Generator] = None,
     include_design_proxies: bool = True,
 ) -> torch.Tensor:
-    """Create a deterministic latent target tied to both conditions and geometry."""
+    """Create a bounded, deterministic multi-scale geometry latent.
+
+    The previous representation devoted 184/192 values to a zero condition
+    projection for unconditioned public CAD. Distinct aircraft then differed
+    in only seven coarse statistics. This descriptor preserves volumetric and
+    orthographic shape information while keeping every value in the diffusion
+    model's configured [0, 1] support.
+    """
     geometry = geometry.to(torch.float32)
     occupied = (geometry > 0.5).to(torch.float32)
     coords = torch.nonzero(occupied, as_tuple=False)
@@ -1339,13 +1372,46 @@ def build_structured_latent_code(
             dtype=torch.float32,
         )
 
-    signature_dim = max(4, latent_dim - geom_stats.numel())
-    condition_signature = _project_condition_signature(condition_vector, signature_dim)
-    base = torch.cat([condition_signature, geom_stats], dim=0)
-    if base.numel() < latent_dim:
-        noise = 0.02 * torch.randn(latent_dim - base.numel(), generator=generator)
-        base = torch.cat([base, noise.to(torch.float32)], dim=0)
-    return base[:latent_dim].to(torch.float32)
+    occupied_5d = occupied.unsqueeze(0).unsqueeze(0)
+    volume_signature = F.adaptive_avg_pool3d(
+        occupied_5d,
+        output_size=(4, 4, 4),
+    ).flatten()
+    projection_signatures = []
+    for axis in range(3):
+        projection = occupied.amax(dim=axis).unsqueeze(0).unsqueeze(0)
+        projection_signatures.append(
+            F.adaptive_avg_pool2d(projection, output_size=(6, 6)).flatten()
+        )
+    geometry_signature = torch.cat(
+        [geom_stats, volume_signature, *projection_signatures],
+        dim=0,
+    ).clamp_(0.0, 1.0)
+
+    if latent_dim <= geometry_signature.numel():
+        return F.adaptive_avg_pool1d(
+            geometry_signature.view(1, 1, -1),
+            latent_dim,
+        ).flatten().to(torch.float32)
+
+    remaining = latent_dim - geometry_signature.numel()
+    normalized_condition = normalize_condition_vector_tensor(
+        condition_vector.to(torch.float32)
+    ).clamp(0.0, 1.0)
+    condition_signature = normalized_condition[:remaining]
+    parts = [geometry_signature, condition_signature]
+    remaining -= int(condition_signature.numel())
+    if remaining > 0:
+        finer_geometry = F.adaptive_avg_pool3d(
+            occupied_5d,
+            output_size=(5, 5, 5),
+        ).flatten()
+        if remaining <= finer_geometry.numel():
+            parts.append(finer_geometry[:remaining])
+        else:
+            repeats = math.ceil(remaining / max(int(finer_geometry.numel()), 1))
+            parts.append(finer_geometry.repeat(repeats)[:remaining])
+    return torch.cat(parts, dim=0)[:latent_dim].to(torch.float32)
 
 
 def sample_design_spec(rng: Optional[random.Random] = None) -> DesignSpec:
@@ -1728,15 +1794,19 @@ def generate_condition_response_smoke_summary(
 # ============================================================================
 
 class GroupedQueryAttention(nn.Module):
-    """Memory-efficient grouped-query attention for 50% KV-cache reduction"""
+    """Grouped-query spatial attention with shared key/value heads."""
 
     def __init__(self, channels: int, num_groups: int = 4, num_kv_groups: int = 4):
         super().__init__()
         self.num_groups = num_groups
         self.num_kv_groups = num_kv_groups
         self.channels = channels
+        if channels % num_groups != 0:
+            raise ValueError("channels must be divisible by query groups")
+        if num_groups % num_kv_groups != 0:
+            raise ValueError("query groups must be divisible by key/value groups")
         self.group_size = channels // num_groups
-        self.kv_group_size = channels // num_kv_groups
+        self.kv_group_size = self.group_size
 
         self.scale = (self.group_size) ** -0.5
 
@@ -1744,8 +1814,9 @@ class GroupedQueryAttention(nn.Module):
         self.to_q = nn.Conv3d(channels, channels, 1)
 
         # KV projections: shared across KV groups
-        self.to_k = nn.Conv3d(channels, self.num_kv_groups * self.kv_group_size, 1)
-        self.to_v = nn.Conv3d(channels, self.num_kv_groups * self.kv_group_size, 1)
+        kv_channels = self.num_kv_groups * self.kv_group_size
+        self.to_k = nn.Conv3d(channels, kv_channels, 1)
+        self.to_v = nn.Conv3d(channels, kv_channels, 1)
 
         # Output projection
         self.to_out = nn.Conv3d(channels, channels, 1)
@@ -1825,6 +1896,17 @@ class ConsistencyModel(nn.Module):
         self.noise_schedule = NoiseSchedule(diffusion_config)
         self.latent_value_min = float(config_value("model", "latent_value_min", 0.0))
         self.latent_value_max = float(config_value("model", "latent_value_max", 1.0))
+        student_encoder_channels = [c // 2 for c in config.encoder_channels]
+        student_decoder_channels = [c // 2 for c in config.decoder_channels]
+        student_attention_groups = int(config.attention_groups)
+        for channels in student_encoder_channels + student_decoder_channels:
+            student_attention_groups = math.gcd(student_attention_groups, int(channels))
+        student_attention_groups = max(1, student_attention_groups)
+        student_kv_groups = math.gcd(
+            student_attention_groups,
+            int(config.attention_kv_groups),
+        )
+        student_kv_groups = max(1, student_kv_groups)
 
         # Teacher model (large, slow) - disable torch.compile for stability
         teacher_config = ModelConfig(
@@ -1833,6 +1915,8 @@ class ConsistencyModel(nn.Module):
             decoder_channels=config.decoder_channels,
             conditioning_dim=config.conditioning_dim,
             attention_groups=config.attention_groups,
+            attention_kv_groups=config.attention_kv_groups,
+            num_attention_layers=config.num_attention_layers,
             enable_gradient_checkpointing=config.enable_gradient_checkpointing,
             use_torch_compile=False  # Disable torch.compile for teacher to avoid overflow errors
         )
@@ -1841,10 +1925,12 @@ class ConsistencyModel(nn.Module):
         # Student model (small, fast)
         student_config = ModelConfig(
             latent_dim=config.latent_dim,
-            encoder_channels=[c // 2 for c in config.encoder_channels],  # Smaller
-            decoder_channels=[c // 2 for c in config.decoder_channels],
+            encoder_channels=student_encoder_channels,
+            decoder_channels=student_decoder_channels,
             conditioning_dim=config.conditioning_dim,
-            attention_groups=4,
+            attention_groups=student_attention_groups,
+            attention_kv_groups=student_kv_groups,
+            num_attention_layers=config.num_attention_layers,
             enable_gradient_checkpointing=True,
             use_torch_compile=False  # Disable torch.compile for student to avoid overflow errors
         )
@@ -2036,15 +2122,24 @@ class NoiseSchedule:
 class SpatialAttention(nn.Module):
     """Self-attention for spatial feature maps with grouped-query attention"""
 
-    def __init__(self, channels: int, num_heads: int = 8, num_groups: int = 4):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        num_groups: int = 8,
+        num_kv_groups: int = 4,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.num_groups = num_groups
         self.channels = channels
-        self.scale = (channels // num_heads) ** -0.5
 
         # Use grouped-query attention instead of multi-head
-        self.grouped_attention = GroupedQueryAttention(channels, num_groups, num_groups)
+        self.grouped_attention = GroupedQueryAttention(
+            channels,
+            num_groups,
+            num_kv_groups,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.grouped_attention(x)
@@ -2053,7 +2148,8 @@ class ResidualBlock3D(nn.Module):
     """3D residual block with optional attention and gradient checkpointing"""
 
     def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int,
-                 use_attention: bool = False, enable_checkpointing: bool = True):
+                 use_attention: bool = False, enable_checkpointing: bool = True,
+                 attention_groups: int = 8, attention_kv_groups: int = 4):
         super().__init__()
 
         self.time_mlp = nn.Sequential(
@@ -2080,7 +2176,11 @@ class ResidualBlock3D(nn.Module):
 
         # Use grouped-query attention with memory optimization
         if use_attention:
-            self.attention = SpatialAttention(out_channels, num_groups=4)
+            self.attention = SpatialAttention(
+                out_channels,
+                num_groups=attention_groups,
+                num_kv_groups=attention_kv_groups,
+            )
         else:
             self.attention = nn.Identity()
 
@@ -2136,19 +2236,31 @@ class LatentDiffusionUNet(nn.Module):
         channels = config.encoder_channels + [config.decoder_channels[-1]]
         self.down_blocks = nn.ModuleList()
         self.down_convs = nn.ModuleList()
+        block_count = len(channels) - 1
+        attention_budget = max(0, min(int(config.num_attention_layers), 2 * block_count + 1))
+        mid_uses_attention = attention_budget > 0
+        remaining_attention = max(0, attention_budget - int(mid_uses_attention))
+        down_attention_count = min(block_count, (remaining_attention + 1) // 2)
+        up_attention_count = min(block_count, remaining_attention - down_attention_count)
+        down_attention_indices = set(range(block_count - down_attention_count, block_count))
+        up_attention_indices = set(range(up_attention_count))
 
         for i in range(len(channels) - 1):
             self.down_blocks.append(ResidualBlock3D(
                 channels[i], channels[i+1], time_emb_dim,
-                use_attention=False,
-                enable_checkpointing=config.enable_gradient_checkpointing
+                use_attention=i in down_attention_indices,
+                enable_checkpointing=config.enable_gradient_checkpointing,
+                attention_groups=config.attention_groups,
+                attention_kv_groups=config.attention_kv_groups,
             ))
             self.down_convs.append(nn.Conv3d(channels[i+1], channels[i+1], 3, stride=1, padding=1))
 
         self.mid_block = ResidualBlock3D(
             channels[-1], channels[-1], time_emb_dim,
-            use_attention=False,
-            enable_checkpointing=config.enable_gradient_checkpointing
+            use_attention=mid_uses_attention,
+            enable_checkpointing=config.enable_gradient_checkpointing,
+            attention_groups=config.attention_groups,
+            attention_kv_groups=config.attention_kv_groups,
         )
 
         self.up_convs = nn.ModuleList()
@@ -2157,8 +2269,10 @@ class LatentDiffusionUNet(nn.Module):
             self.up_convs.append(nn.Conv3d(channels[i], channels[i-1], 3, stride=1, padding=1))
             self.up_blocks.append(ResidualBlock3D(
                 channels[i-1], channels[i-1], time_emb_dim,
-                use_attention=False,
-                enable_checkpointing=config.enable_gradient_checkpointing
+                use_attention=len(self.up_blocks) in up_attention_indices,
+                enable_checkpointing=config.enable_gradient_checkpointing,
+                attention_groups=config.attention_groups,
+                attention_kv_groups=config.attention_kv_groups,
             ))
 
         self.out_conv = nn.Conv3d(channels[0], channels[0], 1)
@@ -5484,11 +5598,21 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     if model_config_override is not None:
         model_config = model_config_override
     elif dataset_manifest:
-        unique_geometry_count = int(
+        observed_unique_geometry_count = int(
             getattr(dataset, "metadata", {}).get("unique_geometry_count", len(dataset))
         )
+        capacity_geometry_count = max(
+            observed_unique_geometry_count,
+            int(
+                config_value(
+                    "scaling",
+                    "capacity_basis_unique_geometries",
+                    observed_unique_geometry_count,
+                )
+            ),
+        )
         model_config = ModelConfig.scaled_for_corpus(
-            unique_geometry_count,
+            capacity_geometry_count,
             base_resolution,
             conditioning_dim=infer_conditioning_dim(),
             latent_dim=latent_dim,
@@ -5497,7 +5621,8 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         model_config.use_torch_compile = enable_compile
         print(
             "Selected corpus-scaled architecture "
-            f"for {unique_geometry_count} unique geometries: latent_dim={model_config.latent_dim}, "
+            f"for {observed_unique_geometry_count} observed / {capacity_geometry_count} capacity-basis "
+            f"geometries: latent_dim={model_config.latent_dim}, "
             f"coordinate_width={model_config.coordinate_decoder_width}."
         )
     else:

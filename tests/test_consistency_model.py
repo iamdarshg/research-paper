@@ -24,9 +24,21 @@ from aircraft_diffusion_cfd import (
     restore_resume_learning_rate_if_zero,
     LatentDiffusionUNet,
     LatentTo3DConverter,
+    GroupedQueryAttention,
     load_width_expanded_state_dict,
     move_optimizer_state,
 )
+
+
+def test_grouped_query_attention_shares_key_value_heads_and_preserves_shape():
+    attention = GroupedQueryAttention(channels=32, num_groups=8, num_kv_groups=4)
+    value = torch.randn(2, 32, 2, 2, 2)
+
+    output = attention(value)
+
+    assert output.shape == value.shape
+    assert attention.to_k.out_channels == 16
+    assert attention.to_v.out_channels == 16
 
 
 def test_consistency_add_noise_preserves_latent_shape():

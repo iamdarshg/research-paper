@@ -18,6 +18,7 @@ import os
 import tempfile
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -249,6 +250,28 @@ def validate_source_performance(performance: Mapping[str, Any]) -> Dict[str, flo
     return validated
 
 
+def assess_source_performance_for_geometry_admission(
+    performance: Mapping[str, Any],
+    *,
+    allow_unavailable: bool,
+) -> Tuple[Optional[Dict[str, float]], Dict[str, Any]]:
+    """Keep interference fail-closed while permitting explicitly unlabeled CAD."""
+    try:
+        validated = validate_source_performance(performance)
+        return validated, {"status": "validated", "reason": None}
+    except CorpusBuildError as exc:
+        if not allow_unavailable or exc.code != "performance_invalid":
+            raise
+        return None, {
+            "status": "unavailable",
+            "reason": str(exc),
+            "claim_boundary": (
+                "Source performance is excluded from labels and evidence; "
+                "this record is admitted for geometry training only."
+            ),
+        }
+
+
 def _load_json_member(archive: zipfile.ZipFile, member_name: str) -> Any:
     try:
         with archive.open(member_name) as handle:
@@ -339,7 +362,15 @@ def voxelize_mesh(mesh: trimesh.Trimesh, grid_size: int) -> np.ndarray:
 
 def _declared_linear_dimensions(payload: Any, *, parent_key: str = "") -> Iterator[float]:
     if isinstance(payload, Mapping):
+        parameter_name = payload.get("parameter_name")
+        if parameter_name is not None and "value" in payload:
+            yield from _declared_linear_dimensions(
+                payload["value"],
+                parent_key=_normalized_field_name(str(parameter_name)),
+            )
         for key, value in payload.items():
+            if parameter_name is not None and key == "value":
+                continue
             normalized = _normalized_field_name(str(key))
             yield from _declared_linear_dimensions(value, parent_key=normalized)
         return
@@ -428,6 +459,7 @@ def _record_from_design(
     design_id: str,
     output_dir: Path,
     grid_size: int,
+    allow_unavailable_performance: bool = False,
 ) -> Dict[str, Any]:
     members = {name.replace("\\", "/").strip("/") for name in archive.namelist()}
     member_paths = {member: f"{prefix}/{member}" for member in REQUIRED_MEMBERS}
@@ -441,7 +473,12 @@ def _record_from_design(
     performance = _load_json_member(archive, member_paths["output.json"])
     if not isinstance(low_level, Mapping) or not isinstance(performance, Mapping):
         raise CorpusBuildError("member_json_invalid", "Low-level design and output members must be objects.")
-    validated_performance = validate_source_performance(performance)
+    validated_performance, performance_validation = (
+        assess_source_performance_for_geometry_admission(
+            performance,
+            allow_unavailable=allow_unavailable_performance,
+        )
+    )
 
     with archive.open(member_paths["cadfile.stl"]) as handle:
         stl_bytes = handle.read()
@@ -490,7 +527,9 @@ def _record_from_design(
         "step_sha256": step_hash,
         "voxel_sha256": _sha256_file(voxel_path),
         "archive_md5": _strip_md5_prefix(str(archive_metadata["checksum"])),
-        "archive_sha256": _sha256_file(archive_path),
+        "archive_sha256": str(
+            archive_metadata.get("sha256") or _sha256_file(archive_path)
+        ),
         "archive_size_bytes": int(archive_metadata["size"]),
         "archive_url": archive_metadata["url"],
         "member_sha256": {
@@ -506,6 +545,7 @@ def _record_from_design(
         "source_native_design_sequence": design_seq,
         "source_native_performance": performance,
         "validated_source_performance": validated_performance,
+        "source_performance_validation": performance_validation,
         "design_spec": design_spec,
         "design_spec_availability": availability,
         "design_spec_provenance": spec_provenance,
@@ -514,7 +554,11 @@ def _record_from_design(
         "canonicalization": canonicalization,
         "aircraft_validity": validity,
         "date_built": datetime.now(timezone.utc).isoformat(),
-        "claim_boundary": "Source CAD and source feasibility outputs support corpus membership only; this record is not flight-test, structural, or CFD validation.",
+        "claim_boundary": (
+            "Source CAD supports geometry-corpus membership. Source performance is usable only when "
+            "source_performance_validation.status is validated; this record is not flight-test, "
+            "structural, or CFD validation."
+        ),
     }
 
 
@@ -559,6 +603,7 @@ def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
     target_count = int(args.target_count)
     grid_size = int(args.grid_size)
     selection_seed = int(args.selection_seed)
+    workers = max(1, int(getattr(args, "workers", 1)))
 
     existing_records = _load_existing_records(manifest_path) if bool(args.resume) else []
     accepted_records = list(existing_records)
@@ -594,45 +639,101 @@ def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
             expected_md5=metadata["checksum"],
             expected_size=metadata["size"],
         )
+        metadata = dict(metadata)
+        metadata["sha256"] = _sha256_file(archive_path)
         accepted_before = len(accepted_records)
         with zipfile.ZipFile(archive_path) as archive:
             prefixes = _design_prefixes(archive)
-            for design_id in deterministic_design_order(prefixes, seed=selection_seed, shard_key=str(metadata["key"])):
+            ordered_ids = deterministic_design_order(
+                prefixes,
+                seed=selection_seed,
+                shard_key=str(metadata["key"]),
+            )
+
+        def process_batch(design_ids: Sequence[str]) -> List[Tuple[str, Optional[Dict[str, Any]], Optional[CorpusBuildError]]]:
+            results = []
+            with zipfile.ZipFile(archive_path) as worker_archive:
+                for design_id in design_ids:
+                    try:
+                        record = _record_from_design(
+                            archive=worker_archive,
+                            archive_path=archive_path,
+                            archive_metadata=metadata,
+                            prefix=prefixes[design_id],
+                            design_id=design_id,
+                            output_dir=output_dir,
+                            grid_size=grid_size,
+                            allow_unavailable_performance=bool(
+                                args.allow_unavailable_performance
+                            ),
+                        )
+                        results.append((design_id, record, None))
+                    except CorpusBuildError as exc:
+                        results.append((design_id, None, exc))
+            return results
+
+        batch_size = 4
+        wave_size = workers * batch_size
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for wave_start in range(0, len(ordered_ids), wave_size):
                 if len(accepted_records) >= target_count:
                     break
-                try:
-                    record = _record_from_design(
-                        archive=archive,
-                        archive_path=archive_path,
-                        archive_metadata=metadata,
-                        prefix=prefixes[design_id],
-                        design_id=design_id,
-                        output_dir=output_dir,
-                        grid_size=grid_size,
-                    )
-                    if record["geometry_sha256"] in accepted_geometry_hashes:
-                        raise CorpusBuildError("duplicate_geometry", "Duplicate source STL hash.")
-                    if record["voxel_sha256"] in accepted_voxel_hashes:
-                        raise CorpusBuildError("duplicate_voxel", "Duplicate canonical voxel hash.")
-                    accepted_records.append(record)
-                    accepted_geometry_hashes.add(record["geometry_sha256"])
-                    accepted_voxel_hashes.add(record["voxel_sha256"])
-                except CorpusBuildError as exc:
-                    rejection_counts[exc.code] += 1
-                    rejections.append(
-                        {
-                            "archive_key": metadata["key"],
-                            "source_design_id": design_id,
-                            "code": exc.code,
-                            "message": str(exc),
-                        }
-                    )
+                wave_ids = ordered_ids[wave_start:wave_start + wave_size]
+                chunks = [
+                    wave_ids[start:start + batch_size]
+                    for start in range(0, len(wave_ids), batch_size)
+                ]
+                wave_results = executor.map(process_batch, chunks)
+                for batch_results in wave_results:
+                    for design_id, record, error in batch_results:
+                        if len(accepted_records) >= target_count:
+                            if record is not None:
+                                (output_dir / str(record["geometry_path"])).unlink(missing_ok=True)
+                            continue
+                        if error is not None:
+                            rejection_counts[error.code] += 1
+                            rejections.append(
+                                {
+                                    "archive_key": metadata["key"],
+                                    "source_design_id": design_id,
+                                    "code": error.code,
+                                    "message": str(error),
+                                }
+                            )
+                            continue
+                        assert record is not None
+                        duplicate_error = None
+                        if record["geometry_sha256"] in accepted_geometry_hashes:
+                            duplicate_error = CorpusBuildError(
+                                "duplicate_geometry",
+                                "Duplicate source STL hash.",
+                            )
+                        elif record["voxel_sha256"] in accepted_voxel_hashes:
+                            duplicate_error = CorpusBuildError(
+                                "duplicate_voxel",
+                                "Duplicate canonical voxel hash.",
+                            )
+                        if duplicate_error is not None:
+                            (output_dir / str(record["geometry_path"])).unlink(missing_ok=True)
+                            rejection_counts[duplicate_error.code] += 1
+                            rejections.append(
+                                {
+                                    "archive_key": metadata["key"],
+                                    "source_design_id": design_id,
+                                    "code": duplicate_error.code,
+                                    "message": str(duplicate_error),
+                                }
+                            )
+                            continue
+                        accepted_records.append(record)
+                        accepted_geometry_hashes.add(record["geometry_sha256"])
+                        accepted_voxel_hashes.add(record["voxel_sha256"])
         archive_reports.append(
             {
                 "archive_key": metadata["key"],
                 "archive_path": str(archive_path),
                 "accepted_count": len(accepted_records) - accepted_before,
-                "archive_sha256": _sha256_file(archive_path),
+                "archive_sha256": metadata["sha256"],
             }
         )
 
@@ -652,6 +753,8 @@ def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
         "preprocessing_version": PREPROCESSING_VERSION,
         "grid_size": grid_size,
         "selection_seed": selection_seed,
+        "workers": workers,
+        "allow_unavailable_performance": bool(args.allow_unavailable_performance),
         "target_count": target_count,
         "accepted_count": len(accepted_records),
         "unique_geometry_count": len(accepted_geometry_hashes),
@@ -675,9 +778,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--grid-size", type=int, default=96)
     parser.add_argument("--target-count", type=int, default=625)
     parser.add_argument("--selection-seed", type=int, default=20260713)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--archive", action="append", default=[], help="Use a local archive instead of downloading a shard; repeatable.")
     parser.add_argument("--shard", action="append", default=[], help="Zenodo archive key to download; repeatable.")
     parser.add_argument("--resume", action="store_true", help="Reuse accepted records from an existing manifest.")
+    parser.add_argument(
+        "--allow-unavailable-performance",
+        action="store_true",
+        help=(
+            "Admit interference-free CAD that passes geometry gates when source performance "
+            "is incomplete; performance remains explicitly unavailable and is never a label."
+        ),
+    )
     args = parser.parse_args(argv)
     report = build_corpus(args)
     print(json.dumps({key: report[key] for key in ("accepted_count", "unique_geometry_count", "rejected_count", "claim_validation")}, indent=2, sort_keys=True))

@@ -36,14 +36,38 @@ def _build_epoch_dataset(
     *,
     max_samples_per_epoch: int,
     subset_seed: int,
+    split: str = "train",
 ) -> Dataset:
-    if max_samples_per_epoch <= 0 or max_samples_per_epoch >= len(dataset):
-        return dataset
+    metadata = getattr(dataset, "metadata", {}) or {}
+    assignments = metadata.get("split_assignments")
+    if isinstance(assignments, list) and len(assignments) == len(dataset):
+        indices = [
+            index
+            for index, assignment in enumerate(assignments)
+            if str(assignment) == str(split)
+        ]
+        if not indices:
+            raise ValueError(f"Dataset has no records in requested split {split!r}")
+    else:
+        indices = list(range(len(dataset)))
+
+    if max_samples_per_epoch <= 0 or max_samples_per_epoch >= len(indices):
+        if len(indices) == len(dataset):
+            return dataset
+        return Subset(dataset, indices)
 
     rng = random.Random(subset_seed)
-    indices = list(range(len(dataset)))
     rng.shuffle(indices)
     return Subset(dataset, indices[:max_samples_per_epoch])
+
+
+def _build_split_dataset(dataset: Dataset, split: str) -> Dataset:
+    return _build_epoch_dataset(
+        dataset,
+        max_samples_per_epoch=0,
+        subset_seed=0,
+        split=split,
+    )
 
 
 def _geometry_promotion_metrics(
@@ -110,6 +134,11 @@ def _build_history_payload(
             "cpu_threads": args.cpu_threads,
             "max_samples_per_epoch": args.max_samples_per_epoch,
             "subset_seed": args.subset_seed,
+            "training_split": args.training_split,
+            "promotion_split": args.promotion_split,
+            "training_sample_count": args.training_sample_count,
+            "promotion_sample_count": args.promotion_sample_count,
+            "stop_on_promotion_pass": args.stop_on_promotion_pass,
             "stability_metric": args.stability_metric,
             "convergence_window": args.convergence_window,
             "convergence_target": args.convergence_target,
@@ -159,6 +188,13 @@ def main() -> int:
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--max-samples-per-epoch", type=int, default=0)
     parser.add_argument("--subset-seed", type=int, default=0)
+    parser.add_argument("--training-split", default="train")
+    parser.add_argument("--promotion-split", default="val")
+    parser.add_argument(
+        "--stop-on-promotion-pass",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config_value("training", "stop_on_promotion_pass", True)),
+    )
     parser.add_argument("--stability-metric", default="optimization_loss")
     parser.add_argument("--convergence-window", type=int, default=20)
     parser.add_argument("--convergence-target", type=float, default=20.0)
@@ -210,8 +246,15 @@ def main() -> int:
     args.resolved_grid_size = resolved_grid_size
     prepare_edt_workspace((resolved_grid_size,) * 3)
 
+    observed_unique_geometry_count = int(
+        dataset.metadata.get("unique_geometry_count", len(dataset))
+    )
+    capacity_geometry_count = max(
+        observed_unique_geometry_count,
+        int(config_value("scaling", "capacity_basis_unique_geometries", observed_unique_geometry_count)),
+    )
     model_config = ModelConfig.scaled_for_corpus(
-        int(dataset.metadata.get("unique_geometry_count", len(dataset))),
+        capacity_geometry_count,
         resolved_grid_size,
         conditioning_dim=infer_conditioning_dim(),
         latent_dim=args.latent_dim,
@@ -245,12 +288,24 @@ def main() -> int:
         dataset,
         max_samples_per_epoch=args.max_samples_per_epoch,
         subset_seed=args.subset_seed,
+        split=args.training_split,
     )
+    try:
+        promotion_dataset = _build_split_dataset(dataset, args.promotion_split)
+    except ValueError:
+        promotion_dataset = epoch_dataset
+        args.promotion_split = args.training_split
+        print(
+            f"Requested promotion split was unavailable; using {args.training_split!r}."
+        )
+    args.training_sample_count = len(epoch_dataset)
+    args.promotion_sample_count = len(promotion_dataset)
 
     print(f"Using device: {device}")
     print(f"CPU threads capped at: {args.cpu_threads}")
     print(f"Using grounded lattice resolution: {resolved_grid_size}^3")
     print(f"Training samples per epoch: {len(epoch_dataset)}/{len(dataset)}")
+    print(f"Promotion samples: {len(promotion_dataset)}/{len(dataset)} ({args.promotion_split})")
 
     diffusion_config = DiffusionConfig(teacher_steps=1000, student_steps=4)
     training_config = TrainingConfig(
@@ -279,6 +334,13 @@ def main() -> int:
         num_workers=0,
         collate_fn=aircraft_collate_fn,
     )
+    promotion_loader = DataLoader(
+        promotion_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=aircraft_collate_fn,
+    )
 
     trainer = OptimizedDiffusionTrainer(model_config, diffusion_config, training_config, cfd_config, device=device)
     if args.resume_from:
@@ -300,7 +362,7 @@ def main() -> int:
     best_checkpoint_path = str((save_dir / "best_geometry_model.pt").resolve())
     best_geometry_metric = float("inf")
     best_promotion_rank = (-1.0, -1.0, -1.0, -1.0)
-    selection_interval = max(1, int(diffusion_config.student_steps))
+    selection_interval = max(1, int(training_config.promotion_interval_epochs))
     initial_geometry_promotion = None
 
     if args.resume_from or args.warm_start_from:
@@ -308,7 +370,7 @@ def main() -> int:
         numpy_rng_state = np.random.get_state()
         torch_rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
-        baseline_promotion = trainer.evaluate_geometry_promotion_gate(train_loader)
+        baseline_promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
         random.setstate(python_rng_state)
         np.random.set_state(numpy_rng_state)
         torch.set_rng_state(torch_rng_state)
@@ -347,8 +409,10 @@ def main() -> int:
         metrics["core_loss"] = compute_core_loss(metrics)
         metrics["selected_as_best_geometry_checkpoint"] = 0.0
         metrics["geometry_selection_evaluated"] = 0.0
+        promotion_passed = False
         if (epoch + 1) % selection_interval == 0:
-            promotion = trainer.evaluate_geometry_promotion_gate(train_loader)
+            promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
+            promotion_passed = promotion.get("status") == "pass"
             metrics["geometry_selection_evaluated"] = 1.0
             promotion_metrics, promotion_rank = _geometry_promotion_metrics(promotion)
             metrics.update(promotion_metrics)
@@ -402,6 +466,12 @@ def main() -> int:
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             checkpoint_path = save_dir / f"checkpoint_monitored_ep{epoch + 1}.pt"
             trainer.save_checkpoint(str(checkpoint_path))
+
+        if args.stop_on_promotion_pass and promotion_passed:
+            print(
+                f"Stopping after epoch {epoch + 1}: validation geometry promotion gate passed."
+            )
+            break
 
         if args.early_stop_on_convergence and stability["converged"]:
             print(f"Early stopping at epoch {epoch + 1}: convergence criteria met.")

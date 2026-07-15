@@ -46,6 +46,20 @@ class TestTrainingStability(unittest.TestCase):
 
         self.assertIs(full_dataset, dataset)
 
+    def test_build_epoch_dataset_honors_manifest_train_split(self):
+        dataset = TensorDataset(torch.arange(6))
+        dataset.metadata = {
+            "split_assignments": ["train", "val", "train", "test", "train", "holdout"]
+        }
+
+        training = _build_epoch_dataset(
+            dataset,
+            max_samples_per_epoch=0,
+            subset_seed=0,
+        )
+
+        self.assertEqual(training.indices, [0, 2, 4])
+
     def test_compute_core_loss_ignores_aerodynamic_term(self):
         metrics = {
             "mse": 1.0,

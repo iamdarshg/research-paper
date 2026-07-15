@@ -15,7 +15,7 @@ model:
   grid_resolution: 96
   xyz_dim: 3
   attention_groups: 8
-  attention_kv_groups: 8
+  attention_kv_groups: 4
   num_attention_layers: 4
   coordinate_decoder_threshold: 96
   coordinate_chunk_size: 16384
@@ -27,14 +27,17 @@ model:
 scaling:
   # This count selects the reported network widths. It is a capacity-planning
   # input, not a claim that these geometries ship in the repository.
-  capacity_basis_unique_geometries: 349
+  capacity_basis_unique_geometries: 500
   reference_unique_geometries: 600
   width_exponent: 0.20
   minimum_scale: 0.75
   maximum_scale: 1.75
-  high_resolution_channel_base: 56
-  high_resolution_decoder_width: 576
-  high_resolution_decoder_depth: 4
+  high_resolution_channel_base: 116
+  high_resolution_channel_step: 48
+  maximum_high_resolution_channel_base: 128
+  high_resolution_decoder_width: 928
+  maximum_high_resolution_decoder_width: 1024
+  high_resolution_decoder_depth: 5
   high_resolution_decoder_depth_large_corpus: 5
   large_corpus_threshold: 4096
 
@@ -72,6 +75,10 @@ training:
   freeze_decoder_for_generated_paths: true
   required_geometry_loss_max: 0.20
   promotion_generation_seeds: 3
+  promotion_interval_epochs: 1
+  stop_on_promotion_pass: true
+  overfit_geometry_gate_samples: 16
+  overfit_min_generated_aircraft_valid_fraction: 0.125
   precision: float32
   save_interval: 25
   val_interval: 1
