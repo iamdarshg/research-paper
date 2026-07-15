@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="394" onload="init(evt)" viewBox="0 0 1200 394" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="394" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\Scripts\py-spy.exe record --pid 2776 --duration 90 --rate 25 --nonblocking --threads --full-filenames --output build/grounded_500_28m_full_20260715/resources/training_flamegraph.svg</text><text id="details" fill="rgb(0,0,0)" x="10" y="40.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="383.00"> </text><svg id="frames" x="10" width="1180" total_samples="1874"><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4001) (2 samples, 0.11%)</title><rect x="0.0000%" y="116" width="0.1067%" height="15" fill="rgb(227,0,7)" fg:x="0" fg:w="2"/><text x="0.2500%" y="126.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="0.0000%" y="132" width="0.1067%" height="15" fill="rgb(217,0,24)" fg:x="0" fg:w="2"/><text x="0.2500%" y="142.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="0.0000%" y="148" width="0.1067%" height="15" fill="rgb(221,193,54)" fg:x="0" fg:w="2"/><text x="0.2500%" y="158.50"></text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2360) (2 samples, 0.11%)</title><rect x="0.0000%" y="164" width="0.1067%" height="15" fill="rgb(248,212,6)" fg:x="0" fg:w="2"/><text x="0.2500%" y="174.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="0.0000%" y="180" width="0.1067%" height="15" fill="rgb(208,68,35)" fg:x="0" fg:w="2"/><text x="0.2500%" y="190.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="0.0000%" y="196" width="0.1067%" height="15" fill="rgb(232,128,0)" fg:x="0" fg:w="2"/><text x="0.2500%" y="206.50"></text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2197) (2 samples, 0.11%)</title><rect x="0.0000%" y="212" width="0.1067%" height="15" fill="rgb(207,160,47)" fg:x="0" fg:w="2"/><text x="0.2500%" y="222.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="0.0000%" y="228" width="0.1067%" height="15" fill="rgb(228,23,34)" fg:x="0" fg:w="2"/><text x="0.2500%" y="238.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="0.0000%" y="244" width="0.1067%" height="15" fill="rgb(218,30,26)" fg:x="0" fg:w="2"/><text x="0.2500%" y="254.50"></text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2145) (2 samples, 0.11%)</title><rect x="0.0000%" y="260" width="0.1067%" height="15" fill="rgb(220,122,19)" fg:x="0" fg:w="2"/><text x="0.2500%" y="270.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="0.0000%" y="276" width="0.1067%" height="15" fill="rgb(250,228,42)" fg:x="0" fg:w="2"/><text x="0.2500%" y="286.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="0.0000%" y="292" width="0.1067%" height="15" fill="rgb(240,193,28)" fg:x="0" fg:w="2"/><text x="0.2500%" y="302.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4085) (3 samples, 0.16%)</title><rect x="0.1067%" y="116" width="0.1601%" height="15" fill="rgb(216,20,37)" fg:x="2" fg:w="3"/><text x="0.3567%" y="126.50"></text></g><g><title>forward_flat_indices (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2513) (3 samples, 0.16%)</title><rect x="0.1067%" y="132" width="0.1601%" height="15" fill="rgb(206,188,39)" fg:x="2" fg:w="3"/><text x="0.3567%" y="142.50"></text></g><g><title>_encode_coordinates (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2445) (3 samples, 0.16%)</title><rect x="0.1067%" y="148" width="0.1601%" height="15" fill="rgb(217,207,13)" fg:x="2" fg:w="3"/><text x="0.3567%" y="158.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4089) (5 samples, 0.27%)</title><rect x="0.2668%" y="116" width="0.2668%" height="15" fill="rgb(231,73,38)" fg:x="5" fg:w="5"/><text x="0.5168%" y="126.50"></text></g><g><title>sparse_voxel_reconstruction_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:692) (5 samples, 0.27%)</title><rect x="0.2668%" y="132" width="0.2668%" height="15" fill="rgb(225,20,46)" fg:x="5" fg:w="5"/><text x="0.5168%" y="142.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="0.8004%" y="276" width="0.1067%" height="15" fill="rgb(210,31,41)" fg:x="15" fg:w="2"/><text x="1.0504%" y="286.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="0.8004%" y="292" width="0.1067%" height="15" fill="rgb(221,200,47)" fg:x="15" fg:w="2"/><text x="1.0504%" y="302.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\container.py:250) (2 samples, 0.11%)</title><rect x="0.8004%" y="308" width="0.1067%" height="15" fill="rgb(226,26,5)" fg:x="15" fg:w="2"/><text x="1.0504%" y="318.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="0.8004%" y="324" width="0.1067%" height="15" fill="rgb(249,33,26)" fg:x="15" fg:w="2"/><text x="1.0504%" y="334.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="0.8004%" y="340" width="0.1067%" height="15" fill="rgb(235,183,28)" fg:x="15" fg:w="2"/><text x="1.0504%" y="350.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\linear.py:134) (2 samples, 0.11%)</title><rect x="0.8004%" y="356" width="0.1067%" height="15" fill="rgb(221,5,38)" fg:x="15" fg:w="2"/><text x="1.0504%" y="366.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4109) (7 samples, 0.37%)</title><rect x="0.5870%" y="116" width="0.3735%" height="15" fill="rgb(247,18,42)" fg:x="11" fg:w="7"/><text x="0.8370%" y="126.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (7 samples, 0.37%)</title><rect x="0.5870%" y="132" width="0.3735%" height="15" fill="rgb(241,131,45)" fg:x="11" fg:w="7"/><text x="0.8370%" y="142.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (7 samples, 0.37%)</title><rect x="0.5870%" y="148" width="0.3735%" height="15" fill="rgb(249,31,29)" fg:x="11" fg:w="7"/><text x="0.8370%" y="158.50"></text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2534) (7 samples, 0.37%)</title><rect x="0.5870%" y="164" width="0.3735%" height="15" fill="rgb(225,111,53)" fg:x="11" fg:w="7"/><text x="0.8370%" y="174.50"></text></g><g><title>_checkpointed_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2486) (7 samples, 0.37%)</title><rect x="0.5870%" y="180" width="0.3735%" height="15" fill="rgb(238,160,17)" fg:x="11" fg:w="7"/><text x="0.8370%" y="190.50"></text></g><g><title>inner (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_compile.py:53) (7 samples, 0.37%)</title><rect x="0.5870%" y="196" width="0.3735%" height="15" fill="rgb(214,148,48)" fg:x="11" fg:w="7"/><text x="0.8370%" y="206.50"></text></g><g><title>_fn (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_dynamo\eval_frame.py:1044) (7 samples, 0.37%)</title><rect x="0.5870%" y="212" width="0.3735%" height="15" fill="rgb(232,36,49)" fg:x="11" fg:w="7"/><text x="0.8370%" y="222.50"></text></g><g><title>checkpoint (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\utils\checkpoint.py:503) (7 samples, 0.37%)</title><rect x="0.5870%" y="228" width="0.3735%" height="15" fill="rgb(209,103,24)" fg:x="11" fg:w="7"/><text x="0.8370%" y="238.50"></text></g><g><title>_decode_latent_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2471) (6 samples, 0.32%)</title><rect x="0.6403%" y="244" width="0.3202%" height="15" fill="rgb(229,88,8)" fg:x="12" fg:w="6"/><text x="0.8903%" y="254.50"></text></g><g><title>_decode_coordinate_features (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2455) (6 samples, 0.32%)</title><rect x="0.6403%" y="260" width="0.3202%" height="15" fill="rgb(213,181,19)" fg:x="12" fg:w="6"/><text x="0.8903%" y="270.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4112) (29 samples, 1.55%)</title><rect x="0.9605%" y="116" width="1.5475%" height="15" fill="rgb(254,191,54)" fg:x="18" fg:w="29"/><text x="1.2105%" y="126.50"></text></g><g><title>sparse_voxel_reconstruction_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:712) (29 samples, 1.55%)</title><rect x="0.9605%" y="132" width="1.5475%" height="15" fill="rgb(241,83,37)" fg:x="18" fg:w="29"/><text x="1.2105%" y="142.50"></text></g><g><title>balanced_voxel_bce_with_logits (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:646) (29 samples, 1.55%)</title><rect x="0.9605%" y="148" width="1.5475%" height="15" fill="rgb(233,36,39)" fg:x="18" fg:w="29"/><text x="1.2105%" y="158.50"></text></g><g><title>_direct_measured_objective_for_single (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3311) (14 samples, 0.75%)</title><rect x="2.5080%" y="212" width="0.7471%" height="15" fill="rgb(226,3,54)" fg:x="47" fg:w="14"/><text x="2.7580%" y="222.50"></text></g><g><title>_binarize_probability_grid_for_solver (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3290) (14 samples, 0.75%)</title><rect x="2.5080%" y="228" width="0.7471%" height="15" fill="rgb(245,192,40)" fg:x="47" fg:w="14"/><text x="2.7580%" y="238.50"></text></g><g><title>reset_force_accounting (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:179) (5 samples, 0.27%)</title><rect x="3.2551%" y="260" width="0.2668%" height="15" fill="rgb(238,167,29)" fg:x="61" fg:w="5"/><text x="3.5051%" y="270.50"></text></g><g><title>collide_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:613) (6 samples, 0.32%)</title><rect x="3.2551%" y="244" width="0.3202%" height="15" fill="rgb(232,182,51)" fg:x="61" fg:w="6"/><text x="3.5051%" y="254.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:402) (8 samples, 0.43%)</title><rect x="3.6286%" y="260" width="0.4269%" height="15" fill="rgb(231,60,39)" fg:x="68" fg:w="8"/><text x="3.8786%" y="270.50"></text></g><g><title>compute_moment_equilibrium (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:174) (7 samples, 0.37%)</title><rect x="3.6820%" y="276" width="0.3735%" height="15" fill="rgb(208,69,12)" fg:x="69" fg:w="7"/><text x="3.9320%" y="286.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:406) (40 samples, 2.13%)</title><rect x="4.0555%" y="260" width="2.1345%" height="15" fill="rgb(235,93,37)" fg:x="76" fg:w="40"/><text x="4.3055%" y="270.50">c..</text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:407) (2 samples, 0.11%)</title><rect x="6.1900%" y="260" width="0.1067%" height="15" fill="rgb(213,116,39)" fg:x="116" fg:w="2"/><text x="6.4400%" y="270.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:413) (12 samples, 0.64%)</title><rect x="6.2967%" y="260" width="0.6403%" height="15" fill="rgb(222,207,29)" fg:x="118" fg:w="12"/><text x="6.5467%" y="270.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:448) (7 samples, 0.37%)</title><rect x="6.9904%" y="260" width="0.3735%" height="15" fill="rgb(206,96,30)" fg:x="131" fg:w="7"/><text x="7.2404%" y="270.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:102) (6 samples, 0.32%)</title><rect x="7.3639%" y="308" width="0.3202%" height="15" fill="rgb(218,138,4)" fg:x="138" fg:w="6"/><text x="7.6139%" y="318.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:106) (9 samples, 0.48%)</title><rect x="7.6841%" y="308" width="0.4803%" height="15" fill="rgb(250,191,14)" fg:x="144" fg:w="9"/><text x="7.9341%" y="318.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:107) (8 samples, 0.43%)</title><rect x="8.1644%" y="308" width="0.4269%" height="15" fill="rgb(239,60,40)" fg:x="153" fg:w="8"/><text x="8.4144%" y="318.50"></text></g><g><title>compute_sdf (D:\CodeProjects\research-paper\CLI\sdf_utils.py:39) (3 samples, 0.16%)</title><rect x="8.5912%" y="324" width="0.1601%" height="15" fill="rgb(206,27,48)" fg:x="161" fg:w="3"/><text x="8.8412%" y="334.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2585) (46 samples, 2.45%)</title><rect x="8.8047%" y="340" width="2.4546%" height="15" fill="rgb(225,35,8)" fg:x="165" fg:w="46"/><text x="9.0547%" y="350.50">di..</text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2588) (4 samples, 0.21%)</title><rect x="11.2593%" y="340" width="0.2134%" height="15" fill="rgb(250,213,24)" fg:x="211" fg:w="4"/><text x="11.5093%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2589) (5 samples, 0.27%)</title><rect x="11.4728%" y="340" width="0.2668%" height="15" fill="rgb(247,123,22)" fg:x="215" fg:w="5"/><text x="11.7228%" y="350.50"></text></g><g><title>compute_sdf (D:\CodeProjects\research-paper\CLI\sdf_utils.py:46) (57 samples, 3.04%)</title><rect x="8.7513%" y="324" width="3.0416%" height="15" fill="rgb(231,138,38)" fg:x="164" fg:w="57"/><text x="9.0013%" y="334.50">com..</text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2569) (2 samples, 0.11%)</title><rect x="11.7930%" y="340" width="0.1067%" height="15" fill="rgb(231,145,46)" fg:x="221" fg:w="2"/><text x="12.0430%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2585) (89 samples, 4.75%)</title><rect x="11.8997%" y="340" width="4.7492%" height="15" fill="rgb(251,118,11)" fg:x="223" fg:w="89"/><text x="12.1497%" y="350.50">distan..</text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2588) (3 samples, 0.16%)</title><rect x="16.6489%" y="340" width="0.1601%" height="15" fill="rgb(217,147,25)" fg:x="312" fg:w="3"/><text x="16.8989%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2589) (2 samples, 0.11%)</title><rect x="16.8090%" y="340" width="0.1067%" height="15" fill="rgb(247,81,37)" fg:x="315" fg:w="2"/><text x="17.0590%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2593) (2 samples, 0.11%)</title><rect x="16.9157%" y="340" width="0.1067%" height="15" fill="rgb(209,12,38)" fg:x="317" fg:w="2"/><text x="17.1657%" y="350.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:76) (162 samples, 8.64%)</title><rect x="8.5912%" y="308" width="8.6446%" height="15" fill="rgb(227,1,9)" fg:x="161" fg:w="162"/><text x="8.8412%" y="318.50">compute_all_..</text></g><g><title>compute_sdf (D:\CodeProjects\research-paper\CLI\sdf_utils.py:53) (102 samples, 5.44%)</title><rect x="11.7930%" y="324" width="5.4429%" height="15" fill="rgb(248,47,43)" fg:x="221" fg:w="102"/><text x="12.0430%" y="334.50">compute..</text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2595) (4 samples, 0.21%)</title><rect x="17.0224%" y="340" width="0.2134%" height="15" fill="rgb(221,10,30)" fg:x="319" fg:w="4"/><text x="17.2724%" y="350.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:87) (5 samples, 0.27%)</title><rect x="17.2359%" y="308" width="0.2668%" height="15" fill="rgb(210,229,1)" fg:x="323" fg:w="5"/><text x="17.4859%" y="318.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:294) (191 samples, 10.19%)</title><rect x="7.3639%" y="276" width="10.1921%" height="15" fill="rgb(222,148,37)" fg:x="138" fg:w="191"/><text x="7.6139%" y="286.50">_apply_bfl_boun..</text></g><g><title>_get_q (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:152) (191 samples, 10.19%)</title><rect x="7.3639%" y="292" width="10.1921%" height="15" fill="rgb(234,67,33)" fg:x="138" fg:w="191"/><text x="7.6139%" y="302.50">_get_q (D:\Code..</text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:311) (3 samples, 0.16%)</title><rect x="17.6094%" y="276" width="0.1601%" height="15" fill="rgb(247,98,35)" fg:x="330" fg:w="3"/><text x="17.8594%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:312) (30 samples, 1.60%)</title><rect x="17.7695%" y="276" width="1.6009%" height="15" fill="rgb(247,138,52)" fg:x="333" fg:w="30"/><text x="18.0195%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:315) (18 samples, 0.96%)</title><rect x="19.3703%" y="276" width="0.9605%" height="15" fill="rgb(213,79,30)" fg:x="363" fg:w="18"/><text x="19.6203%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:322) (19 samples, 1.01%)</title><rect x="20.3308%" y="276" width="1.0139%" height="15" fill="rgb(246,177,23)" fg:x="381" fg:w="19"/><text x="20.5808%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:325) (6 samples, 0.32%)</title><rect x="21.3447%" y="276" width="0.3202%" height="15" fill="rgb(230,62,27)" fg:x="400" fg:w="6"/><text x="21.5947%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:326) (3 samples, 0.16%)</title><rect x="21.6649%" y="276" width="0.1601%" height="15" fill="rgb(216,154,8)" fg:x="406" fg:w="3"/><text x="21.9149%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:332) (5 samples, 0.27%)</title><rect x="21.8250%" y="276" width="0.2668%" height="15" fill="rgb(244,35,45)" fg:x="409" fg:w="5"/><text x="22.0750%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:336) (69 samples, 3.68%)</title><rect x="22.1451%" y="276" width="3.6820%" height="15" fill="rgb(251,115,12)" fg:x="415" fg:w="69"/><text x="22.3951%" y="286.50">_app..</text></g><g><title>wrapped (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:45) (3 samples, 0.16%)</title><rect x="25.6670%" y="292" width="0.1601%" height="15" fill="rgb(240,54,50)" fg:x="481" fg:w="3"/><text x="25.9170%" y="302.50"></text></g><g><title>__rsub__ (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:1075) (3 samples, 0.16%)</title><rect x="25.6670%" y="308" width="0.1601%" height="15" fill="rgb(233,84,52)" fg:x="481" fg:w="3"/><text x="25.9170%" y="318.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:339) (11 samples, 0.59%)</title><rect x="25.8271%" y="276" width="0.5870%" height="15" fill="rgb(207,117,47)" fg:x="484" fg:w="11"/><text x="26.0771%" y="286.50"></text></g><g><title>__rdiv__ (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:1079) (8 samples, 0.43%)</title><rect x="32.8175%" y="308" width="0.4269%" height="15" fill="rgb(249,43,39)" fg:x="615" fg:w="8"/><text x="33.0675%" y="318.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:340) (130 samples, 6.94%)</title><rect x="26.4141%" y="276" width="6.9370%" height="15" fill="rgb(209,38,44)" fg:x="495" fg:w="130"/><text x="26.6641%" y="286.50">_apply_bf..</text></g><g><title>wrapped (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:45) (10 samples, 0.53%)</title><rect x="32.8175%" y="292" width="0.5336%" height="15" fill="rgb(236,212,23)" fg:x="615" fg:w="10"/><text x="33.0675%" y="302.50"></text></g><g><title>__rsub__ (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:1075) (2 samples, 0.11%)</title><rect x="33.2444%" y="308" width="0.1067%" height="15" fill="rgb(242,79,21)" fg:x="623" fg:w="2"/><text x="33.4944%" y="318.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:451) (501 samples, 26.73%)</title><rect x="7.3639%" y="260" width="26.7343%" height="15" fill="rgb(211,96,35)" fg:x="138" fg:w="501"/><text x="7.6139%" y="270.50">collide_and_stream (D:\CodeProjects\researc..</text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:342) (14 samples, 0.75%)</title><rect x="33.3511%" y="276" width="0.7471%" height="15" fill="rgb(253,215,40)" fg:x="625" fg:w="14"/><text x="33.6011%" y="286.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:453) (4 samples, 0.21%)</title><rect x="34.0982%" y="260" width="0.2134%" height="15" fill="rgb(211,81,21)" fg:x="639" fg:w="4"/><text x="34.3482%" y="270.50"></text></g><g><title>_apply_domain_boundaries (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:284) (2 samples, 0.11%)</title><rect x="34.2049%" y="276" width="0.1067%" height="15" fill="rgb(208,190,38)" fg:x="641" fg:w="2"/><text x="34.4549%" y="286.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:202) (11 samples, 0.59%)</title><rect x="34.4184%" y="276" width="0.5870%" height="15" fill="rgb(235,213,38)" fg:x="645" fg:w="11"/><text x="34.6684%" y="286.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:205) (20 samples, 1.07%)</title><rect x="35.0053%" y="276" width="1.0672%" height="15" fill="rgb(237,122,38)" fg:x="656" fg:w="20"/><text x="35.2553%" y="286.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:207) (19 samples, 1.01%)</title><rect x="36.0726%" y="276" width="1.0139%" height="15" fill="rgb(244,218,35)" fg:x="676" fg:w="19"/><text x="36.3226%" y="286.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:208) (19 samples, 1.01%)</title><rect x="37.0864%" y="276" width="1.0139%" height="15" fill="rgb(240,68,47)" fg:x="695" fg:w="19"/><text x="37.3364%" y="286.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:455) (81 samples, 4.32%)</title><rect x="34.3116%" y="260" width="4.3223%" height="15" fill="rgb(210,16,53)" fg:x="643" fg:w="81"/><text x="34.5616%" y="270.50">colli..</text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:209) (10 samples, 0.53%)</title><rect x="38.1003%" y="276" width="0.5336%" height="15" fill="rgb(235,124,12)" fg:x="714" fg:w="10"/><text x="38.3503%" y="286.50"></text></g><g><title>simulate_aerodynamics (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2668) (666 samples, 35.54%)</title><rect x="3.2551%" y="228" width="35.5390%" height="15" fill="rgb(224,169,11)" fg:x="61" fg:w="666"/><text x="3.5051%" y="238.50">simulate_aerodynamics (D:\CodeProjects\research-paper\CLI\..</text></g><g><title>collide_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:628) (660 samples, 35.22%)</title><rect x="3.5752%" y="244" width="35.2188%" height="15" fill="rgb(250,166,2)" fg:x="67" fg:w="660"/><text x="3.8252%" y="254.50">collide_stream (D:\CodeProjects\research-paper\CLI\advanc..</text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:464) (2 samples, 0.11%)</title><rect x="38.6873%" y="260" width="0.1067%" height="15" fill="rgb(242,216,29)" fg:x="725" fg:w="2"/><text x="38.9373%" y="270.50"></text></g><g><title>compute_aerodynamic_coefficients (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:776) (7 samples, 0.37%)</title><rect x="38.7940%" y="244" width="0.3735%" height="15" fill="rgb(230,116,27)" fg:x="727" fg:w="7"/><text x="39.0440%" y="254.50"></text></g><g><title>compute_velocity_gradients (D:\CodeProjects\research-paper\CLI\lbm_diagnostics.py:14) (2 samples, 0.11%)</title><rect x="39.2209%" y="276" width="0.1067%" height="15" fill="rgb(228,99,48)" fg:x="735" fg:w="2"/><text x="39.4709%" y="286.50"></text></g><g><title>_refresh_flow_diagnostics (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:659) (3 samples, 0.16%)</title><rect x="39.2209%" y="260" width="0.1601%" height="15" fill="rgb(253,11,6)" fg:x="735" fg:w="3"/><text x="39.4709%" y="270.50"></text></g><g><title>compute_aerodynamic_coefficients (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:850) (5 samples, 0.27%)</title><rect x="39.2209%" y="244" width="0.2668%" height="15" fill="rgb(247,143,39)" fg:x="735" fg:w="5"/><text x="39.4709%" y="254.50"></text></g><g><title>_direct_measured_objective_for_single (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3318) (682 samples, 36.39%)</title><rect x="3.2551%" y="212" width="36.3927%" height="15" fill="rgb(236,97,10)" fg:x="61" fg:w="682"/><text x="3.5051%" y="222.50">_direct_measured_objective_for_single (D:\CodeProjects\rese..</text></g><g><title>simulate_aerodynamics (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2669) (16 samples, 0.85%)</title><rect x="38.7940%" y="228" width="0.8538%" height="15" fill="rgb(233,208,19)" fg:x="727" fg:w="16"/><text x="39.0440%" y="238.50"></text></g><g><title>_heuristic_metrics (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:168) (2 samples, 0.11%)</title><rect x="39.8613%" y="244" width="0.1067%" height="15" fill="rgb(216,164,2)" fg:x="747" fg:w="2"/><text x="40.1113%" y="254.50"></text></g><g><title>_heuristic_metrics (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:82) (5 samples, 0.27%)</title><rect x="40.0213%" y="244" width="0.2668%" height="15" fill="rgb(220,129,5)" fg:x="750" fg:w="5"/><text x="40.2713%" y="254.50"></text></g><g><title>label (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_measurements.py:218) (5 samples, 0.27%)</title><rect x="40.0213%" y="260" width="0.2668%" height="15" fill="rgb(242,17,10)" fg:x="750" fg:w="5"/><text x="40.2713%" y="270.50"></text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3511) (709 samples, 37.83%)</title><rect x="2.5080%" y="196" width="37.8335%" height="15" fill="rgb(242,107,0)" fg:x="47" fg:w="709"/><text x="2.7580%" y="206.50">forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion..</text></g><g><title>_direct_measured_objective_for_single (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3339) (12 samples, 0.64%)</title><rect x="39.7012%" y="212" width="0.6403%" height="15" fill="rgb(251,28,31)" fg:x="744" fg:w="12"/><text x="39.9512%" y="222.50"></text></g><g><title>evaluate_aircraft_validity (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:370) (12 samples, 0.64%)</title><rect x="39.7012%" y="228" width="0.6403%" height="15" fill="rgb(233,223,10)" fg:x="744" fg:w="12"/><text x="39.9512%" y="238.50"></text></g><g><title>_direct_measured_objective_for_single (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3311) (12 samples, 0.64%)</title><rect x="40.3415%" y="212" width="0.6403%" height="15" fill="rgb(215,21,27)" fg:x="756" fg:w="12"/><text x="40.5915%" y="222.50"></text></g><g><title>_binarize_probability_grid_for_solver (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3290) (12 samples, 0.64%)</title><rect x="40.3415%" y="228" width="0.6403%" height="15" fill="rgb(232,23,21)" fg:x="756" fg:w="12"/><text x="40.5915%" y="238.50"></text></g><g><title>collide_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:613) (8 samples, 0.43%)</title><rect x="41.1419%" y="244" width="0.4269%" height="15" fill="rgb(244,5,23)" fg:x="771" fg:w="8"/><text x="41.3919%" y="254.50"></text></g><g><title>reset_force_accounting (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:179) (8 samples, 0.43%)</title><rect x="41.1419%" y="260" width="0.4269%" height="15" fill="rgb(226,81,46)" fg:x="771" fg:w="8"/><text x="41.3919%" y="270.50"></text></g><g><title>collide_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:616) (3 samples, 0.16%)</title><rect x="41.5688%" y="244" width="0.1601%" height="15" fill="rgb(247,70,30)" fg:x="779" fg:w="3"/><text x="41.8188%" y="254.50"></text></g><g><title>compute_tensor_content_hash (D:\CodeProjects\research-paper\CLI\utils.py:46) (2 samples, 0.11%)</title><rect x="41.6222%" y="260" width="0.1067%" height="15" fill="rgb(212,68,19)" fg:x="780" fg:w="2"/><text x="41.8722%" y="270.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:402) (4 samples, 0.21%)</title><rect x="41.8356%" y="260" width="0.2134%" height="15" fill="rgb(240,187,13)" fg:x="784" fg:w="4"/><text x="42.0856%" y="270.50"></text></g><g><title>compute_moment_equilibrium (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:174) (4 samples, 0.21%)</title><rect x="41.8356%" y="276" width="0.2134%" height="15" fill="rgb(223,113,26)" fg:x="784" fg:w="4"/><text x="42.0856%" y="286.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:406) (30 samples, 1.60%)</title><rect x="42.0491%" y="260" width="1.6009%" height="15" fill="rgb(206,192,2)" fg:x="788" fg:w="30"/><text x="42.2991%" y="270.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:413) (11 samples, 0.59%)</title><rect x="43.6499%" y="260" width="0.5870%" height="15" fill="rgb(241,108,4)" fg:x="818" fg:w="11"/><text x="43.8999%" y="270.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:448) (11 samples, 0.59%)</title><rect x="44.2903%" y="260" width="0.5870%" height="15" fill="rgb(247,173,49)" fg:x="830" fg:w="11"/><text x="44.5403%" y="270.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:102) (4 samples, 0.21%)</title><rect x="44.8773%" y="308" width="0.2134%" height="15" fill="rgb(224,114,35)" fg:x="841" fg:w="4"/><text x="45.1273%" y="318.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:106) (8 samples, 0.43%)</title><rect x="45.0907%" y="308" width="0.4269%" height="15" fill="rgb(245,159,27)" fg:x="845" fg:w="8"/><text x="45.3407%" y="318.50"></text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:107) (9 samples, 0.48%)</title><rect x="45.5176%" y="308" width="0.4803%" height="15" fill="rgb(245,172,44)" fg:x="853" fg:w="9"/><text x="45.7676%" y="318.50"></text></g><g><title>compute_sdf (D:\CodeProjects\research-paper\CLI\sdf_utils.py:39) (2 samples, 0.11%)</title><rect x="45.9979%" y="324" width="0.1067%" height="15" fill="rgb(236,23,11)" fg:x="862" fg:w="2"/><text x="46.2479%" y="334.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2569) (6 samples, 0.32%)</title><rect x="46.1046%" y="340" width="0.3202%" height="15" fill="rgb(205,117,38)" fg:x="864" fg:w="6"/><text x="46.3546%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2585) (43 samples, 2.29%)</title><rect x="46.4248%" y="340" width="2.2946%" height="15" fill="rgb(237,72,25)" fg:x="870" fg:w="43"/><text x="46.6748%" y="350.50">d..</text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2588) (7 samples, 0.37%)</title><rect x="48.7193%" y="340" width="0.3735%" height="15" fill="rgb(244,70,9)" fg:x="913" fg:w="7"/><text x="48.9693%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2589) (5 samples, 0.27%)</title><rect x="49.0928%" y="340" width="0.2668%" height="15" fill="rgb(217,125,39)" fg:x="920" fg:w="5"/><text x="49.3428%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2595) (2 samples, 0.11%)</title><rect x="49.4130%" y="340" width="0.1067%" height="15" fill="rgb(235,36,10)" fg:x="926" fg:w="2"/><text x="49.6630%" y="350.50"></text></g><g><title>compute_sdf (D:\CodeProjects\research-paper\CLI\sdf_utils.py:46) (66 samples, 3.52%)</title><rect x="46.1046%" y="324" width="3.5219%" height="15" fill="rgb(251,123,47)" fg:x="864" fg:w="66"/><text x="46.3546%" y="334.50">com..</text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2600) (2 samples, 0.11%)</title><rect x="49.5197%" y="340" width="0.1067%" height="15" fill="rgb(221,13,13)" fg:x="928" fg:w="2"/><text x="49.7697%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2569) (2 samples, 0.11%)</title><rect x="49.6265%" y="340" width="0.1067%" height="15" fill="rgb(238,131,9)" fg:x="930" fg:w="2"/><text x="49.8765%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2585) (94 samples, 5.02%)</title><rect x="49.7332%" y="340" width="5.0160%" height="15" fill="rgb(211,50,8)" fg:x="932" fg:w="94"/><text x="49.9832%" y="350.50">distan..</text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2588) (3 samples, 0.16%)</title><rect x="54.7492%" y="340" width="0.1601%" height="15" fill="rgb(245,182,24)" fg:x="1026" fg:w="3"/><text x="54.9992%" y="350.50"></text></g><g><title>distance_transform_edt (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_morphology.py:2589) (4 samples, 0.21%)</title><rect x="54.9093%" y="340" width="0.2134%" height="15" fill="rgb(242,14,37)" fg:x="1029" fg:w="4"/><text x="55.1593%" y="350.50"></text></g><g><title>compute_sdf (D:\CodeProjects\research-paper\CLI\sdf_utils.py:53) (104 samples, 5.55%)</title><rect x="49.6265%" y="324" width="5.5496%" height="15" fill="rgb(246,228,12)" fg:x="930" fg:w="104"/><text x="49.8765%" y="334.50">compute..</text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:294) (196 samples, 10.46%)</title><rect x="44.8773%" y="276" width="10.4589%" height="15" fill="rgb(213,55,15)" fg:x="841" fg:w="196"/><text x="45.1273%" y="286.50">_apply_bfl_boun..</text></g><g><title>_get_q (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:152) (196 samples, 10.46%)</title><rect x="44.8773%" y="292" width="10.4589%" height="15" fill="rgb(209,9,3)" fg:x="841" fg:w="196"/><text x="45.1273%" y="302.50">_get_q (D:\Code..</text></g><g><title>compute_all_link_distances (D:\CodeProjects\research-paper\CLI\sdf_utils.py:76) (175 samples, 9.34%)</title><rect x="45.9979%" y="308" width="9.3383%" height="15" fill="rgb(230,59,30)" fg:x="862" fg:w="175"/><text x="46.2479%" y="318.50">compute_all_l..</text></g><g><title>compute_sdf (D:\CodeProjects\research-paper\CLI\sdf_utils.py:62) (2 samples, 0.11%)</title><rect x="55.2295%" y="324" width="0.1067%" height="15" fill="rgb(209,121,21)" fg:x="1035" fg:w="2"/><text x="55.4795%" y="334.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:312) (35 samples, 1.87%)</title><rect x="55.4429%" y="276" width="1.8677%" height="15" fill="rgb(220,109,13)" fg:x="1039" fg:w="35"/><text x="55.6929%" y="286.50">_..</text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:315) (27 samples, 1.44%)</title><rect x="57.3106%" y="276" width="1.4408%" height="15" fill="rgb(232,18,1)" fg:x="1074" fg:w="27"/><text x="57.5606%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:322) (20 samples, 1.07%)</title><rect x="58.8047%" y="276" width="1.0672%" height="15" fill="rgb(215,41,42)" fg:x="1102" fg:w="20"/><text x="59.0547%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:325) (5 samples, 0.27%)</title><rect x="59.8719%" y="276" width="0.2668%" height="15" fill="rgb(224,123,36)" fg:x="1122" fg:w="5"/><text x="60.1219%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:326) (3 samples, 0.16%)</title><rect x="60.1387%" y="276" width="0.1601%" height="15" fill="rgb(240,125,3)" fg:x="1127" fg:w="3"/><text x="60.3887%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:332) (2 samples, 0.11%)</title><rect x="60.2988%" y="276" width="0.1067%" height="15" fill="rgb(205,98,50)" fg:x="1130" fg:w="2"/><text x="60.5488%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:335) (9 samples, 0.48%)</title><rect x="60.4055%" y="276" width="0.4803%" height="15" fill="rgb(205,185,37)" fg:x="1132" fg:w="9"/><text x="60.6555%" y="286.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:336) (97 samples, 5.18%)</title><rect x="60.8858%" y="276" width="5.1761%" height="15" fill="rgb(238,207,15)" fg:x="1141" fg:w="97"/><text x="61.1358%" y="286.50">_apply..</text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:339) (4 samples, 0.21%)</title><rect x="66.0619%" y="276" width="0.2134%" height="15" fill="rgb(213,199,42)" fg:x="1238" fg:w="4"/><text x="66.3119%" y="286.50"></text></g><g><title>__rdiv__ (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:1079) (16 samples, 0.85%)</title><rect x="71.9317%" y="308" width="0.8538%" height="15" fill="rgb(235,201,11)" fg:x="1348" fg:w="16"/><text x="72.1817%" y="318.50"></text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:340) (124 samples, 6.62%)</title><rect x="66.2753%" y="276" width="6.6169%" height="15" fill="rgb(207,46,11)" fg:x="1242" fg:w="124"/><text x="66.5253%" y="286.50">_apply_bf..</text></g><g><title>wrapped (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:45) (18 samples, 0.96%)</title><rect x="71.9317%" y="292" width="0.9605%" height="15" fill="rgb(241,35,35)" fg:x="1348" fg:w="18"/><text x="72.1817%" y="302.50"></text></g><g><title>__rsub__ (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:1075) (2 samples, 0.11%)</title><rect x="72.7855%" y="308" width="0.1067%" height="15" fill="rgb(243,32,47)" fg:x="1364" fg:w="2"/><text x="73.0355%" y="318.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:451) (538 samples, 28.71%)</title><rect x="44.8773%" y="260" width="28.7086%" height="15" fill="rgb(247,202,23)" fg:x="841" fg:w="538"/><text x="45.1273%" y="270.50">collide_and_stream (D:\CodeProjects\research-p..</text></g><g><title>_apply_bfl_boundary (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:342) (13 samples, 0.69%)</title><rect x="72.8922%" y="276" width="0.6937%" height="15" fill="rgb(219,102,11)" fg:x="1366" fg:w="13"/><text x="73.1422%" y="286.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:453) (4 samples, 0.21%)</title><rect x="73.5859%" y="260" width="0.2134%" height="15" fill="rgb(243,110,44)" fg:x="1379" fg:w="4"/><text x="73.8359%" y="270.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:202) (9 samples, 0.48%)</title><rect x="73.8527%" y="276" width="0.4803%" height="15" fill="rgb(222,74,54)" fg:x="1384" fg:w="9"/><text x="74.1027%" y="286.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:205) (26 samples, 1.39%)</title><rect x="74.3330%" y="276" width="1.3874%" height="15" fill="rgb(216,99,12)" fg:x="1393" fg:w="26"/><text x="74.5830%" y="286.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:207) (13 samples, 0.69%)</title><rect x="75.7204%" y="276" width="0.6937%" height="15" fill="rgb(226,22,26)" fg:x="1419" fg:w="13"/><text x="75.9704%" y="286.50"></text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:208) (10 samples, 0.53%)</title><rect x="76.4141%" y="276" width="0.5336%" height="15" fill="rgb(217,163,10)" fg:x="1432" fg:w="10"/><text x="76.6641%" y="286.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:455) (75 samples, 4.00%)</title><rect x="73.7994%" y="260" width="4.0021%" height="15" fill="rgb(213,25,53)" fg:x="1383" fg:w="75"/><text x="74.0494%" y="270.50">coll..</text></g><g><title>_accumulate_momentum_exchange_force (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:209) (16 samples, 0.85%)</title><rect x="76.9477%" y="276" width="0.8538%" height="15" fill="rgb(252,105,26)" fg:x="1442" fg:w="16"/><text x="77.1977%" y="286.50"></text></g><g><title>collide_and_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:456) (2 samples, 0.11%)</title><rect x="77.8015%" y="260" width="0.1067%" height="15" fill="rgb(220,39,43)" fg:x="1458" fg:w="2"/><text x="78.0515%" y="270.50"></text></g><g><title>simulate_aerodynamics (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2668) (691 samples, 36.87%)</title><rect x="41.1419%" y="228" width="36.8730%" height="15" fill="rgb(229,68,48)" fg:x="771" fg:w="691"/><text x="41.3919%" y="238.50">simulate_aerodynamics (D:\CodeProjects\research-paper\CLI\ai..</text></g><g><title>collide_stream (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:628) (680 samples, 36.29%)</title><rect x="41.7289%" y="244" width="36.2860%" height="15" fill="rgb(252,8,32)" fg:x="782" fg:w="680"/><text x="41.9789%" y="254.50">collide_stream (D:\CodeProjects\research-paper\CLI\advanced..</text></g><g><title>compute_aerodynamic_coefficients (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:776) (5 samples, 0.27%)</title><rect x="78.0149%" y="244" width="0.2668%" height="15" fill="rgb(223,20,43)" fg:x="1462" fg:w="5"/><text x="78.2649%" y="254.50"></text></g><g><title>_refresh_flow_diagnostics (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:659) (2 samples, 0.11%)</title><rect x="78.3351%" y="260" width="0.1067%" height="15" fill="rgb(229,81,49)" fg:x="1468" fg:w="2"/><text x="78.5851%" y="270.50"></text></g><g><title>compute_velocity_gradients (D:\CodeProjects\research-paper\CLI\lbm_diagnostics.py:16) (2 samples, 0.11%)</title><rect x="78.3351%" y="276" width="0.1067%" height="15" fill="rgb(236,28,36)" fg:x="1468" fg:w="2"/><text x="78.5851%" y="286.50"></text></g><g><title>compute_aerodynamic_coefficients (D:\CodeProjects\research-paper\CLI\advanced_lbm_solver.py:850) (4 samples, 0.21%)</title><rect x="78.3351%" y="244" width="0.2134%" height="15" fill="rgb(249,185,26)" fg:x="1468" fg:w="4"/><text x="78.5851%" y="254.50"></text></g><g><title>_direct_measured_objective_for_single (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3318) (705 samples, 37.62%)</title><rect x="41.0352%" y="212" width="37.6201%" height="15" fill="rgb(249,174,33)" fg:x="769" fg:w="705"/><text x="41.2852%" y="222.50">_direct_measured_objective_for_single (D:\CodeProjects\resear..</text></g><g><title>simulate_aerodynamics (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2669) (12 samples, 0.64%)</title><rect x="78.0149%" y="228" width="0.6403%" height="15" fill="rgb(233,201,37)" fg:x="1462" fg:w="12"/><text x="78.2649%" y="238.50"></text></g><g><title>_heuristic_metrics (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:78) (2 samples, 0.11%)</title><rect x="78.9221%" y="244" width="0.1067%" height="15" fill="rgb(221,78,26)" fg:x="1479" fg:w="2"/><text x="79.1721%" y="254.50"></text></g><g><title>_heuristic_metrics (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:82) (8 samples, 0.43%)</title><rect x="79.0288%" y="244" width="0.4269%" height="15" fill="rgb(250,127,30)" fg:x="1481" fg:w="8"/><text x="79.2788%" y="254.50"></text></g><g><title>label (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\scipy\ndimage\_measurements.py:218) (8 samples, 0.43%)</title><rect x="79.0288%" y="260" width="0.4269%" height="15" fill="rgb(230,49,44)" fg:x="1481" fg:w="8"/><text x="79.2788%" y="270.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4193) (1,446 samples, 77.16%)</title><rect x="2.5080%" y="116" width="77.1612%" height="15" fill="rgb(229,67,23)" fg:x="47" fg:w="1446"/><text x="2.7580%" y="126.50">train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4193)</text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (1,446 samples, 77.16%)</title><rect x="2.5080%" y="132" width="77.1612%" height="15" fill="rgb(249,83,47)" fg:x="47" fg:w="1446"/><text x="2.7580%" y="142.50">_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775)</text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (1,446 samples, 77.16%)</title><rect x="2.5080%" y="148" width="77.1612%" height="15" fill="rgb(215,43,3)" fg:x="47" fg:w="1446"/><text x="2.7580%" y="158.50">_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786)</text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3627) (1,446 samples, 77.16%)</title><rect x="2.5080%" y="164" width="77.1612%" height="15" fill="rgb(238,154,13)" fg:x="47" fg:w="1446"/><text x="2.7580%" y="174.50">forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3627)</text></g><g><title>apply (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\autograd\function.py:581) (1,446 samples, 77.16%)</title><rect x="2.5080%" y="180" width="77.1612%" height="15" fill="rgb(219,56,2)" fg:x="47" fg:w="1446"/><text x="2.7580%" y="190.50">apply (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\autograd\function.py:581)</text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3521) (737 samples, 39.33%)</title><rect x="40.3415%" y="196" width="39.3276%" height="15" fill="rgb(233,0,4)" fg:x="756" fg:w="737"/><text x="40.5915%" y="206.50">forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_c..</text></g><g><title>_direct_measured_objective_for_single (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3339) (19 samples, 1.01%)</title><rect x="78.6553%" y="212" width="1.0139%" height="15" fill="rgb(235,30,7)" fg:x="1474" fg:w="19"/><text x="78.9053%" y="222.50"></text></g><g><title>evaluate_aircraft_validity (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:370) (18 samples, 0.96%)</title><rect x="78.7086%" y="228" width="0.9605%" height="15" fill="rgb(250,79,13)" fg:x="1475" fg:w="18"/><text x="78.9586%" y="238.50"></text></g><g><title>_heuristic_metrics (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:98) (3 samples, 0.16%)</title><rect x="79.5091%" y="244" width="0.1601%" height="15" fill="rgb(211,146,34)" fg:x="1490" fg:w="3"/><text x="79.7591%" y="254.50"></text></g><g><title>_extent (D:\CodeProjects\research-paper\CLI\aircraft_validity.py:38) (3 samples, 0.16%)</title><rect x="79.5091%" y="260" width="0.1601%" height="15" fill="rgb(228,22,38)" fg:x="1490" fg:w="3"/><text x="79.7591%" y="270.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (4 samples, 0.21%)</title><rect x="79.7225%" y="276" width="0.2134%" height="15" fill="rgb(235,168,5)" fg:x="1494" fg:w="4"/><text x="79.9725%" y="286.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (4 samples, 0.21%)</title><rect x="79.7225%" y="292" width="0.2134%" height="15" fill="rgb(221,155,16)" fg:x="1494" fg:w="4"/><text x="79.9725%" y="302.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\container.py:250) (4 samples, 0.21%)</title><rect x="79.7225%" y="308" width="0.2134%" height="15" fill="rgb(215,215,53)" fg:x="1494" fg:w="4"/><text x="79.9725%" y="318.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (4 samples, 0.21%)</title><rect x="79.7225%" y="324" width="0.2134%" height="15" fill="rgb(223,4,10)" fg:x="1494" fg:w="4"/><text x="79.9725%" y="334.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (4 samples, 0.21%)</title><rect x="79.7225%" y="340" width="0.2134%" height="15" fill="rgb(234,103,6)" fg:x="1494" fg:w="4"/><text x="79.9725%" y="350.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\linear.py:134) (4 samples, 0.21%)</title><rect x="79.7225%" y="356" width="0.2134%" height="15" fill="rgb(227,97,0)" fg:x="1494" fg:w="4"/><text x="79.9725%" y="366.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4227) (7 samples, 0.37%)</title><rect x="79.7225%" y="116" width="0.3735%" height="15" fill="rgb(234,150,53)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="126.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (7 samples, 0.37%)</title><rect x="79.7225%" y="132" width="0.3735%" height="15" fill="rgb(228,201,54)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="142.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (7 samples, 0.37%)</title><rect x="79.7225%" y="148" width="0.3735%" height="15" fill="rgb(222,22,37)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="158.50"></text></g><g><title>forward (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2534) (7 samples, 0.37%)</title><rect x="79.7225%" y="164" width="0.3735%" height="15" fill="rgb(237,53,32)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="174.50"></text></g><g><title>_checkpointed_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2486) (7 samples, 0.37%)</title><rect x="79.7225%" y="180" width="0.3735%" height="15" fill="rgb(233,25,53)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="190.50"></text></g><g><title>inner (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_compile.py:53) (7 samples, 0.37%)</title><rect x="79.7225%" y="196" width="0.3735%" height="15" fill="rgb(210,40,34)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="206.50"></text></g><g><title>_fn (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_dynamo\eval_frame.py:1044) (7 samples, 0.37%)</title><rect x="79.7225%" y="212" width="0.3735%" height="15" fill="rgb(241,220,44)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="222.50"></text></g><g><title>checkpoint (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\utils\checkpoint.py:503) (7 samples, 0.37%)</title><rect x="79.7225%" y="228" width="0.3735%" height="15" fill="rgb(235,28,35)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="238.50"></text></g><g><title>_decode_latent_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2471) (7 samples, 0.37%)</title><rect x="79.7225%" y="244" width="0.3735%" height="15" fill="rgb(210,56,17)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="254.50"></text></g><g><title>_decode_coordinate_features (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2455) (7 samples, 0.37%)</title><rect x="79.7225%" y="260" width="0.3735%" height="15" fill="rgb(224,130,29)" fg:x="1494" fg:w="7"/><text x="79.9725%" y="270.50"></text></g><g><title>silu (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\functional.py:2371) (3 samples, 0.16%)</title><rect x="79.9360%" y="276" width="0.1601%" height="15" fill="rgb(235,212,8)" fg:x="1498" fg:w="3"/><text x="80.1860%" y="286.50"></text></g><g><title>forward_flat_indices (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2513) (6 samples, 0.32%)</title><rect x="80.2028%" y="148" width="0.3202%" height="15" fill="rgb(223,33,50)" fg:x="1503" fg:w="6"/><text x="80.4528%" y="158.50"></text></g><g><title>_encode_coordinates (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2445) (6 samples, 0.32%)</title><rect x="80.2028%" y="164" width="0.3202%" height="15" fill="rgb(219,149,13)" fg:x="1503" fg:w="6"/><text x="80.4528%" y="174.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="80.5763%" y="212" width="0.1067%" height="15" fill="rgb(250,156,29)" fg:x="1510" fg:w="2"/><text x="80.8263%" y="222.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="80.5763%" y="228" width="0.1067%" height="15" fill="rgb(216,193,19)" fg:x="1510" fg:w="2"/><text x="80.8263%" y="238.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\container.py:250) (2 samples, 0.11%)</title><rect x="80.5763%" y="244" width="0.1067%" height="15" fill="rgb(216,135,14)" fg:x="1510" fg:w="2"/><text x="80.8263%" y="254.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (2 samples, 0.11%)</title><rect x="80.5763%" y="260" width="0.1067%" height="15" fill="rgb(241,47,5)" fg:x="1510" fg:w="2"/><text x="80.8263%" y="270.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (2 samples, 0.11%)</title><rect x="80.5763%" y="276" width="0.1067%" height="15" fill="rgb(233,42,35)" fg:x="1510" fg:w="2"/><text x="80.8263%" y="286.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\linear.py:134) (2 samples, 0.11%)</title><rect x="80.5763%" y="292" width="0.1067%" height="15" fill="rgb(231,13,6)" fg:x="1510" fg:w="2"/><text x="80.8263%" y="302.50"></text></g><g><title>_decode_coordinate_features (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2455) (4 samples, 0.21%)</title><rect x="80.5763%" y="196" width="0.2134%" height="15" fill="rgb(207,181,40)" fg:x="1510" fg:w="4"/><text x="80.8263%" y="206.50"></text></g><g><title>silu (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\functional.py:2371) (2 samples, 0.11%)</title><rect x="80.6830%" y="212" width="0.1067%" height="15" fill="rgb(254,173,49)" fg:x="1512" fg:w="2"/><text x="80.9330%" y="222.50"></text></g><g><title>_backward_full_grounded_coordinate_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3868) (14 samples, 0.75%)</title><rect x="80.0961%" y="132" width="0.7471%" height="15" fill="rgb(221,1,38)" fg:x="1501" fg:w="14"/><text x="80.3461%" y="142.50"></text></g><g><title>forward_flat_indices (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2518) (6 samples, 0.32%)</title><rect x="80.5229%" y="148" width="0.3202%" height="15" fill="rgb(206,124,46)" fg:x="1509" fg:w="6"/><text x="80.7729%" y="158.50"></text></g><g><title>_checkpointed_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2492) (6 samples, 0.32%)</title><rect x="80.5229%" y="164" width="0.3202%" height="15" fill="rgb(249,21,11)" fg:x="1509" fg:w="6"/><text x="80.7729%" y="174.50"></text></g><g><title>_decode_latent_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2471) (6 samples, 0.32%)</title><rect x="80.5229%" y="180" width="0.3202%" height="15" fill="rgb(222,201,40)" fg:x="1509" fg:w="6"/><text x="80.7729%" y="190.50"></text></g><g><title>_backward_full_grounded_coordinate_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3872) (49 samples, 2.61%)</title><rect x="80.8965%" y="132" width="2.6147%" height="15" fill="rgb(235,61,29)" fg:x="1516" fg:w="49"/><text x="81.1465%" y="142.50">_b..</text></g><g><title>_encode_coordinates (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2445) (143 samples, 7.63%)</title><rect x="83.5112%" y="164" width="7.6307%" height="15" fill="rgb(219,207,3)" fg:x="1565" fg:w="143"/><text x="83.7612%" y="174.50">_encode_co..</text></g><g><title>forward_flat_indices (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2513) (145 samples, 7.74%)</title><rect x="83.5112%" y="148" width="7.7375%" height="15" fill="rgb(222,56,46)" fg:x="1565" fg:w="145"/><text x="83.7612%" y="158.50">forward_fla..</text></g><g><title>_encode_coordinates (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2449) (2 samples, 0.11%)</title><rect x="91.1419%" y="164" width="0.1067%" height="15" fill="rgb(239,76,54)" fg:x="1708" fg:w="2"/><text x="91.3919%" y="174.50"></text></g><g><title>_backward_full_grounded_coordinate_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3904) (150 samples, 8.00%)</title><rect x="83.5112%" y="132" width="8.0043%" height="15" fill="rgb(231,124,27)" fg:x="1565" fg:w="150"/><text x="83.7612%" y="142.50">_backward_f..</text></g><g><title>forward_flat_indices (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2518) (5 samples, 0.27%)</title><rect x="91.2487%" y="148" width="0.2668%" height="15" fill="rgb(249,195,6)" fg:x="1710" fg:w="5"/><text x="91.4987%" y="158.50"></text></g><g><title>_checkpointed_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2486) (5 samples, 0.27%)</title><rect x="91.2487%" y="164" width="0.2668%" height="15" fill="rgb(237,174,47)" fg:x="1710" fg:w="5"/><text x="91.4987%" y="174.50"></text></g><g><title>inner (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_compile.py:53) (5 samples, 0.27%)</title><rect x="91.2487%" y="180" width="0.2668%" height="15" fill="rgb(206,201,31)" fg:x="1710" fg:w="5"/><text x="91.4987%" y="190.50"></text></g><g><title>_fn (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_dynamo\eval_frame.py:1044) (5 samples, 0.27%)</title><rect x="91.2487%" y="196" width="0.2668%" height="15" fill="rgb(231,57,52)" fg:x="1710" fg:w="5"/><text x="91.4987%" y="206.50"></text></g><g><title>checkpoint (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\utils\checkpoint.py:503) (4 samples, 0.21%)</title><rect x="91.3020%" y="212" width="0.2134%" height="15" fill="rgb(248,177,22)" fg:x="1711" fg:w="4"/><text x="91.5520%" y="222.50"></text></g><g><title>_decode_latent_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2471) (3 samples, 0.16%)</title><rect x="91.3554%" y="228" width="0.1601%" height="15" fill="rgb(215,211,37)" fg:x="1712" fg:w="3"/><text x="91.6054%" y="238.50"></text></g><g><title>_decode_coordinate_features (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2455) (2 samples, 0.11%)</title><rect x="91.4088%" y="244" width="0.1067%" height="15" fill="rgb(241,128,51)" fg:x="1713" fg:w="2"/><text x="91.6588%" y="254.50"></text></g><g><title>_backward_full_grounded_coordinate_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3909) (64 samples, 3.42%)</title><rect x="91.5155%" y="132" width="3.4152%" height="15" fill="rgb(227,165,31)" fg:x="1715" fg:w="64"/><text x="91.7655%" y="142.50">_ba..</text></g><g><title>_backward_full_grounded_coordinate_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3910) (3 samples, 0.16%)</title><rect x="94.9306%" y="132" width="0.1601%" height="15" fill="rgb(228,167,24)" fg:x="1779" fg:w="3"/><text x="95.1806%" y="142.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4253) (287 samples, 15.31%)</title><rect x="80.0961%" y="116" width="15.3148%" height="15" fill="rgb(228,143,12)" fg:x="1501" fg:w="287"/><text x="80.3461%" y="126.50">train_epoch (D:\CodePro..</text></g><g><title>_backward_full_grounded_coordinate_loss (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:3929) (4 samples, 0.21%)</title><rect x="95.1974%" y="132" width="0.2134%" height="15" fill="rgb(249,149,8)" fg:x="1784" fg:w="4"/><text x="95.4474%" y="142.50"></text></g><g><title>backward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_tensor.py:625) (4 samples, 0.21%)</title><rect x="95.1974%" y="148" width="0.2134%" height="15" fill="rgb(243,35,44)" fg:x="1784" fg:w="4"/><text x="95.4474%" y="158.50"></text></g><g><title>backward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\autograd\__init__.py:354) (4 samples, 0.21%)</title><rect x="95.1974%" y="164" width="0.2134%" height="15" fill="rgb(246,89,9)" fg:x="1784" fg:w="4"/><text x="95.4474%" y="174.50"></text></g><g><title>_engine_run_backward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\autograd\graph.py:841) (4 samples, 0.21%)</title><rect x="95.1974%" y="180" width="0.2134%" height="15" fill="rgb(233,213,13)" fg:x="1784" fg:w="4"/><text x="95.4474%" y="190.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4277) (12 samples, 0.64%)</title><rect x="95.4109%" y="116" width="0.6403%" height="15" fill="rgb(233,141,41)" fg:x="1788" fg:w="12"/><text x="95.6609%" y="126.50"></text></g><g><title>move_optimizer_state (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:589) (11 samples, 0.59%)</title><rect x="95.4642%" y="132" width="0.5870%" height="15" fill="rgb(239,167,4)" fg:x="1789" fg:w="11"/><text x="95.7142%" y="142.50"></text></g><g><title>train_epoch (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:4280) (4 samples, 0.21%)</title><rect x="96.0512%" y="116" width="0.2134%" height="15" fill="rgb(209,217,16)" fg:x="1800" fg:w="4"/><text x="96.3012%" y="126.50"></text></g><g><title>move_optimizer_state (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:589) (4 samples, 0.21%)</title><rect x="96.0512%" y="132" width="0.2134%" height="15" fill="rgb(219,88,35)" fg:x="1800" fg:w="4"/><text x="96.3012%" y="142.50"></text></g><g><title>thread (31512): MainThread (1,805 samples, 96.32%)</title><rect x="0.0000%" y="68" width="96.3180%" height="15" fill="rgb(220,193,23)" fg:x="0" fg:w="1805"/><text x="0.2500%" y="78.50">thread (31512): MainThread</text></g><g><title>&lt;module&gt; (D:\CodeProjects\research-paper\CLI\run_monitored_training.py:487) (1,805 samples, 96.32%)</title><rect x="0.0000%" y="84" width="96.3180%" height="15" fill="rgb(230,90,52)" fg:x="0" fg:w="1805"/><text x="0.2500%" y="94.50">&lt;module&gt; (D:\CodeProjects\research-paper\CLI\run_monitored_training.py:487)</text></g><g><title>main (D:\CodeProjects\research-paper\CLI\run_monitored_training.py:400) (1,805 samples, 96.32%)</title><rect x="0.0000%" y="100" width="96.3180%" height="15" fill="rgb(252,106,19)" fg:x="0" fg:w="1805"/><text x="0.2500%" y="110.50">main (D:\CodeProjects\research-paper\CLI\run_monitored_training.py:400)</text></g><g><title>_decode_latent_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2467) (2 samples, 0.11%)</title><rect x="99.1462%" y="164" width="0.1067%" height="15" fill="rgb(206,74,20)" fg:x="1858" fg:w="2"/><text x="99.3962%" y="174.50"></text></g><g><title>_decode_coordinate_features (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2453) (2 samples, 0.11%)</title><rect x="99.2529%" y="180" width="0.1067%" height="15" fill="rgb(230,138,44)" fg:x="1860" fg:w="2"/><text x="99.5029%" y="190.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\activation.py:473) (2 samples, 0.11%)</title><rect x="99.4664%" y="276" width="0.1067%" height="15" fill="rgb(235,182,43)" fg:x="1864" fg:w="2"/><text x="99.7164%" y="286.50"></text></g><g><title>silu (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\functional.py:2371) (2 samples, 0.11%)</title><rect x="99.4664%" y="292" width="0.1067%" height="15" fill="rgb(242,16,51)" fg:x="1864" fg:w="2"/><text x="99.7164%" y="302.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\container.py:250) (10 samples, 0.53%)</title><rect x="99.3597%" y="228" width="0.5336%" height="15" fill="rgb(248,9,4)" fg:x="1862" fg:w="10"/><text x="99.6097%" y="238.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (10 samples, 0.53%)</title><rect x="99.3597%" y="244" width="0.5336%" height="15" fill="rgb(210,31,22)" fg:x="1862" fg:w="10"/><text x="99.6097%" y="254.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (9 samples, 0.48%)</title><rect x="99.4130%" y="260" width="0.4803%" height="15" fill="rgb(239,54,39)" fg:x="1863" fg:w="9"/><text x="99.6630%" y="270.50"></text></g><g><title>forward (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\linear.py:134) (6 samples, 0.32%)</title><rect x="99.5731%" y="276" width="0.3202%" height="15" fill="rgb(230,99,41)" fg:x="1866" fg:w="6"/><text x="99.8231%" y="286.50"></text></g><g><title>unpack_hook (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\utils\checkpoint.py:1154) (17 samples, 0.91%)</title><rect x="99.0395%" y="84" width="0.9072%" height="15" fill="rgb(253,106,12)" fg:x="1856" fg:w="17"/><text x="99.2895%" y="94.50"></text></g><g><title>inner (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_compile.py:53) (17 samples, 0.91%)</title><rect x="99.0395%" y="100" width="0.9072%" height="15" fill="rgb(213,46,41)" fg:x="1856" fg:w="17"/><text x="99.2895%" y="110.50"></text></g><g><title>_fn (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\_dynamo\eval_frame.py:1044) (17 samples, 0.91%)</title><rect x="99.0395%" y="116" width="0.9072%" height="15" fill="rgb(215,133,35)" fg:x="1856" fg:w="17"/><text x="99.2895%" y="126.50"></text></g><g><title>_run_fn_with_dynamo_disabled (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\utils\checkpoint.py:1124) (17 samples, 0.91%)</title><rect x="99.0395%" y="132" width="0.9072%" height="15" fill="rgb(213,28,5)" fg:x="1856" fg:w="17"/><text x="99.2895%" y="142.50"></text></g><g><title>recompute_fn (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\utils\checkpoint.py:1555) (15 samples, 0.80%)</title><rect x="99.1462%" y="148" width="0.8004%" height="15" fill="rgb(215,77,49)" fg:x="1858" fg:w="15"/><text x="99.3962%" y="158.50"></text></g><g><title>_decode_latent_coordinate_chunk (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2471) (13 samples, 0.69%)</title><rect x="99.2529%" y="164" width="0.6937%" height="15" fill="rgb(248,100,22)" fg:x="1860" fg:w="13"/><text x="99.5029%" y="174.50"></text></g><g><title>_decode_coordinate_features (D:\CodeProjects\research-paper\CLI\aircraft_diffusion_cfd.py:2455) (11 samples, 0.59%)</title><rect x="99.3597%" y="180" width="0.5870%" height="15" fill="rgb(208,67,9)" fg:x="1862" fg:w="11"/><text x="99.6097%" y="190.50"></text></g><g><title>_wrapped_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1775) (11 samples, 0.59%)</title><rect x="99.3597%" y="196" width="0.5870%" height="15" fill="rgb(219,133,21)" fg:x="1862" fg:w="11"/><text x="99.6097%" y="206.50"></text></g><g><title>_call_impl (C:\Users\Darsh Gupta\AppData\Roaming\Python\Python312\site-packages\torch\nn\modules\module.py:1786) (11 samples, 0.59%)</title><rect x="99.3597%" y="212" width="0.5870%" height="15" fill="rgb(246,46,29)" fg:x="1862" fg:w="11"/><text x="99.6097%" y="222.50"></text></g><g><title>all (1,874 samples, 100%)</title><rect x="0.0000%" y="52" width="100.0000%" height="15" fill="rgb(246,185,52)" fg:x="0" fg:w="1874"/><text x="0.2500%" y="62.50"></text></g><g><title>thread (34492) (69 samples, 3.68%)</title><rect x="96.3180%" y="68" width="3.6820%" height="15" fill="rgb(252,136,11)" fg:x="1805" fg:w="69"/><text x="96.5680%" y="78.50">thre..</text></g></svg></svg>
