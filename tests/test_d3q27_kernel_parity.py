@@ -229,3 +229,17 @@ def test_reference_path_unchanged_without_flag():
     mask = _cube_mask(16).to(device)
     solver.collide_and_stream(1.6, mask)  # must not raise
     assert torch.isfinite(solver.f).all()
+
+
+@requires_fused
+def test_monitored_training_config_activates_fused_backend():
+    from aircraft_diffusion_cfd import AdvancedCFDSimulator, CFDConfig
+
+    config = CFDConfig(
+        base_grid_resolution=8,
+        resolution=8,
+        use_fused_stream_bfl=True,
+    )
+    simulator = AdvancedCFDSimulator(config, torch.device("cuda"))
+
+    assert simulator.lbm_solver._solver.use_fused_stream_bfl is True

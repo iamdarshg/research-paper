@@ -844,6 +844,8 @@ class CFDConfig:
     lbm_config: LBMPhysicsConfig = None   # LBM parameters
     # Backwards compatibility parameter - default to base_grid_resolution
     resolution: int = None  # If provided, sets base_grid_resolution
+    # Solver streaming/BFL backend override. None defers to LBMPhysicsConfig.
+    use_fused_stream_bfl: Optional[bool] = None
 
     def __post_init__(self):
         # Set default resolution if not provided
