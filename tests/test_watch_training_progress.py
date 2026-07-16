@@ -40,9 +40,12 @@ def test_live_batch_parser_reads_tqdm_loss_postfix(tmp_path):
     console.write_text(
         "loading checkpoint\r"
         "Training: 12%|### | 91/758 [1:02:03<7:35:00, 40.9s/it, "
-        "opt_loss=12.5, mse=0.25, clean_geom=1.1, gen_geom=2.2, "
-        "consistency=3.3, latent_recon=0.4, direct_solver=0.75]\r",
-        encoding="utf-8",
+        "opt_loss=12.5, mse=0.25,\r\n"
+        "clean_geom=1.1, gen_geom=2.2, consistency=3.3, latent_recon=0.4, "
+        "direct_solver=0.75,\r\n"
+        "denoise_conf=0.56]\r\n"
+        "Running D3Q27 GPU LBM solver at base resolution...\r\n",
+        encoding="utf-16",
     )
 
     live = _latest_live_batch(console)
@@ -52,3 +55,5 @@ def test_live_batch_parser_reads_tqdm_loss_postfix(tmp_path):
     assert live["total"] == 758
     assert live["metrics"]["opt_loss"] == 12.5
     assert live["metrics"]["direct_solver"] == 0.75
+    assert live["metrics"]["clean_geom"] == 1.1
+    assert live["metrics"]["denoise_conf"] == 0.56

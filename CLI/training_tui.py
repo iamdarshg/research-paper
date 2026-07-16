@@ -28,29 +28,49 @@ def _latest_live_batch(path: Optional[Path]) -> Optional[Dict[str, Any]]:
         return None
     try:
         with path.open("rb") as handle:
+            prefix = handle.read(4)
             handle.seek(0, 2)
             end = handle.tell()
-            handle.seek(max(0, end - 262144))
-            text = handle.read().decode("utf-8", errors="replace")
+            if prefix.startswith(b"\xff\xfe"):
+                start = max(2, end - 524288)
+                start += start % 2
+                handle.seek(start)
+                text = handle.read().decode("utf-16-le", errors="replace")
+            elif prefix.startswith(b"\xfe\xff"):
+                start = max(2, end - 524288)
+                start += start % 2
+                handle.seek(start)
+                text = handle.read().decode("utf-16-be", errors="replace")
+            else:
+                handle.seek(max(0, end - 262144))
+                text = handle.read().decode("utf-8", errors="replace")
     except OSError:
         return None
 
-    for raw_line in reversed(re.split(r"[\r\n]+", text)):
-        line = ANSI_ESCAPE.sub("", raw_line).strip()
+    lines = [ANSI_ESCAPE.sub("", line).strip() for line in re.split(r"[\r\n]+", text)]
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
         if "opt_loss=" not in line:
             continue
         progress = re.search(r"(?P<done>\d+)/(?P<total>\d+)", line)
+        if progress is None:
+            continue
+        record = line
+        for continuation in lines[index + 1:index + 5]:
+            if continuation.startswith(("Training with optimizations", "Running D3Q27")):
+                break
+            record += " " + continuation
+            if "]" in continuation:
+                break
         values: Dict[str, float] = {}
         for key, raw_value in re.findall(
             r"([A-Za-z_][A-Za-z0-9_]*)=([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
-            line,
+            record,
         ):
             try:
                 values[key] = float(raw_value)
             except ValueError:
                 continue
-        if progress is None:
-            continue
         done = int(progress.group("done"))
         total = int(progress.group("total"))
         timing = re.search(r"\[(?P<timing>[^\]]+)", line)
