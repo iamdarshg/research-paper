@@ -57,16 +57,19 @@ and projected-drag accounting are unchanged.
   `pytorch_reference`; the simplified periodic bounce kernel
   (`stream_bounce_d3q27`) is never substituted.
 
-## A Pre-existing Lattice Observation
+## Lattice Opposite-Table Correction
 
-While validating direction handling, the D3Q27 `opposite` table in
-`CLI/lbm_utils.py` was found to pair the twelve edge directions with vectors
-that are not their geometric negations (e.g. `e_7 = (1,1,0)` pairs with
-`e_8 = (-1,1,0)`; the true opposite is `e_10 = (-1,-1,0)`). Faces and corners
-are correct. The fused kernel intentionally reproduces the table-driven
-reference behavior; correcting the table would change the solver's validated
-claim boundary and calibrated drag constants, and is tracked as a separate
-audit, not part of this optimization.
+The audit found that the D3Q27 `opposite` table in `CLI/lbm_utils.py` paired
+the twelve edge directions with vectors that were not their geometric
+negations. That is a physics defect rather than an acceptable calibration
+choice, so it was corrected before resumed training. A lattice invariant test
+now requires both `e[opposite[i]] == -e[i]` and
+`opposite[opposite[i]] == i` for all 27 directions.
+
+The fused and reference backends were rerun after the correction. All 15 CUDA
+kernel/direct-objective parity tests pass, as do the six core solver tests.
+The fused kernel therefore matches the corrected reference rather than merely
+reproducing the old table defect.
 
 ## Parity Evidence (gates 1-7)
 
@@ -86,6 +89,16 @@ RTX 4060 Laptop GPU, torch 2.9.1+cu130, triton 3.5.1, 2026-07-16:
   connectivity, aircraft-validity, total) reference vs fused;
 - SPSA loss and gradient parity with identical seeds and deltas
   (gradient max-diff and norm gates).
+
+Post-correction verification commands:
+
+```text
+python -m pytest tests/test_solver.py -q
+6 passed
+
+python -m pytest tests/test_d3q27_kernel_parity.py tests/test_direct_solver_fused_parity.py -q
+15 passed
+```
 
 Residual differences are FMA contraction inside the Triton kernel: computed on
 identical state, the force summation is bitwise equal to the reference; the
@@ -109,6 +122,13 @@ therefore absolute, scaled to gross magnitude, not relative to the small net.
 The remaining fused-step cost is dominated by the dense MRT collision
 transforms (plan Phase 2) and the still-CPU SciPy EDT (plan Phase 5), which
 this change intentionally does not touch.
+
+A short post-correction `96^3` rerun retained the performance result. On the
+real AircraftVerse fixture, the complete step improved from `243.02 ms` to
+`84.10 ms` (`2.89x`), the stream/BFL segment improved from `149.23 ms` to
+`2.03 ms` (`73.42x`), and maximum population difference was `1.86e-9`.
+Machine-readable output is in
+`build/d3q27_kernel_profile_opposite_fix_20260716/kernel_profile.json`.
 
 ### One-update A/B (plan delivery step 8)
 

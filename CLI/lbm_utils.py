@@ -165,5 +165,5 @@ class D3Q27Lattice:
         7-18 (edges): diagonal pairs
         19-26 (corners): 3D diagonal pairs
         """
-        opp = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17, 26, 25, 24, 23, 22, 21, 20, 19]
+        opp = [0, 2, 1, 4, 3, 6, 5, 10, 9, 8, 7, 14, 13, 12, 11, 18, 17, 16, 15, 26, 25, 24, 23, 22, 21, 20, 19]
         return torch.tensor(opp, dtype=torch.int64)

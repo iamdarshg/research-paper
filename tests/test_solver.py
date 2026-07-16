@@ -22,6 +22,14 @@ class TestLBMSolvers(unittest.TestCase):
         self.assertEqual(solver.f.shape, (27, 8, 8, 8))
         self.assertFalse(torch.isnan(solver.f).any())
 
+    def test_d3q27_opposites_are_vector_negations(self):
+        ex, ey, ez = D3Q27Lattice.get_vectors()
+        vectors = torch.stack((ex, ey, ez), dim=1)
+        opposite = D3Q27Lattice.get_opposite()
+
+        self.assertTrue(torch.equal(vectors[opposite], -vectors))
+        self.assertTrue(torch.equal(opposite[opposite], torch.arange(27)))
+
     def test_d3q27_step(self):
         solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
         geometry_mask = torch.zeros((8, 8, 8), device=self.device)
