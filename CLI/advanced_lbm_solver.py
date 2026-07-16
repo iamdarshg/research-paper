@@ -20,6 +20,11 @@ try:
 except Exception:  # pragma: no cover - optional acceleration path
     stream_bounce_d3q27 = None
 
+try:
+    from d3q27_kernels import stream_bfl_d3q27
+except Exception:  # pragma: no cover - optional acceleration path
+    stream_bfl_d3q27 = None
+
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
     """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
@@ -50,6 +55,7 @@ class D3Q27Solver:
         device,
         inlet_velocity_lu: float = 0.0,
         use_triton_streaming: bool = False,
+        use_fused_stream_bfl: bool = False,
     ):
         self.res = resolution
         self.device = device
@@ -119,6 +125,17 @@ class D3Q27Solver:
         self._boundary_cache_key = None
         self._boundary_link_cache = None
         self.use_triton_streaming = bool(use_triton_streaming and stream_bounce_d3q27 is not None and device.type == "cuda")
+        # Fused pull-stream + BFL backend (parity-gated). Unsupported
+        # environments fall back explicitly to the PyTorch reference path and
+        # never to the simplified bounce kernel above.
+        fused_requested = bool(use_fused_stream_bfl)
+        self.use_fused_stream_bfl = bool(
+            fused_requested and stream_bfl_d3q27 is not None and device.type == "cuda"
+        )
+        self._fused_stream_bfl_fallback_warned = not fused_requested or self.use_fused_stream_bfl
+        # Relaxation vectors are constant for a fixed omega; rebuilding them
+        # every step created one CUDA tensor per step (plan Phase 1).
+        self._s_vec_cache = {}
 
         # 27 populations
         self.f = torch.zeros(27, resolution, resolution, resolution, device=device)
@@ -202,6 +219,30 @@ class D3Q27Solver:
             if not torch.any(active):
                 continue
 
+            f_in = self.f_pre_stream[i][active]
+            opp_i = self._opposite_list[i]
+            f_out = self.f_temp[opp_i][active]
+            step_force_x += torch.sum(self.ex[i] * (f_in + f_out))
+            step_force_z += torch.sum(self.ez[i] * (f_in + f_out))
+
+        return step_force_x, step_force_z
+
+    def _accumulate_momentum_exchange_force_nosync(self, geometry_mask, geom_hash=None):
+        """Reference momentum-exchange sum without the 26 per-direction
+        ``torch.any`` host synchronizations (plan Phase 1/3).
+
+        This is the reference loop verbatim minus the early-continue: a sum
+        over an empty boolean selection contributes exactly 0.0, so the
+        result is bitwise identical while every step stays asynchronous.
+        """
+        boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
+
+        step_force_x = torch.tensor(0.0, device=self.device)
+        step_force_z = torch.tensor(0.0, device=self.device)
+
+        for i in range(1, 27):
+            link_idx = i - 1
+            active = boundary_links[link_idx]
             f_in = self.f_pre_stream[i][active]
             opp_i = self._opposite_list[i]
             f_out = self.f_temp[opp_i][active]
@@ -382,16 +423,23 @@ class D3Q27Solver:
 
         # Macroscopic velocity with forcing offset (Guo's definition)
         # u = (sum fi ci + 0.5 F) / rho
-        if ext_force is None:
-            ext_force = torch.zeros((3, *rho.shape), device=self.device)
+        # The direct-training path passes no external force; a host boolean
+        # avoids allocating and reducing a 3 x N^3 zero field every step
+        # (plan Phase 1).
+        has_ext_force = ext_force is not None
 
         ux_raw = torch.sum(self.f * self.ex_f, dim=0)
         uy_raw = torch.sum(self.f * self.ey_f, dim=0)
         uz_raw = torch.sum(self.f * self.ez_f, dim=0)
 
-        ux = (ux_raw + 0.5 * ext_force[0]) / (rho + 1e-12)
-        uy = (uy_raw + 0.5 * ext_force[1]) / (rho + 1e-12)
-        uz = (uz_raw + 0.5 * ext_force[2]) / (rho + 1e-12)
+        if has_ext_force:
+            ux = (ux_raw + 0.5 * ext_force[0]) / (rho + 1e-12)
+            uy = (uy_raw + 0.5 * ext_force[1]) / (rho + 1e-12)
+            uz = (uz_raw + 0.5 * ext_force[2]) / (rho + 1e-12)
+        else:
+            ux = ux_raw / (rho + 1e-12)
+            uy = uy_raw / (rho + 1e-12)
+            uz = uz_raw / (rho + 1e-12)
 
         ux = ux.nan_to_num(0.0, posinf=0.0, neginf=0.0)
         uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
@@ -401,16 +449,21 @@ class D3Q27Solver:
         K = torch.tensordot(self.moment_basis, self.f, dims=([1], [0]))
         Keq = self.compute_moment_equilibrium(rho, ux, uy, uz)
 
-        # Build S-vector (relaxation rates)
-        s_nu = float(omega)
-        s_vec = torch.tensor([0.0, self.s_e, s_nu, self.s_h], device=self.device)
-        S = s_vec[self.s_indices].view(27, 1, 1, 1)
+        # Build S-vector (relaxation rates); cached per omega (plan Phase 1).
+        s_key = (float(omega), float(self.s_e), float(self.s_h))
+        S = self._s_vec_cache.get(s_key)
+        if S is None:
+            s_vec = torch.tensor([0.0, self.s_e, float(omega), self.s_h], device=self.device)
+            S = s_vec[self.s_indices].view(27, 1, 1, 1)
+            if len(self._s_vec_cache) > 32:
+                self._s_vec_cache.clear()
+            self._s_vec_cache[s_key] = S
 
         # MRT relaxation towards equilibrium
         K_post = K + S * (Keq - K)
 
         # Actually apply Guo's forcing if ext_force is non-zero
-        if torch.any(ext_force != 0):
+        if has_ext_force and torch.any(ext_force != 0):
             S_guo = self._compute_guo_forcing(rho, torch.stack([ux, uy, uz]), ext_force, omega)
             # Transform Guo source term to moment space if using MRT,
             # or just add to f if using SRT.
@@ -442,7 +495,28 @@ class D3Q27Solver:
                 self.opposite,
             )
 
-        if not used_triton:
+        used_fused_bfl = False
+        if not used_triton and self.use_fused_stream_bfl and stream_bfl_d3q27 is not None:
+            q = self._get_q(geometry_mask, geom_hash=geom_hash)
+            solid_u8 = (geometry_mask > 0.5).to(torch.uint8).contiguous()
+            used_fused_bfl = stream_bfl_d3q27(
+                self.f_pre_stream,
+                self.f_temp,
+                solid_u8,
+                q.contiguous(),
+                self.ex,
+                self.ey,
+                self.ez,
+                self.opposite,
+            )
+            if not used_fused_bfl and not self._fused_stream_bfl_fallback_warned:
+                self.logger.log_warning(
+                    "Fused stream/BFL kernel unavailable at dispatch; using the "
+                    "pytorch_reference streaming and BFL path."
+                )
+                self._fused_stream_bfl_fallback_warned = True
+
+        if not used_triton and not used_fused_bfl:
             # Streaming
             for i in range(27):
                 self.f_temp[i] = torch.roll(self.f[i], shifts=self._stream_shifts[i], dims=(0,1,2))
@@ -452,7 +526,12 @@ class D3Q27Solver:
 
         self._apply_domain_boundaries()
 
-        step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask, geom_hash=geom_hash)
+        if self.use_fused_stream_bfl:
+            step_force_x, step_force_z = self._accumulate_momentum_exchange_force_nosync(
+                geometry_mask, geom_hash=geom_hash
+            )
+        else:
+            step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask, geom_hash=geom_hash)
         step_projected_drag = self._accumulate_projected_pressure_drag_proxy(geometry_mask, geom_hash=geom_hash)
 
         self.f.copy_(self.f_temp)
@@ -461,9 +540,14 @@ class D3Q27Solver:
         # Recompute macroscopic fields from updated populations (Issue #15 Fix 10)
         rho_new = torch.sum(self.f, dim=0).clamp_min(1e-8)
         # Use Guo's velocity definition: u = (sum fi ci + 0.5 F) / rho
-        ux_new = (torch.sum(self.f * self.ex_f, dim=0) + 0.5 * ext_force[0]) / (rho_new + 1e-12)
-        uy_new = (torch.sum(self.f * self.ey_f, dim=0) + 0.5 * ext_force[1]) / (rho_new + 1e-12)
-        uz_new = (torch.sum(self.f * self.ez_f, dim=0) + 0.5 * ext_force[2]) / (rho_new + 1e-12)
+        if has_ext_force:
+            ux_new = (torch.sum(self.f * self.ex_f, dim=0) + 0.5 * ext_force[0]) / (rho_new + 1e-12)
+            uy_new = (torch.sum(self.f * self.ey_f, dim=0) + 0.5 * ext_force[1]) / (rho_new + 1e-12)
+            uz_new = (torch.sum(self.f * self.ez_f, dim=0) + 0.5 * ext_force[2]) / (rho_new + 1e-12)
+        else:
+            ux_new = torch.sum(self.f * self.ex_f, dim=0) / (rho_new + 1e-12)
+            uy_new = torch.sum(self.f * self.ey_f, dim=0) / (rho_new + 1e-12)
+            uz_new = torch.sum(self.f * self.ez_f, dim=0) / (rho_new + 1e-12)
 
         # Update stored macroscopic fields
         cs2 = 1.0 / 3.0
@@ -510,6 +594,11 @@ class D3Q27CascadedSolver:
             device,
             inlet_velocity_lu=self.inlet_velocity_lu,
             use_triton_streaming=bool(getattr(self.phys_config, "use_triton_streaming", False)),
+            use_fused_stream_bfl=bool(
+                getattr(self.phys_config, "use_fused_stream_bfl", False)
+                if getattr(self.config, "use_fused_stream_bfl", None) is None
+                else self.config.use_fused_stream_bfl
+            ),
         )
         # Issue #23: Correctly pass relaxation parameters
         self._solver.s_e = float(getattr(self.phys_config, 's_e_d3q27', 1.2))
@@ -623,7 +712,12 @@ class D3Q27CascadedSolver:
 
         # run steps
         for step in range(steps):
-            v_prev = torch.stack([self.velocity_x, self.velocity_y, self.velocity_z])
+            # v_prev feeds only the convergence check below; short training
+            # solves with check_every > steps never read it, so skip the
+            # 3 x N^3 stack on non-check steps (plan Phase 1).
+            check_this_step = step > 0 and step % check_every == 0
+            if check_this_step:
+                v_prev = torch.stack([self.velocity_x, self.velocity_y, self.velocity_z])
 
             ux, uy, uz, rho = self._solver.collide_and_stream(
                 omega, geometry_mask, ext_force=ext_force, geom_hash=geom_hash
@@ -644,7 +738,7 @@ class D3Q27CascadedSolver:
             self.force_samples = self._solver.force_samples
 
             # Issue #23: Relative L2 norm convergence check
-            if step > 0 and step % check_every == 0:
+            if check_this_step:
                 v_curr = torch.stack([ux, uy, uz])
                 du = v_curr - v_prev
                 u_mag = torch.sqrt(torch.sum(v_curr**2, dim=0) + 1e-12)

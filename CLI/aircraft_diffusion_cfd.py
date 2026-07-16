@@ -809,6 +809,7 @@ class LBMPhysicsConfig:
     # Force computation
     momentum_exchange_correction: bool = True  # Apply momentum-exchange method
     use_triton_streaming: bool = False  # Keep disabled until fused kernel matches physics path exactly
+    use_fused_stream_bfl: bool = False  # Fused pull-stream + q-dependent BFL kernel; enable only with parity evidence
     drag_link_metric_exponent: Optional[float] = None  # Auto D3Q27 face/edge/corner metric correction
     drag_reference_speed: float = 80.0  # Natural-unit reference speed for projected-pressure Cd labels
     drag_speed_normalization_exponent: float = 1.0  # OpenFOAM pressure fallback scales nearly linearly with U_inf

@@ -131,6 +131,7 @@ def _build_history_payload(
                 "training", "consistency_student_learning_rate", 2e-4
             ),
             "solver": args.solver,
+            "lbm_stream_bfl_backend": args.lbm_stream_bfl_backend,
             "cpu_threads": args.cpu_threads,
             "max_samples_per_epoch": args.max_samples_per_epoch,
             "subset_seed": args.subset_seed,
@@ -180,6 +181,16 @@ def main() -> int:
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-4)))
     parser.add_argument("--solver", default=str(config_value("cfd", "solver", "D3Q27")))
+    parser.add_argument(
+        "--lbm-stream-bfl-backend",
+        choices=("pytorch_reference", "fused_stream_bfl"),
+        default="pytorch_reference",
+        help=(
+            "Streaming/BFL backend for the direct D3Q27 solver. fused_stream_bfl "
+            "requires the parity gates in tests/test_d3q27_kernel_parity.py and "
+            "tests/test_direct_solver_fused_parity.py to pass on this machine."
+        ),
+    )
     parser.add_argument("--save-dir", default="./checkpoints_monitored")
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--warm-start-from", default=None)
@@ -325,7 +336,11 @@ def main() -> int:
         direct_aircraft_validity_weight=args.direct_aircraft_validity_weight,
         require_direct_solver_every_iteration=True,
     )
-    cfd_config = CFDConfig(base_grid_resolution=resolved_grid_size, solver_type=args.solver)
+    cfd_config = CFDConfig(
+        base_grid_resolution=resolved_grid_size,
+        solver_type=args.solver,
+        use_fused_stream_bfl=(args.lbm_stream_bfl_backend == "fused_stream_bfl"),
+    )
 
     train_loader = DataLoader(
         epoch_dataset,
