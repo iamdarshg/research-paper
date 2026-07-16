@@ -613,6 +613,18 @@ def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
     rejections: List[Dict[str, Any]] = []
     archive_reports: List[Dict[str, Any]] = []
 
+    prior_rejections: List[Dict[str, Any]] = []
+    examined_ids: set = set()
+    if bool(getattr(args, "skip_examined", False)):
+        if ledger_path.exists():
+            for line in ledger_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    entry = json.loads(line)
+                    prior_rejections.append(entry)
+                    examined_ids.add((str(entry.get("archive_key")), str(entry.get("source_design_id"))))
+        for record in accepted_records:
+            examined_ids.add((str(record.get("source_archive_key")), str(record.get("source_design_id"))))
+
     local_archives = [Path(value).resolve() for value in (args.archive or [])]
     if local_archives:
         archive_entries = [(path, _local_archive_metadata(path)) for path in local_archives]
@@ -649,6 +661,12 @@ def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
                 seed=selection_seed,
                 shard_key=str(metadata["key"]),
             )
+        if examined_ids:
+            ordered_ids = [
+                design_id
+                for design_id in ordered_ids
+                if (str(metadata["key"]), design_id) not in examined_ids
+            ]
 
         def process_batch(design_ids: Sequence[str]) -> List[Tuple[str, Optional[Dict[str, Any]], Optional[CorpusBuildError]]]:
             results = []
@@ -739,7 +757,7 @@ def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
 
     accepted_records.sort(key=lambda record: str(record["source_id"]))
     _atomic_write_jsonl(manifest_path, accepted_records)
-    _atomic_write_jsonl(ledger_path, rejections)
+    _atomic_write_jsonl(ledger_path, prior_rejections + rejections)
     basic_validation = validate_manifest_file(str(manifest_path), level="basic")
     claim_validation = validate_manifest_file(
         str(manifest_path),
@@ -760,6 +778,7 @@ def build_corpus(args: argparse.Namespace) -> Dict[str, Any]:
         "unique_geometry_count": len(accepted_geometry_hashes),
         "unique_voxel_count": len(accepted_voxel_hashes),
         "rejected_count": len(rejections),
+        "prior_rejection_count": len(prior_rejections),
         "rejection_counts": dict(sorted(rejection_counts.items())),
         "archives": archive_reports,
         "manifest_path": str(manifest_path),
@@ -782,6 +801,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--archive", action="append", default=[], help="Use a local archive instead of downloading a shard; repeatable.")
     parser.add_argument("--shard", action="append", default=[], help="Zenodo archive key to download; repeatable.")
     parser.add_argument("--resume", action="store_true", help="Reuse accepted records from an existing manifest.")
+    parser.add_argument(
+        "--skip-examined",
+        action="store_true",
+        help=(
+            "Skip designs already present in the output rejection ledger or manifest; "
+            "prior ledger entries are preserved in the rewritten ledger."
+        ),
+    )
     parser.add_argument(
         "--allow-unavailable-performance",
         action="store_true",
