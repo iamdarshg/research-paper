@@ -110,6 +110,11 @@ def test_spsa_loss_and_gradient_parity():
             prob, spec, _simulator(fused), STEPS,
             0.05,      # perturbation
             10.0,      # gradient_clip
+            {           # component_gradient_max_norms
+                "aero_loss": 10.0,
+                "connectivity_loss": 10.0,
+                "aircraft_validity_loss": 10.0,
+            },
             0.5,       # connectivity_weight
             0.5,       # aircraft_validity_weight
             0.5,       # threshold

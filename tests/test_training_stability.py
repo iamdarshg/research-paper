@@ -10,12 +10,42 @@ CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
 if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
-from run_monitored_training import _build_epoch_dataset, _geometry_promotion_metrics
+from run_monitored_training import (
+    RunLocalCosineScheduler,
+    _build_epoch_dataset,
+    _geometry_non_regression,
+    _geometry_promotion_metrics,
+)
 from training_stability import compute_core_loss, summarize_stability
 
 
 class TestTrainingStability(unittest.TestCase):
-    def test_geometry_promotion_rank_prefers_validity_then_worst_seed_recall(self):
+    def test_run_local_scheduler_decays_each_group_to_nonzero_floor(self):
+        first = torch.nn.Parameter(torch.tensor([1.0]))
+        second = torch.nn.Parameter(torch.tensor([2.0]))
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": [first], "lr": 2.0e-4},
+                {"params": [second], "lr": 5.0e-5},
+            ]
+        )
+        scheduler = RunLocalCosineScheduler(
+            optimizer,
+            total_updates=4,
+            min_lr_ratio=0.1,
+        )
+
+        observed = []
+        for _ in range(4):
+            scheduler.step()
+            observed.append([group["lr"] for group in optimizer.param_groups])
+
+        self.assertGreater(observed[0][0], observed[-1][0])
+        self.assertAlmostEqual(observed[-1][0], 2.0e-5)
+        self.assertAlmostEqual(observed[-1][1], 5.0e-6)
+        self.assertTrue(all(value > 0.0 for row in observed for value in row))
+
+    def test_geometry_promotion_rank_includes_validity_diversity_and_shape(self):
         metrics, rank = _geometry_promotion_metrics(
             {
                 "status": "fail",
@@ -23,12 +53,43 @@ class TestTrainingStability(unittest.TestCase):
                 "generated_topk_recall": 0.7,
                 "generated_worst_topk_recall": 0.6,
                 "generated_aircraft_valid_fraction": 1.0 / 3.0,
+                "generated_unique_fraction": 0.8,
+                "generated_mean_largest_component_fraction": 0.9,
+                "generated_mean_normalization_boundary_fraction": 0.02,
             }
         )
 
-        self.assertEqual(rank, (1.0 / 3.0, 0.6, 0.7, 0.9))
+        self.assertEqual(
+            rank,
+            (1.0 / 3.0, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9),
+        )
         self.assertAlmostEqual(metrics["geometry_selection_metric"], 0.3)
         self.assertEqual(metrics["promotion_gate_passed"], 0.0)
+
+    def test_geometry_non_regression_rejects_boundary_and_diversity_collapse(self):
+        baseline = {
+            "generated_unique_fraction": 1.0,
+            "generated_mean_largest_component_fraction": 0.9,
+            "generated_mean_normalization_boundary_fraction": 0.01,
+            "generated_worst_topk_recall": 0.2,
+        }
+        candidate = {
+            "generated_unique_fraction": 0.5,
+            "generated_mean_largest_component_fraction": 0.9,
+            "generated_mean_normalization_boundary_fraction": 0.5,
+            "generated_worst_topk_recall": 0.2,
+        }
+
+        decision = _geometry_non_regression(candidate, baseline)
+
+        self.assertEqual(decision["status"], "fail")
+        self.assertEqual(
+            decision["failed_checks"],
+            [
+                "generated_unique_fraction",
+                "generated_mean_normalization_boundary_fraction",
+            ],
+        )
 
     def test_build_epoch_dataset_uses_deterministic_subset(self):
         dataset = TensorDataset(torch.arange(10))

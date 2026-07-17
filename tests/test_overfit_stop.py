@@ -139,6 +139,9 @@ def test_geometry_promotion_gate_rejects_collapsed_geometry():
     assert decision["failed_checks"] == [
         "reconstruction_topk_recall",
         "generated_aircraft_valid_fraction",
+        "generated_unique_fraction",
+        "generated_mean_largest_component_fraction",
+        "generated_mean_normalization_boundary_fraction",
     ]
 
 

@@ -51,8 +51,21 @@ diffusion:
 training:
   batch_size: 1
   learning_rate: 0.0002
+  lr_min_ratio: 0.10
   converter_learning_rate: 0.0002
   consistency_student_learning_rate: 0.0002
+  # Distillation is sparse for cost, but its own counter cycles over all four
+  # inference timesteps instead of repeatedly sampling unsupported levels.
+  consistency_interval: 20
+  consistency_loss_type: huber
+  consistency_huber_delta: 1.0
+  consistency_raw_mse_fail_threshold: 1000000.0
+  consistency_timestep_sampling: inference_stratified
+  # Per-branch trust regions are calibrated against the preserved checkpoint
+  # before a long run. They limit extreme gradients but never amplify small ones.
+  consistency_gradient_max_norm: 0.25
+  student_data_gradient_max_norm: 1.0
+  student_direct_gradient_max_norm: 1.0
   weight_decay: 0.0001
   offload_optimizer_state_between_steps: true
   num_epochs: 200
@@ -79,6 +92,13 @@ training:
   stop_on_promotion_pass: true
   overfit_geometry_gate_samples: 16
   overfit_min_generated_aircraft_valid_fraction: 0.125
+  overfit_min_generated_unique_fraction: 0.50
+  overfit_min_generated_mean_largest_component_fraction: 0.70
+  overfit_max_generated_mean_normalization_boundary_fraction: 0.05
+  promotion_unique_fraction_tolerance: 0.05
+  promotion_component_fraction_tolerance: 0.02
+  promotion_boundary_fraction_tolerance: 0.01
+  promotion_worst_recall_tolerance: 0.01
   precision: float32
   save_interval: 25
   val_interval: 1
@@ -94,6 +114,9 @@ training:
   # Maximum norm of the measured SPSA voxel gradient. The model-level gradient
   # clip independently bounds the combined neural update after backpropagation.
   direct_solver_gradient_clip: 1.0
+  direct_aero_gradient_max_norm: 1.0
+  direct_connectivity_gradient_max_norm: 1.0
+  direct_validity_gradient_max_norm: 1.0
   direct_connectivity_weight: 1.0
   direct_aircraft_validity_weight: 1.0
   require_direct_solver_every_iteration: true

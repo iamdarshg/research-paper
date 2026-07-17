@@ -16,6 +16,7 @@ Current implementation details include:
 import os
 import sys
 import json
+import hashlib
 import math
 import pickle
 import argparse
@@ -26,7 +27,7 @@ import threading
 import multiprocessing as mp
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence
+from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -54,6 +55,12 @@ from aircraft_validity import evaluate_aircraft_validity
 from condition_feasibility import validate_condition_feasibility
 from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
 from geometry_store import CompactGeometryStore
+from multiobjective_gradients import (
+    capture_gradients,
+    clear_gradients,
+    combine_gradient_branches,
+    gradient_cosine_similarity,
+)
 from validate_manifest import validate_manifest_file
 
 warnings.filterwarnings('ignore')
@@ -265,14 +272,38 @@ class TrainingConfig:
     consistency_student_learning_rate: float = float(
         config_value("training", "consistency_student_learning_rate", 2e-4)
     )
+    consistency_interval: int = int(
+        config_value("training", "consistency_interval", 20)
+    )
+    consistency_loss_type: str = str(
+        config_value("training", "consistency_loss_type", "huber")
+    )
+    consistency_huber_delta: float = float(
+        config_value("training", "consistency_huber_delta", 1.0)
+    )
+    consistency_raw_mse_fail_threshold: float = float(
+        config_value("training", "consistency_raw_mse_fail_threshold", 1.0e6)
+    )
+    consistency_timestep_sampling: str = str(
+        config_value("training", "consistency_timestep_sampling", "inference_stratified")
+    )
+    consistency_gradient_max_norm: float = float(
+        config_value("training", "consistency_gradient_max_norm", 0.25)
+    )
+    student_data_gradient_max_norm: float = float(
+        config_value("training", "student_data_gradient_max_norm", 1.0)
+    )
+    student_direct_gradient_max_norm: float = float(
+        config_value("training", "student_direct_gradient_max_norm", 1.0)
+    )
     weight_decay: float = float(config_value("training", "weight_decay", 1e-4))
     offload_optimizer_state_between_steps: bool = bool(
         config_value("training", "offload_optimizer_state_between_steps", True)
     )
     num_epochs: int = int(config_value("training", "num_epochs", 200))
     warmup_steps: int = int(config_value("training", "warmup_steps", 1000))
-    gradient_clip: float = 0.99
-    ema_decay: float = 0.99
+    gradient_clip: float = float(config_value("training", "gradient_clip", 1.0))
+    ema_decay: float = float(config_value("training", "ema_decay", 0.999))
     disconnection_penalty: float = float(config_value("training", "disconnection_penalty", 30.0))
     precision: str = str(config_value("training", "precision", "float32"))
     save_interval: int = int(config_value("training", "save_interval", 25))
@@ -310,6 +341,15 @@ class TrainingConfig:
     direct_solver_gradient_clip: float = float(
         config_value("training", "direct_solver_gradient_clip", 1.0)
     )
+    direct_aero_gradient_max_norm: float = float(
+        config_value("training", "direct_aero_gradient_max_norm", 1.0)
+    )
+    direct_connectivity_gradient_max_norm: float = float(
+        config_value("training", "direct_connectivity_gradient_max_norm", 1.0)
+    )
+    direct_validity_gradient_max_norm: float = float(
+        config_value("training", "direct_validity_gradient_max_norm", 1.0)
+    )
     direct_connectivity_weight: float = float(config_value("training", "direct_connectivity_weight", 1.0))
     direct_aircraft_validity_weight: float = float(config_value("training", "direct_aircraft_validity_weight", 1.0))
     direct_solver_target_occupancy: Optional[float] = None
@@ -329,6 +369,23 @@ class TrainingConfig:
     overfit_min_reconstruction_topk_recall: float = 0.2
     overfit_min_generated_aircraft_valid_fraction: float = float(
         config_value("training", "overfit_min_generated_aircraft_valid_fraction", 0.125)
+    )
+    overfit_min_generated_unique_fraction: float = float(
+        config_value("training", "overfit_min_generated_unique_fraction", 0.50)
+    )
+    overfit_min_generated_mean_largest_component_fraction: float = float(
+        config_value(
+            "training",
+            "overfit_min_generated_mean_largest_component_fraction",
+            0.70,
+        )
+    )
+    overfit_max_generated_mean_normalization_boundary_fraction: float = float(
+        config_value(
+            "training",
+            "overfit_max_generated_mean_normalization_boundary_fraction",
+            0.05,
+        )
     )
     promotion_interval_epochs: int = int(
         config_value("training", "promotion_interval_epochs", 1)
@@ -361,6 +418,31 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
         errors.append("direct_aircraft_validity_weight must be greater than 0")
     if training_config.timestep_sampling not in {"inference_stratified", "random"}:
         errors.append("timestep_sampling must be inference_stratified or random")
+    if int(training_config.consistency_interval) <= 0:
+        errors.append("consistency_interval must be greater than 0")
+    if training_config.consistency_loss_type not in {"mse", "huber"}:
+        errors.append("consistency_loss_type must be mse or huber")
+    if float(training_config.consistency_huber_delta) <= 0.0:
+        errors.append("consistency_huber_delta must be greater than 0")
+    if float(training_config.consistency_raw_mse_fail_threshold) <= 0.0:
+        errors.append("consistency_raw_mse_fail_threshold must be greater than 0")
+    for field_name in (
+        "consistency_gradient_max_norm",
+        "student_data_gradient_max_norm",
+        "student_direct_gradient_max_norm",
+        "direct_aero_gradient_max_norm",
+        "direct_connectivity_gradient_max_norm",
+        "direct_validity_gradient_max_norm",
+    ):
+        if float(getattr(training_config, field_name)) <= 0.0:
+            errors.append(f"{field_name} must be greater than 0")
+    if training_config.consistency_timestep_sampling not in {
+        "inference_stratified",
+        "random",
+    }:
+        errors.append(
+            "consistency_timestep_sampling must be inference_stratified or random"
+        )
     fixed_target = training_config.direct_solver_target_occupancy
     has_fixed_target = (
         fixed_target is not None
@@ -401,6 +483,13 @@ def evaluate_geometry_promotion_gate(
     """Decide whether geometry quality is sufficient to promote a checkpoint."""
     recall = float(metrics.get("reconstruction_topk_recall", 0.0))
     valid_fraction = float(metrics.get("generated_aircraft_valid_fraction", 0.0))
+    unique_fraction = float(metrics.get("generated_unique_fraction", 0.0))
+    mean_component_fraction = float(
+        metrics.get("generated_mean_largest_component_fraction", 0.0)
+    )
+    mean_boundary_fraction = float(
+        metrics.get("generated_mean_normalization_boundary_fraction", 1.0)
+    )
     checks = {
         "reconstruction_topk_recall": (
             recall >= float(training_config.overfit_min_reconstruction_topk_recall)
@@ -408,6 +497,22 @@ def evaluate_geometry_promotion_gate(
         "generated_aircraft_valid_fraction": (
             valid_fraction
             >= float(training_config.overfit_min_generated_aircraft_valid_fraction)
+        ),
+        "generated_unique_fraction": (
+            unique_fraction
+            >= float(training_config.overfit_min_generated_unique_fraction)
+        ),
+        "generated_mean_largest_component_fraction": (
+            mean_component_fraction
+            >= float(
+                training_config.overfit_min_generated_mean_largest_component_fraction
+            )
+        ),
+        "generated_mean_normalization_boundary_fraction": (
+            mean_boundary_fraction
+            <= float(
+                training_config.overfit_max_generated_mean_normalization_boundary_fraction
+            )
         ),
     }
     failed_checks = [name for name, passed in checks.items() if not passed]
@@ -422,6 +527,15 @@ def evaluate_geometry_promotion_gate(
             ),
             "generated_aircraft_valid_fraction": float(
                 training_config.overfit_min_generated_aircraft_valid_fraction
+            ),
+            "generated_unique_fraction": float(
+                training_config.overfit_min_generated_unique_fraction
+            ),
+            "generated_mean_largest_component_fraction": float(
+                training_config.overfit_min_generated_mean_largest_component_fraction
+            ),
+            "generated_mean_normalization_boundary_fraction": float(
+                training_config.overfit_max_generated_mean_normalization_boundary_fraction
             ),
         },
     }
@@ -627,7 +741,9 @@ def combine_training_loss_terms(
         + consistency_loss
         + training_config.latent_reconstruction_weight * latent_reconstruction_loss_val
         + training_config.direct_solver_loss_weight * direct_solver_loss_val
-    ).nan_to_num(0.0)
+    )
+    if not torch.isfinite(optimization_loss):
+        raise FloatingPointError("Combined training loss is nonfinite")
     return optimization_loss
 
 
@@ -1938,6 +2054,7 @@ class ConsistencyModel(nn.Module):
             use_torch_compile=False  # Disable torch.compile for student to avoid overflow errors
         )
         self.student_model = LatentDiffusionUNet(student_config, diffusion_config).to(dtype)
+        self.last_consistency_metrics: Dict[str, float] = {}
 
         # Initialize student with teacher weights
         self._initialize_student()
@@ -1958,25 +2075,58 @@ class ConsistencyModel(nn.Module):
         t_student: torch.Tensor,
         t_teacher: torch.Tensor,
         condition: torch.Tensor = None,
+        *,
+        loss_type: str = "mse",
+        huber_delta: float = 1.0,
     ) -> torch.Tensor:
         """Consistency training loss between teacher and student models"""
-        batch_size = x_0.shape[0]
-        device = x_0.device
-
         if not torch.equal(t_student, t_teacher):
             raise ValueError("Consistency teacher and student must evaluate the same diffusion timestep")
+        if loss_type not in {"mse", "huber"}:
+            raise ValueError(f"Unsupported consistency loss type: {loss_type}")
+        if float(huber_delta) <= 0.0:
+            raise ValueError("Consistency Huber delta must be greater than 0")
+        if not torch.isfinite(x_0).all():
+            raise FloatingPointError("Consistency input latent contains nonfinite values")
 
         # Teacher and student see the same noisy latent at the same timestep.
         noise = torch.randn_like(x_0)
         x_t_teacher = self._add_noise(x_0, t_teacher, noise)
+        if not torch.isfinite(x_t_teacher).all():
+            raise FloatingPointError("Consistency noised latent contains nonfinite values")
         with torch.no_grad():
             pred_teacher = self.teacher_model(x_t_teacher, t_teacher, condition=condition)
 
         pred_student = self.student_model(x_t_teacher, t_student, condition=condition)
+        if not torch.isfinite(pred_teacher).all():
+            raise FloatingPointError("Consistency teacher prediction contains nonfinite values")
+        if not torch.isfinite(pred_student).all():
+            raise FloatingPointError("Consistency student prediction contains nonfinite values")
 
-        # Consistency loss: make student predictions close to teacher
-        loss = F.mse_loss(pred_student, pred_teacher.detach())
+        residual = pred_student.float() - pred_teacher.detach().float()
+        raw_mse = residual.square().mean()
+        if loss_type == "huber":
+            loss = F.smooth_l1_loss(
+                pred_student.float(),
+                pred_teacher.detach().float(),
+                beta=float(huber_delta),
+            )
+        else:
+            loss = raw_mse
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Consistency loss is nonfinite")
 
+        with torch.no_grad():
+            self.last_consistency_metrics = {
+                "loss": float(loss.detach().item()),
+                "raw_mse": float(raw_mse.detach().item()),
+                "teacher_rms": float(pred_teacher.detach().float().square().mean().sqrt().item()),
+                "student_rms": float(pred_student.detach().float().square().mean().sqrt().item()),
+                "residual_rms": float(raw_mse.detach().sqrt().item()),
+                "timestep_mean": float(t_student.detach().float().mean().item()),
+                "timestep_min": float(t_student.detach().min().item()),
+                "timestep_max": float(t_student.detach().max().item()),
+            }
         return loss
 
     def _add_noise(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
@@ -3321,6 +3471,21 @@ def _direct_measured_objective_for_single(
     cfd_results = cfd_simulator.simulate_aerodynamics(geometry, steps=max(1, int(cfd_steps)))
 
     occupancy = float(geometry_cpu.mean().item())
+    for coefficient_name in (
+        "training_drag_coefficient",
+        "calibrated_drag_coefficient",
+        "drag_coefficient",
+        "lift_coefficient",
+    ):
+        if coefficient_name not in cfd_results:
+            continue
+        coefficient_value = cfd_results[coefficient_name]
+        if isinstance(coefficient_value, (int, float, np.floating)) and not np.isfinite(
+            float(coefficient_value)
+        ):
+            raise FloatingPointError(
+                f"Direct solver returned nonfinite {coefficient_name}"
+            )
     drag_coefficient = AerodynamicLoss._select_loss_drag_coefficient(cfd_results)
     raw_lift = cfd_results.get("lift_coefficient", 0.0)
     lift_coefficient = abs(float(raw_lift)) if isinstance(raw_lift, (int, float, np.floating)) else 0.0
@@ -3366,7 +3531,7 @@ def _direct_measured_objective_for_single(
         + float(aircraft_validity_weight) * validity_loss
     )
     components = {
-        "total_loss": float(np.nan_to_num(total_loss, nan=0.0, posinf=1.0e6, neginf=1.0e6)),
+        "total_loss": float(total_loss),
         "aero_loss": float(aero_loss),
         "drag_coefficient": float(drag_coefficient),
         "drag_loss": float(drag_loss),
@@ -3377,6 +3542,14 @@ def _direct_measured_objective_for_single(
         "connectivity_loss": float(connectivity_weight) * float(connectivity_loss),
         "aircraft_validity_loss": float(aircraft_validity_weight) * float(validity_loss),
     }
+    nonfinite_components = [
+        name for name, value in components.items() if not np.isfinite(float(value))
+    ]
+    if nonfinite_components:
+        raise FloatingPointError(
+            "Direct measured objective produced nonfinite components: "
+            + ", ".join(nonfinite_components)
+        )
     return components if return_components else components["total_loss"]
 
 
@@ -3412,6 +3585,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         cfd_steps: int,
         perturbation: float,
         gradient_clip: float,
+        component_gradient_max_norms: Mapping[str, float],
         connectivity_weight: float,
         aircraft_validity_weight: float,
         threshold: float,
@@ -3442,6 +3616,11 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         generator = torch.Generator(device=fields.device)
         generator.manual_seed(int(seed) % (2**63 - 1))
         direction_count = max(1, int(directions))
+        component_names = (
+            "aero_loss",
+            "connectivity_loss",
+            "aircraft_validity_loss",
+        )
 
         if isinstance(target_occupancy, torch.Tensor):
             detached_targets = target_occupancy.detach().reshape(-1).float().cpu()
@@ -3478,7 +3657,10 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             )
             base_loss = float(base_components["total_loss"])
             base_component_records.append(base_components)
-            sample_grad = torch.zeros_like(sample_field)
+            raw_component_grads = {
+                name: torch.zeros_like(sample_field) for name in component_names
+            }
+            legacy_total_grad = torch.zeros_like(sample_field)
             for _ in range(direction_count):
                 low_frequency_grid = int(perturbation_grid_size)
                 if low_frequency_grid > 1 and any(dim > low_frequency_grid for dim in sample_field.shape):
@@ -3511,7 +3693,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     delta = delta.mul(2.0).sub(1.0)
                 plus_field = sample_field + eps * delta
                 minus_field = sample_field - eps * delta
-                plus_loss = _direct_measured_objective_for_single(
+                plus_components = _direct_measured_objective_for_single(
                     torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
                     design_spec,
                     cfd_simulator,
@@ -3520,8 +3702,9 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     aircraft_validity_weight,
                     threshold,
                     sample_target,
+                    return_components=True,
                 )
-                minus_loss = _direct_measured_objective_for_single(
+                minus_components = _direct_measured_objective_for_single(
                     torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
                     design_spec,
                     cfd_simulator,
@@ -3530,10 +3713,100 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     aircraft_validity_weight,
                     threshold,
                     sample_target,
+                    return_components=True,
                 )
-                sample_grad.add_(((plus_loss - minus_loss) / (2.0 * eps)) * delta)
+                legacy_total_grad.add_(
+                    (
+                        (plus_components["total_loss"] - minus_components["total_loss"])
+                        / (2.0 * eps)
+                    )
+                    * delta
+                )
+                for component_name in component_names:
+                    raw_component_grads[component_name].add_(
+                        (
+                            (
+                                plus_components[component_name]
+                                - minus_components[component_name]
+                            )
+                            / (2.0 * eps)
+                        )
+                        * delta
+                    )
                 _clear_direct_solver_geometry_caches(cfd_simulator)
-            sample_grad.div_(direction_count)
+            legacy_total_grad.div_(direction_count)
+            for component_grad in raw_component_grads.values():
+                component_grad.div_(direction_count)
+
+            summed_raw_grad = sum(raw_component_grads.values())
+            if not torch.allclose(
+                summed_raw_grad,
+                legacy_total_grad,
+                atol=1.0e-5,
+                rtol=1.0e-4,
+            ):
+                max_difference = float(
+                    (summed_raw_grad - legacy_total_grad).abs().max().item()
+                )
+                raise RuntimeError(
+                    "Direct SPSA component gradients do not sum to the measured "
+                    f"total objective gradient (max difference {max_difference:.6g})"
+                )
+
+            applied_component_grads: Dict[str, torch.Tensor] = {}
+            for component_name, component_grad in raw_component_grads.items():
+                component_norm = component_grad.norm()
+                if not torch.isfinite(component_norm):
+                    raise FloatingPointError(
+                        f"Direct SPSA {component_name} gradient is nonfinite"
+                    )
+                raw_norm = float(component_norm.item())
+                component_limit = float(
+                    component_gradient_max_norms.get(component_name, 0.0)
+                )
+                component_scale = 1.0
+                if component_limit > 0.0 and raw_norm > component_limit:
+                    component_scale = component_limit / max(raw_norm, 1.0e-12)
+                applied_component = component_grad * component_scale
+                applied_component_grads[component_name] = applied_component
+                prefix = component_name.removesuffix("_loss")
+                base_components[f"{prefix}_spsa_gradient_norm_unclipped"] = raw_norm
+                base_components[f"{prefix}_spsa_gradient_norm"] = float(
+                    applied_component.norm().item()
+                )
+                base_components[f"{prefix}_spsa_gradient_scale"] = float(
+                    component_scale
+                )
+                base_components[f"{prefix}_spsa_gradient_norm_limit"] = float(
+                    component_limit
+                )
+
+            for first_name, second_name in (
+                ("aero_loss", "connectivity_loss"),
+                ("aero_loss", "aircraft_validity_loss"),
+                ("connectivity_loss", "aircraft_validity_loss"),
+            ):
+                first_gradient = raw_component_grads[first_name]
+                second_gradient = raw_component_grads[second_name]
+                first_norm = first_gradient.norm()
+                second_norm = second_gradient.norm()
+                if float(first_norm.item()) == 0.0 or float(second_norm.item()) == 0.0:
+                    cosine = 0.0
+                else:
+                    cosine = float(
+                        (
+                            torch.sum(first_gradient.double() * second_gradient.double())
+                            / (first_norm.double() * second_norm.double())
+                        ).item()
+                    )
+                    cosine = float(np.clip(cosine, -1.0, 1.0))
+                first_prefix = first_name.removesuffix("_loss")
+                second_prefix = second_name.removesuffix("_loss")
+                base_components[
+                    f"{first_prefix}_{second_prefix}_spsa_gradient_cosine"
+                ] = cosine
+
+            sample_grad = sum(applied_component_grads.values())
             grad_norm = sample_grad.norm()
             clip_value = float(gradient_clip)
             # SPSA estimates the gradient of one global measured objective, not
@@ -3552,6 +3825,9 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 )
             grad_estimate[batch_idx] = sample_grad / max(batch_size, 1)
             base_losses.append(base_loss)
+            base_components["legacy_spsa_gradient_norm_unclipped"] = float(
+                legacy_total_grad.norm().item()
+            )
             base_components["spsa_gradient_norm_unclipped"] = unclipped_norm
             base_components["spsa_gradient_norm"] = float(sample_grad.norm().item())
             base_components["spsa_gradient_norm_limit"] = float(gradient_norm_limit)
@@ -3574,7 +3850,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (grad_estimate,) = ctx.saved_tensors
         grad = grad_output.to(dtype=grad_estimate.dtype) * grad_estimate
-        return grad, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class DirectSolverSPSALoss(nn.Module):
@@ -3591,6 +3867,9 @@ class DirectSolverSPSALoss(nn.Module):
         perturbation: float = 0.15,
         perturbation_grid_size: int = 0,
         gradient_clip: float = 1.0,
+        aero_gradient_max_norm: float = 1.0,
+        connectivity_gradient_max_norm: float = 1.0,
+        validity_gradient_max_norm: float = 1.0,
         connectivity_weight: float = 0.0,
         aircraft_validity_weight: float = 0.0,
         threshold: float = 0.5,
@@ -3604,6 +3883,11 @@ class DirectSolverSPSALoss(nn.Module):
         self.perturbation = float(perturbation)
         self.perturbation_grid_size = int(perturbation_grid_size)
         self.gradient_clip = float(gradient_clip)
+        self.component_gradient_max_norms = {
+            "aero_loss": float(aero_gradient_max_norm),
+            "connectivity_loss": float(connectivity_gradient_max_norm),
+            "aircraft_validity_loss": float(validity_gradient_max_norm),
+        }
         self.connectivity_weight = float(connectivity_weight)
         self.aircraft_validity_weight = float(aircraft_validity_weight)
         self.threshold = float(threshold)
@@ -3634,6 +3918,7 @@ class DirectSolverSPSALoss(nn.Module):
             self.cfd_steps,
             self.perturbation,
             self.gradient_clip,
+            self.component_gradient_max_norms,
             self.connectivity_weight,
             self.aircraft_validity_weight,
             self.threshold,
@@ -3728,6 +4013,7 @@ class OptimizedDiffusionTrainer:
             weight_decay=training_config.weight_decay,
         )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
+        self.scheduler_step_per_update = False
 
         # Gradient scaler for mixed precision
         self.scaler = _make_grad_scaler(self.device.type)
@@ -3741,6 +4027,9 @@ class OptimizedDiffusionTrainer:
             perturbation=training_config.direct_solver_perturbation,
             perturbation_grid_size=training_config.direct_solver_perturbation_grid_size,
             gradient_clip=training_config.direct_solver_gradient_clip,
+            aero_gradient_max_norm=training_config.direct_aero_gradient_max_norm,
+            connectivity_gradient_max_norm=training_config.direct_connectivity_gradient_max_norm,
+            validity_gradient_max_norm=training_config.direct_validity_gradient_max_norm,
             connectivity_weight=training_config.direct_connectivity_weight,
             aircraft_validity_weight=training_config.direct_aircraft_validity_weight,
             target_occupancy=training_config.direct_solver_target_occupancy,
@@ -3762,9 +4051,14 @@ class OptimizedDiffusionTrainer:
         # Logging
         self.writer = SummaryWriter(log_dir='./runs')
         self.global_step = 0
+        self.consistency_update_step = 0
+        self.last_consistency_metrics: Dict[str, float] = {}
         self.training_history: List[Dict[str, Any]] = []
         self.stop_decision: Optional[Dict[str, Any]] = None
         self.geometry_promotion_gate: Optional[Dict[str, Any]] = None
+        self.update_metrics_callback: Optional[
+            Callable[[Dict[str, Any]], None]
+        ] = None
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -3773,11 +4067,11 @@ class OptimizedDiffusionTrainer:
         return copy.deepcopy(model)
 
     def _sync_consistency_teacher(self) -> None:
-        """Keep the consistency teacher aligned with the trained diffusion model."""
+        """Keep the consistency teacher aligned with the stable diffusion EMA."""
         teacher_model = getattr(self.consistency_model, "teacher_model", None)
         if teacher_model is None or not hasattr(teacher_model, "load_state_dict"):
             return
-        teacher_model.load_state_dict(self.diffusion_model.state_dict())
+        teacher_model.load_state_dict(self.ema_model.state_dict())
         teacher_model.to(self.device).to(self.dtype)
         teacher_model.eval()
         for parameter in teacher_model.parameters():
@@ -3954,8 +4248,27 @@ class OptimizedDiffusionTrainer:
         total_direct_validity = 0.0
         total_spsa_gradient_norm = 0.0
         total_spsa_gradient_norm_unclipped = 0.0
+        total_aero_spsa_gradient_norm = 0.0
+        total_aero_spsa_gradient_norm_unclipped = 0.0
+        total_connectivity_spsa_gradient_norm = 0.0
+        total_connectivity_spsa_gradient_norm_unclipped = 0.0
+        total_validity_spsa_gradient_norm = 0.0
+        total_validity_spsa_gradient_norm_unclipped = 0.0
+        total_consistency_raw_mse = 0.0
+        total_consistency_teacher_rms = 0.0
+        total_consistency_student_rms = 0.0
+        consistency_eval_count = 0
+        total_student_data_gradient_raw = 0.0
+        total_student_data_gradient_applied = 0.0
+        total_student_consistency_gradient_raw = 0.0
+        total_student_consistency_gradient_applied = 0.0
+        total_student_direct_gradient_raw = 0.0
+        total_student_direct_gradient_applied = 0.0
         direct_solver_eval_count = 0
         direct_solver_call_count = 0
+        student_parameters = tuple(
+            self.consistency_model.student_model.parameters()
+        )
 
         pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
 
@@ -3982,7 +4295,7 @@ class OptimizedDiffusionTrainer:
 
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
-            if batch_idx % 20 == 0:  # Every 20 batches
+            if batch_idx % max(1, int(self.training_config.consistency_interval)) == 0:
                 consistency_loss = self._compute_consistency_loss(latent, condition=condition)
 
             # Random timestep for diffusion training
@@ -4175,11 +4488,11 @@ class OptimizedDiffusionTrainer:
             ].mean().detach().clamp_min(
                 float(self.training_config.minimum_denoising_geometry_confidence)
             )
-            optimization_loss_val = combine_training_loss_terms(
+            data_optimization_loss_val = combine_training_loss_terms(
                 mse_loss_val,
                 geometry_loss_val,
                 generation_geometry_loss_val,
-                consistency_loss,
+                consistency_loss.detach().new_zeros(()),
                 self.training_config,
                 direct_solver_loss_val=None,
                 clean_geometry_loss_val=clean_geometry_loss_val,
@@ -4187,9 +4500,28 @@ class OptimizedDiffusionTrainer:
                 latent_reconstruction_loss_val=latent_reconstruction_loss_val,
             )
 
-            # Backward pass
+            # Backpropagate independent student branches sequentially. The
+            # branch combiner limits only extreme gradients and never amplifies
+            # a small finite contribution.
             self.optimizer.zero_grad()
-            optimization_loss_val.backward()
+            data_optimization_loss_val.backward()
+            student_data_gradients = capture_gradients(student_parameters)
+            clear_gradients(student_parameters)
+
+            if consistency_loss.requires_grad:
+                consistency_loss.backward()
+                student_consistency_gradients = capture_gradients(
+                    student_parameters
+                )
+            else:
+                student_consistency_gradients = tuple(
+                    None for _ in student_parameters
+                )
+            clear_gradients(student_parameters)
+            student_direct_gradients = tuple(None for _ in student_parameters)
+            optimization_loss_val = (
+                data_optimization_loss_val.detach() + consistency_loss.detach()
+            )
 
             if run_direct_solver_loss:
                 direct_logit_leaf = direct_logit_snapshot.detach().requires_grad_(True)
@@ -4199,7 +4531,9 @@ class OptimizedDiffusionTrainer:
                     self.cfd_simulator,
                     seed=self.global_step,
                     reference_occupancy=reference_occupancy,
-                ).nan_to_num(0.0)
+                )
+                if not torch.isfinite(measured_direct_loss):
+                    raise FloatingPointError("Direct measured solver loss is nonfinite")
                 measured_direct_loss.backward()
                 direct_logit_gradient = direct_logit_leaf.grad
                 if direct_logit_gradient is None:
@@ -4235,6 +4569,8 @@ class OptimizedDiffusionTrainer:
                         * direct_logit_gradient
                     )
                 )
+                student_direct_gradients = capture_gradients(student_parameters)
+                clear_gradients(student_parameters)
                 direct_solver_evaluated = True
                 direct_solver_call_count += int(latent.shape[0]) * (
                     1 + 2 * int(self.training_config.direct_solver_directions)
@@ -4270,6 +4606,46 @@ class OptimizedDiffusionTrainer:
                 ).backward()
             clean_geometry_loss_val = grounded_full_loss.detach()
 
+            branch_telemetry = combine_gradient_branches(
+                student_parameters,
+                {
+                    "data": student_data_gradients,
+                    "consistency": student_consistency_gradients,
+                    "direct": student_direct_gradients,
+                },
+                {
+                    "data": float(
+                        self.training_config.student_data_gradient_max_norm
+                    ),
+                    "consistency": float(
+                        self.training_config.consistency_gradient_max_norm
+                    ),
+                    "direct": float(
+                        self.training_config.student_direct_gradient_max_norm
+                    ),
+                },
+            )
+            student_gradient_cosines = {
+                "data_consistency": gradient_cosine_similarity(
+                    student_data_gradients,
+                    student_consistency_gradients,
+                    first_name="data",
+                    second_name="consistency",
+                ),
+                "data_direct": gradient_cosine_similarity(
+                    student_data_gradients,
+                    student_direct_gradients,
+                    first_name="data",
+                    second_name="direct",
+                ),
+                "consistency_direct": gradient_cosine_similarity(
+                    student_consistency_gradients,
+                    student_direct_gradients,
+                    first_name="consistency",
+                    second_name="direct",
+                ),
+            }
+
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), self.training_config.gradient_clip)
             torch.nn.utils.clip_grad_norm_(self.converter.parameters(), self.training_config.gradient_clip)
@@ -4279,6 +4655,8 @@ class OptimizedDiffusionTrainer:
             if self.training_config.offload_optimizer_state_between_steps:
                 move_optimizer_state(self.optimizer, self.device)
             self.optimizer.step()
+            if self.scheduler_step_per_update:
+                self.scheduler.step()
             if self.training_config.offload_optimizer_state_between_steps:
                 move_optimizer_state(self.optimizer, "cpu")
 
@@ -4292,6 +4670,32 @@ class OptimizedDiffusionTrainer:
             total_geometry += geometry_loss_val.item()
             total_generation_geometry += generation_geometry_loss_val.item()
             total_consistency += consistency_loss.item()
+            data_gradient_metrics = branch_telemetry["data"]
+            consistency_gradient_metrics = branch_telemetry["consistency"]
+            direct_gradient_metrics = branch_telemetry["direct"]
+            total_student_data_gradient_raw += data_gradient_metrics.raw_norm
+            total_student_data_gradient_applied += data_gradient_metrics.applied_norm
+            total_student_consistency_gradient_raw += (
+                consistency_gradient_metrics.raw_norm
+            )
+            total_student_consistency_gradient_applied += (
+                consistency_gradient_metrics.applied_norm
+            )
+            total_student_direct_gradient_raw += direct_gradient_metrics.raw_norm
+            total_student_direct_gradient_applied += (
+                direct_gradient_metrics.applied_norm
+            )
+            if consistency_loss.requires_grad:
+                consistency_eval_count += 1
+                total_consistency_raw_mse += float(
+                    self.last_consistency_metrics.get("raw_mse", 0.0)
+                )
+                total_consistency_teacher_rms += float(
+                    self.last_consistency_metrics.get("teacher_rms", 0.0)
+                )
+                total_consistency_student_rms += float(
+                    self.last_consistency_metrics.get("student_rms", 0.0)
+                )
             total_latent_reconstruction += latent_reconstruction_loss_val.item()
             total_denoising_geometry_confidence += denoising_geometry_confidence.item()
             total_direct_solver += direct_solver_loss_val.item()
@@ -4305,6 +4709,30 @@ class OptimizedDiffusionTrainer:
                 total_spsa_gradient_norm_unclipped += float(
                     components.get("spsa_gradient_norm_unclipped", 0.0)
                 )
+                total_aero_spsa_gradient_norm += float(
+                    components.get("aero_spsa_gradient_norm", 0.0)
+                )
+                total_aero_spsa_gradient_norm_unclipped += float(
+                    components.get("aero_spsa_gradient_norm_unclipped", 0.0)
+                )
+                total_connectivity_spsa_gradient_norm += float(
+                    components.get("connectivity_spsa_gradient_norm", 0.0)
+                )
+                total_connectivity_spsa_gradient_norm_unclipped += float(
+                    components.get(
+                        "connectivity_spsa_gradient_norm_unclipped",
+                        0.0,
+                    )
+                )
+                total_validity_spsa_gradient_norm += float(
+                    components.get("aircraft_validity_spsa_gradient_norm", 0.0)
+                )
+                total_validity_spsa_gradient_norm_unclipped += float(
+                    components.get(
+                        "aircraft_validity_spsa_gradient_norm_unclipped",
+                        0.0,
+                    )
+                )
                 direct_solver_eval_count += 1
 
             pbar.set_postfix({
@@ -4317,9 +4745,81 @@ class OptimizedDiffusionTrainer:
                 'latent_recon': latent_reconstruction_loss_val.item(),
                 'direct_solver': direct_solver_loss_val.item(),
                 'denoise_conf': denoising_geometry_confidence.item(),
+                'grad_data': data_gradient_metrics.applied_norm,
+                'grad_cons': consistency_gradient_metrics.applied_norm,
+                'grad_direct': direct_gradient_metrics.applied_norm,
             })
 
             self.global_step += 1
+            if self.update_metrics_callback is not None:
+                direct_components = (
+                    dict(self.direct_solver_loss.last_components)
+                    if direct_solver_evaluated
+                    else {}
+                )
+                self.update_metrics_callback(
+                    {
+                        "kind": "optimizer_update",
+                        "global_step": int(self.global_step),
+                        "completed_in_epoch": int(batch_idx + 1),
+                        "total_in_epoch": int(len(train_loader)),
+                        "losses": {
+                            "optimization": float(optimization_loss_val.item()),
+                            "mse": float(mse_loss_val.item()),
+                            "clean_geometry": float(clean_geometry_loss_val.item()),
+                            "geometry": float(geometry_loss_val.item()),
+                            "generation_geometry": float(
+                                generation_geometry_loss_val.item()
+                            ),
+                            "consistency": float(consistency_loss.item()),
+                            "latent_reconstruction": float(
+                                latent_reconstruction_loss_val.item()
+                            ),
+                            "direct_solver": float(direct_solver_loss_val.item()),
+                        },
+                        "consistency": {
+                            "evaluated": bool(consistency_loss.requires_grad),
+                            **(
+                                dict(self.last_consistency_metrics)
+                                if consistency_loss.requires_grad
+                                else {}
+                            ),
+                        },
+                        "student_gradients": {
+                            branch_name: {
+                                "raw_norm": float(branch_metrics.raw_norm),
+                                "applied_norm": float(branch_metrics.applied_norm),
+                                "scale": float(branch_metrics.scale),
+                                "present": bool(branch_metrics.present),
+                                "nonzero": bool(branch_metrics.nonzero),
+                            }
+                            for branch_name, branch_metrics in branch_telemetry.items()
+                        },
+                        "student_gradient_cosines": student_gradient_cosines,
+                        "direct_solver": {
+                            "evaluated": bool(direct_solver_evaluated),
+                            "call_count": (
+                                int(latent.shape[0])
+                                * (
+                                    1
+                                    + 2
+                                    * int(
+                                        self.training_config.direct_solver_directions
+                                    )
+                                )
+                                if direct_solver_evaluated
+                                else 0
+                            ),
+                            "components": direct_components,
+                        },
+                        "learning_rates": {
+                            str(group.get("name", "unnamed")): float(
+                                group.get("lr", 0.0)
+                            )
+                            for group in self.optimizer.param_groups
+                        },
+                    }
+                )
 
             # Clear memory
             if batch_idx % 10 == 0:
@@ -4362,6 +4862,37 @@ class OptimizedDiffusionTrainer:
             'geometry_reconstruction': total_geometry / len(train_loader),
             'generation_reconstruction': total_generation_geometry / len(train_loader),
             'consistency': total_consistency / len(train_loader),
+            'consistency_raw_mse': (
+                total_consistency_raw_mse / max(consistency_eval_count, 1)
+            ),
+            'consistency_teacher_rms': (
+                total_consistency_teacher_rms / max(consistency_eval_count, 1)
+            ),
+            'consistency_student_rms': (
+                total_consistency_student_rms / max(consistency_eval_count, 1)
+            ),
+            'consistency_eval_count': consistency_eval_count,
+            'student_data_gradient_norm_raw': (
+                total_student_data_gradient_raw / len(train_loader)
+            ),
+            'student_data_gradient_norm_applied': (
+                total_student_data_gradient_applied / len(train_loader)
+            ),
+            'student_consistency_gradient_norm_raw': (
+                total_student_consistency_gradient_raw
+                / max(consistency_eval_count, 1)
+            ),
+            'student_consistency_gradient_norm_applied': (
+                total_student_consistency_gradient_applied
+                / max(consistency_eval_count, 1)
+            ),
+            'student_direct_gradient_norm_raw': (
+                total_student_direct_gradient_raw / max(direct_solver_eval_count, 1)
+            ),
+            'student_direct_gradient_norm_applied': (
+                total_student_direct_gradient_applied
+                / max(direct_solver_eval_count, 1)
+            ),
             'latent_reconstruction': total_latent_reconstruction / len(train_loader),
             'denoising_geometry_confidence': (
                 total_denoising_geometry_confidence / len(train_loader)
@@ -4378,6 +4909,29 @@ class OptimizedDiffusionTrainer:
             'direct_spsa_gradient_norm_unclipped': (
                 total_spsa_gradient_norm_unclipped / max(direct_solver_eval_count, 1)
             ),
+            'direct_aero_spsa_gradient_norm': (
+                total_aero_spsa_gradient_norm / max(direct_solver_eval_count, 1)
+            ),
+            'direct_aero_spsa_gradient_norm_unclipped': (
+                total_aero_spsa_gradient_norm_unclipped
+                / max(direct_solver_eval_count, 1)
+            ),
+            'direct_connectivity_spsa_gradient_norm': (
+                total_connectivity_spsa_gradient_norm
+                / max(direct_solver_eval_count, 1)
+            ),
+            'direct_connectivity_spsa_gradient_norm_unclipped': (
+                total_connectivity_spsa_gradient_norm_unclipped
+                / max(direct_solver_eval_count, 1)
+            ),
+            'direct_validity_spsa_gradient_norm': (
+                total_validity_spsa_gradient_norm
+                / max(direct_solver_eval_count, 1)
+            ),
+            'direct_validity_spsa_gradient_norm_unclipped': (
+                total_validity_spsa_gradient_norm_unclipped
+                / max(direct_solver_eval_count, 1)
+            ),
             'direct_solver_iteration_coverage': (
                 direct_solver_eval_count / max(optimizer_iterations, 1)
             ),
@@ -4390,25 +4944,41 @@ class OptimizedDiffusionTrainer:
     ) -> torch.Tensor:
         """Compute consistency loss for progressive distillation"""
         self._sync_consistency_teacher()
-        batch_size = latent.shape[0]
-        device = latent.device
-
-        # Distill teacher and student predictions at the exact same timestep.
-        t_student = torch.randint(
-            0,
-            self.diffusion_config.timesteps,
-            (batch_size,),
-            device=device,
+        # The dedicated counter advances once per sparse distillation update.
+        # Using global_step here would select only timestep 999 when the
+        # consistency interval is a multiple of the four-step schedule.
+        t_student = select_training_timesteps(
+            global_step=self.consistency_update_step,
+            batch_size=latent.shape[0],
+            diffusion_timesteps=self.diffusion_config.timesteps,
+            inference_steps=self.diffusion_config.student_steps,
+            device=latent.device,
+            mode=self.training_config.consistency_timestep_sampling,
         )
         t_teacher = t_student
 
-        # Compute consistency loss
-        return self.consistency_model.consistency_loss(
+        loss = self.consistency_model.consistency_loss(
             latent,
             t_student,
             t_teacher,
             condition=condition,
+            loss_type=self.training_config.consistency_loss_type,
+            huber_delta=self.training_config.consistency_huber_delta,
         )
+        self.last_consistency_metrics = dict(
+            self.consistency_model.last_consistency_metrics
+        )
+        raw_mse = float(self.last_consistency_metrics.get("raw_mse", float("inf")))
+        if raw_mse > float(
+            self.training_config.consistency_raw_mse_fail_threshold
+        ):
+            raise FloatingPointError(
+                "Consistency raw MSE exceeded the fail-closed threshold: "
+                f"{raw_mse:.6g} > "
+                f"{self.training_config.consistency_raw_mse_fail_threshold:.6g}"
+            )
+        self.consistency_update_step += 1
+        return loss
 
     def evaluate_geometry_promotion_gate(
         self,
@@ -4418,6 +4988,10 @@ class OptimizedDiffusionTrainer:
         max_samples = max(1, int(self.training_config.overfit_geometry_gate_samples))
         recall_values: List[float] = []
         generated_recall_values: List[float] = []
+        generated_hashes: List[str] = []
+        generated_component_fractions: List[float] = []
+        generated_boundary_fractions: List[float] = []
+        generated_failure_counts: Dict[str, int] = {}
         valid_count = 0
         sample_count = 0
         generated_evaluation_count = 0
@@ -4486,6 +5060,37 @@ class OptimizedDiffusionTrainer:
                         )
                         validity = evaluate_aircraft_validity(generated)
                         valid_count += int(validity.get("status") == "pass")
+                        generated_cpu = (
+                            generated_bool.detach()
+                            .to(device="cpu", dtype=torch.uint8)
+                            .contiguous()
+                            .numpy()
+                        )
+                        generated_hashes.append(
+                            hashlib.sha256(generated_cpu.tobytes()).hexdigest()
+                        )
+                        validity_metrics = validity.get("metrics", {})
+                        generated_component_fractions.append(
+                            float(
+                                validity_metrics.get(
+                                    "largest_component_fraction",
+                                    0.0,
+                                )
+                            )
+                        )
+                        generated_boundary_fractions.append(
+                            float(
+                                validity_metrics.get(
+                                    "normalization_boundary_fraction",
+                                    1.0,
+                                )
+                            )
+                        )
+                        for failed_check in validity.get("failed_checks", []):
+                            failed_name = str(failed_check)
+                            generated_failure_counts[failed_name] = (
+                                generated_failure_counts.get(failed_name, 0) + 1
+                            )
                         generated_evaluation_count += 1
                     sample_count += 1
                     if sample_count >= max_samples:
@@ -4515,6 +5120,32 @@ class OptimizedDiffusionTrainer:
             "generated_aircraft_valid_fraction": (
                 valid_count / max(generated_evaluation_count, 1)
             ),
+            "generated_unique_count": len(set(generated_hashes)),
+            "generated_unique_fraction": (
+                len(set(generated_hashes))
+                / max(generated_evaluation_count, 1)
+            ),
+            "generated_mean_largest_component_fraction": (
+                float(np.mean(generated_component_fractions))
+                if generated_component_fractions
+                else 0.0
+            ),
+            "generated_worst_largest_component_fraction": (
+                float(np.min(generated_component_fractions))
+                if generated_component_fractions
+                else 0.0
+            ),
+            "generated_mean_normalization_boundary_fraction": (
+                float(np.mean(generated_boundary_fractions))
+                if generated_boundary_fractions
+                else 1.0
+            ),
+            "generated_worst_normalization_boundary_fraction": (
+                float(np.max(generated_boundary_fractions))
+                if generated_boundary_fractions
+                else 1.0
+            ),
+            "generated_failure_counts": generated_failure_counts,
         }
         return evaluate_geometry_promotion_gate(metrics, self.training_config)
 
@@ -4591,7 +5222,8 @@ class OptimizedDiffusionTrainer:
                     )
                     self.save_checkpoint(str(checkpoint_path))
 
-            self.scheduler.step()
+            if not getattr(self, "scheduler_step_per_update", False):
+                self.scheduler.step()
         return history
 
     def save_checkpoint(self, path: str):
@@ -4606,8 +5238,14 @@ class OptimizedDiffusionTrainer:
             'ema_model': self.ema_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
+            'scheduler_step_per_update': bool(
+                getattr(self, 'scheduler_step_per_update', False)
+            ),
             'scaler': self.scaler.state_dict(),
             'global_step': self.global_step,
+            'consistency_update_step': int(
+                getattr(self, 'consistency_update_step', 0)
+            ),
             'model_config': asdict(self.model_config),
             'diffusion_config': asdict(self.diffusion_config),
             'training_config': asdict(self.training_config),
@@ -4621,9 +5259,9 @@ class OptimizedDiffusionTrainer:
         checkpoint = torch.load(path, map_location=self.device)
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
-        self._sync_consistency_teacher()
         self.converter.load_state_dict(checkpoint['converter'])
         self.ema_model.load_state_dict(checkpoint['ema_model'])
+        self._sync_consistency_teacher()
         optimizer_state_loaded = True
         try:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -4649,8 +5287,17 @@ class OptimizedDiffusionTrainer:
                 "Restored optimizer learning rate from the current training config "
                 f"({self.training_config.learning_rate}) after loading a zero-LR checkpoint."
             )
-        elif optimizer_state_loaded and 'scheduler' in checkpoint:
+        elif (
+            optimizer_state_loaded
+            and 'scheduler' in checkpoint
+            and not bool(checkpoint.get('scheduler_step_per_update', False))
+        ):
             self.scheduler.load_state_dict(checkpoint['scheduler'])
+        elif bool(checkpoint.get('scheduler_step_per_update', False)):
+            print(
+                "Checkpoint used a run-local update scheduler; the caller must "
+                "configure the new run horizon before training."
+            )
         if 'scaler' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler'])
         if self.training_config.offload_optimizer_state_between_steps:
@@ -4661,6 +5308,17 @@ class OptimizedDiffusionTrainer:
                     f"{offloaded_bytes / (1024 ** 2):.1f} MiB"
                 )
         self.global_step = checkpoint['global_step']
+        self.consistency_update_step = int(
+            checkpoint.get(
+                'consistency_update_step',
+                (
+                    self.global_step
+                    + max(1, int(self.training_config.consistency_interval))
+                    - 1
+                )
+                // max(1, int(self.training_config.consistency_interval)),
+            )
+        )
         print(f"Optimized checkpoint loaded from {path}")
 
     def warm_start_checkpoint(self, path: str) -> Dict[str, Any]:
@@ -4674,6 +5332,17 @@ class OptimizedDiffusionTrainer:
         )
         self.ema_model.load_state_dict(checkpoint["ema_model"])
         self.global_step = int(checkpoint.get("global_step", 0))
+        self.consistency_update_step = int(
+            checkpoint.get(
+                "consistency_update_step",
+                (
+                    self.global_step
+                    + max(1, int(self.training_config.consistency_interval))
+                    - 1
+                )
+                // max(1, int(self.training_config.consistency_interval)),
+            )
+        )
         self._sync_consistency_teacher()
         report = {
             "source": str(Path(path).resolve()),

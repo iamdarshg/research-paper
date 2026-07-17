@@ -1,7 +1,7 @@
 import json
 
 from watch_training_progress import snapshot
-from training_tui import _latest_live_batch
+from training_tui import _latest_live_batch, _latest_update
 
 
 def test_snapshot_labels_completed_epoch_and_loss_trend(tmp_path):
@@ -57,3 +57,38 @@ def test_live_batch_parser_reads_tqdm_loss_postfix(tmp_path):
     assert live["metrics"]["direct_solver"] == 0.75
     assert live["metrics"]["clean_geom"] == 1.1
     assert live["metrics"]["denoise_conf"] == 0.56
+
+
+def test_live_update_reader_prefers_structured_within_epoch_metrics(tmp_path):
+    updates = tmp_path / "updates.jsonl"
+    updates.write_text(
+        json.dumps(
+            {
+                "kind": "optimizer_update",
+                "global_step": 43,
+                "completed_in_epoch": 12,
+                "total_in_epoch": 40,
+                "losses": {
+                    "optimization": 8.5,
+                    "mse": 1.2,
+                    "direct_solver": 0.7,
+                },
+                "student_gradients": {
+                    "data": {"applied_norm": 0.8},
+                    "consistency": {"applied_norm": 0.2},
+                    "direct": {"applied_norm": 0.6},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    live = _latest_update(updates)
+
+    assert live is not None
+    assert live["done"] == 12
+    assert live["total"] == 40
+    assert live["metrics"]["opt_loss"] == 8.5
+    assert live["metrics"]["grad_cons"] == 0.2
+    assert live["timing"] == "global step 43"

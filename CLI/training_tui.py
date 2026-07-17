@@ -23,6 +23,54 @@ from watch_training_progress import snapshot
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+def _latest_update(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if path is None or not path.exists():
+        return None
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            end = handle.tell()
+            handle.seek(max(0, end - 262144))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("kind") != "optimizer_update":
+            continue
+        done = int(record.get("completed_in_epoch", 0))
+        total = int(record.get("total_in_epoch", 0))
+        losses = record.get("losses", {})
+        gradients = record.get("student_gradients", {})
+        return {
+            "done": done,
+            "total": total,
+            "fraction": done / max(total, 1),
+            "timing": f"global step {int(record.get('global_step', 0))}",
+            "metrics": {
+                "opt_loss": losses.get("optimization"),
+                "mse": losses.get("mse"),
+                "clean_geom": losses.get("clean_geometry"),
+                "geom": losses.get("geometry"),
+                "gen_geom": losses.get("generation_geometry"),
+                "consistency": losses.get("consistency"),
+                "latent_recon": losses.get("latent_reconstruction"),
+                "direct_solver": losses.get("direct_solver"),
+                "grad_data": (gradients.get("data") or {}).get("applied_norm"),
+                "grad_cons": (gradients.get("consistency") or {}).get(
+                    "applied_norm"
+                ),
+                "grad_direct": (gradients.get("direct") or {}).get(
+                    "applied_norm"
+                ),
+            },
+        }
+    return None
+
+
 def _latest_live_batch(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     if path is None or not path.exists():
         return None
@@ -174,6 +222,9 @@ def _live_batch_table(live_batch: Optional[Dict[str, Any]]) -> Table:
         ("Generated geometry", _number(metrics.get("gen_geom"), 5)),
         ("Consistency", _number(metrics.get("consistency"), 5)),
         ("Latent reconstruction", _number(metrics.get("latent_recon"), 5)),
+        ("Data gradient", _number(metrics.get("grad_data"), 5)),
+        ("Consistency gradient", _number(metrics.get("grad_cons"), 5)),
+        ("Direct gradient", _number(metrics.get("grad_direct"), 5)),
         ("MSE", _number(metrics.get("mse"), 5)),
     ]
     for name, value in rows:
@@ -264,17 +315,19 @@ def main() -> int:
     parser.add_argument("--history-path", required=True)
     parser.add_argument("--telemetry-path", required=True)
     parser.add_argument("--console-log", default=None)
+    parser.add_argument("--updates-path", default=None)
     parser.add_argument("--trainer-pid", type=int, default=None)
     parser.add_argument("--refresh", type=float, default=5.0)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
 
     console_log = Path(args.console_log) if args.console_log else None
+    updates_path = Path(args.updates_path) if args.updates_path else None
 
     def view() -> Group:
         return render(
             snapshot(Path(args.history_path), Path(args.telemetry_path), args.trainer_pid),
-            _latest_live_batch(console_log),
+            _latest_update(updates_path) or _latest_live_batch(console_log),
             _recent_telemetry(Path(args.telemetry_path)),
         )
 

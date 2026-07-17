@@ -325,6 +325,70 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertIn("aero_loss", loss_fn.last_components)
         self.assertIn("connectivity_loss", loss_fn.last_components)
         self.assertIn("aircraft_validity_loss", loss_fn.last_components)
+        for prefix in ("aero", "connectivity", "aircraft_validity"):
+            self.assertIn(
+                f"{prefix}_spsa_gradient_norm_unclipped",
+                loss_fn.last_components,
+            )
+            self.assertIn(
+                f"{prefix}_spsa_gradient_norm",
+                loss_fn.last_components,
+            )
+            self.assertIn(
+                f"{prefix}_spsa_gradient_scale",
+                loss_fn.last_components,
+            )
+
+    def test_direct_solver_applies_component_trust_region_without_extra_solves(self):
+        voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
+        simulator = _GeometrySensitiveSimulator()
+        loss_fn = DirectSolverSPSALoss(
+            cfd_steps=1,
+            perturbation=0.2,
+            gradient_clip=10.0,
+            aero_gradient_max_norm=0.01,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+            directions=2,
+            seed=9,
+        )
+
+        loss_fn(
+            voxels,
+            DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0),
+            simulator,
+            seed=9,
+        ).backward()
+
+        self.assertEqual(len(simulator.calls), 5)
+        self.assertGreater(
+            loss_fn.last_components["aero_spsa_gradient_norm_unclipped"],
+            loss_fn.last_components["aero_spsa_gradient_norm"],
+        )
+        self.assertLessEqual(
+            loss_fn.last_components["aero_spsa_gradient_norm"],
+            0.01 + 1.0e-7,
+        )
+
+    def test_direct_solver_fails_closed_on_nonfinite_measured_value(self):
+        voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
+        simulator = _FakeSimulator(
+            {
+                "training_drag_coefficient": float("nan"),
+                "lift_coefficient": 0.0,
+            }
+        )
+        loss_fn = DirectSolverSPSALoss(
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+        )
+
+        with self.assertRaisesRegex(FloatingPointError, "nonfinite"):
+            loss_fn(
+                voxels,
+                DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0),
+                simulator,
+            )
 
     def test_direct_solver_spsa_adds_aircraft_validity_regression_to_loss(self):
         voxels = torch.full((1, 8, 8, 8), 0.5, dtype=torch.float32, requires_grad=True)

@@ -11,6 +11,7 @@ if CLI_DIR not in sys.path:
 from aircraft_diffusion_cfd import (
     CFDConfig,
     ConsistencyModel,
+    DesignSpec,
     DiffusionConfig,
     ModelConfig,
     OptimizedDiffusionTrainer,
@@ -326,7 +327,7 @@ def test_optimizer_state_offload_moves_adam_moments():
     )
 
 
-def test_trainer_syncs_consistency_teacher_from_diffusion_model():
+def test_trainer_syncs_consistency_teacher_from_diffusion_ema():
     model_config = ModelConfig(
         latent_dim=4,
         encoder_channels=[8, 8, 8],
@@ -354,18 +355,179 @@ def test_trainer_syncs_consistency_teacher_from_diffusion_model():
         == trainer.training_config.converter_learning_rate
     )
     with torch.no_grad():
-        for index, parameter in enumerate(trainer.diffusion_model.parameters(), start=1):
-            parameter.fill_(index * 0.01)
+        for parameter in trainer.diffusion_model.parameters():
+            parameter.fill_(0.01)
+        for parameter in trainer.ema_model.parameters():
+            parameter.fill_(0.02)
         for parameter in trainer.consistency_model.teacher_model.parameters():
             parameter.zero_()
 
     trainer._sync_consistency_teacher()
 
-    for teacher_parameter, diffusion_parameter in zip(
+    for teacher_parameter, ema_parameter, diffusion_parameter in zip(
         trainer.consistency_model.teacher_model.parameters(),
+        trainer.ema_model.parameters(),
         trainer.diffusion_model.parameters(),
     ):
-        assert torch.equal(teacher_parameter, diffusion_parameter)
+        assert torch.equal(teacher_parameter, ema_parameter)
+        assert not torch.equal(teacher_parameter, diffusion_parameter)
+
+
+def test_consistency_huber_retains_raw_mse_but_bounds_extreme_gradient():
+    class ConstantTeacher(torch.nn.Module):
+        def forward(self, value, timestep, condition=None):
+            return torch.zeros_like(value)
+
+    class ScaledStudent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(100.0))
+
+        def forward(self, value, timestep, condition=None):
+            return torch.ones_like(value) * self.scale
+
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    model = ConsistencyModel(config, DiffusionConfig(timesteps=8))
+    model.teacher_model = ConstantTeacher()
+    model.student_model = ScaledStudent()
+
+    loss = model.consistency_loss(
+        torch.zeros((1, 4)),
+        torch.tensor([7]),
+        torch.tensor([7]),
+        loss_type="huber",
+        huber_delta=1.0,
+    )
+    loss.backward()
+
+    assert model.last_consistency_metrics["raw_mse"] == 10_000.0
+    assert float(loss.detach()) == 99.5
+    assert torch.allclose(model.student_model.scale.grad, torch.tensor(1.0))
+
+
+def test_sparse_consistency_updates_cycle_over_every_inference_timestep():
+    model_config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        model_config,
+        DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4),
+        TrainingConfig(num_epochs=1, consistency_interval=20),
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    observed = []
+
+    def fake_consistency_loss(
+        latent,
+        t_student,
+        t_teacher,
+        condition=None,
+        *,
+        loss_type,
+        huber_delta,
+    ):
+        observed.append(int(t_student.item()))
+        trainer.consistency_model.last_consistency_metrics = {
+            "timestep_mean": float(t_student.item()),
+            "raw_mse": 0.0,
+        }
+        return latent.sum() * 0.0
+
+    trainer.consistency_model.consistency_loss = fake_consistency_loss
+    for _ in range(4):
+        trainer._compute_consistency_loss(torch.zeros((1, 4)))
+
+    assert observed == [7, 5, 2, 0]
+    assert trainer.consistency_update_step == 4
+
+
+def test_train_epoch_recombines_data_consistency_and_direct_student_gradients():
+    class DifferentiableDirectLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.last_components = {}
+
+        def forward(
+            self,
+            logits,
+            design_spec,
+            simulator,
+            seed=None,
+            reference_occupancy=None,
+        ):
+            self.calls += 1
+            value = torch.sigmoid(logits).mean()
+            self.last_components = {
+                "aero_loss": float(value.detach()),
+                "connectivity_loss": 0.1,
+                "aircraft_validity_loss": 0.2,
+                "spsa_gradient_norm": 0.3,
+                "spsa_gradient_norm_unclipped": 0.4,
+                "aero_spsa_gradient_norm": 0.1,
+                "aero_spsa_gradient_norm_unclipped": 0.2,
+                "connectivity_spsa_gradient_norm": 0.1,
+                "connectivity_spsa_gradient_norm_unclipped": 0.2,
+                "aircraft_validity_spsa_gradient_norm": 0.1,
+                "aircraft_validity_spsa_gradient_norm_unclipped": 0.2,
+            }
+            return value
+
+    model_config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        model_config,
+        DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4),
+        TrainingConfig(
+            num_epochs=1,
+            consistency_interval=1,
+            direct_solver_steps=1,
+            direct_solver_directions=1,
+            direct_solver_interval=1,
+            offload_optimizer_state_between_steps=False,
+        ),
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    fake_direct = DifferentiableDirectLoss()
+    trainer.direct_solver_loss = fake_direct
+    batch = {
+        "latent": torch.zeros((1, 4)),
+        "geometry": torch.zeros((1, 4, 4, 4)),
+        "design_spec": [DesignSpec()],
+    }
+
+    metrics = trainer.train_epoch([batch], grid_size=4)
+
+    assert fake_direct.calls == 1
+    assert metrics["direct_solver_eval_count"] == 1
+    assert metrics["direct_solver_call_count"] == 3
+    assert metrics["direct_solver_iteration_coverage"] == 1.0
+    assert metrics["consistency_eval_count"] == 1
+    assert metrics["student_data_gradient_norm_applied"] > 0.0
+    assert metrics["student_consistency_gradient_norm_applied"] > 0.0
+    assert metrics["student_direct_gradient_norm_applied"] > 0.0
+    assert trainer.global_step == 1
 
 
 def test_restore_resume_learning_rate_if_zero_resets_completed_checkpoint_lr():

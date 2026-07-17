@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -13,7 +14,6 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from aircraft_diffusion_cfd import (
     AircraftDesignDataset,
@@ -29,6 +29,82 @@ from aircraft_diffusion_cfd import (
 from experiment_config import GLOBAL_CONFIG_PATH, config_value
 from training_stability import compute_core_loss, summarize_stability
 from sdf_utils import prepare_edt_workspace
+
+
+def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, sort_keys=True, allow_nan=False)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+
+
+class RunLocalCosineScheduler:
+    """Cosine decay over successful optimizer updates with a nonzero floor."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        total_updates: int,
+        min_lr_ratio: float,
+    ) -> None:
+        if int(total_updates) <= 0:
+            raise ValueError("total_updates must be greater than 0")
+        if not 0.0 < float(min_lr_ratio) <= 1.0:
+            raise ValueError("min_lr_ratio must be in (0, 1]")
+        self.optimizer = optimizer
+        self.total_updates = int(total_updates)
+        self.min_lr_ratio = float(min_lr_ratio)
+        self.completed_updates = 0
+        self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self._apply_learning_rates()
+
+    def _factor(self) -> float:
+        progress = min(
+            1.0,
+            max(0.0, self.completed_updates / max(self.total_updates, 1)),
+        )
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
+
+    def _apply_learning_rates(self) -> None:
+        factor = self._factor()
+        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            group["lr"] = float(base_lr) * factor
+
+    def step(self) -> None:
+        self.completed_updates = min(
+            self.total_updates,
+            self.completed_updates + 1,
+        )
+        self._apply_learning_rates()
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "scheduler_type": "run_local_cosine_updates_v1",
+            "total_updates": self.total_updates,
+            "min_lr_ratio": self.min_lr_ratio,
+            "completed_updates": self.completed_updates,
+            "base_lrs": list(self.base_lrs),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        if state_dict.get("scheduler_type") != "run_local_cosine_updates_v1":
+            raise ValueError("Incompatible scheduler state")
+        if int(state_dict["total_updates"]) != self.total_updates:
+            raise ValueError("Scheduler update horizon does not match this run")
+        if float(state_dict["min_lr_ratio"]) != self.min_lr_ratio:
+            raise ValueError("Scheduler minimum LR ratio does not match this run")
+        base_lrs = [float(value) for value in state_dict["base_lrs"]]
+        if len(base_lrs) != len(self.optimizer.param_groups):
+            raise ValueError("Scheduler optimizer group count does not match")
+        self.base_lrs = base_lrs
+        self.completed_updates = min(
+            self.total_updates,
+            max(0, int(state_dict["completed_updates"])),
+        )
+        self._apply_learning_rates()
 
 
 def _build_epoch_dataset(
@@ -72,7 +148,7 @@ def _build_split_dataset(dataset: Dataset, split: str) -> Dataset:
 
 def _geometry_promotion_metrics(
     promotion: Dict[str, Any],
-) -> tuple[Dict[str, float], tuple[float, float, float, float]]:
+) -> tuple[Dict[str, float], tuple[float, ...]]:
     metrics = {
         "promotion_reconstruction_topk_recall": float(
             promotion.get("reconstruction_topk_recall", 0.0)
@@ -86,16 +162,94 @@ def _geometry_promotion_metrics(
         "promotion_generated_aircraft_valid_fraction": float(
             promotion.get("generated_aircraft_valid_fraction", 0.0)
         ),
+        "promotion_generated_unique_fraction": float(
+            promotion.get("generated_unique_fraction", 0.0)
+        ),
+        "promotion_generated_mean_largest_component_fraction": float(
+            promotion.get("generated_mean_largest_component_fraction", 0.0)
+        ),
+        "promotion_generated_mean_normalization_boundary_fraction": float(
+            promotion.get(
+                "generated_mean_normalization_boundary_fraction",
+                1.0,
+            )
+        ),
         "promotion_gate_passed": float(promotion.get("status") == "pass"),
     }
     rank = (
         metrics["promotion_generated_aircraft_valid_fraction"],
+        metrics["promotion_generated_unique_fraction"],
+        metrics["promotion_generated_mean_largest_component_fraction"],
+        -metrics["promotion_generated_mean_normalization_boundary_fraction"],
         metrics["promotion_generated_worst_topk_recall"],
         metrics["promotion_generated_topk_recall"],
         metrics["promotion_reconstruction_topk_recall"],
     )
-    metrics["geometry_selection_metric"] = 1.0 - rank[2]
+    metrics["geometry_selection_metric"] = (
+        1.0 - metrics["promotion_generated_topk_recall"]
+    )
     return metrics, rank
+
+
+def _geometry_non_regression(
+    candidate: Dict[str, Any],
+    baseline: Dict[str, Any],
+) -> Dict[str, Any]:
+    tolerances = {
+        "generated_unique_fraction": float(
+            config_value("training", "promotion_unique_fraction_tolerance", 0.05)
+        ),
+        "generated_mean_largest_component_fraction": float(
+            config_value("training", "promotion_component_fraction_tolerance", 0.02)
+        ),
+        "generated_mean_normalization_boundary_fraction": float(
+            config_value("training", "promotion_boundary_fraction_tolerance", 0.01)
+        ),
+        "generated_worst_topk_recall": float(
+            config_value("training", "promotion_worst_recall_tolerance", 0.01)
+        ),
+    }
+    checks = {
+        "generated_unique_fraction": (
+            float(candidate.get("generated_unique_fraction", 0.0))
+            >= float(baseline.get("generated_unique_fraction", 0.0))
+            - tolerances["generated_unique_fraction"]
+        ),
+        "generated_mean_largest_component_fraction": (
+            float(candidate.get("generated_mean_largest_component_fraction", 0.0))
+            >= float(
+                baseline.get("generated_mean_largest_component_fraction", 0.0)
+            )
+            - tolerances["generated_mean_largest_component_fraction"]
+        ),
+        "generated_mean_normalization_boundary_fraction": (
+            float(
+                candidate.get(
+                    "generated_mean_normalization_boundary_fraction",
+                    1.0,
+                )
+            )
+            <= float(
+                baseline.get(
+                    "generated_mean_normalization_boundary_fraction",
+                    1.0,
+                )
+            )
+            + tolerances["generated_mean_normalization_boundary_fraction"]
+        ),
+        "generated_worst_topk_recall": (
+            float(candidate.get("generated_worst_topk_recall", 0.0))
+            >= float(baseline.get("generated_worst_topk_recall", 0.0))
+            - tolerances["generated_worst_topk_recall"]
+        ),
+    }
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    return {
+        "status": "pass" if not failed_checks else "fail",
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "tolerances": tolerances,
+    }
 
 
 def _build_history_payload(
@@ -126,6 +280,10 @@ def _build_history_payload(
             "grid_size_requested": args.grid_size,
             "grid_size_resolved": args.resolved_grid_size,
             "learning_rate": args.learning_rate,
+            "lr_schedule": "run_local_cosine_updates_v1",
+            "lr_min_ratio": args.lr_min_ratio,
+            "planned_optimizer_updates": args.planned_optimizer_updates,
+            "updates_output": str(Path(args.updates_output).resolve()),
             "converter_learning_rate": config_value("training", "converter_learning_rate", 1e-3),
             "consistency_student_learning_rate": config_value(
                 "training", "consistency_student_learning_rate", 2e-4
@@ -180,6 +338,12 @@ def main() -> int:
     parser.add_argument("--latent-dim", type=int, default=int(config_value("model", "latent_dim", 192)))
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-4)))
+    parser.add_argument(
+        "--lr-min-ratio",
+        type=float,
+        default=float(config_value("training", "lr_min_ratio", 0.10)),
+        help="Nonzero fraction of each optimizer-group base LR at the end of this run.",
+    )
     parser.add_argument("--solver", default=str(config_value("cfd", "solver", "D3Q27")))
     parser.add_argument(
         "--lbm-stream-bfl-backend",
@@ -195,6 +359,11 @@ def main() -> int:
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--warm-start-from", default=None)
     parser.add_argument("--history-output", default="./build/monitored_training/history.json")
+    parser.add_argument(
+        "--updates-output",
+        default=None,
+        help="Append-only per-optimizer-update JSONL; defaults beside history.json.",
+    )
     parser.add_argument("--save-every", type=int, default=int(config_value("training", "save_interval", 25)))
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--max-samples-per-epoch", type=int, default=0)
@@ -228,6 +397,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.resume_from and args.warm_start_from:
         parser.error("--resume-from and --warm-start-from are mutually exclusive")
+    if not 0.0 < float(args.lr_min_ratio) <= 1.0:
+        parser.error("--lr-min-ratio must be in (0, 1]")
 
     os.environ["OMP_NUM_THREADS"] = str(args.cpu_threads)
     os.environ["MKL_NUM_THREADS"] = str(args.cpu_threads)
@@ -349,6 +520,7 @@ def main() -> int:
         num_workers=0,
         collate_fn=aircraft_collate_fn,
     )
+    args.planned_optimizer_updates = len(train_loader) * max(1, int(args.num_epochs))
     promotion_loader = DataLoader(
         promotion_dataset,
         batch_size=args.batch_size,
@@ -362,23 +534,38 @@ def main() -> int:
         trainer.load_checkpoint(args.resume_from)
     elif args.warm_start_from:
         trainer.warm_start_checkpoint(args.warm_start_from)
-    trainer.scheduler = CosineAnnealingLR(
+    trainer.scheduler = RunLocalCosineScheduler(
         trainer.optimizer,
-        T_max=max(1, int(args.num_epochs)),
+        total_updates=args.planned_optimizer_updates,
+        min_lr_ratio=args.lr_min_ratio,
     )
+    trainer.scheduler_step_per_update = True
 
     save_dir = Path(args.save_dir).resolve()
     save_dir.mkdir(parents=True, exist_ok=True)
     history_output = Path(args.history_output).resolve()
     history_output.parent.mkdir(parents=True, exist_ok=True)
+    updates_output = (
+        Path(args.updates_output).resolve()
+        if args.updates_output
+        else history_output.with_name("updates.jsonl")
+    )
+    updates_output.parent.mkdir(parents=True, exist_ok=True)
+    updates_output.write_text("", encoding="utf-8")
+    args.updates_output = str(updates_output)
+    trainer.update_metrics_callback = lambda record: _append_jsonl(
+        updates_output,
+        record,
+    )
 
     history: List[Dict[str, Any]] = []
     final_checkpoint_path = str((save_dir / "final_monitored_model.pt").resolve())
     best_checkpoint_path = str((save_dir / "best_geometry_model.pt").resolve())
     best_geometry_metric = float("inf")
-    best_promotion_rank = (-1.0, -1.0, -1.0, -1.0)
+    best_promotion_rank = (-1.0,) * 7
     selection_interval = max(1, int(training_config.promotion_interval_epochs))
     initial_geometry_promotion = None
+    promotion_baseline: Dict[str, Any] = {}
 
     if args.resume_from or args.warm_start_from:
         python_rng_state = random.getstate()
@@ -386,6 +573,7 @@ def main() -> int:
         torch_rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
         baseline_promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
+        promotion_baseline = dict(baseline_promotion)
         random.setstate(python_rng_state)
         np.random.set_state(numpy_rng_state)
         torch.set_rng_state(torch_rng_state)
@@ -406,8 +594,9 @@ def main() -> int:
         print(
             "Initial geometry promotion baseline: "
             f"valid_fraction={best_promotion_rank[0]:.6g}, "
-            f"worst_recall={best_promotion_rank[1]:.6g}, "
-            f"mean_recall={best_promotion_rank[2]:.6g}"
+            f"unique_fraction={best_promotion_rank[1]:.6g}, "
+            f"worst_recall={best_promotion_rank[4]:.6g}, "
+            f"mean_recall={best_promotion_rank[5]:.6g}"
         )
 
     for epoch in range(args.num_epochs):
@@ -417,7 +606,8 @@ def main() -> int:
             "epoch": epoch + 1,
             **{key: float(value) for key, value in metrics.items()},
         }
-        trainer.scheduler.step()
+        if not getattr(trainer, "scheduler_step_per_update", False):
+            trainer.scheduler.step()
         for group in trainer.optimizer.param_groups:
             group_name = str(group.get("name", "unnamed"))
             metrics[f"learning_rate_{group_name}"] = float(group.get("lr", 0.0))
@@ -427,11 +617,26 @@ def main() -> int:
         promotion_passed = False
         if (epoch + 1) % selection_interval == 0:
             promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
-            promotion_passed = promotion.get("status") == "pass"
+            non_regression = (
+                _geometry_non_regression(promotion, promotion_baseline)
+                if promotion_baseline
+                else {"status": "pass", "failed_checks": []}
+            )
+            promotion_passed = (
+                promotion.get("status") == "pass"
+                and non_regression.get("status") == "pass"
+            )
             metrics["geometry_selection_evaluated"] = 1.0
             promotion_metrics, promotion_rank = _geometry_promotion_metrics(promotion)
             metrics.update(promotion_metrics)
-            if promotion_rank > best_promotion_rank:
+            metrics["promotion_gate_passed"] = float(promotion_passed)
+            metrics["promotion_non_regression_passed"] = float(
+                non_regression.get("status") == "pass"
+            )
+            metrics["promotion_non_regression_failed_count"] = float(
+                len(non_regression.get("failed_checks", []))
+            )
+            if promotion_passed and promotion_rank > best_promotion_rank:
                 best_promotion_rank = promotion_rank
                 best_geometry_metric = metrics["geometry_selection_metric"]
                 trainer.save_checkpoint(best_checkpoint_path)
