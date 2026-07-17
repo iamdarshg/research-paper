@@ -273,7 +273,7 @@ class TrainingConfig:
         config_value("training", "consistency_student_learning_rate", 2e-4)
     )
     consistency_interval: int = int(
-        config_value("training", "consistency_interval", 20)
+        config_value("training", "consistency_interval", 10)
     )
     consistency_loss_type: str = str(
         config_value("training", "consistency_loss_type", "huber")

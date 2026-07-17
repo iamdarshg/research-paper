@@ -144,10 +144,12 @@ connectivity, and validity.
   `consistency_interval`, `consistency_loss_type`,
   `consistency_huber_delta`, `consistency_timestep_sampling`, and
   `consistency_gradient_max_norm`.
-- [ ] Retain the current sparse consistency frequency initially, but add a
-  dedicated persisted `consistency_update_step`. Cycle that counter over
+- [ ] Use a sparse 10-update consistency frequency for the staged recovery,
+  which covers all four inference levels once during the 40-update probe, and
+  add a dedicated persisted `consistency_update_step`. Cycle that counter over
   `[999, 666, 333, 0]`; do not index the schedule with `global_step % 4`
-  because an interval of 20 would repeatedly select the same timestep.
+  because an interval-based global step can repeatedly select the same
+  timestep.
 - [ ] Feed teacher and student the same latent, noise realization, timestep,
   and mission condition.
 - [ ] Optimize a per-element Smooth L1/Huber consistency residual with a delta

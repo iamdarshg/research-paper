@@ -2,7 +2,7 @@ from pathlib import Path
 
 import yaml
 
-from aircraft_diffusion_cfd import ModelConfig
+from aircraft_diffusion_cfd import ModelConfig, TrainingConfig
 from experiment_config import GLOBAL_CONFIG_PATH, load_global_config
 from update_model_capacity_report import END_MARKER, START_MARKER, _config_digest, build_report
 
@@ -11,8 +11,10 @@ def test_global_config_drives_default_and_scaled_latent_width():
     config = load_global_config()
     assert GLOBAL_CONFIG_PATH.name == "config.yaml"
     assert int(config["model"]["latent_dim"]) == 192
+    assert int(config["training"]["consistency_interval"]) == 10
     assert ModelConfig().latent_dim == 192
     assert ModelConfig.scaled_for_corpus(349, 96).latent_dim == 192
+    assert TrainingConfig().consistency_interval == 10
 
 
 def test_global_config_rejects_missing_required_sections(tmp_path: Path):

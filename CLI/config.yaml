@@ -56,7 +56,9 @@ training:
   consistency_student_learning_rate: 0.0002
   # Distillation is sparse for cost, but its own counter cycles over all four
   # inference timesteps instead of repeatedly sampling unsupported levels.
-  consistency_interval: 20
+  # Four sparse consistency updates in the 40-update stabilization probe cover
+  # the complete [999, 666, 333, 0] inference schedule once.
+  consistency_interval: 10
   consistency_loss_type: huber
   consistency_huber_delta: 1.0
   consistency_raw_mse_fail_threshold: 1000000.0
