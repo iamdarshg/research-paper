@@ -19,6 +19,7 @@ from diagnose_training_branches import (
     DIRECT_SCALAR_COMPONENT_FIELDS,
     DiagnosticRuntime,
     PreflightConfig,
+    _student_gradient_branch,
     build_argument_parser,
     exact_inference_timesteps,
     run_preflight,
@@ -267,6 +268,17 @@ def test_summary_statistics_include_requested_percentiles_and_max():
 
 def test_exact_inference_schedule_matches_four_training_levels():
     assert exact_inference_timesteps(1000, 4) == [999, 666, 333, 0]
+
+
+def test_student_gradient_snapshots_are_parked_on_cpu():
+    parameter = torch.nn.Parameter(torch.tensor([1.0], device="cpu"))
+    (parameter.square().sum()).backward()
+
+    gradients, norm = _student_gradient_branch((parameter,), "probe")
+
+    assert gradients[0] is not None
+    assert gradients[0].device.type == "cpu"
+    assert norm == pytest.approx(2.0)
 
 
 def test_preflight_hashes_inputs_records_exact_fields_and_solver_calls(tmp_path):

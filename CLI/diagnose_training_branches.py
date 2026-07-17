@@ -33,6 +33,7 @@ from aircraft_diffusion_cfd import (
     NoiseSchedule,
     TrainingConfig,
     bound_latent_to_corpus_support,
+    config_value,
     deterministic_split_assignments,
     load_grounded_manifest_records,
     sparse_voxel_reconstruction_loss,
@@ -349,7 +350,9 @@ def build_runtime(
         coordinate_decoder_width=model_config.coordinate_decoder_width,
         coordinate_decoder_depth=model_config.coordinate_decoder_depth,
         coordinate_fourier_bands=model_config.coordinate_fourier_bands,
-        enable_coordinate_gradient_checkpointing=False,
+        enable_coordinate_gradient_checkpointing=bool(
+            config_value("model", "coordinate_gradient_checkpointing", True)
+        ),
     ).to(device=device, dtype=dtype)
 
     consistency_model.load_state_dict(checkpoint["consistency_model"])
@@ -359,7 +362,8 @@ def build_runtime(
         consistency_model.teacher_model.load_state_dict(ema_state)
 
     consistency_model.eval()
-    converter.eval()
+    consistency_model.student_model.train()
+    converter.train()
     for parameter in consistency_model.teacher_model.parameters():
         parameter.requires_grad_(False)
 
@@ -546,7 +550,15 @@ def _student_gradient_branch(
     parameters: Sequence[torch.nn.Parameter],
     branch_name: str,
 ) -> tuple[tuple[Optional[torch.Tensor], ...], float]:
-    gradients = capture_gradients(parameters)
+    # The three completed branches are needed together only for scalar cosine
+    # measurements. Park each detached snapshot in system memory so the active
+    # 96^3 decoder or LBM phase owns the GPU working set.
+    gradients = tuple(
+        None
+        if gradient is None
+        else gradient.to(device="cpu", copy=True)
+        for gradient in capture_gradients(parameters)
+    )
     norm = gradient_l2_norm(gradients, branch_name=branch_name)
     return gradients, _require_finite_scalar(f"{branch_name} gradient norm", norm)
 
