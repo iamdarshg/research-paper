@@ -116,6 +116,47 @@ def test_gradient_cosine_similarity_reports_alignment_and_conflict():
     assert gradient_cosine_similarity(first, (None,)) == 0.0
 
 
+def test_conflicting_direct_component_is_projected_off_data_anchor():
+    parameter = torch.nn.Parameter(torch.zeros(2))
+
+    telemetry = combine_gradient_branches(
+        [parameter],
+        {
+            "data": (torch.tensor([1.0, 0.0]),),
+            "direct": (torch.tensor([-1.0, 1.0]),),
+        },
+        max_norms={"data": 10.0, "direct": 10.0},
+        conflict_anchor="data",
+        project_conflicting_branches=("direct",),
+    )
+
+    assert torch.allclose(parameter.grad, torch.tensor([1.0, 1.0]))
+    assert telemetry["direct"].conflict_projected
+    assert telemetry["direct"].anchor_cosine_before < 0.0
+    assert telemetry["direct"].anchor_cosine_after == pytest.approx(0.0)
+    assert telemetry["direct"].projection_norm == pytest.approx(1.0)
+
+
+def test_aligned_direct_component_is_preserved_without_projection():
+    parameter = torch.nn.Parameter(torch.zeros(2))
+
+    telemetry = combine_gradient_branches(
+        [parameter],
+        {
+            "data": (torch.tensor([1.0, 0.0]),),
+            "direct": (torch.tensor([1.0, 1.0]),),
+        },
+        max_norms={"data": 10.0, "direct": 10.0},
+        conflict_anchor="data",
+        project_conflicting_branches=("direct",),
+    )
+
+    assert torch.allclose(parameter.grad, torch.tensor([2.0, 1.0]))
+    assert not telemetry["direct"].conflict_projected
+    assert telemetry["direct"].anchor_cosine_before > 0.0
+    assert telemetry["direct"].anchor_cosine_after > 0.0
+
+
 def test_missing_gradients_remain_missing_and_are_reported():
     first = torch.nn.Parameter(torch.zeros(1))
     second = torch.nn.Parameter(torch.zeros(1))

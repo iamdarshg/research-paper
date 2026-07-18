@@ -15,6 +15,10 @@ from aircraft_diffusion_cfd import (
     DesignSpec,
     DirectSolverSPSALoss,
     TrainingConfig,
+    _aggregate_aircraft_validity_violations,
+    _binarize_probability_grid_for_solver,
+    _calibrate_global_geometry_threshold,
+    _direct_measured_objective_for_single,
     combine_training_loss_terms,
 )
 
@@ -37,6 +41,7 @@ class _GeometrySensitiveSimulator:
         weighted_occupancy = float((geom * weights).sum().detach().cpu().item() / weights.sum().detach().cpu().item())
         self.calls.append({"steps": steps, "weighted_occupancy": weighted_occupancy})
         return {
+            "drag_coefficient": 0.1 + weighted_occupancy,
             "training_drag_coefficient": 0.1 + weighted_occupancy,
             "lift_coefficient": 0.0,
         }
@@ -48,7 +53,29 @@ class _OccupancyRecordingSimulator:
 
     def simulate_aerodynamics(self, geometry, steps=100):
         self.occupancies.append(float(geometry.float().mean().item()))
-        return {"training_drag_coefficient": 0.0, "lift_coefficient": 1.0}
+        return {
+            "drag_coefficient": 0.1,
+            "training_drag_coefficient": 0.0,
+            "lift_coefficient": 1.0,
+        }
+
+
+class _AxisRecordingSimulator:
+    def __init__(self, results=None):
+        self.device = torch.device("cpu")
+        self.geometries = []
+        self.results = results or {
+            "drag_coefficient": 0.7,
+            "calibrated_drag_coefficient": 0.2,
+            "training_drag_coefficient": 0.1,
+            "lift_coefficient": 0.0,
+            "lbm_converged": False,
+            "force_stability": 1.0,
+        }
+
+    def simulate_aerodynamics(self, geometry, steps=100):
+        self.geometries.append(geometry.detach().cpu().clone())
+        return dict(self.results)
 
 
 class _GeometryCacheSimulator(_GeometrySensitiveSimulator):
@@ -139,6 +166,174 @@ class TestAerodynamicLoss(unittest.TestCase):
 
         self.assertFalse(ConnectivityLoss()(voxels).requires_grad)
         self.assertFalse(AerodynamicLoss()(voxels, spec, simulator).requires_grad)
+
+    def test_direct_objective_converts_model_zyx_geometry_to_solver_xyz(self):
+        probabilities = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        probabilities = probabilities / probabilities.max()
+        simulator = _AxisRecordingSimulator()
+
+        _direct_measured_objective_for_single(
+            probabilities,
+            DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0),
+            simulator,
+            cfd_steps=7,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+            threshold=0.5,
+            target_occupancy=0.25,
+        )
+
+        canonical = _binarize_probability_grid_for_solver(
+            probabilities,
+            threshold=0.5,
+            target_occupancy=None,
+        )
+        self.assertEqual(tuple(simulator.geometries[0].shape), (4, 3, 2))
+        self.assertTrue(
+            torch.equal(
+                simulator.geometries[0],
+                canonical.permute(2, 1, 0).contiguous(),
+            )
+        )
+
+    def test_direct_objective_uses_raw_drag_not_calibrated_training_proxy(self):
+        simulator = _AxisRecordingSimulator()
+
+        components = _direct_measured_objective_for_single(
+            torch.ones((4, 4, 4)),
+            DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0),
+            simulator,
+            cfd_steps=1,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+            threshold=0.5,
+            target_occupancy=0.25,
+            return_components=True,
+        )
+
+        self.assertAlmostEqual(components["drag_coefficient"], 0.7)
+        self.assertAlmostEqual(components["total_loss"], 0.7)
+        self.assertEqual(components["solver_used_raw_drag"], 1.0)
+
+    def test_direct_objective_penalizes_zero_incidence_lift_residual(self):
+        simulator = _AxisRecordingSimulator(
+            {
+                "drag_coefficient": 0.0,
+                "lift_coefficient": -2.0,
+            }
+        )
+
+        components = _direct_measured_objective_for_single(
+            torch.ones((4, 4, 4)),
+            DesignSpec(space_weight=0.0, drag_weight=0.0, lift_weight=1.0),
+            simulator,
+            cfd_steps=1,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+            threshold=0.5,
+            target_occupancy=None,
+            return_components=True,
+        )
+
+        self.assertEqual(components["lift_coefficient"], 2.0)
+        self.assertEqual(components["lift_loss"], 2.0)
+        self.assertEqual(components["total_loss"], 2.0)
+
+    def test_direct_objective_fails_closed_without_finite_positive_raw_drag(self):
+        simulator = _AxisRecordingSimulator(
+            {
+                "drag_coefficient": float("nan"),
+                "calibrated_drag_coefficient": 0.2,
+                "training_drag_coefficient": 0.1,
+                "lift_coefficient": 0.0,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            FloatingPointError,
+            "raw momentum-exchange",
+        ):
+            _direct_measured_objective_for_single(
+                torch.ones((4, 4, 4)),
+                DesignSpec(),
+                simulator,
+                cfd_steps=1,
+                connectivity_weight=0.0,
+                aircraft_validity_weight=0.0,
+                threshold=0.5,
+                target_occupancy=0.25,
+            )
+
+    def test_direct_objective_target_occupancy_does_not_choose_voxels(self):
+        probabilities = torch.linspace(0.0, 1.0, 64).reshape(4, 4, 4)
+        simulator = _AxisRecordingSimulator()
+        spec = DesignSpec(space_weight=1.0, drag_weight=0.0, lift_weight=0.0)
+
+        _direct_measured_objective_for_single(
+            probabilities,
+            spec,
+            simulator,
+            cfd_steps=1,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+            threshold=0.7,
+            target_occupancy=0.05,
+        )
+        _direct_measured_objective_for_single(
+            probabilities,
+            spec,
+            simulator,
+            cfd_steps=1,
+            connectivity_weight=0.0,
+            aircraft_validity_weight=0.0,
+            threshold=0.7,
+            target_occupancy=0.40,
+        )
+
+        self.assertTrue(torch.equal(simulator.geometries[0], simulator.geometries[1]))
+
+    def test_global_threshold_calibration_matches_corpus_not_each_sample(self):
+        probabilities = torch.tensor([0.1, 0.2, 0.8, 0.9])
+        targets = torch.tensor([0.0, 0.0, 0.0, 1.0])
+
+        threshold, report = _calibrate_global_geometry_threshold(
+            probabilities,
+            targets,
+        )
+
+        self.assertGreaterEqual(threshold, 0.8)
+        self.assertLess(threshold, 0.9)
+        self.assertAlmostEqual(report["target_occupied_fraction"], 0.25)
+        self.assertAlmostEqual(report["materialized_occupied_fraction"], 0.25)
+
+    def test_fixed_threshold_exposes_near_solid_probability_collapse(self):
+        probabilities = torch.full((4, 4, 4), 0.997)
+
+        intrinsic = _binarize_probability_grid_for_solver(
+            probabilities,
+            threshold=0.99,
+            target_occupancy=None,
+        )
+        target_carved = _binarize_probability_grid_for_solver(
+            probabilities,
+            threshold=0.99,
+            target_occupancy=0.10,
+        )
+
+        self.assertEqual(float(intrinsic.mean()), 1.0)
+        self.assertLess(float(target_carved.mean()), 0.2)
+
+    def test_validity_aggregation_keeps_one_hard_failure_dominant(self):
+        scores = {f"gate_{index}": 0.0 for index in range(12)}
+        scores["gate_0"] = 1.0
+
+        mean_value, worst_value, total = (
+            _aggregate_aircraft_validity_violations(scores)
+        )
+
+        self.assertAlmostEqual(mean_value, 1.0 / 12.0)
+        self.assertEqual(worst_value, 1.0)
+        self.assertAlmostEqual(total, 1.0 + 1.0 / 12.0)
 
     def test_training_loss_contains_only_optimizer_terms(self):
         parameter = torch.tensor(2.0, requires_grad=True)
@@ -273,7 +468,7 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertEqual(len(simulator.calls), 5)
         self.assertIsNotNone(voxels.grad)
 
-    def test_direct_solver_can_estimate_rank_invariant_gradient_in_logit_space(self):
+    def test_direct_solver_logit_space_uses_intrinsic_threshold_occupancy(self):
         logits = torch.linspace(-3.0, 3.0, 64).reshape(1, 4, 4, 4).requires_grad_(True)
         simulator = _OccupancyRecordingSimulator()
         loss_fn = DirectSolverSPSALoss(
@@ -294,8 +489,11 @@ class TestAerodynamicLoss(unittest.TestCase):
         ).backward()
 
         self.assertEqual(len(simulator.occupancies), 3)
-        self.assertTrue(all(abs(value - 0.25) < 1.0e-7 for value in simulator.occupancies))
+        self.assertTrue(
+            any(abs(value - 0.25) > 1.0e-7 for value in simulator.occupancies)
+        )
         self.assertIsNotNone(logits.grad)
+        self.assertGreater(float(logits.grad.abs().sum()), 0.0)
 
     def test_direct_solver_reports_components_and_applies_configured_gradient_limit(self):
         voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
@@ -322,10 +520,16 @@ class TestAerodynamicLoss(unittest.TestCase):
             loss_fn.last_components["spsa_gradient_norm"],
             expected_limit + 1e-7,
         )
+        self.assertIn("occupancy_loss", loss_fn.last_components)
         self.assertIn("aero_loss", loss_fn.last_components)
         self.assertIn("connectivity_loss", loss_fn.last_components)
         self.assertIn("aircraft_validity_loss", loss_fn.last_components)
-        for prefix in ("aero", "connectivity", "aircraft_validity"):
+        for prefix in (
+            "occupancy",
+            "aero",
+            "connectivity",
+            "aircraft_validity",
+        ):
             self.assertIn(
                 f"{prefix}_spsa_gradient_norm_unclipped",
                 loss_fn.last_components,
@@ -374,6 +578,7 @@ class TestAerodynamicLoss(unittest.TestCase):
         voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
         simulator = _FakeSimulator(
             {
+                "drag_coefficient": float("nan"),
                 "training_drag_coefficient": float("nan"),
                 "lift_coefficient": 0.0,
             }
@@ -383,7 +588,7 @@ class TestAerodynamicLoss(unittest.TestCase):
             aircraft_validity_weight=0.0,
         )
 
-        with self.assertRaisesRegex(FloatingPointError, "nonfinite"):
+        with self.assertRaisesRegex(FloatingPointError, "finite raw"):
             loss_fn(
                 voxels,
                 DesignSpec(space_weight=0.0, drag_weight=1.0, lift_weight=0.0),
@@ -416,12 +621,17 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertIsNotNone(voxels.grad)
         self.assertGreater(float(voxels.grad.abs().sum()), 0.0)
 
-    def test_direct_solver_uses_each_source_geometry_occupancy_not_empty_threshold_output(self):
-        voxels = torch.zeros((1, 4, 4, 4), dtype=torch.float32, requires_grad=True)
+    def test_direct_solver_uses_reference_occupancy_only_as_loss_target(self):
+        voxels = torch.full(
+            (1, 4, 4, 4),
+            0.6,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
         simulator = _GeometrySensitiveSimulator()
         loss_fn = DirectSolverSPSALoss(
             cfd_steps=1,
-            perturbation=0.1,
+            perturbation=0.2,
             gradient_clip=10.0,
             connectivity_weight=0.0,
             target_occupancy=None,

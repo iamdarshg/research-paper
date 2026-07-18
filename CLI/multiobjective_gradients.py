@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -25,6 +25,10 @@ class BranchGradientTelemetry:
     scale: float
     present: bool
     nonzero: bool
+    anchor_cosine_before: float = 0.0
+    anchor_cosine_after: float = 0.0
+    conflict_projected: bool = False
+    projection_norm: float = 0.0
 
 
 def capture_gradients(
@@ -153,6 +157,122 @@ def gradient_cosine_similarity(
     return float(max(-1.0, min(1.0, cosine)))
 
 
+def _gradient_dot_product(
+    first: Sequence[Optional[torch.Tensor]],
+    second: Sequence[Optional[torch.Tensor]],
+    *,
+    first_name: str,
+    second_name: str,
+) -> float:
+    if len(first) != len(second):
+        raise ValueError("gradient branches must have the same buffer count")
+
+    dot = 0.0
+    for parameter_index, (first_gradient, second_gradient) in enumerate(
+        zip(first, second)
+    ):
+        if first_gradient is None or second_gradient is None:
+            continue
+        _validate_gradient_tensor(
+            first_gradient,
+            branch_name=first_name,
+            parameter_index=parameter_index,
+        )
+        _validate_gradient_tensor(
+            second_gradient,
+            branch_name=second_name,
+            parameter_index=parameter_index,
+        )
+        dot += float(
+            torch.sum(
+                first_gradient.detach().double()
+                * second_gradient.detach().double()
+            ).item()
+        )
+    if not math.isfinite(dot):
+        raise NonFiniteGradientError(
+            f"gradient dot product for {first_name!r} and {second_name!r} "
+            "is nonfinite"
+        )
+    return dot
+
+
+def project_conflicting_gradient(
+    gradients: Sequence[Optional[torch.Tensor]],
+    anchor: Sequence[Optional[torch.Tensor]],
+    *,
+    branch_name: str,
+    anchor_name: str,
+) -> tuple[GradientBuffer, float, float, bool, float]:
+    """Remove only the component that points uphill on an anchor objective."""
+
+    if len(gradients) != len(anchor):
+        raise ValueError("gradient branches must have the same buffer count")
+
+    cosine_before = gradient_cosine_similarity(
+        gradients,
+        anchor,
+        first_name=branch_name,
+        second_name=anchor_name,
+    )
+    branch_norm = gradient_l2_norm(gradients, branch_name=branch_name)
+    anchor_norm = gradient_l2_norm(anchor, branch_name=anchor_name)
+    if branch_norm == 0.0 or anchor_norm == 0.0 or cosine_before >= 0.0:
+        cloned = tuple(
+            None
+            if gradient is None
+            else gradient.detach().clone(memory_format=torch.preserve_format)
+            for gradient in gradients
+        )
+        return cloned, cosine_before, cosine_before, False, 0.0
+
+    dot = _gradient_dot_product(
+        gradients,
+        anchor,
+        first_name=branch_name,
+        second_name=anchor_name,
+    )
+    anchor_norm_squared = anchor_norm * anchor_norm
+    coefficient = dot / max(anchor_norm_squared, 1.0e-300)
+    projected: list[Optional[torch.Tensor]] = []
+    for gradient, anchor_gradient in zip(gradients, anchor):
+        if gradient is None and anchor_gradient is None:
+            projected.append(None)
+            continue
+        if gradient is None:
+            projected.append(
+                anchor_gradient.detach().clone(
+                    memory_format=torch.preserve_format
+                ).mul_(-coefficient)
+            )
+            continue
+        value = gradient.detach().clone(memory_format=torch.preserve_format)
+        if anchor_gradient is not None:
+            value.add_(anchor_gradient, alpha=-coefficient)
+        projected.append(value)
+
+    projected_buffer = tuple(projected)
+    cosine_after = gradient_cosine_similarity(
+        projected_buffer,
+        anchor,
+        first_name=branch_name,
+        second_name=anchor_name,
+    )
+    if cosine_after < -1.0e-6:
+        raise NonFiniteGradientError(
+            f"conflict projection left branch {branch_name!r} opposed to "
+            f"anchor {anchor_name!r}: cosine={cosine_after:.6g}"
+        )
+    projection_norm = abs(dot) / max(anchor_norm, 1.0e-300)
+    return (
+        projected_buffer,
+        cosine_before,
+        cosine_after,
+        True,
+        projection_norm,
+    )
+
+
 def apply_max_norm(
     gradients: Sequence[Optional[torch.Tensor]],
     max_norm: float,
@@ -237,6 +357,9 @@ def combine_gradient_branches(
     parameters: Iterable[torch.nn.Parameter],
     branches: Mapping[str, Sequence[Optional[torch.Tensor]]],
     max_norms: Mapping[str, float],
+    *,
+    conflict_anchor: Optional[str] = None,
+    project_conflicting_branches: Sequence[str] = (),
 ) -> dict[str, BranchGradientTelemetry]:
     """Independently limit named branches and replace target ``.grad`` buffers."""
 
@@ -253,6 +376,7 @@ def combine_gradient_branches(
 
     combined: list[Optional[torch.Tensor]] = [None] * len(parameter_list)
     telemetry: dict[str, BranchGradientTelemetry] = {}
+    applied_branches: dict[str, GradientBuffer] = {}
 
     for branch_name, gradients in branches.items():
         gradient_list = tuple(gradients)
@@ -267,7 +391,52 @@ def combine_gradient_branches(
             branch_name=branch_name,
         )
         telemetry[branch_name] = branch_telemetry
+        applied_branches[branch_name] = applied
 
+    projected_names = tuple(project_conflicting_branches)
+    if conflict_anchor is None and projected_names:
+        raise ValueError(
+            "conflict_anchor is required when project_conflicting_branches is set"
+        )
+    if conflict_anchor is not None:
+        if conflict_anchor not in applied_branches:
+            raise ValueError(f"unknown conflict anchor branch: {conflict_anchor}")
+        unknown_projected = set(projected_names).difference(applied_branches)
+        if unknown_projected:
+            names = ", ".join(sorted(unknown_projected))
+            raise ValueError(f"unknown projected gradient branches: {names}")
+        if conflict_anchor in projected_names:
+            raise ValueError("conflict anchor cannot be projected against itself")
+
+        anchor_gradients = applied_branches[conflict_anchor]
+        for branch_name in projected_names:
+            (
+                projected,
+                cosine_before,
+                cosine_after,
+                was_projected,
+                projection_norm,
+            ) = project_conflicting_gradient(
+                applied_branches[branch_name],
+                anchor_gradients,
+                branch_name=branch_name,
+                anchor_name=conflict_anchor,
+            )
+            applied_branches[branch_name] = projected
+            telemetry[branch_name] = replace(
+                telemetry[branch_name],
+                applied_norm=gradient_l2_norm(
+                    projected,
+                    branch_name=branch_name,
+                ),
+                anchor_cosine_before=cosine_before,
+                anchor_cosine_after=cosine_after,
+                conflict_projected=was_projected,
+                projection_norm=projection_norm,
+            )
+
+    for branch_name in branches:
+        applied = applied_branches[branch_name]
         for parameter_index, gradient in enumerate(applied):
             if gradient is None:
                 continue

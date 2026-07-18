@@ -359,6 +359,27 @@ class TestLiveConditioningPath(unittest.TestCase):
             schema["vector_dim"],
         )
 
+    def test_generator_uses_zero_condition_for_unconditioned_checkpoint(self):
+        schema = _load_conditioning_schema()
+        generator = object.__new__(cli_module.OptimizedAircraftGenerator)
+        generator.device = torch.device("cpu")
+        generator.model_config = types.SimpleNamespace(latent_dim=8)
+        generator.consistency_model = mock.Mock()
+        generator.consistency_model.fast_inference.return_value = torch.ones((1, 8))
+        generator.converter = mock.Mock(return_value=torch.zeros((1, 8, 8, 8)))
+
+        cli_module.OptimizedAircraftGenerator.generate(
+            generator,
+            None,
+            num_steps=3,
+        )
+
+        condition = generator.consistency_model.fast_inference.call_args.kwargs[
+            "condition"
+        ]
+        self.assertEqual(condition.shape, (1, schema["vector_dim"]))
+        self.assertEqual(float(condition.abs().sum()), 0.0)
+
     def test_condition_response_smoke_summary_reports_meaningful_deltas(self):
         with mock.patch.object(cli_module.Path, "mkdir"), \
              mock.patch.object(cli_module.Path, "open", mock.mock_open()) as mock_file:

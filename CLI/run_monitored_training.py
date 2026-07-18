@@ -149,16 +149,36 @@ def _build_split_dataset(dataset: Dataset, split: str) -> Dataset:
 def _geometry_promotion_metrics(
     promotion: Dict[str, Any],
 ) -> tuple[Dict[str, float], tuple[float, ...]]:
+    reconstruction_recall = float(
+        promotion.get(
+            "reconstruction_recall",
+            promotion.get("reconstruction_topk_recall", 0.0),
+        )
+    )
+    generated_recall = float(
+        promotion.get(
+            "generated_recall",
+            promotion.get("generated_topk_recall", 0.0),
+        )
+    )
+    generated_worst_recall = float(
+        promotion.get(
+            "generated_worst_recall",
+            promotion.get("generated_worst_topk_recall", 0.0),
+        )
+    )
+    generated_occupancy_error = abs(
+        float(promotion.get("generated_mean_occupied_fraction", 0.0))
+        - float(promotion.get("target_mean_occupied_fraction", 0.0))
+    )
     metrics = {
-        "promotion_reconstruction_topk_recall": float(
-            promotion.get("reconstruction_topk_recall", 0.0)
-        ),
-        "promotion_generated_topk_recall": float(
-            promotion.get("generated_topk_recall", 0.0)
-        ),
-        "promotion_generated_worst_topk_recall": float(
-            promotion.get("generated_worst_topk_recall", 0.0)
-        ),
+        "promotion_reconstruction_recall": reconstruction_recall,
+        "promotion_generated_recall": generated_recall,
+        "promotion_generated_worst_recall": generated_worst_recall,
+        # Compatibility aliases for existing monitors and history reports.
+        "promotion_reconstruction_topk_recall": reconstruction_recall,
+        "promotion_generated_topk_recall": generated_recall,
+        "promotion_generated_worst_topk_recall": generated_worst_recall,
         "promotion_generated_aircraft_valid_fraction": float(
             promotion.get("generated_aircraft_valid_fraction", 0.0)
         ),
@@ -174,19 +194,23 @@ def _geometry_promotion_metrics(
                 1.0,
             )
         ),
+        "promotion_generated_occupancy_error": generated_occupancy_error,
         "promotion_gate_passed": float(promotion.get("status") == "pass"),
     }
     rank = (
         metrics["promotion_generated_aircraft_valid_fraction"],
+        -metrics["promotion_generated_occupancy_error"],
         metrics["promotion_generated_unique_fraction"],
         metrics["promotion_generated_mean_largest_component_fraction"],
         -metrics["promotion_generated_mean_normalization_boundary_fraction"],
-        metrics["promotion_generated_worst_topk_recall"],
-        metrics["promotion_generated_topk_recall"],
-        metrics["promotion_reconstruction_topk_recall"],
+        metrics["promotion_generated_worst_recall"],
+        metrics["promotion_generated_recall"],
+        metrics["promotion_reconstruction_recall"],
     )
     metrics["geometry_selection_metric"] = (
-        1.0 - metrics["promotion_generated_topk_recall"]
+        metrics["promotion_generated_occupancy_error"]
+        + 1.0
+        - metrics["promotion_generated_recall"]
     )
     return metrics, rank
 
@@ -196,6 +220,9 @@ def _geometry_non_regression(
     baseline: Dict[str, Any],
 ) -> Dict[str, Any]:
     tolerances = {
+        "generated_aircraft_valid_fraction": float(
+            config_value("training", "promotion_valid_fraction_tolerance", 0.0)
+        ),
         "generated_unique_fraction": float(
             config_value("training", "promotion_unique_fraction_tolerance", 0.05)
         ),
@@ -205,11 +232,23 @@ def _geometry_non_regression(
         "generated_mean_normalization_boundary_fraction": float(
             config_value("training", "promotion_boundary_fraction_tolerance", 0.01)
         ),
-        "generated_worst_topk_recall": float(
+        "generated_worst_recall": float(
             config_value("training", "promotion_worst_recall_tolerance", 0.01)
+        ),
+        "generated_occupancy_error": float(
+            config_value(
+                "training",
+                "promotion_occupancy_error_tolerance",
+                0.005,
+            )
         ),
     }
     checks = {
+        "generated_aircraft_valid_fraction": (
+            float(candidate.get("generated_aircraft_valid_fraction", 0.0))
+            >= float(baseline.get("generated_aircraft_valid_fraction", 0.0))
+            - tolerances["generated_aircraft_valid_fraction"]
+        ),
         "generated_unique_fraction": (
             float(candidate.get("generated_unique_fraction", 0.0))
             >= float(baseline.get("generated_unique_fraction", 0.0))
@@ -237,10 +276,35 @@ def _geometry_non_regression(
             )
             + tolerances["generated_mean_normalization_boundary_fraction"]
         ),
-        "generated_worst_topk_recall": (
-            float(candidate.get("generated_worst_topk_recall", 0.0))
-            >= float(baseline.get("generated_worst_topk_recall", 0.0))
-            - tolerances["generated_worst_topk_recall"]
+        "generated_worst_recall": (
+            float(
+                candidate.get(
+                    "generated_worst_recall",
+                    candidate.get("generated_worst_topk_recall", 0.0),
+                )
+            )
+            >= float(
+                baseline.get(
+                    "generated_worst_recall",
+                    baseline.get("generated_worst_topk_recall", 0.0),
+                )
+            )
+            - tolerances["generated_worst_recall"]
+        ),
+        "generated_occupancy_error": (
+            abs(
+                float(
+                    candidate.get("generated_mean_occupied_fraction", 0.0)
+                )
+                - float(candidate.get("target_mean_occupied_fraction", 0.0))
+            )
+            <= abs(
+                float(
+                    baseline.get("generated_mean_occupied_fraction", 0.0)
+                )
+                - float(baseline.get("target_mean_occupied_fraction", 0.0))
+            )
+            + tolerances["generated_occupancy_error"]
         ),
     }
     failed_checks = [name for name, passed in checks.items() if not passed]
@@ -258,7 +322,7 @@ def _build_history_payload(
     device: torch.device,
     history: List[Dict[str, Any]],
     stability: Dict[str, Any],
-    checkpoint_path: str,
+    checkpoint_path: str | None,
     model_config: ModelConfig,
     best_checkpoint_path: str | None = None,
     best_geometry_metric: float | None = None,
@@ -298,6 +362,8 @@ def _build_history_payload(
             "promotion_split": args.promotion_split,
             "training_sample_count": args.training_sample_count,
             "promotion_sample_count": args.promotion_sample_count,
+            "promotion_evaluation_samples": args.promotion_evaluation_samples,
+            "promotion_generation_seeds": args.promotion_generation_seeds,
             "stop_on_promotion_pass": args.stop_on_promotion_pass,
             "stability_metric": args.stability_metric,
             "convergence_window": args.convergence_window,
@@ -308,6 +374,7 @@ def _build_history_payload(
             "oscillation_cv_threshold": args.oscillation_cv_threshold,
             "early_stop_on_convergence": args.early_stop_on_convergence,
             "save_every": args.save_every,
+            "save_final_checkpoint": args.save_final_checkpoint,
             "direct_solver_loss_weight": args.direct_solver_loss_weight,
             "direct_solver_steps": args.direct_solver_steps,
             "direct_solver_directions": args.direct_solver_directions,
@@ -318,9 +385,21 @@ def _build_history_payload(
             "direct_solver_gradient_clip": config_value(
                 "training", "direct_solver_gradient_clip", 1.0
             ),
+            "geometry_probability_threshold": getattr(
+                args,
+                "geometry_probability_threshold",
+                None,
+            ),
+            "geometry_threshold_calibration": getattr(
+                args,
+                "geometry_threshold_calibration",
+                None,
+            ),
         },
         "device": str(device),
-        "checkpoint_path": str(Path(checkpoint_path).resolve()),
+        "checkpoint_path": (
+            str(Path(checkpoint_path).resolve()) if checkpoint_path else None
+        ),
         "best_checkpoint_path": (
             str(Path(best_checkpoint_path).resolve()) if best_checkpoint_path else None
         ),
@@ -367,11 +446,27 @@ def main() -> int:
         help="Append-only per-optimizer-update JSONL; defaults beside history.json.",
     )
     parser.add_argument("--save-every", type=int, default=int(config_value("training", "save_interval", 25)))
+    parser.add_argument(
+        "--save-final-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save the final optimizer state even when it does not pass promotion.",
+    )
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--max-samples-per-epoch", type=int, default=0)
     parser.add_argument("--subset-seed", type=int, default=0)
     parser.add_argument("--training-split", default="train")
     parser.add_argument("--promotion-split", default="val")
+    parser.add_argument(
+        "--promotion-evaluation-samples",
+        type=int,
+        default=int(config_value("training", "overfit_geometry_gate_samples", 16)),
+    )
+    parser.add_argument(
+        "--promotion-generation-seeds",
+        type=int,
+        default=int(config_value("training", "promotion_generation_seeds", 6)),
+    )
     parser.add_argument(
         "--stop-on-promotion-pass",
         action=argparse.BooleanOptionalAction,
@@ -401,6 +496,10 @@ def main() -> int:
         parser.error("--resume-from and --warm-start-from are mutually exclusive")
     if not 0.0 < float(args.lr_min_ratio) <= 1.0:
         parser.error("--lr-min-ratio must be in (0, 1]")
+    if args.promotion_evaluation_samples <= 0:
+        parser.error("--promotion-evaluation-samples must be greater than 0")
+    if args.promotion_generation_seeds <= 0:
+        parser.error("--promotion-generation-seeds must be greater than 0")
 
     os.environ["OMP_NUM_THREADS"] = str(args.cpu_threads)
     os.environ["MKL_NUM_THREADS"] = str(args.cpu_threads)
@@ -507,6 +606,8 @@ def main() -> int:
         direct_solver_perturbation_grid_size=args.direct_solver_perturbation_grid_size,
         direct_connectivity_weight=args.direct_connectivity_weight,
         direct_aircraft_validity_weight=args.direct_aircraft_validity_weight,
+        overfit_geometry_gate_samples=args.promotion_evaluation_samples,
+        promotion_generation_seeds=args.promotion_generation_seeds,
         require_direct_solver_every_iteration=True,
     )
     cfd_config = CFDConfig(
@@ -530,12 +631,27 @@ def main() -> int:
         num_workers=0,
         collate_fn=aircraft_collate_fn,
     )
+    calibration_dataset = _build_split_dataset(dataset, args.training_split)
+    calibration_loader = DataLoader(
+        calibration_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=aircraft_collate_fn,
+    )
 
     trainer = OptimizedDiffusionTrainer(model_config, diffusion_config, training_config, cfd_config, device=device)
     if args.resume_from:
         trainer.load_checkpoint(args.resume_from)
     elif args.warm_start_from:
         trainer.warm_start_checkpoint(args.warm_start_from)
+    threshold_calibration = trainer.calibrate_geometry_materialization_threshold(
+        calibration_loader
+    )
+    args.geometry_probability_threshold = float(
+        trainer.geometry_probability_threshold
+    )
+    args.geometry_threshold_calibration = threshold_calibration
     trainer.scheduler = RunLocalCosineScheduler(
         trainer.optimizer,
         total_updates=args.planned_optimizer_updates,
@@ -562,9 +678,12 @@ def main() -> int:
 
     history: List[Dict[str, Any]] = []
     final_checkpoint_path = str((save_dir / "final_monitored_model.pt").resolve())
-    best_checkpoint_path = str((save_dir / "best_geometry_model.pt").resolve())
+    candidate_best_checkpoint_path = str(
+        (save_dir / "best_geometry_model.pt").resolve()
+    )
+    best_checkpoint_path: str | None = None
     best_geometry_metric = float("inf")
-    best_promotion_rank = (-1.0,) * 7
+    best_promotion_rank = (-1.0,) * 8
     selection_interval = max(1, int(training_config.promotion_interval_epochs))
     initial_geometry_promotion = None
     initial_geometry_promotion_report = None
@@ -594,13 +713,27 @@ def main() -> int:
                 Path(args.resume_from or args.warm_start_from).resolve()
             ),
         }
-        trainer.save_checkpoint(best_checkpoint_path)
+        best_checkpoint_path = str(
+            Path(args.resume_from or args.warm_start_from).resolve()
+        )
+        initial_promotion_path = history_output.with_name(
+            "initial_geometry_promotion.json"
+        )
+        initial_promotion_path.write_text(
+            json.dumps(initial_geometry_promotion_report, indent=2) + "\n",
+            encoding="utf-8",
+        )
         print(
             "Initial geometry promotion baseline: "
-            f"valid_fraction={best_promotion_rank[0]:.6g}, "
-            f"unique_fraction={best_promotion_rank[1]:.6g}, "
-            f"worst_recall={best_promotion_rank[4]:.6g}, "
-            f"mean_recall={best_promotion_rank[5]:.6g}"
+            "valid_fraction="
+            f"{baseline_metrics['promotion_generated_aircraft_valid_fraction']:.6g}, "
+            "occupancy_error="
+            f"{baseline_metrics['promotion_generated_occupancy_error']:.6g}, "
+            "unique_fraction="
+            f"{baseline_metrics['promotion_generated_unique_fraction']:.6g}, "
+            "worst_recall="
+            f"{baseline_metrics['promotion_generated_worst_recall']:.6g}, "
+            f"mean_recall={baseline_metrics['promotion_generated_recall']:.6g}"
         )
 
     for epoch in range(args.num_epochs):
@@ -642,10 +775,15 @@ def main() -> int:
             )
             metrics["promotion_report"] = dict(promotion)
             metrics["promotion_non_regression_report"] = dict(non_regression)
-            if promotion_passed and promotion_rank > best_promotion_rank:
+            candidate_improved = (
+                non_regression.get("status") == "pass"
+                and promotion_rank > best_promotion_rank
+            )
+            if candidate_improved:
                 best_promotion_rank = promotion_rank
                 best_geometry_metric = metrics["geometry_selection_metric"]
-                trainer.save_checkpoint(best_checkpoint_path)
+                trainer.save_checkpoint(candidate_best_checkpoint_path)
+                best_checkpoint_path = candidate_best_checkpoint_path
                 metrics["selected_as_best_geometry_checkpoint"] = 1.0
         else:
             metrics["geometry_selection_metric"] = float("nan")
@@ -679,7 +817,9 @@ def main() -> int:
             device=device,
             history=history,
             stability=stability,
-            checkpoint_path=final_checkpoint_path,
+            checkpoint_path=(
+                final_checkpoint_path if args.save_final_checkpoint else None
+            ),
             model_config=model_config,
             best_checkpoint_path=best_checkpoint_path,
             best_geometry_metric=(
@@ -704,8 +844,11 @@ def main() -> int:
             print(f"Early stopping at epoch {epoch + 1}: convergence criteria met.")
             break
 
-    trainer.save_checkpoint(final_checkpoint_path)
-    print(f"Final monitored checkpoint saved to {final_checkpoint_path}")
+    if args.save_final_checkpoint:
+        trainer.save_checkpoint(final_checkpoint_path)
+        print(f"Final monitored checkpoint saved to {final_checkpoint_path}")
+    else:
+        print("Final checkpoint save disabled for this smoke run.")
     print(f"History written to {history_output}")
     return 0
 

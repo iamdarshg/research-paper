@@ -128,7 +128,9 @@ def test_geometry_promotion_gate_rejects_collapsed_geometry():
 
     decision = evaluate_geometry_promotion_gate(
         {
-            "reconstruction_topk_recall": 0.0,
+            "materialization_mode": "fixed_global_threshold",
+            "geometry_threshold_calibrated": True,
+            "reconstruction_recall": 0.0,
             "generated_aircraft_valid_fraction": 0.0,
             "sample_count": 8,
         },
@@ -137,11 +139,12 @@ def test_geometry_promotion_gate_rejects_collapsed_geometry():
 
     assert decision["status"] == "fail"
     assert decision["failed_checks"] == [
-        "reconstruction_topk_recall",
+        "reconstruction_recall",
         "generated_aircraft_valid_fraction",
         "generated_unique_fraction",
         "generated_mean_largest_component_fraction",
         "generated_mean_normalization_boundary_fraction",
+        "generated_minimum_mean_occupied_fraction",
     ]
 
 

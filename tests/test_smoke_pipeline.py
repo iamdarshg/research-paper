@@ -3,6 +3,7 @@ import sys
 import unittest
 import json
 from dataclasses import asdict
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -255,11 +256,16 @@ class TestCLISmokePipeline(unittest.TestCase):
         trainer.cfd_config = CFDConfig(base_grid_resolution=24, solver_type="D3Q27")
         trainer.cfd_config.lbm_config = LBMPhysicsConfig(grid_spacing=0.125)
 
-        with mock.patch.object(cli_module.torch, "save") as mock_save:
+        with mock.patch.object(cli_module.torch, "save") as mock_save, \
+             mock.patch.object(cli_module.os, "replace") as mock_replace:
             trainer.save_checkpoint("fake-checkpoint.pt")
 
         saved_payload, saved_path = mock_save.call_args.args
-        self.assertEqual(saved_path, "fake-checkpoint.pt")
+        self.assertEqual(saved_path, "fake-checkpoint.pt.tmp")
+        mock_replace.assert_called_once_with(
+            Path("fake-checkpoint.pt.tmp"),
+            Path("fake-checkpoint.pt"),
+        )
         self.assertIn("cfd_config", saved_payload)
         self.assertEqual(saved_payload["cfd_config"]["base_grid_resolution"], 24)
         self.assertEqual(saved_payload["cfd_config"]["solver_type"], "D3Q27")

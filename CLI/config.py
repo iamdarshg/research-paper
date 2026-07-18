@@ -136,7 +136,7 @@ class LBMPhysicsConfig:
     drag_link_metric_exponent: Optional[float] = None  # Auto D3Q27 face/edge/corner metric correction
     drag_reference_speed: float = 80.0  # Natural-unit reference speed for projected-pressure Cd labels
     drag_speed_normalization_exponent: float = 1.0  # OpenFOAM pressure fallback scales nearly linearly with U_inf
-    use_shape_drag_correction: bool = True # Keep True by default for stable training, but solver labels it separately
+    use_shape_drag_correction: bool = False
     shape_drag_correction_coefficients: Tuple[float, ...] = (
         -12.633030612111941, 27.87582461044955, -10.247055184812014,
         22.962648171191816, -17.337224317584685, -3.946645931513679,

@@ -107,6 +107,43 @@ def test_fast_inference_respects_corpus_latent_support():
     assert float(generated.detach().max()) <= 1.0
 
 
+def test_fast_inference_replays_explicit_initial_noise_with_gradients():
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    model = ConsistencyModel(
+        config,
+        DiffusionConfig(timesteps=8, student_steps=4),
+    )
+    model.eval()
+    initial_noise = torch.randn((1, 4))
+
+    torch.manual_seed(1)
+    first = model.fast_inference(
+        (1, 4),
+        num_steps=4,
+        initial_noise=initial_noise,
+    )
+    torch.manual_seed(999)
+    second = model.fast_inference(
+        (1, 4),
+        num_steps=4,
+        initial_noise=initial_noise,
+    )
+    second.sum().backward()
+
+    assert torch.equal(first.detach(), second.detach())
+    assert any(
+        parameter.grad is not None
+        and float(parameter.grad.detach().abs().sum()) > 0.0
+        for parameter in model.student_model.parameters()
+    )
+
+
 def test_training_timesteps_cycle_over_exact_inference_schedule():
     observed = [
         int(

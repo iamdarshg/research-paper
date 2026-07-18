@@ -61,19 +61,21 @@ class TestTrainingStability(unittest.TestCase):
 
         self.assertEqual(
             rank,
-            (1.0 / 3.0, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9),
+            (1.0 / 3.0, -0.0, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9),
         )
         self.assertAlmostEqual(metrics["geometry_selection_metric"], 0.3)
         self.assertEqual(metrics["promotion_gate_passed"], 0.0)
 
     def test_geometry_non_regression_rejects_boundary_and_diversity_collapse(self):
         baseline = {
+            "generated_aircraft_valid_fraction": 0.75,
             "generated_unique_fraction": 1.0,
             "generated_mean_largest_component_fraction": 0.9,
             "generated_mean_normalization_boundary_fraction": 0.01,
             "generated_worst_topk_recall": 0.2,
         }
         candidate = {
+            "generated_aircraft_valid_fraction": 0.75,
             "generated_unique_fraction": 0.5,
             "generated_mean_largest_component_fraction": 0.9,
             "generated_mean_normalization_boundary_fraction": 0.5,
@@ -89,6 +91,50 @@ class TestTrainingStability(unittest.TestCase):
                 "generated_unique_fraction",
                 "generated_mean_normalization_boundary_fraction",
             ],
+        )
+
+    def test_geometry_non_regression_rejects_aircraft_validity_drop(self):
+        baseline = {
+            "generated_aircraft_valid_fraction": 0.5,
+            "generated_unique_fraction": 1.0,
+            "generated_mean_largest_component_fraction": 0.9,
+            "generated_mean_normalization_boundary_fraction": 0.01,
+            "generated_worst_topk_recall": 0.2,
+        }
+        candidate = {
+            **baseline,
+            "generated_aircraft_valid_fraction": 0.25,
+        }
+
+        decision = _geometry_non_regression(candidate, baseline)
+
+        self.assertEqual(decision["status"], "fail")
+        self.assertEqual(
+            decision["failed_checks"],
+            ["generated_aircraft_valid_fraction"],
+        )
+
+    def test_geometry_non_regression_rejects_worse_occupancy_collapse(self):
+        baseline = {
+            "generated_aircraft_valid_fraction": 0.0,
+            "generated_unique_fraction": 1.0,
+            "generated_mean_largest_component_fraction": 1.0,
+            "generated_mean_normalization_boundary_fraction": 0.5,
+            "generated_worst_recall": 1.0,
+            "generated_mean_occupied_fraction": 0.75,
+            "target_mean_occupied_fraction": 0.01,
+        }
+        candidate = {
+            **baseline,
+            "generated_mean_occupied_fraction": 0.90,
+        }
+
+        decision = _geometry_non_regression(candidate, baseline)
+
+        self.assertEqual(decision["status"], "fail")
+        self.assertEqual(
+            decision["failed_checks"],
+            ["generated_occupancy_error"],
         )
 
     def test_build_epoch_dataset_uses_deterministic_subset(self):

@@ -95,7 +95,13 @@ def _render_projection_grid(
     for row_index, (label, binary) in enumerate(rows):
         for column_index, (axis, view_name) in enumerate(views):
             panel = axes[row_index, column_index]
-            panel.imshow(_projection(binary, axis), cmap="Greys", interpolation="nearest")
+            panel.imshow(
+                _projection(binary, axis),
+                cmap="Greys",
+                interpolation="nearest",
+                vmin=0,
+                vmax=1,
+            )
             panel.set_title(f"{label}: {view_name}", fontsize=9)
             panel.set_xticks([])
             panel.set_yticks([])
@@ -114,7 +120,10 @@ def _evaluate_binary(
     result = {
         "occupied_voxels": int(binary_cpu.sum().item()),
         "overlap": _overlap_metrics(binary_cpu, target),
-        "aircraft_validity": evaluate_aircraft_validity(binary_cpu.numpy()),
+        "aircraft_validity": evaluate_aircraft_validity(
+            binary_cpu.numpy(),
+            canonicalize=False,
+        ),
     }
     if probability is not None:
         result["probability_ranking"] = _probability_ranking_metrics(
@@ -147,6 +156,7 @@ def main() -> int:
     sample = dataset[args.sample_index]
     target = sample["geometry"].detach().cpu().float()
     target_occupancy = float(target.mean().item())
+    geometry_threshold = float(generator.geometry_probability_threshold)
     geometries: List[tuple[str, np.ndarray]] = [("ground truth", target.numpy())]
 
     with torch.no_grad():
@@ -154,7 +164,8 @@ def main() -> int:
         clean_probability = torch.sigmoid(generator.converter(latent))[0]
         clean_binary = _binarize_probability_grid_for_solver(
             clean_probability,
-            target_occupancy=target_occupancy,
+            threshold=geometry_threshold,
+            target_occupancy=None,
         )
 
     report: Dict[str, Any] = {
@@ -163,7 +174,12 @@ def main() -> int:
         "sample_index": args.sample_index,
         "source_record": manifest_records[args.sample_index],
         "target_occupancy": target_occupancy,
-        "ground_truth_validity": evaluate_aircraft_validity(target.numpy()),
+        "geometry_probability_threshold": geometry_threshold,
+        "materialization_mode": "fixed_global_threshold",
+        "ground_truth_validity": evaluate_aircraft_validity(
+            target.numpy(),
+            canonicalize=False,
+        ),
         "clean_reconstruction": _evaluate_binary(
             clean_binary,
             target,
@@ -183,12 +199,14 @@ def main() -> int:
             torch.cuda.manual_seed_all(seed)
         with torch.no_grad():
             probability = generator.generate(
-                sample["design_spec"],
+                None,
                 num_steps=generator.diffusion_config.student_steps,
+                condition_vector=sample["condition_vector"],
             )
             binary = _binarize_probability_grid_for_solver(
                 probability,
-                target_occupancy=target_occupancy,
+                threshold=geometry_threshold,
+                target_occupancy=None,
             )
         result = {
             "seed": seed,

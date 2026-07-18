@@ -122,6 +122,7 @@ class _TinySimulator:
             (geometry * weights).sum().item() / weights.sum().item()
         )
         return {
+            "drag_coefficient": 0.1 + weighted_occupancy,
             "training_drag_coefficient": 0.1 + weighted_occupancy,
             "lift_coefficient": 0.25 + 0.1 * weighted_occupancy,
         }
