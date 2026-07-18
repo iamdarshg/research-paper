@@ -50,10 +50,13 @@ diffusion:
 
 training:
   batch_size: 1
-  learning_rate: 0.0002
+  # Continuation from the preserved checkpoint uses a conservative LR. The
+  # 2e-4 recovery probe moved diffusion weights 3.7% in 40 samples and failed
+  # fixed-validation promotion despite reducing the measured solver loss.
+  learning_rate: 0.00002
   lr_min_ratio: 0.10
-  converter_learning_rate: 0.0002
-  consistency_student_learning_rate: 0.0002
+  converter_learning_rate: 0.00002
+  consistency_student_learning_rate: 0.00002
   # Distillation is sparse for cost, but its own counter cycles over all four
   # inference timesteps instead of repeatedly sampling unsupported levels.
   # Four sparse consistency updates in the 40-update stabilization probe cover
@@ -67,7 +70,10 @@ training:
   # before a long run. They limit extreme gradients but never amplify small ones.
   consistency_gradient_max_norm: 0.25
   student_data_gradient_max_norm: 1.0
-  student_direct_gradient_max_norm: 1.0
+  # The first 40-update probe found data/direct cosine < -0.9 on 11 updates.
+  # Retain the measured branch while preventing it from canceling a unit data
+  # branch during highly conflicting updates.
+  student_direct_gradient_max_norm: 0.25
   weight_decay: 0.0001
   offload_optimizer_state_between_steps: true
   num_epochs: 200

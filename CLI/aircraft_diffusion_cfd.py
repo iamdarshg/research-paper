@@ -267,10 +267,10 @@ class ModelConfig:
 class TrainingConfig:
     """Training hyperparameters"""
     batch_size: int = int(config_value("training", "batch_size", 1))
-    learning_rate: float = float(config_value("training", "learning_rate", 2e-4))
-    converter_learning_rate: float = float(config_value("training", "converter_learning_rate", 1e-3))
+    learning_rate: float = float(config_value("training", "learning_rate", 2e-5))
+    converter_learning_rate: float = float(config_value("training", "converter_learning_rate", 2e-5))
     consistency_student_learning_rate: float = float(
-        config_value("training", "consistency_student_learning_rate", 2e-4)
+        config_value("training", "consistency_student_learning_rate", 2e-5)
     )
     consistency_interval: int = int(
         config_value("training", "consistency_interval", 10)
@@ -294,7 +294,7 @@ class TrainingConfig:
         config_value("training", "student_data_gradient_max_norm", 1.0)
     )
     student_direct_gradient_max_norm: float = float(
-        config_value("training", "student_direct_gradient_max_norm", 1.0)
+        config_value("training", "student_direct_gradient_max_norm", 0.25)
     )
     weight_decay: float = float(config_value("training", "weight_decay", 1e-4))
     offload_optimizer_state_between_steps: bool = bool(

@@ -65,7 +65,7 @@ Current training options:
 
 - `--num-epochs` default `100`
 - `--batch-size` default `4`
-- `--learning-rate` default `2e-4`
+- `--learning-rate` default `2e-5`
 - `--latent-dim` default `16`
 - `--grid-size` optional explicit training/CFD voxel resolution override
 - `--precision` default `float32`

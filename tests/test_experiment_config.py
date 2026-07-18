@@ -12,9 +12,15 @@ def test_global_config_drives_default_and_scaled_latent_width():
     assert GLOBAL_CONFIG_PATH.name == "config.yaml"
     assert int(config["model"]["latent_dim"]) == 192
     assert int(config["training"]["consistency_interval"]) == 10
+    assert float(config["training"]["learning_rate"]) == 2.0e-5
+    assert float(config["training"]["converter_learning_rate"]) == 2.0e-5
+    assert float(config["training"]["consistency_student_learning_rate"]) == 2.0e-5
+    assert float(config["training"]["student_direct_gradient_max_norm"]) == 0.25
     assert ModelConfig().latent_dim == 192
     assert ModelConfig.scaled_for_corpus(349, 96).latent_dim == 192
     assert TrainingConfig().consistency_interval == 10
+    assert TrainingConfig().learning_rate == 2.0e-5
+    assert TrainingConfig().student_direct_gradient_max_norm == 0.25
 
 
 def test_global_config_rejects_missing_required_sections(tmp_path: Path):

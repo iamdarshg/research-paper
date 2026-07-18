@@ -263,6 +263,7 @@ def _build_history_payload(
     best_checkpoint_path: str | None = None,
     best_geometry_metric: float | None = None,
     initial_geometry_promotion: Dict[str, Any] | None = None,
+    initial_geometry_promotion_report: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return {
         "config": {
@@ -284,9 +285,9 @@ def _build_history_payload(
             "lr_min_ratio": args.lr_min_ratio,
             "planned_optimizer_updates": args.planned_optimizer_updates,
             "updates_output": str(Path(args.updates_output).resolve()),
-            "converter_learning_rate": config_value("training", "converter_learning_rate", 1e-3),
+            "converter_learning_rate": config_value("training", "converter_learning_rate", 2e-5),
             "consistency_student_learning_rate": config_value(
-                "training", "consistency_student_learning_rate", 2e-4
+                "training", "consistency_student_learning_rate", 2e-5
             ),
             "solver": args.solver,
             "lbm_stream_bfl_backend": args.lbm_stream_bfl_backend,
@@ -325,6 +326,7 @@ def _build_history_payload(
         ),
         "best_geometry_metric": best_geometry_metric,
         "initial_geometry_promotion": initial_geometry_promotion,
+        "initial_geometry_promotion_report": initial_geometry_promotion_report,
         "history": history,
         "stability": stability,
     }
@@ -337,7 +339,7 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=int(config_value("training", "batch_size", 1)))
     parser.add_argument("--latent-dim", type=int, default=int(config_value("model", "latent_dim", 192)))
     parser.add_argument("--grid-size", type=int, default=None)
-    parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-4)))
+    parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-5)))
     parser.add_argument(
         "--lr-min-ratio",
         type=float,
@@ -565,6 +567,7 @@ def main() -> int:
     best_promotion_rank = (-1.0,) * 7
     selection_interval = max(1, int(training_config.promotion_interval_epochs))
     initial_geometry_promotion = None
+    initial_geometry_promotion_report = None
     promotion_baseline: Dict[str, Any] = {}
 
     if args.resume_from or args.warm_start_from:
@@ -574,6 +577,7 @@ def main() -> int:
         cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
         baseline_promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
         promotion_baseline = dict(baseline_promotion)
+        initial_geometry_promotion_report = dict(baseline_promotion)
         random.setstate(python_rng_state)
         np.random.set_state(numpy_rng_state)
         torch.set_rng_state(torch_rng_state)
@@ -636,6 +640,8 @@ def main() -> int:
             metrics["promotion_non_regression_failed_count"] = float(
                 len(non_regression.get("failed_checks", []))
             )
+            metrics["promotion_report"] = dict(promotion)
+            metrics["promotion_non_regression_report"] = dict(non_regression)
             if promotion_passed and promotion_rank > best_promotion_rank:
                 best_promotion_rank = promotion_rank
                 best_geometry_metric = metrics["geometry_selection_metric"]
@@ -680,6 +686,7 @@ def main() -> int:
                 best_geometry_metric if np.isfinite(best_geometry_metric) else None
             ),
             initial_geometry_promotion=initial_geometry_promotion,
+            initial_geometry_promotion_report=initial_geometry_promotion_report,
         )
         history_output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
