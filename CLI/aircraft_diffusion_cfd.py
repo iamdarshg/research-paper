@@ -56,6 +56,7 @@ from condition_feasibility import validate_condition_feasibility
 from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
 from geometry_store import CompactGeometryStore
 from multiobjective_gradients import (
+    AdaptiveGradientScaler,
     capture_gradients,
     clear_gradients,
     combine_gradient_branches,
@@ -298,6 +299,18 @@ class TrainingConfig:
     )
     project_conflicting_direct_gradient: bool = bool(
         config_value("training", "project_conflicting_direct_gradient", True)
+    )
+    enable_pcgrad: bool = bool(
+        config_value("training", "enable_pcgrad", True)
+    )
+    enable_adaptive_balancing: bool = bool(
+        config_value("training", "enable_adaptive_balancing", True)
+    )
+    adaptive_max_ratio: float = float(
+        config_value("training", "adaptive_max_ratio", 2.0)
+    )
+    adaptive_ema_decay: float = float(
+        config_value("training", "adaptive_ema_decay", 0.9)
     )
     weight_decay: float = float(config_value("training", "weight_decay", 1e-4))
     offload_optimizer_state_between_steps: bool = bool(
@@ -2675,6 +2688,7 @@ class LatentTo3DConverter(nn.Module):
             )
             self.coordinate_output = nn.Linear(self.coordinate_decoder_width, 1)
         self.register_buffer("_coordinate_grid", torch.empty(0), persistent=False)
+        self.register_buffer("_cached_encoded_coords", torch.empty(0), persistent=False)
 
     def _coordinates(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if (
@@ -2690,12 +2704,41 @@ class LatentTo3DConverter(nn.Module):
     def _encode_coordinates(self, coordinates: torch.Tensor) -> torch.Tensor:
         if self.coordinate_fourier_bands <= 0:
             return coordinates
+        # Cache the encoded coordinates when they match the full grid. The
+        # coordinate grid is fixed at a given resolution, so recomputing sin/cos
+        # for all 6 Fourier bands on every chunk (108× per update) is redundant.
+        # Cache size: 96^3 × (3 + 2*3*6) = 884736 × 39 ≈ 132 MiB at FP32.
+        full_grid_size = self.grid_resolution ** 3
+        if (
+            coordinates.shape == (full_grid_size, 3)
+            and coordinates.device == self._coordinate_grid.device
+            and coordinates.dtype == self._coordinate_grid.dtype
+            and torch.equal(coordinates, self._coordinate_grid)
+        ):
+            expected = full_grid_size * (3 * (1 + 2 * self.coordinate_fourier_bands))
+            if (
+                self._cached_encoded_coords.numel() == expected
+                and self._cached_encoded_coords.device == coordinates.device
+                and self._cached_encoded_coords.dtype == coordinates.dtype
+            ):
+                return self._cached_encoded_coords
+
         frequencies = torch.pow(
             coordinates.new_tensor(2.0),
             torch.arange(self.coordinate_fourier_bands, device=coordinates.device, dtype=coordinates.dtype),
         ) * torch.pi
         phases = coordinates.unsqueeze(-1) * frequencies
         encoded = torch.cat((coordinates, phases.sin().flatten(start_dim=-2), phases.cos().flatten(start_dim=-2)), dim=-1)
+
+        # Store in cache if this was the full grid
+        if (
+            coordinates.shape == (full_grid_size, 3)
+            and coordinates.device == self._coordinate_grid.device
+            and coordinates.dtype == self._coordinate_grid.dtype
+            and torch.equal(coordinates, self._coordinate_grid)
+        ):
+            self._cached_encoded_coords = encoded.detach().clone()
+
         return encoded
 
     def _decode_coordinate_features(self, decoder_input: torch.Tensor) -> torch.Tensor:
@@ -4284,6 +4327,15 @@ class OptimizedDiffusionTrainer:
         # Pipeline parallelism
         self.pipeline = PipelineParallelism(training_config)
 
+        # Adaptive gradient scaler (EMA-tracked, limits non-data branches)
+        self.adaptive_scaler: Optional[AdaptiveGradientScaler] = None
+        if training_config.enable_adaptive_balancing:
+            self.adaptive_scaler = AdaptiveGradientScaler(
+                data_branch_name="data",
+                max_ratio=training_config.adaptive_max_ratio,
+                ema_decay=training_config.adaptive_ema_decay,
+            )
+
         # Logging
         self.writer = SummaryWriter(log_dir='./runs')
         self.global_step = 0
@@ -4974,14 +5026,18 @@ class OptimizedDiffusionTrainer:
                 },
                 conflict_anchor=(
                     "data"
-                    if self.training_config.project_conflicting_direct_gradient
+                    if not self.training_config.enable_pcgrad
+                    and self.training_config.project_conflicting_direct_gradient
                     else None
                 ),
                 project_conflicting_branches=(
                     ("direct",)
-                    if self.training_config.project_conflicting_direct_gradient
+                    if not self.training_config.enable_pcgrad
+                    and self.training_config.project_conflicting_direct_gradient
                     else ()
                 ),
+                adaptive_scaler=self.adaptive_scaler,
+                enable_pcgrad=self.training_config.enable_pcgrad,
             )
             student_gradient_cosines = {
                 "data_consistency": gradient_cosine_similarity(

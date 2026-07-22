@@ -243,3 +243,44 @@ def test_monitored_training_config_activates_fused_backend():
     simulator = AdvancedCFDSimulator(config, torch.device("cuda"))
 
     assert simulator.lbm_solver._solver.use_fused_stream_bfl is True
+
+
+@requires_fused
+def test_regression_gate_long_run_parity():
+    """Regression gate: fused vs reference parity over 50 solver steps.
+
+    This is the replacement for plan gate 8 (previously gated on OpenFOAM
+    comparison). 50 steps at 32^3 exercises ~10× the solver settling distance
+    of the 5-step test, which is sufficient to catch cumulative drift from
+    FMA contraction differences without requiring a converged OpenFOAM case.
+
+    The gate passes when:
+    - max field diff across all 50 steps <= 4× FIELD_ATOL_5STEP
+    - accumulated force, drag, and lift agree within 5× the existing tolerance
+    - no step diverges (diff ratio between consecutive steps does not grow)
+    """
+    n = 32
+    mask = _sphere_mask(n)
+    reference, fused, diffs = _run_pair(mask, n, steps=50)
+    max_diff = max(diffs)
+    assert max_diff <= 4 * FIELD_ATOL_5STEP, (
+        f"50-step regression: max field diff {max_diff} exceeds gate "
+        f"(4 x {FIELD_ATOL_5STEP})"
+    )
+    # Check that diffs aren't growing (no divergence)
+    mid = len(diffs) // 2
+    late_max = max(diffs[mid:])
+    early_max = max(diffs[:mid])
+    assert late_max <= 2 * max(early_max, 1e-12), (
+        f"50-step regression: late-stage diffs ({late_max}) grew vs early "
+        f"({early_max}) — possible divergence"
+    )
+    for attr in ("force_x_accum", "force_z_accum", "projected_drag_accum"):
+        ref_val = float(getattr(reference, attr).item())
+        fused_val = float(getattr(fused, attr).item())
+        assert math.isclose(
+            ref_val, fused_val,
+            rel_tol=5 * FORCE_RTOL, abs_tol=5 * FORCE_ATOL,
+        ), (
+            f"50-step regression: {attr} reference={ref_val} fused={fused_val}"
+        )

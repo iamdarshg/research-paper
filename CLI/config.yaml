@@ -77,6 +77,17 @@ training:
   # Preserve every compatible CFD gradient component, but do not let a measured
   # solver step point uphill on the grounded aircraft-data objective.
   project_conflicting_direct_gradient: true
+  # When true, use PCGrad-style pairwise projection across ALL branches
+  # (data, consistency, direct) instead of single-direction anchor projection.
+  # PCGrad handles 3-way conflicts that `project_conflicting_direct_gradient`
+  # alone cannot resolve.
+  enable_pcgrad: true
+  # Adaptive gradient balancing: limits non-data branches to at most
+  # `adaptive_max_ratio × EMA(data_norm)` to prevent any single branch
+  # from dominating the update.
+  enable_adaptive_balancing: true
+  adaptive_max_ratio: 2.0
+  adaptive_ema_decay: 0.9
   weight_decay: 0.0001
   offload_optimizer_state_between_steps: true
   num_epochs: 200
@@ -123,9 +134,9 @@ training:
   coordinate_positive_fraction: 0.5
   direct_solver_loss_weight: 1.0
   direct_solver_interval: 1
-  direct_solver_steps: 5
-  # 1 base solve + 16 antithetic plus/minus pairs = 33 sequential solves/loss.
-  direct_solver_directions: 16
+  direct_solver_steps: 50
+  # 1 base solve + 32 antithetic plus/minus pairs = 65 sequential solves/loss.
+  direct_solver_directions: 32
   direct_solver_perturbation: 0.15
   direct_solver_perturbation_grid_size: 12
   # Maximum norm of the measured SPSA voxel gradient. The model-level gradient

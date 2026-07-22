@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -29,6 +29,151 @@ class BranchGradientTelemetry:
     anchor_cosine_after: float = 0.0
     conflict_projected: bool = False
     projection_norm: float = 0.0
+    adaptive_scale: float = 1.0
+
+
+class AdaptiveGradientScaler:
+    """EMA-tracked adaptive scaler that limits non-data branches relative to data.
+
+    Maintains a running EMA of the data branch gradient norm. When a non-data
+    branch norm exceeds ``max_ratio * data_ema``, it is scaled down. Never
+    amplifies a tiny branch. This prevents any single branch from dominating
+    the update while preserving its direction.
+
+    Args:
+        data_branch_name: Name of the anchor (data) branch.
+        max_ratio: Maximum allowed ratio of a non-data branch norm to the
+            data EMA norm. Default 2.0 means non-data branches can be at most
+            2x the data gradient.
+        ema_decay: Decay factor for the running EMA. Default 0.9.
+    """
+
+    def __init__(
+        self,
+        data_branch_name: str = "data",
+        max_ratio: float = 2.0,
+        ema_decay: float = 0.9,
+    ):
+        self._data_branch = data_branch_name
+        self._max_ratio = float(max_ratio)
+        self._ema_decay = float(ema_decay)
+        self._data_norm_ema: Optional[float] = None
+
+    @property
+    def data_norm_ema(self) -> Optional[float]:
+        """Current EMA of the data branch gradient norm."""
+        return self._data_norm_ema
+
+    def update_ema(self, branch_norms: Mapping[str, float]) -> None:
+        """Update the running EMA from the current update's branch norms."""
+        data_norm = branch_norms.get(self._data_branch)
+        if data_norm is not None and data_norm > 0.0:
+            if self._data_norm_ema is None:
+                self._data_norm_ema = data_norm
+            else:
+                self._data_norm_ema = (
+                    self._ema_decay * self._data_norm_ema
+                    + (1.0 - self._ema_decay) * data_norm
+                )
+
+    def compute_adaptive_scale(self, branch_norm: float, branch_name: str) -> float:
+        """Return the scaling factor for a non-data branch (1.0 = no scaling)."""
+        if branch_name == self._data_branch:
+            return 1.0
+        if self._data_norm_ema is None or self._data_norm_ema <= 0.0:
+            return 1.0
+        if branch_norm <= 0.0:
+            return 1.0
+        max_allowed = self._max_ratio * self._data_norm_ema
+        if branch_norm <= max_allowed:
+            return 1.0
+        return max_allowed / branch_norm
+
+
+def pcgrad_project_pairwise(
+    applied_branches: Dict[str, GradientBuffer],
+) -> Dict[str, GradientBuffer]:
+    """PCGrad-style pairwise conflict resolution across all branches.
+
+    For every pair of branches with negative cosine similarity, project each
+    branch away from the component that conflicts with the other. Iterates
+    until no negative-cosine pairs remain (or max 10 rounds) so the order of
+    projection does not bias the result.
+
+    Args:
+        applied_branches: Dict mapping branch name to its (already max-norm'd)
+            gradient buffer.
+
+    Returns:
+        New dict with conflict-resolved gradient buffers.
+    """
+    names = list(applied_branches.keys())
+    if len(names) < 2:
+        return dict(applied_branches)
+
+    current = {n: tuple(g.detach().clone() if g is not None else None
+                         for g in applied_branches[n])
+               for n in names}
+
+    for _round in range(10):
+        any_projected = False
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                ni, nj = names[i], names[j]
+                gi, gj = current[ni], current[nj]
+
+                cos = gradient_cosine_similarity(gi, gj,
+                                                  first_name=ni, second_name=nj)
+                if cos >= 0.0:
+                    continue
+
+                # Both branches conflict: project each away from the other.
+                # For branch gi: remove its projection onto gj
+                dot_ij = _gradient_dot_product(gi, gj, first_name=ni, second_name=nj)
+                gj_norm_sq = gradient_l2_norm(gj, branch_name=nj)
+                gj_norm_sq = max(gj_norm_sq * gj_norm_sq, 1.0e-300)
+                coeff_ij = dot_ij / gj_norm_sq
+
+                # For branch gj: remove its projection onto gi
+                dot_ji = _gradient_dot_product(gj, gi, first_name=nj, second_name=ni)
+                gi_norm_sq = gradient_l2_norm(gi, branch_name=ni)
+                gi_norm_sq = max(gi_norm_sq * gi_norm_sq, 1.0e-300)
+                coeff_ji = dot_ji / gi_norm_sq
+
+                proj_gi: list[Optional[torch.Tensor]] = []
+                proj_gj: list[Optional[torch.Tensor]] = []
+                for pgi, pgj in zip(gi, gj):
+                    # Project gi away from gj
+                    if pgi is None and pgj is None:
+                        proj_gi.append(None)
+                        proj_gj.append(None)
+                        continue
+                    if pgi is None:
+                        proj_gi.append(pgj.detach().clone().mul_(-coeff_ij)
+                                       if pgj is not None else None)
+                    else:
+                        v = pgi.detach().clone()
+                        if pgj is not None:
+                            v.add_(pgj, alpha=-coeff_ij)
+                        proj_gi.append(v)
+
+                    if pgj is None:
+                        proj_gj.append(pgi.detach().clone().mul_(-coeff_ji)
+                                       if pgi is not None else None)
+                    else:
+                        v = pgj.detach().clone()
+                        if pgi is not None:
+                            v.add_(pgi, alpha=-coeff_ji)
+                        proj_gj.append(v)
+
+                current[ni] = tuple(proj_gi)
+                current[nj] = tuple(proj_gj)
+                any_projected = True
+
+        if not any_projected:
+            break
+
+    return current
 
 
 def capture_gradients(
@@ -360,8 +505,22 @@ def combine_gradient_branches(
     *,
     conflict_anchor: Optional[str] = None,
     project_conflicting_branches: Sequence[str] = (),
+    adaptive_scaler: Optional[AdaptiveGradientScaler] = None,
+    enable_pcgrad: bool = False,
 ) -> dict[str, BranchGradientTelemetry]:
-    """Independently limit named branches and replace target ``.grad`` buffers."""
+    """Independently limit named branches and replace target ``.grad`` buffers.
+
+    Applies, in order:
+    1. Per-branch max-norm trust regions.
+    2. Adaptive scaling (non-data branches limited relative to data EMA).
+    3. Conflict projection against the anchor (existing single-direction
+       projection, used when enable_pcgrad is False).
+    4. Or PCGrad-style pairwise projection (used when enable_pcgrad is True).
+    5. Summation of all processed branches into the parameter gradients.
+
+    When PCGrad is enabled, ``conflict_anchor`` and
+    ``project_conflicting_branches`` are ignored (PCGrad handles all pairs).
+    """
 
     parameter_list = tuple(parameters)
     unknown_limits = set(max_norms).difference(branches)
@@ -393,8 +552,52 @@ def combine_gradient_branches(
         telemetry[branch_name] = branch_telemetry
         applied_branches[branch_name] = applied
 
+    # Step 2: Adaptive scaling (non-data branches limited relative to data EMA)
+    if adaptive_scaler is not None:
+        raw_norms = {
+            name: gradient_l2_norm(
+                applied_branches[name], branch_name=name
+            )
+            for name in branches
+        }
+        adaptive_scaler.update_ema(raw_norms)
+        for branch_name in branches:
+            branch_norm = raw_norms[branch_name]
+            adaptive_scale = adaptive_scaler.compute_adaptive_scale(
+                branch_norm, branch_name
+            )
+            if adaptive_scale < 1.0:
+                applied = tuple(
+                    None if g is None else g * adaptive_scale
+                    for g in applied_branches[branch_name]
+                )
+                applied_branches[branch_name] = applied
+                old_telemetry = telemetry[branch_name]
+                telemetry[branch_name] = replace(
+                    old_telemetry,
+                    applied_norm=gradient_l2_norm(
+                        applied, branch_name=branch_name
+                    ),
+                    adaptive_scale=adaptive_scale,
+                )
+
+    # Step 3/4: Conflict resolution
     projected_names = tuple(project_conflicting_branches)
-    if conflict_anchor is None and projected_names:
+    if enable_pcgrad and len(branches) >= 2:
+        # PCGrad handles all pairs; ignores single-direction anchor
+        applied_branches = pcgrad_project_pairwise(
+            dict(applied_branches)  # copy
+        )
+        for branch_name in applied_branches:
+            telemetry[branch_name] = replace(
+                telemetry[branch_name],
+                applied_norm=gradient_l2_norm(
+                    applied_branches[branch_name],
+                    branch_name=branch_name,
+                ),
+                conflict_projected=True,
+            )
+    elif conflict_anchor is None and projected_names:
         raise ValueError(
             "conflict_anchor is required when project_conflicting_branches is set"
         )
