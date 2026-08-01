@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
+import sys
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -37,6 +41,155 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(line + "\n")
         handle.flush()
+
+
+def _sha256_file(path) -> str:
+    """SHA-256 of a file's bytes, streamed (checkpoints can be hundreds of MB)."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write_text(path, text: str) -> None:
+    """Write text atomically: temp file in the same dir, flush + fsync, rename."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_json(path, payload: Dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
+
+
+# Effective-config fields folded into the config hash. Run-local bookkeeping
+# (paths, resume pointers, output locations) is intentionally excluded so that
+# a resumed session started from a different working directory still hashes
+# identically to the session that wrote the checkpoint it resumes from.
+CONFIG_HASH_ARG_FIELDS = (
+    "manifest",
+    "num_epochs",
+    "batch_size",
+    "latent_dim",
+    "grid_size",
+    "resolved_grid_size",
+    "learning_rate",
+    "lr_min_ratio",
+    "solver",
+    "lbm_stream_bfl_backend",
+    "cpu_threads",
+    "max_samples_per_epoch",
+    "subset_seed",
+    "training_split",
+    "promotion_split",
+    "training_sample_count",
+    "promotion_sample_count",
+    "promotion_evaluation_samples",
+    "promotion_generation_seeds",
+    "stop_on_promotion_pass",
+    "stability_metric",
+    "convergence_window",
+    "convergence_target",
+    "convergence_cv_threshold",
+    "convergence_drift_threshold",
+    "required_geometry_loss_max",
+    "oscillation_cv_threshold",
+    "early_stop_on_convergence",
+    "save_every",
+    "save_final_checkpoint",
+    "direct_solver_loss_weight",
+    "direct_solver_steps",
+    "direct_solver_directions",
+    "direct_connectivity_weight",
+    "direct_aircraft_validity_weight",
+    "direct_solver_perturbation",
+    "direct_solver_perturbation_grid_size",
+    "geometry_probability_threshold",
+    "geometry_threshold_calibration",
+    "effective_fixed_validation_seeds",
+    "max_optimizer_updates",
+    "checkpoint_every_updates",
+)
+
+
+def _config_hash(
+    args: argparse.Namespace,
+    model_config,
+    diffusion_config,
+    training_config,
+    cfd_config,
+) -> str:
+    """SHA-256 over the serialized effective run configuration."""
+    relevant = {
+        field: getattr(args, field, None) for field in CONFIG_HASH_ARG_FIELDS
+    }
+    payload = {
+        "args": relevant,
+        "model_config": asdict(model_config),
+        "diffusion_config": asdict(diffusion_config),
+        "training_config": asdict(training_config),
+        "cfd_config": asdict(cfd_config),
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _write_resume_manifest(
+    *,
+    save_dir,
+    checkpoint_path,
+    trainer,
+    args: argparse.Namespace,
+    config_hash: str,
+    corpus_manifest_hash: Optional[str],
+    source_checkpoint_sha256: Optional[str],
+) -> None:
+    """Atomically record the latest checkpoint and its lineage in --save-dir."""
+    checkpoint_path = Path(checkpoint_path)
+    consumed = max(0, int(getattr(trainer, "train_data_consumed", 0) or 0))
+    epoch_length = max(0, int(getattr(trainer, "train_data_epoch_length", 0) or 0))
+    if epoch_length > 0 and consumed >= epoch_length:
+        # Mirror save_checkpoint's normalization: at an epoch boundary the
+        # persisted counter refers to the NEXT epoch, starting at zero.
+        consumed = 0
+    payload = {
+        "schema_version": 1,
+        "latest_checkpoint": str(checkpoint_path.resolve()),
+        "latest_checkpoint_sha256": _sha256_file(checkpoint_path),
+        "cumulative_optimizer_updates": int(trainer.global_step),
+        "source_checkpoint_sha256": source_checkpoint_sha256,
+        "config_hash": config_hash,
+        "corpus_manifest_hash": corpus_manifest_hash,
+        "geometry_probability_threshold": float(
+            getattr(
+                trainer,
+                "geometry_probability_threshold",
+                trainer.training_config.geometry_materialization_threshold,
+            )
+        ),
+        "fixed_validation_seeds": list(
+            getattr(trainer, "fixed_validation_seeds", None) or []
+        )
+        or None,
+        "data_position": {
+            "consumed": consumed,
+            "epoch_length": epoch_length,
+        },
+        "command_line": " ".join(sys.argv),
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _atomic_write_json(save_dir / "resume_manifest.json", payload)
+    print(f"Resume manifest updated: {save_dir / 'resume_manifest.json'}")
 
 
 class RunLocalCosineScheduler:
@@ -328,6 +481,7 @@ def _build_history_payload(
     best_geometry_metric: float | None = None,
     initial_geometry_promotion: Dict[str, Any] | None = None,
     initial_geometry_promotion_report: Dict[str, Any] | None = None,
+    cumulative_updates_at_start: int = 0,
 ) -> Dict[str, Any]:
     return {
         "config": {
@@ -375,6 +529,13 @@ def _build_history_payload(
             "early_stop_on_convergence": args.early_stop_on_convergence,
             "save_every": args.save_every,
             "save_final_checkpoint": args.save_final_checkpoint,
+            "max_optimizer_updates": args.max_optimizer_updates,
+            "checkpoint_every_updates": args.checkpoint_every_updates,
+            "fixed_validation_seeds": list(
+                getattr(args, "effective_fixed_validation_seeds", None) or []
+            )
+            or None,
+            "cumulative_updates_at_start": int(cumulative_updates_at_start),
             "direct_solver_loss_weight": args.direct_solver_loss_weight,
             "direct_solver_steps": args.direct_solver_steps,
             "direct_solver_directions": args.direct_solver_directions,
@@ -491,6 +652,37 @@ def main() -> int:
     parser.add_argument("--direct-aircraft-validity-weight", type=float, default=float(config_value("training", "direct_aircraft_validity_weight", 1.0)))
     parser.add_argument("--direct-solver-perturbation", type=float, default=float(config_value("training", "direct_solver_perturbation", 0.15)))
     parser.add_argument("--direct-solver-perturbation-grid-size", type=int, default=int(config_value("training", "direct_solver_perturbation_grid_size", 12)))
+    parser.add_argument(
+        "--max-optimizer-updates",
+        type=int,
+        default=None,
+        help=(
+            "Cap the number of ACTUAL optimizer updates performed by this "
+            "invocation, independent of epoch size and --max-samples-per-epoch. "
+            "With --resume-from, this is the number of ADDITIONAL updates; the "
+            "checkpoint retains the cumulative count and a resumed run never "
+            "repeats or skips an optimizer update."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-every-updates",
+        type=int,
+        default=0,
+        help=(
+            "Checkpoint atomically after every N optimizer updates "
+            "(0 disables; --save-every epoch cadence is kept)."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-validation-seeds",
+        default=None,
+        help=(
+            "Comma-separated explicit seed list (e.g. '0,1,2,3,4,5') for the "
+            "fixed-seed promotion/generation evaluation. Used verbatim and "
+            "preserved across resume sessions; the default keeps the current "
+            "deterministic seed derivation."
+        ),
+    )
     args = parser.parse_args()
     if args.resume_from and args.warm_start_from:
         parser.error("--resume-from and --warm-start-from are mutually exclusive")
@@ -498,6 +690,18 @@ def main() -> int:
         parser.error("--lr-min-ratio must be in (0, 1]")
     if args.promotion_evaluation_samples <= 0:
         parser.error("--promotion-evaluation-samples must be greater than 0")
+    if args.max_optimizer_updates is not None and args.max_optimizer_updates <= 0:
+        parser.error("--max-optimizer-updates must be greater than 0")
+    if args.checkpoint_every_updates < 0:
+        parser.error("--checkpoint-every-updates must be non-negative")
+    if args.fixed_validation_seeds is not None:
+        parsed_seeds = [
+            int(token.strip())
+            for token in args.fixed_validation_seeds.split(",")
+            if token.strip()
+        ]
+        if not parsed_seeds:
+            parser.error("--fixed-validation-seeds must contain at least one integer")
     if args.promotion_generation_seeds <= 0:
         parser.error("--promotion-generation-seeds must be greater than 0")
 
@@ -542,12 +746,14 @@ def main() -> int:
         conditioning_dim=infer_conditioning_dim(),
         latent_dim=args.latent_dim,
     )
+    resume_checkpoint_payload: Optional[Dict[str, Any]] = None
     if args.resume_from:
         checkpoint_metadata = torch.load(
             args.resume_from,
             map_location="cpu",
             weights_only=False,
         )
+        resume_checkpoint_payload = checkpoint_metadata
         checkpoint_model_config = ModelConfig(**checkpoint_metadata["model_config"])
         if int(checkpoint_model_config.grid_resolution) != int(resolved_grid_size):
             raise ValueError(
@@ -616,11 +822,36 @@ def main() -> int:
         use_fused_stream_bfl=(args.lbm_stream_bfl_backend == "fused_stream_bfl"),
     )
 
+    # Deterministic train-data generator: the DataLoader permutation for each
+    # epoch is drawn lazily from this generator, and the pre-epoch generator
+    # state plus a consumed-sample counter are persisted in every checkpoint.
+    # On resume the state is restored and the interrupted epoch is skipped
+    # ahead by the consumed count, so the resumed run sees exactly the sample
+    # ordering an uninterrupted run would have produced.
+    train_generator = torch.Generator()
+    resume_data_position = (
+        (resume_checkpoint_payload or {}).get("data_position") or {}
+    )
+    restored_generator_state = resume_data_position.get("generator_state")
+    if args.resume_from and restored_generator_state is not None:
+        try:
+            train_generator.set_state(restored_generator_state)
+            print("Restored deterministic train-data generator state from checkpoint.")
+        except Exception as exc:
+            print(
+                "Warning: could not restore train-data generator state "
+                f"({exc}); falling back to seed 0."
+            )
+            train_generator.manual_seed(0)
+    else:
+        train_generator.manual_seed(0)
+
     train_loader = DataLoader(
         epoch_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,
+        generator=train_generator,
         collate_fn=aircraft_collate_fn,
     )
     args.planned_optimizer_updates = len(train_loader) * max(1, int(args.num_epochs))
@@ -645,19 +876,115 @@ def main() -> int:
         trainer.load_checkpoint(args.resume_from)
     elif args.warm_start_from:
         trainer.warm_start_checkpoint(args.warm_start_from)
-    threshold_calibration = trainer.calibrate_geometry_materialization_threshold(
-        calibration_loader
+    trainer.train_data_generator = train_generator
+    trainer.train_data_epoch_length = int(len(train_loader))
+    if (
+        args.resume_from
+        and int(getattr(trainer, "train_data_epoch_length", 0) or 0) > 0
+        and len(train_loader) != int(trainer.train_data_epoch_length)
+    ):
+        print(
+            "Warning: resumed epoch length "
+            f"{len(train_loader)} differs from checkpoint epoch length "
+            f"{trainer.train_data_epoch_length}; the data-position skip may "
+            "be misaligned if --max-samples-per-epoch changed."
+        )
+    checkpoint_scheduler_state = (
+        (resume_checkpoint_payload or {}).get("scheduler") or {}
     )
+    resuming_run_local_scheduler = (
+        args.resume_from
+        and checkpoint_scheduler_state.get("scheduler_type")
+        == "run_local_cosine_updates_v1"
+    )
+    if resuming_run_local_scheduler:
+        # Keep the original update horizon so the cosine LR trajectory is
+        # bit-identical to the uninterrupted run; --num-epochs only bounds the
+        # loop, and --max-optimizer-updates bounds this invocation.
+        args.planned_optimizer_updates = int(
+            checkpoint_scheduler_state["total_updates"]
+        )
+        print(
+            "Resuming run-local cosine scheduler with "
+            f"{args.planned_optimizer_updates}-update horizon from checkpoint."
+        )
+    if args.resume_from and "geometry_probability_threshold" in (
+        resume_checkpoint_payload or {}
+    ):
+        # The threshold MUST come from the checkpoint on resume, not from a
+        # fresh calibration over the (possibly shuffled) dataset.
+        threshold_calibration = dict(
+            (resume_checkpoint_payload or {}).get(
+                "geometry_threshold_calibration"
+            )
+            or {}
+        )
+        threshold_calibration.setdefault("source", "checkpoint")
+        threshold_calibration.setdefault(
+            "threshold", float(trainer.geometry_probability_threshold)
+        )
+        print(
+            "Resuming with geometry probability threshold "
+            f"{trainer.geometry_probability_threshold:.6g} from checkpoint; "
+            "skipping recalibration."
+        )
+    else:
+        threshold_calibration = trainer.calibrate_geometry_materialization_threshold(
+            calibration_loader
+        )
     args.geometry_probability_threshold = float(
         trainer.geometry_probability_threshold
     )
     args.geometry_threshold_calibration = threshold_calibration
+
+    if args.fixed_validation_seeds is not None:
+        fixed_seeds = [
+            int(token.strip())
+            for token in args.fixed_validation_seeds.split(",")
+            if token.strip()
+        ]
+        if (
+            args.resume_from
+            and trainer.fixed_validation_seeds
+            and trainer.fixed_validation_seeds != fixed_seeds
+        ):
+            print(
+                "Warning: --fixed-validation-seeds "
+                f"{fixed_seeds} override the checkpoint's seeds "
+                f"{trainer.fixed_validation_seeds}."
+            )
+        trainer.fixed_validation_seeds = fixed_seeds
+    elif not args.resume_from:
+        trainer.fixed_validation_seeds = None
+    args.effective_fixed_validation_seeds = list(
+        trainer.fixed_validation_seeds or []
+    )
+    if args.effective_fixed_validation_seeds:
+        print(
+            "Fixed validation seeds for promotion evaluation: "
+            f"{args.effective_fixed_validation_seeds}"
+        )
+
     trainer.scheduler = RunLocalCosineScheduler(
         trainer.optimizer,
         total_updates=args.planned_optimizer_updates,
         min_lr_ratio=args.lr_min_ratio,
     )
+    if resuming_run_local_scheduler:
+        trainer.scheduler.load_state_dict(checkpoint_scheduler_state)
     trainer.scheduler_step_per_update = True
+
+    if args.max_optimizer_updates is not None:
+        start_cumulative = int(trainer.global_step)
+        trainer.optimizer_update_cap = start_cumulative + args.max_optimizer_updates
+        print(
+            "Optimizer update cap: "
+            f"{start_cumulative} cumulative + {args.max_optimizer_updates} "
+            f"additional = {trainer.optimizer_update_cap} cumulative updates."
+        )
+    else:
+        trainer.optimizer_update_cap = None
+    cumulative_updates_at_start = int(trainer.global_step)
 
     save_dir = Path(args.save_dir).resolve()
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -669,12 +996,63 @@ def main() -> int:
         else history_output.with_name("updates.jsonl")
     )
     updates_output.parent.mkdir(parents=True, exist_ok=True)
-    updates_output.write_text("", encoding="utf-8")
+    if not args.resume_from:
+        # Fresh run: start a clean append-only update log. Resumed sessions
+        # append, keeping the full optimizer-update history in one file.
+        updates_output.write_text("", encoding="utf-8")
     args.updates_output = str(updates_output)
-    trainer.update_metrics_callback = lambda record: _append_jsonl(
-        updates_output,
-        record,
+
+    corpus_manifest_hash = _sha256_file(args.manifest)
+    source_checkpoint_sha256 = None
+    if args.resume_from:
+        source_checkpoint_sha256 = _sha256_file(args.resume_from)
+    elif args.warm_start_from:
+        source_checkpoint_sha256 = _sha256_file(args.warm_start_from)
+    config_hash = _config_hash(
+        args,
+        model_config,
+        diffusion_config,
+        training_config,
+        cfd_config,
     )
+    trainer.checkpoint_lineage = {
+        "source_checkpoint_sha256": source_checkpoint_sha256,
+        "config_hash": config_hash,
+        "corpus_manifest_hash": corpus_manifest_hash,
+        "command_line": " ".join(sys.argv),
+    }
+    print(f"Config hash: {config_hash}")
+    print(f"Corpus manifest hash: {corpus_manifest_hash}")
+
+    def _save_checkpoint(path) -> None:
+        """Save a checkpoint and atomically update the resume manifest."""
+        trainer.save_checkpoint(str(path))
+        _write_resume_manifest(
+            save_dir=save_dir,
+            checkpoint_path=path,
+            trainer=trainer,
+            args=args,
+            config_hash=config_hash,
+            corpus_manifest_hash=corpus_manifest_hash,
+            source_checkpoint_sha256=source_checkpoint_sha256,
+        )
+
+    updates_this_invocation = 0
+
+    def _on_update(record: Dict[str, Any]) -> None:
+        nonlocal updates_this_invocation
+        _append_jsonl(updates_output, record)
+        updates_this_invocation += 1
+        if (
+            args.checkpoint_every_updates > 0
+            and updates_this_invocation % args.checkpoint_every_updates == 0
+        ):
+            cadence_path = save_dir / (
+                f"checkpoint_updates_{int(trainer.global_step):06d}.pt"
+            )
+            _save_checkpoint(cadence_path)
+
+    trainer.update_metrics_callback = _on_update
 
     history: List[Dict[str, Any]] = []
     final_checkpoint_path = str((save_dir / "final_monitored_model.pt").resolve())
@@ -719,10 +1097,7 @@ def main() -> int:
         initial_promotion_path = history_output.with_name(
             "initial_geometry_promotion.json"
         )
-        initial_promotion_path.write_text(
-            json.dumps(initial_geometry_promotion_report, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        _atomic_write_json(initial_promotion_path, initial_geometry_promotion_report)
         print(
             "Initial geometry promotion baseline: "
             "valid_fraction="
@@ -775,6 +1150,9 @@ def main() -> int:
             )
             metrics["promotion_report"] = dict(promotion)
             metrics["promotion_non_regression_report"] = dict(non_regression)
+            seeds_used = list(promotion.get("generation_seeds_used") or [])
+            if seeds_used:
+                metrics["promotion_generation_seeds_used"] = seeds_used
             candidate_improved = (
                 non_regression.get("status") == "pass"
                 and promotion_rank > best_promotion_rank
@@ -782,7 +1160,7 @@ def main() -> int:
             if candidate_improved:
                 best_promotion_rank = promotion_rank
                 best_geometry_metric = metrics["geometry_selection_metric"]
-                trainer.save_checkpoint(candidate_best_checkpoint_path)
+                _save_checkpoint(candidate_best_checkpoint_path)
                 best_checkpoint_path = candidate_best_checkpoint_path
                 metrics["selected_as_best_geometry_checkpoint"] = 1.0
         else:
@@ -827,12 +1205,24 @@ def main() -> int:
             ),
             initial_geometry_promotion=initial_geometry_promotion,
             initial_geometry_promotion_report=initial_geometry_promotion_report,
+            cumulative_updates_at_start=cumulative_updates_at_start,
         )
-        history_output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_json(history_output, payload)
 
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             checkpoint_path = save_dir / f"checkpoint_monitored_ep{epoch + 1}.pt"
-            trainer.save_checkpoint(str(checkpoint_path))
+            _save_checkpoint(checkpoint_path)
+
+        if (
+            trainer.optimizer_update_cap is not None
+            and int(trainer.global_step) >= int(trainer.optimizer_update_cap)
+        ):
+            print(
+                f"Optimizer update cap reached "
+                f"({trainer.optimizer_update_cap} cumulative updates); "
+                "stopping training."
+            )
+            break
 
         if args.stop_on_promotion_pass and promotion_passed:
             print(
@@ -845,7 +1235,7 @@ def main() -> int:
             break
 
     if args.save_final_checkpoint:
-        trainer.save_checkpoint(final_checkpoint_path)
+        _save_checkpoint(final_checkpoint_path)
         print(f"Final monitored checkpoint saved to {final_checkpoint_path}")
     else:
         print("Final checkpoint save disabled for this smoke run.")

@@ -1,0 +1,95 @@
+# recovery_colab_free.yaml — 40-update recovery probe on a free cloud GPU
+#
+# Reference protocol for issue #39's low-compute recovery ladder (Phases B/C)
+# on free Google Colab (T4, ~16 GB) or an equivalent no-card GPU runtime.
+# This is a DOCUMENTED protocol, not a run_protocol.py schema: it exists so the
+# exact bounded, resumable commands are pinned in one place. The notebook
+# `notebooks/free_colab_recovery.ipynb` wraps these commands.
+#
+# Free-session semantics
+# ----------------------
+# - Colab free sessions are interruptible and short-lived. NEVER attempt one
+#   uninterrupted 40-update session. Run at most 5 optimizer updates per
+#   session, export the resume bundle, download it, and on the next session
+#   upload + import it and continue.
+# - `--max-optimizer-updates 5` means FIVE ADDITIONAL updates in that
+#   invocation; the checkpoint retains the CUMULATIVE count. A resumed run
+#   never repeats or skips an optimizer update (verified: updates.jsonl is
+#   append-only across sessions with gapless global_steps).
+# - `--checkpoint-every-updates 1` writes an atomic checkpoint + updates
+#   resume_manifest.json after every update, so losing a session loses at most
+#   the in-flight update.
+# - `--fixed-validation-seeds` pins the promotion/fixed-seed evaluation set
+#   across all sessions; it is stored in the checkpoint and resume manifest.
+#
+# Promotion discipline
+# --------------------
+# - The preserved source checkpoint is never overwritten: every session
+#   resumes from the latest downloaded bundle.
+# - After each 5-update chunk, evaluate on the same six fixed seeds and label
+#   every candidate `promoted_*` or `rejected_*` with a report.
+# - Stop immediately on: nonfinite values, solver-coverage failure, occupancy
+#   collapse, missing lineage, or a material worst-seed validity regression.
+# - A candidate is promoted only if it improves the lexicographic validation
+#   rank AND passes all mandatory checks (see issue #39 "Promotion criteria").
+
+# ── Fixed protocol settings ────────────────────────────────────────────────
+protocol:
+  name: recovery_colab_free
+  issue: 39
+  grid_size: 96                 # keep the current grid fixed (issue #39)
+  batch_size: 1                 # memory-bounded path; do not redesign for larger
+  solver: D3Q27                 # internal parity-tested solver; no external CFD
+  direct_solver_steps: 50       # matches CLI/config.yaml default
+  direct_solver_directions: 16  # 16 (CLI default), NOT config.yaml's 32:
+                                # fewer SPSA directions = fewer solver calls per
+                                # update = safer inside a free-session wall-clock
+                                # budget; 50-step solves stay accurate enough for
+                                # the recovery probe.
+  total_updates: 40             # Phase C probe length (cumulative)
+  updates_per_session: 5        # conservative per free session; raise to 10 only
+                                # after measuring wall time + download headroom
+  checkpoint_every_updates: 1   # atomic checkpoint after every update
+  fixed_validation_seeds: [0, 1, 2, 3, 4, 5]   # identical across all sessions
+  manifest: docs/dataset/minimal_grounded_manifest.jsonl   # checked-in default;
+                                # replace with the full 1069-geometry corpus
+                                # manifest when it is available on the runtime
+  cpu_threads: 4
+
+# ── Per-session commands (run inside the Colab notebook) ───────────────────
+#
+# Session 0 — one-update validation (Phase B):
+#   python CLI/run_monitored_training.py \
+#     --manifest docs/dataset/minimal_grounded_manifest.jsonl \
+#     --batch-size 1 --grid-size 96 --solver D3Q27 \
+#     --direct-solver-steps 50 --direct-solver-directions 16 \
+#     --max-optimizer-updates 1 --checkpoint-every-updates 1 \
+#     --fixed-validation-seeds 0,1,2,3,4,5 \
+#     --save-dir /content/output/session_000 --cpu-threads 4
+#   Verify: exactly one optimizer update; expected solver-call count; fixed-
+#   threshold free-running evaluation ran; occupancy/validity/connectivity/raw
+#   aero values/gradient norms/cosine similarities/VRAM/wall time recorded;
+#   resume checkpoint reloads in a fresh process.
+#
+# Sessions 1..8 — five updates each (Phase C):
+#   python CLI/run_monitored_training.py \
+#     --manifest docs/dataset/minimal_grounded_manifest.jsonl \
+#     --batch-size 1 --grid-size 96 --solver D3Q27 \
+#     --direct-solver-steps 50 --direct-solver-directions 16 \
+#     --resume-from /content/output/session_NNN/checkpoint_updates_0000XX.pt \
+#     --max-optimizer-updates 5 --checkpoint-every-updates 1 \
+#     --fixed-validation-seeds 0,1,2,3,4,5 \
+#     --save-dir /content/output/session_NNN --cpu-threads 4
+#   After each session, export + download the bundle:
+#     python CLI/export_resume_bundle.py \
+#       --input /content/output/session_NNN --output /content/resume_session_NNN.tar.gz
+#   Stop when cumulative updates reach 40. On the next session:
+#     python CLI/import_resume_bundle.py \
+#       --input /content/resume_session_NNN.tar.gz --output /content/output/session_NNN \
+#       --print-resume-command
+#
+# ── Acceptance ─────────────────────────────────────────────────────────────
+# Phase C passes when the promoted checkpoint improves the fixed validation
+# rank without regressing worst-seed validity, recall, diversity, occupancy
+# envelope, or connectivity — with full lineage (run/checkpoint/manifest/
+# protocol hashes) recorded in resume_manifest.json.

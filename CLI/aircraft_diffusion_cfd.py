@@ -4347,6 +4347,25 @@ class OptimizedDiffusionTrainer:
         self.update_metrics_callback: Optional[
             Callable[[Dict[str, Any]], None]
         ] = None
+
+        # Interruption-safe free-session support (issue #39): bounded-update
+        # runs with fully resumable state. These attributes are owned by the
+        # caller (run_monitored_training.py) except where noted.
+        self.train_data_generator: Optional[torch.Generator] = None
+        self.train_data_consumed: int = 0
+        self.train_data_epoch_length: int = 0
+        self.train_data_resume_skip: int = 0
+        self.train_data_generator_state_restore: Optional[torch.Tensor] = None
+        # Absolute cumulative optimizer-update cap; the training loop stops as
+        # soon as self.global_step reaches it (None = uncapped).
+        self.optimizer_update_cap: Optional[int] = None
+        # Explicit fixed generation seeds for promotion evaluation, used
+        # verbatim and preserved across resume sessions (None = legacy
+        # deterministic seed derivation).
+        self.fixed_validation_seeds: Optional[List[int]] = None
+        # Lineage provenance injected by the CLI (source/config/corpus hashes
+        # and the exact command line) and embedded in every checkpoint.
+        self.checkpoint_lineage: Dict[str, Any] = {}
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -4661,9 +4680,35 @@ class OptimizedDiffusionTrainer:
             self.consistency_model.student_model.parameters()
         )
 
+        # Interruption-safe session bookkeeping: snapshot the deterministic
+        # data generator at epoch start (the permutation is drawn lazily by
+        # the loader iterator, so this is the exact pre-epoch state), reset
+        # the consumed-sample counter, and honor a resume skip-ahead so a
+        # resumed session continues exactly where the previous session stopped.
+        self.train_data_epoch_length = int(len(train_loader))
+        self.train_data_consumed = 0
+        resume_skip = max(0, int(getattr(self, "train_data_resume_skip", 0) or 0))
+        if getattr(self, "train_data_generator", None) is not None:
+            self._train_epoch_generator_state = (
+                self.train_data_generator.get_state()
+            )
+        optimizer_iterations_done = 0
+
         pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
 
         for batch_idx, batch in enumerate(pbar):
+            if (
+                getattr(self, "optimizer_update_cap", None) is not None
+                and int(self.global_step) >= int(self.optimizer_update_cap)
+            ):
+                break
+            if batch_idx < resume_skip:
+                # Data-position skip: advance the loader's index without any
+                # compute. The permutation was fully materialized at iterator
+                # creation, so this consumes no global RNG and reproduces the
+                # exact sample ordering of the interrupted session.
+                self.train_data_consumed += 1
+                continue
             batch = transfer_training_batch_to_device(
                 batch,
                 self.device,
@@ -5177,6 +5222,8 @@ class OptimizedDiffusionTrainer:
             })
 
             self.global_step += 1
+            optimizer_iterations_done += 1
+            self.train_data_consumed += int(latent.shape[0])
             if self.update_metrics_callback is not None:
                 direct_components = (
                     dict(self.direct_solver_loss.last_components)
@@ -5263,17 +5310,21 @@ class OptimizedDiffusionTrainer:
             if batch_idx % 10 == 0:
                 torch.cuda.empty_cache()
 
-        avg_optimization_loss = total_optimization_loss / len(train_loader)
+        # A resume skip-ahead applies only to the first epoch of a resumed
+        # session; subsequent epochs run in full.
+        self.train_data_resume_skip = 0
+        epoch_denominator = max(optimizer_iterations_done, 1)
+        avg_optimization_loss = total_optimization_loss / epoch_denominator
 
         # Log to tensorboard
         self.writer.add_scalar('Loss/total', avg_optimization_loss, self.global_step)
         self.writer.add_scalar('Loss/optimization', avg_optimization_loss, self.global_step)
-        self.writer.add_scalar('Loss/mse', total_mse / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/clean_geometry_reconstruction', total_clean_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/direct_solver', total_direct_solver / len(train_loader), self.global_step)
+        self.writer.add_scalar('Loss/mse', total_mse / epoch_denominator, self.global_step)
+        self.writer.add_scalar('Loss/clean_geometry_reconstruction', total_clean_geometry / epoch_denominator, self.global_step)
+        self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / epoch_denominator, self.global_step)
+        self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / epoch_denominator, self.global_step)
+        self.writer.add_scalar('Loss/consistency', total_consistency / epoch_denominator, self.global_step)
+        self.writer.add_scalar('Loss/direct_solver', total_direct_solver / epoch_denominator, self.global_step)
         if direct_solver_eval_count > 0:
             self.writer.add_scalar('Loss/direct_solver_eval', total_direct_solver_eval / direct_solver_eval_count, self.global_step)
             self.writer.add_scalar('Loss/direct_occupancy', total_direct_occupancy / direct_solver_eval_count, self.global_step)
@@ -5286,7 +5337,7 @@ class OptimizedDiffusionTrainer:
             if direct_solver_eval_count > 0
             else 0.0
         )
-        optimizer_iterations = len(train_loader)
+        optimizer_iterations = optimizer_iterations_done
         validate_direct_solver_iteration_coverage(
             direct_solver_eval_count,
             optimizer_iterations,
@@ -5296,11 +5347,11 @@ class OptimizedDiffusionTrainer:
         return {
             'loss': avg_optimization_loss,
             'optimization_loss': avg_optimization_loss,
-            'mse': total_mse / len(train_loader),
-            'clean_geometry_reconstruction': total_clean_geometry / len(train_loader),
-            'geometry_reconstruction': total_geometry / len(train_loader),
-            'generation_reconstruction': total_generation_geometry / len(train_loader),
-            'consistency': total_consistency / len(train_loader),
+            'mse': total_mse / epoch_denominator,
+            'clean_geometry_reconstruction': total_clean_geometry / epoch_denominator,
+            'geometry_reconstruction': total_geometry / epoch_denominator,
+            'generation_reconstruction': total_generation_geometry / epoch_denominator,
+            'consistency': total_consistency / epoch_denominator,
             'consistency_raw_mse': (
                 total_consistency_raw_mse / max(consistency_eval_count, 1)
             ),
@@ -5312,10 +5363,10 @@ class OptimizedDiffusionTrainer:
             ),
             'consistency_eval_count': consistency_eval_count,
             'student_data_gradient_norm_raw': (
-                total_student_data_gradient_raw / len(train_loader)
+                total_student_data_gradient_raw / epoch_denominator
             ),
             'student_data_gradient_norm_applied': (
-                total_student_data_gradient_applied / len(train_loader)
+                total_student_data_gradient_applied / epoch_denominator
             ),
             'student_consistency_gradient_norm_raw': (
                 total_student_consistency_gradient_raw
@@ -5332,12 +5383,12 @@ class OptimizedDiffusionTrainer:
                 total_student_direct_gradient_applied
                 / max(direct_solver_eval_count, 1)
             ),
-            'latent_reconstruction': total_latent_reconstruction / len(train_loader),
+            'latent_reconstruction': total_latent_reconstruction / epoch_denominator,
             'denoising_geometry_confidence': (
-                total_denoising_geometry_confidence / len(train_loader)
+                total_denoising_geometry_confidence / epoch_denominator
             ),
-            'diffusion_timestep': total_diffusion_timestep / len(train_loader),
-            'direct_solver_loss': total_direct_solver / len(train_loader),
+            'diffusion_timestep': total_diffusion_timestep / epoch_denominator,
+            'direct_solver_loss': total_direct_solver / epoch_denominator,
             'direct_solver_eval_loss': avg_direct_solver_eval,
             'direct_solver_eval_count': direct_solver_eval_count,
             'direct_solver_call_count': direct_solver_call_count,
@@ -5443,6 +5494,7 @@ class OptimizedDiffusionTrainer:
         reconstruction_occupancy_fractions: List[float] = []
         generated_occupancy_fractions: List[float] = []
         generated_failure_counts: Dict[str, int] = {}
+        seeds_used: List[int] = []
         valid_count = 0
         sample_count = 0
         generated_evaluation_count = 0
@@ -5472,6 +5524,10 @@ class OptimizedDiffusionTrainer:
                     1,
                     int(self.training_config.promotion_generation_seeds),
                 )
+                fixed_seeds = [
+                    int(seed)
+                    for seed in (getattr(self, "fixed_validation_seeds", None) or [])
+                ]
 
                 for index in range(latent.shape[0]):
                     target = target_batch[index] > 0.5
@@ -5490,9 +5546,18 @@ class OptimizedDiffusionTrainer:
                     recall_values.append(overlap / max(target_occupied, 1))
 
                     for seed_slot in range(generation_seed_count):
-                        generation_seed = (
-                            sample_count * generation_seed_count + seed_slot
-                        )
+                        if fixed_seeds:
+                            # Explicit fixed validation seeds are used verbatim
+                            # (issue #39): the same seed set is reproduced
+                            # across every resume session.
+                            generation_seed = fixed_seeds[
+                                seed_slot % len(fixed_seeds)
+                            ]
+                        else:
+                            generation_seed = (
+                                sample_count * generation_seed_count + seed_slot
+                            )
+                        seeds_used.append(generation_seed)
                         torch.manual_seed(generation_seed)
                         if self.device.type == "cuda":
                             torch.cuda.manual_seed_all(generation_seed)
@@ -5657,6 +5722,7 @@ class OptimizedDiffusionTrainer:
                 else 1.0
             ),
             "generated_failure_counts": generated_failure_counts,
+            "generation_seeds_used": seeds_used,
         }
         return evaluate_geometry_promotion_gate(metrics, self.training_config)
 
@@ -5743,6 +5809,71 @@ class OptimizedDiffusionTrainer:
         self._sync_consistency_teacher()
         checkpoint_path = Path(path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Data-position state: the deterministic train DataLoader generator's
+        # state at the START of the current epoch plus how many samples of that
+        # epoch have been consumed. At an epoch boundary (consumed == length)
+        # the generator state is already the pre-permutation state of the NEXT
+        # epoch, so the counter is normalized to zero and the state is kept.
+        train_epoch_length = max(0, int(getattr(self, "train_data_epoch_length", 0) or 0))
+        train_consumed = max(0, int(getattr(self, "train_data_consumed", 0) or 0))
+        if train_epoch_length > 0 and train_consumed >= train_epoch_length:
+            train_consumed = 0
+        generator_state = None
+        if train_consumed > 0 and hasattr(self, "_train_epoch_generator_state"):
+            # Mid-epoch save: the snapshot was captured before the current
+            # epoch's permutation was drawn, so restoring it and skipping
+            # `consumed` samples reproduces the exact remaining sample order.
+            generator_state = self._train_epoch_generator_state
+        elif getattr(self, "train_data_generator", None) is not None:
+            # Between epochs (consumed == 0) the live generator state is
+            # already the pre-permutation state of the NEXT epoch.
+            try:
+                generator_state = self.train_data_generator.get_state()
+            except Exception:
+                generator_state = None
+
+        rng_state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
+        }
+
+        lineage = {
+            "source_checkpoint_sha256": getattr(
+                self, "checkpoint_lineage", {}
+            ).get("source_checkpoint_sha256"),
+            "config_hash": getattr(
+                self, "checkpoint_lineage", {}
+            ).get("config_hash"),
+            "corpus_manifest_hash": getattr(
+                self, "checkpoint_lineage", {}
+            ).get("corpus_manifest_hash"),
+            "command_line": getattr(
+                self, "checkpoint_lineage", {}
+            ).get("command_line"),
+            "geometry_probability_threshold": float(
+                getattr(
+                    self,
+                    "geometry_probability_threshold",
+                    self.training_config.geometry_materialization_threshold,
+                )
+            ),
+            "cumulative_optimizer_updates": int(self.global_step),
+            "fixed_validation_seeds": list(
+                getattr(self, "fixed_validation_seeds", None) or []
+            )
+            or None,
+            # Filled after serialization below (SHA-256 of the serialized
+            # payload bytes before writing).
+            "checkpoint_self_sha256": None,
+        }
+
         checkpoint = {
             'diffusion_model': self.diffusion_model.state_dict(),
             'consistency_model': self.consistency_model.state_dict(),
@@ -5782,12 +5913,43 @@ class OptimizedDiffusionTrainer:
                     },
                 )
             ),
+            # Interruption-safe resume state (issue #39).
+            'rng_state': rng_state,
+            'data_position': {
+                "generator_state": generator_state,
+                "consumed": train_consumed,
+                "epoch_length": train_epoch_length,
+            },
+            'cumulative_optimizer_updates': int(self.global_step),
+            'fixed_validation_seeds': list(
+                getattr(self, "fixed_validation_seeds", None) or []
+            )
+            or None,
+            'lineage': lineage,
         }
+        # Compute the checkpoint self SHA-256 over the serialized payload bytes
+        # BEFORE writing, then re-serialize with the hash embedded. The on-disk
+        # file's own SHA-256 (used by resume_manifest.json and bundle
+        # verification) is computed by the caller over the written file.
+        import io as _io
+
+        _payload_buffer = _io.BytesIO()
+        torch.save(checkpoint, _payload_buffer)
+        _payload_bytes = _payload_buffer.getvalue()
+        checkpoint['lineage']['checkpoint_self_sha256'] = hashlib.sha256(
+            _payload_bytes
+        ).hexdigest()
+
         temporary_path = checkpoint_path.with_suffix(
             checkpoint_path.suffix + ".tmp"
         )
         try:
             torch.save(checkpoint, str(temporary_path))
+            if temporary_path.exists():
+                # Atomic durability: flush + fsync before the rename so a
+                # crash after os.replace() cannot leave a truncated file.
+                with temporary_path.open("rb") as handle:
+                    os.fsync(handle.fileno())
             os.replace(temporary_path, checkpoint_path)
         except Exception:
             temporary_path.unlink(missing_ok=True)
@@ -5796,7 +5958,14 @@ class OptimizedDiffusionTrainer:
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
+        # weights_only=False: issue #39 checkpoints embed numpy/python RNG
+        # states (np.random.get_state() tuples) that are not on the
+        # weights-only allowlist; legacy checkpoints remain fully supported.
+        checkpoint = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False,
+        )
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
         self.converter.load_state_dict(checkpoint['converter'])
@@ -5867,6 +6036,63 @@ class OptimizedDiffusionTrainer:
                 ),
                 calibration=checkpoint.get('geometry_threshold_calibration'),
             )
+        # Interruption-safe resume state (issue #39). Every key is optional so
+        # legacy checkpoints (weights + configs only) still load unchanged.
+        cumulative_updates = int(
+            checkpoint.get(
+                'cumulative_optimizer_updates',
+                checkpoint.get('global_step', 0),
+            )
+        )
+        self.global_step = cumulative_updates
+        fixed_seeds = checkpoint.get('fixed_validation_seeds')
+        self.fixed_validation_seeds = (
+            [int(seed) for seed in fixed_seeds] if fixed_seeds else None
+        )
+        rng_state = checkpoint.get('rng_state') or {}
+        if rng_state.get('torch') is not None:
+            try:
+                torch.set_rng_state(rng_state['torch'].cpu())
+            except Exception as exc:
+                print(f"Warning: could not restore torch RNG state ({exc}).")
+        if rng_state.get('numpy') is not None:
+            try:
+                np.random.set_state(rng_state['numpy'])
+            except Exception as exc:
+                print(f"Warning: could not restore numpy RNG state ({exc}).")
+        if rng_state.get('python') is not None:
+            try:
+                random.setstate(rng_state['python'])
+            except Exception as exc:
+                print(f"Warning: could not restore python RNG state ({exc}).")
+        if rng_state.get('cuda') is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(
+                    [state.cpu() for state in rng_state['cuda']]
+                )
+            except Exception as exc:
+                print(f"Warning: could not restore CUDA RNG state ({exc}).")
+        data_position = checkpoint.get('data_position') or {}
+        self.train_data_resume_skip = max(
+            0,
+            int(data_position.get('consumed', 0) or 0),
+        )
+        self.train_data_epoch_length = max(
+            0,
+            int(data_position.get('epoch_length', 0) or 0),
+        )
+        self.train_data_generator_state_restore = data_position.get(
+            'generator_state'
+        )
+        lineage = checkpoint.get('lineage') or {}
+        self.checkpoint_lineage = {
+            "source_checkpoint_sha256": lineage.get(
+                "source_checkpoint_sha256"
+            ),
+            "config_hash": lineage.get("config_hash"),
+            "corpus_manifest_hash": lineage.get("corpus_manifest_hash"),
+            "command_line": lineage.get("command_line"),
+        }
         print(f"Optimized checkpoint loaded from {path}")
 
     def warm_start_checkpoint(self, path: str) -> Dict[str, Any]:
