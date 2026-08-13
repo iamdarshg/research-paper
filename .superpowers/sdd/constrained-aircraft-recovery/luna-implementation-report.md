@@ -1,17 +1,16 @@
 # Luna Implementation Report: Constrained Aircraft Recovery
 
-Status: `DONE_WITH_CONCERNS`
+Status: `SUPERSEDED_PENDING_REREVIEW`
 
 ## Summary
 
 Tasks 1 through 5 were implemented in order on branch
-`codex/constrained-aircraft-recovery`, based at `feef092`. Tasks 1 through 4
-are complete and committed. Round 2's scoped Critical and Important findings
-are addressed in `432c8a9` and covered by production-path regressions. Task 5's
-focused and full-suite gates were run. Round 3's scoped production lifecycle
-findings are addressed in `36d73f8` and covered by train_epoch/runner
-integration regressions. No real `96^3` smoke was run in rounds 2 or 3, so
-live interruption/resume and promotion remain unverified. No full epoch was
+`codex/constrained-aircraft-recovery`, based at `feef092`. This report records
+the implementation through review round 3 and is not a closure statement.
+Round 4 found additional mixed-batch guard transport and generated-path
+converter-freeze defects; its changes and evidence are recorded separately in
+`fix-round-4-report.md`. No real `96^3` smoke was run in rounds 2 through 4,
+so live interruption/resume and promotion remain unverified. No full epoch was
 launched.
 
 ## Commits

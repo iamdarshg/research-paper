@@ -1,10 +1,11 @@
 # Constrained Recovery Smoke Evidence
 
-Status: `DONE_WITH_CONCERNS`
+Status: `IMPLEMENTED_PENDING_REREVIEW`
 
-Round-3 status: the implementation fixes from `36d73f8` passed the dedicated
-and affected focused suites. This document's real-smoke artifacts predate all
-three review-fix rounds; no new real smoke was run by instruction.
+Round-4 status: implementation commit `e6f9016` passed dedicated, affected,
+and full automated suites. This document's real-smoke artifacts predate all
+four review-fix rounds; no new real smoke was run by instruction. This is not
+closure or promotion evidence.
 
 ## Scope
 
@@ -86,3 +87,27 @@ or promotion behavior.
 The round-3 dedicated review suite passed `21 tests`; affected focused suites
 passed `101 tests`; and the fresh full suite passed `431 tests` with three
 existing environment warnings. No real smoke was run.
+
+## Round-4 Automated Boundary
+
+Round 4 corrected batch-position transport for active topology guards and made
+`freeze_decoder_for_generated_paths` operate on the captured gradient buffers
+that are restored before the optimizer step. Batch-size-2 tests cover first
+inactive/later active, first active/later inactive, and distinct guards on the
+two samples. Each case preserves the two base measured values, performs the
+expected six objective calls for one SPSA direction, produces full `[B, ...]`
+guard tensors with exact zeros at inactive positions, and replays the union of
+active guards through `train_epoch`.
+
+The converter-freeze production test observes gradients immediately before
+the optimizer step. With the switch enabled, generated data, direct, and
+topology converter entries are removed while the clean grounded converter
+gradient remains nonzero. With the switch disabled, generated converter
+entries remain. The switch is present in the exact-resume training-config
+fingerprint.
+
+Verification for `e6f9016`: dedicated round-4 selection `5 passed`; complete
+review module `25 passed`; affected suites `97 passed`; full `pytest -q` `435
+passed, 3 warnings in 311.63s`. The warnings are existing `pkg_resources`
+deprecations. No real smoke was run, so current-code live 96-cubed resume and
+promotion remain unverified.

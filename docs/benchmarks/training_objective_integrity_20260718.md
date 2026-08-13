@@ -172,7 +172,7 @@ truth or a claim-bearing aerodynamic coefficient.
 
 The first review round (`f4e29c0`) added deterministic trajectory,
 crash-reconciliation, promotion-baseline, compatibility, final-guard, and
-calibrated-margin tests. Round 2 (`432c8a9`) closes the scoped integration
+calibrated-margin tests. Round 2 (`432c8a9`) addressed its then-scoped integration
 findings with production-path tests for separate parameter-space topology
 guards, saved-threshold compatibility, complete objective fingerprinting,
 next-epoch cadence reset, and exact full-lattice margin capture in the student
@@ -192,3 +192,19 @@ claim is made. The round-3 dedicated production suite passed `21 tests`, the
 affected focused suites passed `101 tests`, and the fresh full suite passed
 `431 tests` with three existing warnings. These bounded tests do not replace
 the unrun live smoke.
+
+Round 4 (`e6f9016`) corrected two additional production lifecycle defects.
+Measured topology guard gradients now remain aligned to original batch
+positions, with exact zero tensors for inactive samples, and the ordered union
+of active guard names cannot be overwritten by first-sample telemetry. The
+generated-path decoder freeze now filters converter entries from captured
+data, consistency, direct, and topology buffers before adding the separate
+clean grounded converter gradient. Enabled and disabled behavior is tested at
+the optimizer boundary, and the switch remains part of exact-resume
+compatibility through the full training-config fingerprint.
+
+Round-4 verification passed the dedicated selection (`5 tests`), complete
+review module (`25 tests`), affected suites (`97 tests`), and full suite (`435
+tests`, three existing warnings). This is automated implementation evidence,
+not closure: no current-code live 96-cubed exact-resume run or promotion was
+performed.
