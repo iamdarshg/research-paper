@@ -152,3 +152,20 @@ not claim-bearing aerodynamic coefficients.
 The next continuation should be described as recovery training, not final model
 training. It should retain only candidates that improve the fixed validation
 rank, and publication figures must come from the fixed-threshold evaluator.
+
+## Constrained Aircraft Recovery Implementation (2026-08-13)
+
+Tasks 1 through 4 are implemented on `codex/constrained-aircraft-recovery`.
+The focused tests and the full suite passed before the final numerical guard
+projection hardening; the post-hardening focused projection tests also passed.
+The permitted real `96^3` smoke was bounded with the exact `D3Q27` /
+`fused_stream_bfl` configuration and completed one optimizer update with 33
+measured solver calls. It then stopped before the eighth-update checkpoint:
+the first run exposed the intentional-interruption coverage contract, and the
+retry exposed a float32 residual in measured guard projection. Those fixes are
+committed, but the final 8-update smoke and exact-resume continuation were not
+completed within the execution window. No promotion result is claimed.
+
+This remains an internal recovery-training result. The smoke's five-step raw
+LBM force was transient (`lbm_converged=0`) and is not external-PDE ground
+truth or a claim-bearing aerodynamic coefficient.
