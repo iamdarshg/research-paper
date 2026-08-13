@@ -103,6 +103,71 @@ def _controlled_spsa_objective(active_guards_by_sample):
     return objective, calls
 
 
+def _controlled_design_spec_objective():
+    calls = []
+
+    def objective(
+        probabilities,
+        design_spec,
+        simulator,
+        cfd_steps,
+        connectivity_weight,
+        aircraft_validity_weight,
+        threshold,
+        target_occupancy,
+        return_components=False,
+    ):
+        call_index = len(calls)
+        sample_index = call_index // 3
+        phase = call_index % 3
+        signed_offset = 0.0 if phase == 0 else (1.0 if phase == 1 else -1.0)
+        occupancy_loss = float(design_spec.space_weight) * (
+            1.0 + sample_index + 0.05 * signed_offset
+        )
+        aero_loss = (
+            float(design_spec.drag_weight)
+            * (10.0 + sample_index + 0.07 * signed_offset)
+            + float(design_spec.lift_weight)
+            * (100.0 + sample_index + 0.11 * signed_offset)
+        )
+        components = {
+            "occupancy_loss": occupancy_loss,
+            "aero_loss": aero_loss,
+            "connectivity_loss": 0.0,
+            "aircraft_validity_loss": 0.0,
+            "connectivity_guard_shortfall": 0.0,
+        }
+        components["total_loss"] = sum(
+            components[name]
+            for name in (
+                "occupancy_loss",
+                "aero_loss",
+                "connectivity_loss",
+                "aircraft_validity_loss",
+            )
+        )
+        calls.append(
+            {
+                "sample_index": sample_index,
+                "phase": phase,
+                "design_spec": design_spec,
+                "components": dict(components),
+            }
+        )
+        return components if return_components else probabilities.new_tensor(
+            components["total_loss"]
+        )
+
+    return objective, calls
+
+
+def _round5_design_specs():
+    return (
+        DesignSpec(space_weight=0.80, drag_weight=0.15, lift_weight=0.05),
+        DesignSpec(space_weight=0.05, drag_weight=0.25, lift_weight=0.70),
+    )
+
+
 def _round4_trainer(*, freeze_decoder_for_generated_paths=True):
     model = ModelConfig(
         latent_dim=4,
@@ -142,6 +207,23 @@ def _round4_trainer(*, freeze_decoder_for_generated_paths=True):
     trainer.geometry_threshold_calibrated = True
     trainer.geometry_probability_threshold = 0.5
     return trainer
+
+
+def _round5_direct_loss():
+    return DirectSolverSPSALoss(
+        cfd_steps=1,
+        perturbation=0.2,
+        perturbation_grid_size=0,
+        gradient_clip=100.0,
+        aero_gradient_max_norm=100.0,
+        occupancy_gradient_max_norm=100.0,
+        connectivity_gradient_max_norm=100.0,
+        validity_gradient_max_norm=100.0,
+        connectivity_weight=0.0,
+        aircraft_validity_weight=0.0,
+        directions=1,
+        seed=29,
+    )
 
 
 def test_resumed_suffix_coverage_uses_processed_suffix():
@@ -245,6 +327,139 @@ def test_lbm_shape_drag_configuration_remains_dataclass_and_serializable():
     }
     restored = __import__("aircraft_diffusion_cfd").LBMPhysicsConfig(**payload)
     assert restored.shape_drag_correction_coefficients == (-1.0, 0.5)
+
+
+def test_direct_spsa_preserves_per_sample_design_specs_and_weighted_scalar(
+    monkeypatch,
+):
+    objective, calls = _controlled_design_spec_objective()
+    monkeypatch.setattr(recovery, "_direct_measured_objective_for_single", objective)
+    specs = _round5_design_specs()
+    probabilities = torch.stack(
+        (
+            torch.full((4, 4, 4), 0.25),
+            torch.full((4, 4, 4), 0.75),
+        )
+    ).requires_grad_(True)
+
+    measured_loss = _round5_direct_loss()(
+        probabilities,
+        specs,
+        object(),
+        seed=29,
+    )
+    measured_loss.backward()
+
+    assert len(calls) == 6
+    assert [call["design_spec"] for call in calls[:3]] == [specs[0]] * 3
+    assert [call["phase"] for call in calls[:3]] == [0, 1, 2]
+    assert [call["design_spec"] for call in calls[3:]] == [specs[1]] * 3
+    assert [call["phase"] for call in calls[3:]] == [0, 1, 2]
+    expected = sum(
+        calls[sample_index * 3]["components"]["total_loss"]
+        for sample_index in range(2)
+    ) / 2.0
+    first_spec_for_both = (
+        specs[0].space_weight * 1.0
+        + specs[0].drag_weight * 10.0
+        + specs[0].lift_weight * 100.0
+        + specs[0].space_weight * 2.0
+        + specs[0].drag_weight * 11.0
+        + specs[0].lift_weight * 101.0
+    ) / 2.0
+    assert measured_loss.item() == pytest.approx(expected)
+    assert measured_loss.item() != pytest.approx(first_spec_for_both)
+    assert probabilities.grad is not None
+    assert torch.isfinite(probabilities.grad).all()
+
+
+@pytest.mark.parametrize("as_singleton_sequence", [False, True])
+def test_direct_spsa_broadcasts_single_design_spec_for_compatibility(
+    monkeypatch,
+    as_singleton_sequence,
+):
+    objective, calls = _controlled_design_spec_objective()
+    monkeypatch.setattr(recovery, "_direct_measured_objective_for_single", objective)
+    spec = _round5_design_specs()[0]
+    probabilities = torch.stack(
+        (
+            torch.full((4, 4, 4), 0.25),
+            torch.full((4, 4, 4), 0.75),
+        )
+    ).requires_grad_(True)
+
+    spec_input = (spec,) if as_singleton_sequence else spec
+    _round5_direct_loss()(probabilities, spec_input, object(), seed=29).backward()
+
+    assert len(calls) == 6
+    assert [call["design_spec"] for call in calls] == [spec] * 6
+
+
+def test_direct_spsa_rejects_mismatched_design_spec_count(monkeypatch):
+    objective, calls = _controlled_design_spec_objective()
+    monkeypatch.setattr(recovery, "_direct_measured_objective_for_single", objective)
+    probabilities = torch.stack(
+        (
+            torch.full((4, 4, 4), 0.25),
+            torch.full((4, 4, 4), 0.75),
+        )
+    ).requires_grad_(True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"design_spec sequence must contain one value or one value per batch item.*3.*batch size 2",
+    ):
+        _round5_direct_loss()(
+            probabilities,
+            (*_round5_design_specs(), _round5_design_specs()[0]),
+            object(),
+            seed=29,
+        )
+
+    assert calls == []
+
+
+def test_train_epoch_preserves_per_sample_design_specs_for_all_solver_calls(
+    monkeypatch,
+):
+    objective, calls = _controlled_design_spec_objective()
+    monkeypatch.setattr(recovery, "_direct_measured_objective_for_single", objective)
+    specs = _round5_design_specs()
+    torch.manual_seed(37)
+    trainer = _round4_trainer()
+    trainer.direct_solver_loss = _round5_direct_loss()
+    batch = {
+        "latent": torch.tensor(
+            [[0.1, 0.2, 0.3, 0.4], [0.6, 0.7, 0.8, 0.9]],
+            dtype=torch.float32,
+        ),
+        "geometry": torch.stack(
+            (torch.zeros((4, 4, 4)), torch.ones((4, 4, 4)))
+        ),
+        "design_spec": list(specs),
+    }
+
+    metrics = trainer.train_epoch([batch], grid_size=4)
+
+    assert len(calls) == 6
+    assert [call["design_spec"] for call in calls[:3]] == [specs[0]] * 3
+    assert [call["design_spec"] for call in calls[3:]] == [specs[1]] * 3
+    expected = sum(
+        calls[sample_index * 3]["components"]["total_loss"]
+        for sample_index in range(2)
+    ) / 2.0
+    first_spec_for_both = (
+        specs[0].space_weight * 1.0
+        + specs[0].drag_weight * 10.0
+        + specs[0].lift_weight * 100.0
+        + specs[0].space_weight * 2.0
+        + specs[0].drag_weight * 11.0
+        + specs[0].lift_weight * 101.0
+    ) / 2.0
+    assert metrics["direct_solver_loss"] == pytest.approx(expected)
+    assert metrics["direct_solver_loss"] != pytest.approx(first_spec_for_both)
+    assert metrics["direct_solver_eval_count"] == 1
+    assert metrics["direct_solver_call_count"] == 6
 
 
 @pytest.mark.parametrize(

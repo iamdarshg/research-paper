@@ -4014,7 +4014,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
     def forward(
         ctx,
         voxel_grid: torch.Tensor,
-        design_spec: DesignSpec,
+        design_spec: Union[DesignSpec, Sequence[DesignSpec]],
         cfd_simulator: "AdvancedCFDSimulator",
         cfd_steps: int,
         perturbation: float,
@@ -4043,6 +4043,28 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             )
 
         batch_size = int(fields.shape[0])
+        if isinstance(design_spec, DesignSpec):
+            design_specs = (design_spec,)
+        elif isinstance(design_spec, Sequence) and not isinstance(
+            design_spec, (str, bytes)
+        ):
+            design_specs = tuple(design_spec)
+        else:
+            raise TypeError(
+                "design_spec must be a DesignSpec or a sequence of DesignSpec values"
+            )
+        if len(design_specs) not in {1, batch_size}:
+            raise ValueError(
+                "design_spec sequence must contain one value or one value per "
+                f"batch item, got {len(design_specs)} values for batch size "
+                f"{batch_size}"
+            )
+        for spec_index, sample_spec in enumerate(design_specs):
+            if not isinstance(sample_spec, DesignSpec):
+                raise TypeError(
+                    "design_spec sequence entries must be DesignSpec values, "
+                    f"got {type(sample_spec).__name__} at index {spec_index}"
+                )
         grad_estimate = torch.zeros_like(fields)
         base_losses: List[float] = []
         base_component_records: List[Dict[str, float]] = []
@@ -4074,6 +4096,9 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
 
         for batch_idx in range(batch_size):
             sample_field = fields[batch_idx]
+            sample_design_spec = design_specs[
+                0 if len(design_specs) == 1 else batch_idx
+            ]
             sample_probs = (
                 torch.sigmoid(sample_field)
                 if input_is_logits
@@ -4086,7 +4111,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             )
             base_components = _direct_measured_objective_for_single(
                 sample_probs,
-                design_spec,
+                sample_design_spec,
                 cfd_simulator,
                 cfd_steps,
                 connectivity_weight,
@@ -4135,7 +4160,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 minus_field = sample_field - eps * delta
                 plus_components = _direct_measured_objective_for_single(
                     torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
-                    design_spec,
+                    sample_design_spec,
                     cfd_simulator,
                     cfd_steps,
                     connectivity_weight,
@@ -4146,7 +4171,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 )
                 minus_components = _direct_measured_objective_for_single(
                     torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
-                    design_spec,
+                    sample_design_spec,
                     cfd_simulator,
                     cfd_steps,
                     connectivity_weight,
@@ -4482,7 +4507,7 @@ class DirectSolverSPSALoss(nn.Module):
     def forward(
         self,
         voxel_grid: torch.Tensor,
-        design_spec: DesignSpec,
+        design_spec: Union[DesignSpec, Sequence[DesignSpec]],
         cfd_simulator: "AdvancedCFDSimulator",
         seed: Optional[int] = None,
         reference_occupancy: Optional[Union[float, torch.Tensor]] = None,
@@ -5351,8 +5376,6 @@ class OptimizedDiffusionTrainer:
             geometry_target = batch['geometry']
             condition = batch.get('condition_vector')
             design_spec = batch.get('design_spec', DesignSpec(target_speed=50.0))
-            if isinstance(design_spec, list):
-                design_spec = design_spec[0]
 
             # Resize geometry to current grid size
             if grid_size != geometry_target.shape[1]:
