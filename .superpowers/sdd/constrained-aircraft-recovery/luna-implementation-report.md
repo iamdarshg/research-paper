@@ -8,9 +8,10 @@ Tasks 1 through 5 were implemented in order on branch
 `codex/constrained-aircraft-recovery`, based at `feef092`. This report records
 the implementation through review round 3 and is not a closure statement.
 Round 4 found additional mixed-batch guard transport and generated-path
-converter-freeze defects; its changes and evidence are recorded separately in
-`fix-round-4-report.md`. No real `96^3` smoke was run in rounds 2 through 4,
-so live interruption/resume and promotion remain unverified. No full epoch was
+converter-freeze defects, and round 5 found a separate per-sample
+`DesignSpec` transport defect. Their changes and evidence are recorded in the
+round-specific reports. No real `96^3` smoke was run in rounds 2 through 5, so
+live interruption/resume and promotion remain unverified. No full epoch was
 launched.
 
 ## Commits

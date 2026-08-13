@@ -2,9 +2,9 @@
 
 Status: `IMPLEMENTED_PENDING_REREVIEW`
 
-Round-4 status: implementation commit `e6f9016` passed dedicated, affected,
+Round-5 status: implementation commit `aa701c0` passed dedicated, affected,
 and full automated suites. This document's real-smoke artifacts predate all
-four review-fix rounds; no new real smoke was run by instruction. This is not
+five review-fix rounds; no new real smoke was run by instruction. This is not
 closure or promotion evidence.
 
 ## Scope
@@ -94,10 +94,12 @@ Round 4 corrected batch-position transport for active topology guards and made
 `freeze_decoder_for_generated_paths` operate on the captured gradient buffers
 that are restored before the optimizer step. Batch-size-2 tests cover first
 inactive/later active, first active/later inactive, and distinct guards on the
-two samples. Each case preserves the two base measured values, performs the
-expected six objective calls for one SPSA direction, produces full `[B, ...]`
+two samples. Each case preserves two controlled base values, performs six
+controlled objective calls for one SPSA direction, produces full `[B, ...]`
 guard tensors with exact zeros at inactive positions, and replays the union of
-active guards through `train_epoch`.
+active guards through `train_epoch`. Those round-4 fixtures did not vary the
+samples' `DesignSpec` values, so they were not evidence of per-sample mission
+weight integrity.
 
 The converter-freeze production test observes gradients immediately before
 the optimizer step. With the switch enabled, generated data, direct, and
@@ -111,3 +113,24 @@ review module `25 passed`; affected suites `97 passed`; full `pytest -q` `435
 passed, 3 warnings in 311.63s`. The warnings are existing `pkg_resources`
 deprecations. No real smoke was run, so current-code live 96-cubed resume and
 promotion remain unverified.
+
+## Round-5 Design-Spec Boundary
+
+Round 5 carries the batch-aligned `DesignSpec` sequence preserved by collation
+through `train_epoch` and `DirectSolverSPSALoss`. For sample index `i`, its
+base, plus, and minus measured calls receive `design_specs[i]`. A lone
+`DesignSpec` and a one-element sequence retain broadcast compatibility; any
+other sequence length must equal the direct-objective batch size and is
+rejected before a measured call.
+
+The batch-size-2 controlled objective uses deliberately different
+`space_weight`, `drag_weight`, and `lift_weight` values and records every
+received spec. Direct-loss and production `train_epoch` tests both verify all
+six calls, the mean of the two correctly weighted base objectives, inequality
+from the known-wrong first-spec-for-both result, unchanged call accounting,
+and finite gradients.
+
+Verification for `aa701c0`: dedicated design-spec selection `5 passed`;
+complete review module `30 passed`; affected suites `97 passed`; full
+`pytest -q` `440 passed, 3 warnings in 341.45s`. No real smoke was run, so
+current-code live 96-cubed resume and promotion remain unverified.

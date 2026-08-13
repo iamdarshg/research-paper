@@ -26,8 +26,10 @@ Production regressions cover all required batch-size-2 patterns:
 For every pattern, the test exercises both direct production SPSA aggregation
 and a real one-update `train_epoch` replay. It checks `[B, ...]` guard shapes,
 zero inactive slices, nonzero active slices, the ordered guard union, the mean
-of both base measured scalar values, one evaluation record, and six measured
-objective calls for two samples with one SPSA direction.
+of two controlled base values, one evaluation record, and six controlled
+objective calls for two samples with one SPSA direction. Round 4 did not vary
+or prove per-sample `DesignSpec` transport; that separate integrity defect and
+its weighted-scalar evidence are covered by round 5.
 
 ## Generated-Path Converter Freeze
 

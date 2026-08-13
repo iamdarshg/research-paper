@@ -208,3 +208,21 @@ review module (`25 tests`), affected suites (`97 tests`), and full suite (`435
 tests`, three existing warnings). This is automated implementation evidence,
 not closure: no current-code live 96-cubed exact-resume run or promotion was
 performed.
+
+Round 5 (`aa701c0`) preserves the batch-aligned aircraft mission specification
+through the measured direct objective. `DirectSolverSPSALoss` accepts one
+`DesignSpec` for backward-compatible broadcast or a sequence containing one
+value or exactly one value per batch sample. Other lengths fail before solver
+work. Each sample's base and every antithetic plus/minus evaluation use that
+sample's own `space_weight`, `drag_weight`, `lift_weight`, and remaining
+mission fields.
+
+Fresh call-recording tests use two controlled geometries and deliberately
+different objective weights. They verify both the direct SPSA interface and a
+production `train_epoch` update, including all six per-sample calls, the mean
+of the correctly weighted scalar objectives, inequality from first-spec
+reuse, finite gradients, unchanged call counts, singleton compatibility, and
+mismatch rejection. Round-5 verification passed the dedicated selection (`5
+tests`), complete review module (`30 tests`), affected suites (`97 tests`), and
+full suite (`440 tests`, three existing warnings). No current-code live
+96-cubed exact-resume run or promotion was performed.
