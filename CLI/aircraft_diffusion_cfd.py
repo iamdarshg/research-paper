@@ -1211,15 +1211,8 @@ class LBMPhysicsConfig:
 
 def capture_data_anchor_gradients(
     parameters: Iterable[torch.nn.Parameter],
-    reconstruction_loss: torch.Tensor,
-    *,
-    exact_margin_loss: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], ...]:
-    """Capture the data anchor after every grounded data term is backpropagated."""
-    total_loss = reconstruction_loss
-    if exact_margin_loss is not None:
-        total_loss = total_loss + exact_margin_loss
-    total_loss.backward()
+    """Capture the data anchor after all grounded data terms are backpropagated."""
     gradients = capture_gradients(parameters)
     clear_gradients(parameters)
     return gradients
@@ -5559,8 +5552,7 @@ class OptimizedDiffusionTrainer:
                     generation_geometry_loss_val.detach()
                     + exact_generation_margin_loss_val / generation_weight
                 )
-            student_data_gradients = capture_gradients(student_parameters)
-            clear_gradients(student_parameters)
+            student_data_gradients = capture_data_anchor_gradients(student_parameters)
 
             if consistency_loss.requires_grad:
                 consistency_loss.backward()

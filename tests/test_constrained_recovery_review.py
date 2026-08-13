@@ -27,7 +27,7 @@ from aircraft_diffusion_cfd import (
     validate_run_state_compatibility,
     validate_direct_solver_iteration_coverage,
 )
-from multiobjective_gradients import capture_gradients, clear_gradients, combine_gradient_branches
+from multiobjective_gradients import combine_gradient_branches
 from run_monitored_training import (
     _append_jsonl,
     _build_split_dataset,
@@ -370,22 +370,16 @@ def test_captured_student_data_anchor_includes_exact_margin_and_blocks_direct_co
     latent = parameter.reshape(1, 1, 1, 1)
     target = torch.ones((1, 1, 1, 2))
 
+    (parameter * 0.0).backward()
     margin_value = trainer._backward_full_grounded_threshold_margin(
         latent,
         target,
         loss_scale=1.0,
     )
-    captured = capture_gradients([parameter])
-    clear_gradients([parameter])
+    captured = capture_data_anchor_gradients([parameter])
 
     assert margin_value.item() > 0.0
     assert captured[0].item() < 0.0
-
-    captured = capture_data_anchor_gradients(
-        [parameter],
-        parameter.detach().mul(0.0),
-        exact_margin_loss=parameter.detach().mul(0.0) + captured[0].detach() * parameter,
-    )
 
     combine_gradient_branches(
         [parameter],
