@@ -4046,10 +4046,11 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         grad_estimate = torch.zeros_like(fields)
         base_losses: List[float] = []
         base_component_records: List[Dict[str, float]] = []
-        accepted_guard_gradients: Dict[str, List[torch.Tensor]] = {
-            name: []
+        accepted_guard_gradients: Dict[str, torch.Tensor] = {
+            name: torch.zeros_like(fields)
             for name in ("connectivity_loss", "aircraft_validity_loss")
         }
+        active_guard_union: set[str] = set()
         eps = max(float(perturbation), 1.0e-6)
         generator = torch.Generator(device=fields.device)
         generator.manual_seed(int(seed) % (2**63 - 1))
@@ -4231,6 +4232,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 and "aircraft_validity_loss" in applied_component_grads
             ):
                 active_guard_names.append("aircraft_validity_loss")
+            active_guard_union.update(active_guard_names)
             guard_gradients = {
                 name: (applied_component_grads[name],)
                 for name in ("connectivity_loss", "aircraft_validity_loss")
@@ -4285,7 +4287,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         if combined_component_gradient is None
                         else combined_component_gradient + component_value
                     )
-            for guard_name in accepted_guard_gradients:
+            for guard_name, batch_guard_gradient in accepted_guard_gradients.items():
                 if guard_name not in active_guard_names:
                     continue
                 guard_value = guard_component_values.get(guard_name)
@@ -4293,9 +4295,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     guard_value = guard_value[0]
                 if guard_value is None:
                     guard_value = torch.zeros_like(sample_field)
-                accepted_guard_gradients[guard_name].append(
-                    guard_value.detach().clone()
-                )
+                batch_guard_gradient[batch_idx].copy_(guard_value.detach())
             if combined_component_gradient is None:
                 combined_component_gradient = torch.zeros_like(sample_field)
             accepted_component_grads = {"combined": combined_component_gradient}
@@ -4401,21 +4401,22 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         ctx.original_ndim = original_ndim
         mean_loss = float(np.mean(base_losses)) if base_losses else 0.0
         component_sink.clear()
-        component_sink["_accepted_guard_gradients"] = {
-            name: torch.stack(values, dim=0).div(max(batch_size, 1))
-            for name, values in accepted_guard_gradients.items()
-            if values
-        }
-        component_sink["active_guard_names"] = [
+        active_guard_names = [
             name
             for name in ("connectivity_loss", "aircraft_validity_loss")
-            if any(
-                name in record.get("active_guard_names", [])
-                for record in base_component_records
-            )
+            if name in active_guard_union
         ]
+        component_sink["_accepted_guard_gradients"] = {
+            name: values.div(max(batch_size, 1))
+            for name, values in accepted_guard_gradients.items()
+            if name in active_guard_union
+        }
+        component_sink["active_guard_names"] = list(active_guard_names)
+        component_sink["active_guard_set"] = list(active_guard_names)
         if base_component_records:
             for key in base_component_records[0]:
+                if key in {"active_guard_names", "active_guard_set"}:
+                    continue
                 values = [record[key] for record in base_component_records if key in record]
                 if not values:
                     continue
@@ -5307,6 +5308,30 @@ class OptimizedDiffusionTrainer:
                 range(parameter_index, parameter_index + count)
             )
             parameter_index += count
+        converter_parameter_indices = frozenset(
+            optimizer_group_indices.get("coordinate_converter", ())
+        )
+
+        def converter_gradient_norm(
+            gradients: Sequence[Optional[torch.Tensor]],
+            *,
+            branch_name: str,
+        ) -> float:
+            return gradient_l2_norm(
+                tuple(
+                    gradients[index]
+                    for index in sorted(converter_parameter_indices)
+                ),
+                branch_name=f"{branch_name}_converter",
+            )
+
+        def without_converter_gradients(
+            gradients: Sequence[Optional[torch.Tensor]],
+        ) -> Tuple[Optional[torch.Tensor], ...]:
+            return tuple(
+                None if index in converter_parameter_indices else gradient
+                for index, gradient in enumerate(gradients)
+            )
 
         start_batch = max(0, int(start_batch))
         processed_updates = 0
@@ -5714,11 +5739,45 @@ class OptimizedDiffusionTrainer:
                     + float(self.training_config.direct_solver_loss_weight)
                     * direct_solver_loss_val
                 )
+            generated_path_gradients = {
+                "data": data_gradients,
+                "consistency": consistency_gradients,
+                "direct": direct_gradients,
+                **topology_guard_gradients,
+            }
+            generated_path_converter_norms_before_freeze = {
+                name: converter_gradient_norm(
+                    gradients,
+                    branch_name=f"generated_{name}_before_freeze",
+                )
+                for name, gradients in generated_path_gradients.items()
+            }
             if self.training_config.freeze_decoder_for_generated_paths:
-                # Optional ablation: discard generated-path converter gradients
-                # while preserving their upstream denoiser gradients.
-                for parameter in self.converter.parameters():
-                    parameter.grad = None
+                # Captured branches, not live .grad fields, are restored below.
+                # Strip generated-path converter entries before adding the
+                # separate clean grounded decoder gradient.
+                data_gradients = without_converter_gradients(data_gradients)
+                consistency_gradients = without_converter_gradients(
+                    consistency_gradients
+                )
+                direct_gradients = without_converter_gradients(direct_gradients)
+                topology_guard_gradients = {
+                    name: without_converter_gradients(gradients)
+                    for name, gradients in topology_guard_gradients.items()
+                }
+            generated_path_gradients = {
+                "data": data_gradients,
+                "consistency": consistency_gradients,
+                "direct": direct_gradients,
+                **topology_guard_gradients,
+            }
+            generated_path_converter_norms_after_freeze = {
+                name: converter_gradient_norm(
+                    gradients,
+                    branch_name=f"generated_{name}_after_freeze",
+                )
+                for name, gradients in generated_path_gradients.items()
+            }
             # Always add an exact grounded full-lattice decoder gradient. The
             # generated and CFD graphs have already been released, so this is
             # sequential without dropping any loss contribution.
@@ -5762,6 +5821,10 @@ class OptimizedDiffusionTrainer:
             clean_geometry_loss_val = grounded_full_loss.detach()
             clean_data_gradients = capture_gradients(optimizer_parameters)
             clear_gradients(optimizer_parameters)
+            clean_grounded_converter_gradient_norm = converter_gradient_norm(
+                clean_data_gradients,
+                branch_name="clean_grounded",
+            )
             data_gradients = add_gradient_buffers(
                 data_gradients,
                 clean_data_gradients,
@@ -5820,6 +5883,15 @@ class OptimizedDiffusionTrainer:
                 ),
                 "exact_margin_loss": float(
                     exact_generation_margin_loss_val.detach().item()
+                ),
+                "clean_grounded_converter_gradient_norm": (
+                    clean_grounded_converter_gradient_norm
+                ),
+                "generated_path_converter_gradient_norms_before_freeze": (
+                    generated_path_converter_norms_before_freeze
+                ),
+                "generated_path_converter_gradient_norms_after_freeze": (
+                    generated_path_converter_norms_after_freeze
                 ),
             }
             student_gradient_cosines = {

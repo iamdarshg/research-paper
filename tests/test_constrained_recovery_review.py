@@ -17,6 +17,7 @@ from aircraft_diffusion_cfd import (
     CFDConfig,
     ConsistencyModel,
     DesignSpec,
+    DirectSolverSPSALoss,
     DiffusionConfig,
     ModelConfig,
     OptimizedDiffusionTrainer,
@@ -28,6 +29,7 @@ from aircraft_diffusion_cfd import (
     validate_run_state_compatibility,
     validate_direct_solver_iteration_coverage,
 )
+import aircraft_diffusion_cfd as recovery
 from multiobjective_gradients import combine_gradient_branches
 from run_monitored_training import (
     _append_jsonl,
@@ -42,6 +44,104 @@ from run_monitored_training import (
     restore_promotion_baseline,
 )
 import run_monitored_training as monitored_training
+
+
+def _controlled_spsa_objective(active_guards_by_sample):
+    calls = []
+    slopes = {
+        "occupancy_loss": 0.05,
+        "aero_loss": 0.07,
+        "connectivity_loss": 0.09,
+        "aircraft_validity_loss": 0.11,
+    }
+
+    def objective(
+        probabilities,
+        design_spec,
+        simulator,
+        cfd_steps,
+        connectivity_weight,
+        aircraft_validity_weight,
+        threshold,
+        target_occupancy,
+        return_components=False,
+    ):
+        call_index = len(calls)
+        sample_index = call_index // 3
+        phase = call_index % 3
+        signed_offset = 0.0 if phase == 0 else (1.0 if phase == 1 else -1.0)
+        active_guards = set(active_guards_by_sample[sample_index])
+        components = {
+            "occupancy_loss": 1.0 + sample_index,
+            "aero_loss": 2.0 + sample_index,
+            "connectivity_loss": 0.4 + sample_index,
+            "aircraft_validity_loss": (
+                0.5 + sample_index
+                if "aircraft_validity_loss" in active_guards
+                else 0.0
+            ),
+            "connectivity_guard_shortfall": (
+                0.2 if "connectivity_loss" in active_guards else 0.0
+            ),
+        }
+        for name, slope in slopes.items():
+            components[name] += signed_offset * slope
+        components["total_loss"] = sum(
+            components[name] for name in slopes
+        )
+        calls.append(
+            {
+                "sample_index": sample_index,
+                "phase": phase,
+                "components": dict(components),
+            }
+        )
+        return components if return_components else probabilities.new_tensor(
+            components["total_loss"]
+        )
+
+    return objective, calls
+
+
+def _round4_trainer(*, freeze_decoder_for_generated_paths=True):
+    model = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    diffusion = DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4)
+    training = TrainingConfig(
+        num_epochs=1,
+        consistency_interval=100,
+        direct_solver_steps=1,
+        direct_solver_directions=1,
+        direct_solver_interval=1,
+        direct_solver_perturbation_grid_size=0,
+        direct_solver_gradient_clip=100.0,
+        direct_aero_gradient_max_norm=100.0,
+        direct_occupancy_gradient_max_norm=100.0,
+        direct_connectivity_gradient_max_norm=100.0,
+        direct_validity_gradient_max_norm=100.0,
+        student_data_gradient_max_norm=100.0,
+        student_direct_gradient_max_norm=100.0,
+        gradient_clip=100.0,
+        offload_optimizer_state_between_steps=False,
+        freeze_decoder_for_generated_paths=freeze_decoder_for_generated_paths,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        model,
+        diffusion,
+        training,
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    trainer.geometry_threshold_calibrated = True
+    trainer.geometry_probability_threshold = 0.5
+    return trainer
 
 
 def test_resumed_suffix_coverage_uses_processed_suffix():
@@ -145,6 +245,206 @@ def test_lbm_shape_drag_configuration_remains_dataclass_and_serializable():
     }
     restored = __import__("aircraft_diffusion_cfd").LBMPhysicsConfig(**payload)
     assert restored.shape_drag_correction_coefficients == (-1.0, 0.5)
+
+
+@pytest.mark.parametrize(
+    ("active_guards_by_sample", "expected_union"),
+    [
+        (((), ("connectivity_loss",)), ["connectivity_loss"]),
+        ((("connectivity_loss",), ()), ["connectivity_loss"]),
+        (
+            (
+                ("connectivity_loss",),
+                ("aircraft_validity_loss",),
+            ),
+            ["connectivity_loss", "aircraft_validity_loss"],
+        ),
+    ],
+    ids=(
+        "first-inactive-later-active",
+        "first-active-later-inactive",
+        "different-guards-per-sample",
+    ),
+)
+def test_mixed_batch_spsa_guards_remain_batch_aligned_and_replay_in_train_epoch(
+    monkeypatch,
+    active_guards_by_sample,
+    expected_union,
+):
+    objective, calls = _controlled_spsa_objective(active_guards_by_sample)
+    monkeypatch.setattr(recovery, "_direct_measured_objective_for_single", objective)
+    loss_fn = DirectSolverSPSALoss(
+        cfd_steps=1,
+        perturbation=0.2,
+        perturbation_grid_size=0,
+        gradient_clip=100.0,
+        aero_gradient_max_norm=100.0,
+        occupancy_gradient_max_norm=100.0,
+        connectivity_gradient_max_norm=100.0,
+        validity_gradient_max_norm=100.0,
+        connectivity_weight=1.0,
+        aircraft_validity_weight=1.0,
+        directions=1,
+        seed=17,
+    )
+    probabilities = torch.stack(
+        (
+            torch.full((4, 4, 4), 0.35),
+            torch.full((4, 4, 4), 0.65),
+        )
+    ).requires_grad_(True)
+
+    measured_loss = loss_fn(probabilities, DesignSpec(), object(), seed=17)
+    measured_loss.backward()
+
+    assert len(calls) == 6
+    assert [call["sample_index"] for call in calls] == [0, 0, 0, 1, 1, 1]
+    expected_base_losses = [
+        calls[index * 3]["components"]["total_loss"] for index in range(2)
+    ]
+    assert measured_loss.item() == pytest.approx(sum(expected_base_losses) / 2.0)
+    assert loss_fn.last_components["active_guard_names"] == expected_union
+    guard_buffers = loss_fn.last_components["_accepted_guard_gradients"]
+    assert set(guard_buffers) == set(expected_union)
+    for guard_name in expected_union:
+        guard = guard_buffers[guard_name]
+        assert guard.shape == probabilities.shape
+        for sample_index, active_names in enumerate(active_guards_by_sample):
+            if guard_name in active_names:
+                assert torch.count_nonzero(guard[sample_index]).item() > 0
+            else:
+                assert torch.equal(
+                    guard[sample_index],
+                    torch.zeros_like(guard[sample_index]),
+                )
+
+    objective, train_calls = _controlled_spsa_objective(active_guards_by_sample)
+    monkeypatch.setattr(recovery, "_direct_measured_objective_for_single", objective)
+    torch.manual_seed(23)
+    trainer = _round4_trainer()
+    batch = {
+        "latent": torch.tensor(
+            [[0.1, 0.2, 0.3, 0.4], [0.6, 0.7, 0.8, 0.9]],
+            dtype=torch.float32,
+        ),
+        "geometry": torch.stack(
+            (torch.zeros((4, 4, 4)), torch.ones((4, 4, 4)))
+        ),
+        "design_spec": [DesignSpec(), DesignSpec()],
+    }
+
+    metrics = trainer.train_epoch([batch], grid_size=4)
+
+    expected_replayed = [
+        replay_name
+        for source_name, replay_name in (
+            ("connectivity_loss", "connectivity"),
+            ("aircraft_validity_loss", "validity"),
+        )
+        if source_name in expected_union
+    ]
+    assert len(train_calls) == 6
+    assert metrics["direct_solver_eval_count"] == 1
+    assert metrics["direct_solver_call_count"] == 6
+    assert trainer.last_gradient_lifecycle["replayed_guard_names"] == expected_replayed
+
+
+def test_generated_path_converter_freeze_filters_captured_branches_before_step():
+    class ControlledMeasuredObjective(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.last_components = {}
+
+        def forward(self, logits, design_spec, simulator, seed=None, reference_occupancy=None):
+            self.last_components = {
+                "aero_loss": 0.2,
+                "occupancy_loss": 0.1,
+                "connectivity_loss": 0.3,
+                "aircraft_validity_loss": 0.0,
+                "active_guard_names": ["connectivity_loss"],
+                "_accepted_guard_gradients": {
+                    "connectivity_loss": torch.full_like(logits, 0.5),
+                },
+                "spsa_gradient_norm": 1.0,
+                "spsa_gradient_norm_unclipped": 1.0,
+            }
+            return logits.mean()
+
+    def run_one_update(freeze_enabled):
+        torch.manual_seed(101)
+        trainer = _round4_trainer(
+            freeze_decoder_for_generated_paths=freeze_enabled
+        )
+        trainer.direct_solver_loss = ControlledMeasuredObjective()
+        captured = {}
+
+        def capture_step(*args, **kwargs):
+            converter_group = next(
+                group
+                for group in trainer.optimizer.param_groups
+                if group.get("name") == "coordinate_converter"
+            )
+            captured["converter_gradients"] = tuple(
+                None
+                if parameter.grad is None
+                else parameter.grad.detach().clone()
+                for parameter in converter_group["params"]
+            )
+            captured["lifecycle"] = dict(trainer.last_gradient_lifecycle)
+
+        trainer.optimizer.step = capture_step
+        torch.manual_seed(303)
+        trainer.train_epoch(
+            [
+                {
+                    "latent": torch.tensor([[0.2, 0.4, 0.6, 0.8]]),
+                    "geometry": torch.ones((1, 4, 4, 4)),
+                    "design_spec": [DesignSpec()],
+                }
+            ],
+            grid_size=4,
+        )
+        return captured
+
+    frozen = run_one_update(True)
+    unfrozen = run_one_update(False)
+
+    frozen_lifecycle = frozen["lifecycle"]
+    unfrozen_lifecycle = unfrozen["lifecycle"]
+    assert frozen_lifecycle["clean_grounded_converter_gradient_norm"] > 0.0
+    assert unfrozen_lifecycle["clean_grounded_converter_gradient_norm"] > 0.0
+    assert frozen_lifecycle["generated_path_converter_gradient_norms_before_freeze"]["data"] > 0.0
+    assert frozen_lifecycle["generated_path_converter_gradient_norms_before_freeze"]["direct"] > 0.0
+    assert frozen_lifecycle["generated_path_converter_gradient_norms_before_freeze"]["connectivity"] > 0.0
+    assert all(
+        value == 0.0
+        for value in frozen_lifecycle[
+            "generated_path_converter_gradient_norms_after_freeze"
+        ].values()
+    )
+    assert unfrozen_lifecycle[
+        "generated_path_converter_gradient_norms_after_freeze"
+    ] == pytest.approx(
+        unfrozen_lifecycle[
+            "generated_path_converter_gradient_norms_before_freeze"
+        ]
+    )
+
+    frozen_converter = tuple(
+        gradient for gradient in frozen["converter_gradients"] if gradient is not None
+    )
+    unfrozen_converter = tuple(
+        gradient for gradient in unfrozen["converter_gradients"] if gradient is not None
+    )
+    assert frozen_converter
+    assert sum(float(gradient.norm().item()) for gradient in frozen_converter) > 0.0
+    assert any(
+        not torch.allclose(frozen_gradient, unfrozen_gradient)
+        for frozen_gradient, unfrozen_gradient in zip(
+            frozen_converter,
+            unfrozen_converter,
+        )
+    )
 
 
 def test_train_epoch_preserves_all_group_gradients_and_active_guard_invariant():
@@ -500,6 +800,7 @@ def test_resume_fingerprint_contains_live_training_behavior():
         gradient_clip=0.4,
         ema_decay=0.97,
         project_conflicting_direct_gradient=False,
+        freeze_decoder_for_generated_paths=False,
         geometry_reconstruction_weight=1.2,
         generation_reconstruction_weight=0.8,
         threshold_positive_margin=0.04,
@@ -549,6 +850,7 @@ def test_resume_fingerprint_contains_live_training_behavior():
     assert configuration["training_config"]["generation_reconstruction_weight"] == 0.8
     assert configuration["geometry_materialization_threshold"] == 0.37
     assert configuration["training_config"]["project_conflicting_direct_gradient"] is False
+    assert configuration["training_config"]["freeze_decoder_for_generated_paths"] is False
 
 
 def test_next_epoch_checkpoint_cadence_resets_to_zero_segment():
