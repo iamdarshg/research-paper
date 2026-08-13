@@ -28,7 +28,11 @@ from aircraft_diffusion_cfd import (
     resolve_grounded_grid_size,
 )
 from experiment_config import GLOBAL_CONFIG_PATH, config_value
-from training_stability import compute_core_loss, summarize_stability
+from training_stability import (
+    compute_core_loss,
+    evaluate_directional_promotion_gate,
+    summarize_stability,
+)
 from sdf_utils import prepare_edt_workspace
 
 
@@ -798,7 +802,7 @@ def main() -> int:
     initial_geometry_promotion_report = None
     promotion_baseline: Dict[str, Any] = {}
 
-    if args.resume_from or args.warm_start_from:
+    if args.resume_from or args.warm_start_from or not promotion_baseline:
         python_rng_state = random.getstate()
         numpy_rng_state = np.random.get_state()
         torch_rng_state = torch.get_rng_state()
@@ -818,12 +822,16 @@ def main() -> int:
         initial_geometry_promotion = {
             **baseline_metrics,
             "status": str(baseline_promotion.get("status", "fail")),
-            "source_checkpoint": str(
-                Path(args.resume_from or args.warm_start_from).resolve()
+            "source_checkpoint": (
+                str(Path(args.resume_from or args.warm_start_from).resolve())
+                if (args.resume_from or args.warm_start_from)
+                else "fresh_run_initial_state"
             ),
         }
-        best_checkpoint_path = str(
-            Path(args.resume_from or args.warm_start_from).resolve()
+        best_checkpoint_path = (
+            str(Path(args.resume_from or args.warm_start_from).resolve())
+            if (args.resume_from or args.warm_start_from)
+            else None
         )
         initial_promotion_path = history_output.with_name(
             "initial_geometry_promotion.json"
@@ -879,11 +887,17 @@ def main() -> int:
         promotion_passed = False
         if (epoch + 1) % selection_interval == 0:
             promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
-            non_regression = (
-                _geometry_non_regression(promotion, promotion_baseline)
+            directional_gate = (
+                evaluate_directional_promotion_gate(promotion, promotion_baseline)
                 if promotion_baseline
-                else {"status": "pass", "failed_checks": []}
+                else {"status": "pass", "failed_conditions": [], "conditions": {}}
             )
+            non_regression = {
+                **directional_gate,
+                "failed_checks": list(
+                    directional_gate.get("failed_conditions", [])
+                ),
+            }
             promotion_passed = (
                 promotion.get("status") == "pass"
                 and non_regression.get("status") == "pass"
@@ -900,10 +914,8 @@ def main() -> int:
             )
             metrics["promotion_report"] = dict(promotion)
             metrics["promotion_non_regression_report"] = dict(non_regression)
-            candidate_improved = (
-                non_regression.get("status") == "pass"
-                and promotion_rank > best_promotion_rank
-            )
+            metrics["promotion_directional_gate"] = dict(directional_gate)
+            candidate_improved = promotion_passed
             if candidate_improved:
                 best_promotion_rank = promotion_rank
                 best_geometry_metric = metrics["geometry_selection_metric"]

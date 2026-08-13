@@ -17,9 +17,64 @@ from run_monitored_training import (
     _geometry_promotion_metrics,
 )
 from training_stability import compute_core_loss, summarize_stability
+from training_stability import evaluate_directional_promotion_gate
 
 
 class TestTrainingStability(unittest.TestCase):
+    def test_directional_gate_rejects_completed_epoch_topology_regression(self):
+        baseline = {
+            "generated_mean_occupied_fraction": 0.05,
+            "target_mean_occupied_fraction": 0.02,
+            "generated_mean_largest_component_fraction": 0.9872801371,
+            "reconstruction_recall": 0.2431656392,
+            "generated_aircraft_valid_fraction": 0.0,
+            "generated_unique_fraction": 0.9479166667,
+            "materialization_mode": "fixed_global_threshold",
+            "geometry_threshold_calibrated": True,
+        }
+        candidate = {
+            "generated_mean_occupied_fraction": 0.01,
+            "target_mean_occupied_fraction": 0.02,
+            "generated_mean_largest_component_fraction": 0.5276170658,
+            "reconstruction_recall": 0.0,
+            "generated_aircraft_valid_fraction": 0.1041666667,
+            "generated_unique_fraction": 0.5416666667,
+            "materialization_mode": "fixed_global_threshold",
+            "geometry_threshold_calibrated": True,
+        }
+
+        report = evaluate_directional_promotion_gate(candidate, baseline)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(
+            report["failed_conditions"],
+            [
+                "largest_component_floor",
+                "largest_component_non_regression",
+                "reconstruction_recall_non_regression",
+                "uniqueness_non_regression",
+            ],
+        )
+        self.assertEqual(report["conditions"]["generated_occupancy_error"]["passed"], True)
+
+    def test_directional_gate_requires_strict_validity_improvement_below_half(self):
+        baseline = {
+            "generated_mean_occupied_fraction": 0.2,
+            "target_mean_occupied_fraction": 0.1,
+            "generated_mean_largest_component_fraction": 0.8,
+            "reconstruction_recall": 0.5,
+            "generated_aircraft_valid_fraction": 0.4,
+            "generated_unique_fraction": 0.8,
+            "materialization_mode": "fixed_global_threshold",
+            "geometry_threshold_calibrated": True,
+        }
+        candidate = {**baseline, "generated_mean_occupied_fraction": 0.1}
+
+        report = evaluate_directional_promotion_gate(candidate, baseline)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["failed_conditions"], ["generated_validity_improvement"])
+
     def test_run_local_scheduler_decays_each_group_to_nonzero_floor(self):
         first = torch.nn.Parameter(torch.tensor([1.0]))
         second = torch.nn.Parameter(torch.tensor([2.0]))

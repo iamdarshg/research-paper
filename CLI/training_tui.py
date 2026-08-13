@@ -195,9 +195,19 @@ def _metric_table(metrics: Optional[Dict[str, Any]]) -> Table:
         ("Aircraft validity loss", metrics.get("direct_aircraft_validity_loss"), 5),
         ("SPSA gradient norm", metrics.get("direct_spsa_gradient_norm"), 5),
         ("Solver calls", metrics.get("direct_solver_call_count"), 0),
+        (
+            "Promotion failures",
+            ", ".join(
+                metrics.get("promotion_directional_gate", {}).get(
+                    "failed_conditions", []
+                )
+            )
+            or "none",
+            0,
+        ),
     ]
     for name, value, digits in rows:
-        table.add_row(name, _number(value, digits))
+        table.add_row(name, value if isinstance(value, str) else _number(value, digits))
     return table
 
 
