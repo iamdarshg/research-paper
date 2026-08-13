@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, is_dataclass
 import hashlib
 import json
 import math
@@ -28,6 +29,7 @@ from aircraft_diffusion_cfd import (
     infer_conditioning_dim,
     restore_rng_state,
     resolve_grounded_grid_size,
+    resolve_run_state_path,
 )
 from experiment_config import GLOBAL_CONFIG_PATH, config_value
 from training_stability import (
@@ -59,6 +61,80 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> Dict[str, Any]:
         "record_count": int(record_count),
         "start_offset": int(start),
     }
+
+
+def _prepare_geometry_threshold_for_run(
+    trainer: OptimizedDiffusionTrainer,
+    calibration_loader: Any,
+    *,
+    resume_run_state: Optional[Path],
+) -> Dict[str, Any]:
+    """Restore an exact-run threshold before compatibility is constructed."""
+    if resume_run_state is None:
+        return trainer.calibrate_geometry_materialization_threshold(calibration_loader)
+
+    resolved_path = resolve_run_state_path(resume_run_state)
+    state = torch.load(
+        resolved_path,
+        map_location=trainer.device,
+        weights_only=False,
+    )
+    if "geometry_probability_threshold" not in state:
+        raise ValueError("Exact resume state is missing its saved geometry threshold")
+    trainer._set_geometry_probability_threshold(
+        state["geometry_probability_threshold"],
+        calibrated=bool(state.get("geometry_threshold_calibrated", True)),
+        calibration=state.get("geometry_threshold_calibration"),
+    )
+    return dict(state.get("geometry_threshold_calibration", {}))
+
+
+def _dataclass_fingerprint(value: Any) -> Any:
+    if is_dataclass(value):
+        return asdict(value)
+    return value
+
+
+def _build_objective_configuration_fingerprint(
+    *,
+    args: Any,
+    training_config: TrainingConfig,
+    model_config: ModelConfig,
+    diffusion_config: DiffusionConfig,
+    cfd_config: CFDConfig,
+    geometry_probability_threshold: float,
+    sample_order: List[int],
+    promotion_sample_order: List[int],
+) -> Dict[str, Any]:
+    """Describe every live model, objective, and optimizer behavior."""
+    return {
+        "num_epochs": int(args.num_epochs),
+        "planned_optimizer_updates": int(args.planned_optimizer_updates),
+        "batch_size": int(args.batch_size),
+        "subset_seed": int(args.subset_seed),
+        "sample_order": list(sample_order),
+        "promotion_split": str(args.promotion_split),
+        "promotion_sample_order": list(promotion_sample_order),
+        "promotion_evaluation_samples": int(args.promotion_evaluation_samples),
+        "promotion_generation_seeds": int(args.promotion_generation_seeds),
+        "solver": str(args.solver),
+        "lbm_stream_bfl_backend": str(args.lbm_stream_bfl_backend),
+        "geometry_materialization_threshold": float(geometry_probability_threshold),
+        "training_config": _dataclass_fingerprint(training_config),
+        "model_config": _dataclass_fingerprint(model_config),
+        "diffusion_config": _dataclass_fingerprint(diffusion_config),
+        "cfd_config": _dataclass_fingerprint(cfd_config),
+    }
+
+
+def _reset_epoch_checkpoint_segment(
+    resume_state_info: Dict[str, Any],
+    *,
+    next_epoch: int,
+) -> None:
+    """Start checkpoint cadence from zero after a completed epoch."""
+    resume_state_info["epoch_index"] = int(next_epoch)
+    resume_state_info["completed_in_epoch"] = 0
 
 
 def _reconcile_updates_log(path: Path, checkpoint_log: Dict[str, Any]) -> Dict[str, Any]:
@@ -809,8 +885,10 @@ def main() -> int:
         trainer.load_checkpoint(args.resume_from)
     elif args.warm_start_from:
         trainer.warm_start_checkpoint(args.warm_start_from)
-    threshold_calibration = trainer.calibrate_geometry_materialization_threshold(
-        calibration_loader
+    threshold_calibration = _prepare_geometry_threshold_for_run(
+        trainer,
+        calibration_loader,
+        resume_run_state=(Path(args.resume_run_state) if args.resume_run_state else None),
     )
     args.geometry_probability_threshold = float(
         trainer.geometry_probability_threshold
@@ -832,54 +910,16 @@ def main() -> int:
         "latent_dim": int(model_config.latent_dim),
         "split": str(args.training_split),
         "sample_count": int(len(epoch_dataset)),
-        "configuration": {
-            "num_epochs": int(args.num_epochs),
-            "planned_optimizer_updates": int(args.planned_optimizer_updates),
-            "batch_size": int(args.batch_size),
-            "subset_seed": int(args.subset_seed),
-            "sample_order": list(sample_order),
-            "promotion_split": str(args.promotion_split),
-            "promotion_sample_order": _dataset_sample_order(promotion_dataset),
-            "promotion_evaluation_samples": int(args.promotion_evaluation_samples),
-            "promotion_generation_seeds": int(args.promotion_generation_seeds),
-            "solver": str(args.solver),
-            "lbm_stream_bfl_backend": str(args.lbm_stream_bfl_backend),
-            "direct_solver_loss_weight": float(args.direct_solver_loss_weight),
-            "direct_solver_steps": int(args.direct_solver_steps),
-            "direct_solver_directions": int(args.direct_solver_directions),
-            "direct_solver_perturbation": float(args.direct_solver_perturbation),
-            "direct_connectivity_weight": float(args.direct_connectivity_weight),
-            "direct_aircraft_validity_weight": float(args.direct_aircraft_validity_weight),
-            "direct_solver_perturbation_grid_size": int(
-                args.direct_solver_perturbation_grid_size
-            ),
-            "geometry_materialization_threshold": float(
-                trainer.geometry_probability_threshold
-            ),
-            "threshold_positive_margin": float(training_config.threshold_positive_margin),
-            "threshold_negative_margin": float(training_config.threshold_negative_margin),
-            "threshold_positive_margin_weight": float(
-                training_config.threshold_positive_margin_weight
-            ),
-            "threshold_negative_margin_weight": float(
-                training_config.threshold_negative_margin_weight
-            ),
-            "direct_solver_gradient_clip": float(
-                training_config.direct_solver_gradient_clip
-            ),
-            "direct_aero_gradient_max_norm": float(
-                training_config.direct_aero_gradient_max_norm
-            ),
-            "direct_occupancy_gradient_max_norm": float(
-                training_config.direct_occupancy_gradient_max_norm
-            ),
-            "direct_connectivity_gradient_max_norm": float(
-                training_config.direct_connectivity_gradient_max_norm
-            ),
-            "direct_validity_gradient_max_norm": float(
-                training_config.direct_validity_gradient_max_norm
-            ),
-        },
+        "configuration": _build_objective_configuration_fingerprint(
+            args=args,
+            training_config=training_config,
+            model_config=model_config,
+            diffusion_config=diffusion_config,
+            cfd_config=cfd_config,
+            geometry_probability_threshold=trainer.geometry_probability_threshold,
+            sample_order=sample_order,
+            promotion_sample_order=_dataset_sample_order(promotion_dataset),
+        ),
     }
 
     save_dir = Path(args.save_dir).resolve()
@@ -1083,6 +1123,10 @@ def main() -> int:
                 f"{run_state_target}"
             )
             break
+        _reset_epoch_checkpoint_segment(
+            resume_state_info,
+            next_epoch=epoch + 1,
+        )
         if args.checkpoint_every_updates > 0:
             trainer.save_run_state(
                 run_state_target,

@@ -27,7 +27,7 @@ import threading
 import multiprocessing as mp
 import random
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence
+from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence, Iterable
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -1207,6 +1207,22 @@ class LBMPhysicsConfig:
     use_shape_drag_correction: bool = bool(
         config_value("cfd", "use_shape_drag_correction", False)
     )
+
+
+def capture_data_anchor_gradients(
+    parameters: Iterable[torch.nn.Parameter],
+    reconstruction_loss: torch.Tensor,
+    *,
+    exact_margin_loss: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[torch.Tensor], ...]:
+    """Capture the data anchor after every grounded data term is backpropagated."""
+    total_loss = reconstruction_loss
+    if exact_margin_loss is not None:
+        total_loss = total_loss + exact_margin_loss
+    total_loss.backward()
+    gradients = capture_gradients(parameters)
+    clear_gradients(parameters)
+    return gradients
     shape_drag_correction_coefficients: Tuple[float, ...] = (
         -12.633030612111941, 27.87582461044955, -10.247055184812014,
         22.962648171191816, -17.337224317584685, -3.946645931513679,
@@ -4030,6 +4046,10 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         grad_estimate = torch.zeros_like(fields)
         base_losses: List[float] = []
         base_component_records: List[Dict[str, float]] = []
+        accepted_guard_gradients: Dict[str, List[torch.Tensor]] = {
+            name: []
+            for name in ("connectivity_loss", "aircraft_validity_loss")
+        }
         eps = max(float(perturbation), 1.0e-6)
         generator = torch.Generator(device=fields.device)
         generator.manual_seed(int(seed) % (2**63 - 1))
@@ -4251,7 +4271,32 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     {},
                 )
             )
-            accepted_component_grads = {"combined": accepted_component_grads[0]}
+            if guard_gradients:
+                guard_component_values = guard_gradients
+                combined_component_gradient = accepted_component_grads[0]
+            else:
+                guard_component_values = accepted_component_grads
+                combined_component_gradient = None
+                for component_value in accepted_component_grads.values():
+                    if component_value is None:
+                        continue
+                    combined_component_gradient = (
+                        component_value.detach().clone()
+                        if combined_component_gradient is None
+                        else combined_component_gradient + component_value
+                    )
+            for guard_name in accepted_guard_gradients:
+                guard_value = guard_component_values.get(guard_name)
+                if isinstance(guard_value, tuple):
+                    guard_value = guard_value[0]
+                if guard_value is None:
+                    guard_value = torch.zeros_like(sample_field)
+                accepted_guard_gradients[guard_name].append(
+                    guard_value.detach().clone()
+                )
+            if combined_component_gradient is None:
+                combined_component_gradient = torch.zeros_like(sample_field)
+            accepted_component_grads = {"combined": combined_component_gradient}
             base_components["active_guard_set"] = list(active_guard_names)
             base_components["guard_active_connectivity"] = float(
                 "connectivity_loss" in active_guard_names
@@ -4353,6 +4398,11 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         ctx.original_ndim = original_ndim
         mean_loss = float(np.mean(base_losses)) if base_losses else 0.0
         component_sink.clear()
+        component_sink["_accepted_guard_gradients"] = {
+            name: torch.stack(values, dim=0).div(max(batch_size, 1))
+            for name, values in accepted_guard_gradients.items()
+            if values
+        }
         if base_component_records:
             for key in base_component_records[0]:
                 values = [record[key] for record in base_component_records if key in record]
@@ -4696,6 +4746,11 @@ class OptimizedDiffusionTrainer:
         """Restore an interrupted run after its original scheduler is configured."""
         resolved_path = resolve_run_state_path(path)
         state = torch.load(resolved_path, map_location=self.device, weights_only=False)
+        self._set_geometry_probability_threshold(
+            state["geometry_probability_threshold"],
+            calibrated=bool(state.get("geometry_threshold_calibrated", True)),
+            calibration=state.get("geometry_threshold_calibration"),
+        )
         actual_compatibility = state.get("compatibility", {})
         mismatches = validate_run_state_compatibility(
             actual_compatibility,
@@ -4731,11 +4786,6 @@ class OptimizedDiffusionTrainer:
         self.scaler.load_state_dict(state.get("scaler", {}))
         self.global_step = int(state["global_step"])
         self.consistency_update_step = int(state.get("consistency_update_step", 0))
-        self._set_geometry_probability_threshold(
-            state["geometry_probability_threshold"],
-            calibrated=bool(state.get("geometry_threshold_calibrated", True)),
-            calibration=state.get("geometry_threshold_calibration"),
-        )
         restore_rng_state(state["rng"])
         self._sync_consistency_teacher()
         return {
@@ -5066,6 +5116,117 @@ class OptimizedDiffusionTrainer:
             ).backward()
         return full_loss.detach()
 
+    def _backward_full_grounded_threshold_margin(
+        self,
+        latent: torch.Tensor,
+        geometry_target: torch.Tensor,
+        *,
+        loss_scale: float,
+    ) -> torch.Tensor:
+        """Backpropagate the exact calibrated margin through the student path."""
+        if not self.geometry_threshold_calibrated:
+            return latent.new_zeros(())
+        scale = float(loss_scale)
+        if scale == 0.0:
+            return latent.new_zeros(())
+
+        if getattr(self.converter, "decoder_mode", "dense") == "dense":
+            logits = self.converter(latent).nan_to_num(0.0).float()
+            loss = grounded_threshold_margin_loss(
+                logits,
+                geometry_target.float(),
+                threshold=self.geometry_probability_threshold,
+                positive_margin=self.training_config.threshold_positive_margin,
+                negative_margin=self.training_config.threshold_negative_margin,
+                positive_weight=self.training_config.threshold_positive_margin_weight,
+                negative_weight=self.training_config.threshold_negative_margin_weight,
+                from_logits=True,
+            ) * scale
+            loss.backward()
+            return loss.detach()
+
+        flat_target = geometry_target.float().reshape(geometry_target.shape[0], -1)
+        total_voxels = int(flat_target.shape[1])
+        chunk_size = max(1, int(self.model_config.coordinate_chunk_size))
+        positive_count = flat_target.sum().clamp_min(0.0)
+        negative_count = (flat_target.numel() - positive_count).clamp_min(0.0)
+        positive_boundary = min(
+            1.0 - torch.finfo(flat_target.dtype).eps,
+            float(self.geometry_probability_threshold)
+            + float(self.training_config.threshold_positive_margin),
+        )
+        negative_boundary = max(
+            0.0,
+            float(self.geometry_probability_threshold)
+            - float(self.training_config.threshold_negative_margin),
+        )
+
+        positive_sum = flat_target.new_zeros(())
+        negative_sum = flat_target.new_zeros(())
+        with torch.no_grad():
+            for start in range(0, total_voxels, chunk_size):
+                stop = min(start + chunk_size, total_voxels)
+                indices = torch.arange(start, stop, device=self.device)
+                target_chunk = flat_target.index_select(1, indices)
+                logits = self.converter.forward_flat_indices(latent, indices).float()
+                probabilities = torch.sigmoid(logits).nan_to_num(0.0)
+                positive_mask = target_chunk > 0.5
+                negative_mask = ~positive_mask
+                positive_sum += (
+                    (positive_boundary - probabilities).clamp_min(0.0).square()
+                    * positive_mask
+                ).sum()
+                negative_sum += (
+                    (probabilities - negative_boundary).clamp_min(0.0).square()
+                    * negative_mask
+                ).sum()
+
+        positive_loss = (
+            positive_sum / positive_count
+            if float(positive_count.item()) > 0.0
+            else flat_target.new_zeros(())
+        )
+        negative_loss = (
+            negative_sum / negative_count
+            if float(negative_count.item()) > 0.0
+            else flat_target.new_zeros(())
+        )
+        detached_loss = scale * (
+            float(self.training_config.threshold_positive_margin_weight)
+            * positive_loss
+            + float(self.training_config.threshold_negative_margin_weight)
+            * negative_loss
+        )
+        for start in range(0, total_voxels, chunk_size):
+            stop = min(start + chunk_size, total_voxels)
+            indices = torch.arange(start, stop, device=self.device)
+            target_chunk = flat_target.index_select(1, indices)
+            logits = self.converter.forward_flat_indices(latent, indices).float()
+            probabilities = torch.sigmoid(logits).nan_to_num(0.0)
+            positive_mask = target_chunk > 0.5
+            negative_mask = ~positive_mask
+            chunk_loss = logits.new_zeros(())
+            if float(positive_count.item()) > 0.0:
+                chunk_loss = chunk_loss + (
+                    float(self.training_config.threshold_positive_margin_weight)
+                    * (
+                        (positive_boundary - probabilities).clamp_min(0.0).square()
+                        * positive_mask
+                    ).sum()
+                    / positive_count
+                )
+            if float(negative_count.item()) > 0.0:
+                chunk_loss = chunk_loss + (
+                    float(self.training_config.threshold_negative_margin_weight)
+                    * (
+                        (probabilities - negative_boundary).clamp_min(0.0).square()
+                        * negative_mask
+                    ).sum()
+                    / negative_count
+                )
+            (scale * chunk_loss).backward()
+        return detached_loss.detach()
+
     def train_epoch(
         self,
         train_loader: DataLoader,
@@ -5303,27 +5464,6 @@ class OptimizedDiffusionTrainer:
                     population_positive_counts=population_positive_counts,
                     population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
-                if self.geometry_threshold_calibrated:
-                    geometry_loss_val = geometry_loss_val + grounded_threshold_margin_loss(
-                        geom_logits_sample,
-                        target_sample,
-                        threshold=self.geometry_probability_threshold,
-                        positive_margin=self.training_config.threshold_positive_margin,
-                        negative_margin=self.training_config.threshold_negative_margin,
-                        positive_weight=self.training_config.threshold_positive_margin_weight,
-                        negative_weight=self.training_config.threshold_negative_margin_weight,
-                        from_logits=True,
-                    )
-                    generation_geometry_loss_val = generation_geometry_loss_val + grounded_threshold_margin_loss(
-                        generation_geom_logits_sample,
-                        target_sample,
-                        threshold=self.geometry_probability_threshold,
-                        positive_margin=self.training_config.threshold_positive_margin,
-                        negative_margin=self.training_config.threshold_negative_margin,
-                        positive_weight=self.training_config.threshold_positive_margin_weight,
-                        negative_weight=self.training_config.threshold_negative_margin_weight,
-                        from_logits=True,
-                    )
                 if run_optimizer_grid_loss:
                     with torch.no_grad():
                         direct_solver_field = self.converter(
@@ -5353,28 +5493,6 @@ class OptimizedDiffusionTrainer:
                     geometry_target.float(),
                     dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
-                if self.geometry_threshold_calibrated:
-                    geometry_loss_val = geometry_loss_val + grounded_threshold_margin_loss(
-                        geom_logits.float(),
-                        geometry_target.float(),
-                        threshold=self.geometry_probability_threshold,
-                        positive_margin=self.training_config.threshold_positive_margin,
-                        negative_margin=self.training_config.threshold_negative_margin,
-                        positive_weight=self.training_config.threshold_positive_margin_weight,
-                        negative_weight=self.training_config.threshold_negative_margin_weight,
-                        from_logits=True,
-                    )
-                    generation_geometry_loss_val = generation_geometry_loss_val + grounded_threshold_margin_loss(
-                        generation_geom_logits.float(),
-                        geometry_target.float(),
-                        threshold=self.geometry_probability_threshold,
-                        positive_margin=self.training_config.threshold_positive_margin,
-                        negative_margin=self.training_config.threshold_negative_margin,
-                        positive_weight=self.training_config.threshold_positive_margin_weight,
-                        negative_weight=self.training_config.threshold_negative_margin_weight,
-                        from_logits=True,
-                    )
-
             direct_solver_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_evaluated = False
             run_direct_solver_loss = (
@@ -5418,6 +5536,29 @@ class OptimizedDiffusionTrainer:
             # a small finite contribution.
             self.optimizer.zero_grad()
             data_optimization_loss_val.backward()
+            exact_generation_margin_loss_val = (
+                self._backward_full_grounded_threshold_margin(
+                    generation_latent,
+                    geometry_target,
+                    loss_scale=float(
+                        self.training_config.generation_reconstruction_weight
+                    ),
+                )
+                if self.geometry_threshold_calibrated
+                else data_optimization_loss_val.detach().new_zeros(())
+            )
+            data_optimization_loss_val = (
+                data_optimization_loss_val.detach()
+                + exact_generation_margin_loss_val
+            )
+            generation_weight = float(
+                self.training_config.generation_reconstruction_weight
+            )
+            if generation_weight != 0.0:
+                generation_geometry_loss_val = (
+                    generation_geometry_loss_val.detach()
+                    + exact_generation_margin_loss_val / generation_weight
+                )
             student_data_gradients = capture_gradients(student_parameters)
             clear_gradients(student_parameters)
 
@@ -5432,6 +5573,9 @@ class OptimizedDiffusionTrainer:
                 )
             clear_gradients(student_parameters)
             student_direct_gradients = tuple(None for _ in student_parameters)
+            student_topology_guard_gradients: Dict[
+                str, Tuple[Optional[torch.Tensor], ...]
+            ] = {}
             optimization_loss_val = (
                 data_optimization_loss_val.detach() + consistency_loss.detach()
             )
@@ -5454,6 +5598,11 @@ class OptimizedDiffusionTrainer:
                 direct_logit_gradient = direct_logit_gradient.detach()
                 direct_solver_loss_val = measured_direct_loss.detach()
                 del measured_direct_loss, direct_logit_leaf
+                parameter_guard_logit_gradients = (
+                    self.direct_solver_loss.last_components.pop(
+                        "_accepted_guard_gradients", {}
+                    )
+                )
 
                 # Replay the exact free-running inference path after CFD. This
                 # applies the measured SPSA gradient to the model used at
@@ -5471,11 +5620,30 @@ class OptimizedDiffusionTrainer:
                 direct_optimizer_logits = self.converter(
                     direct_generation_latent
                 ).nan_to_num(0.0)
-                direct_optimizer_logits.backward(
-                    gradient=(
-                        float(self.training_config.direct_solver_loss_weight)
-                        * direct_logit_gradient
+                direct_weight = float(
+                    self.training_config.direct_solver_loss_weight
+                )
+                topology_guard_names = {
+                    "connectivity_loss": "connectivity",
+                    "aircraft_validity_loss": "validity",
+                }
+                for source_name, guard_name in topology_guard_names.items():
+                    guard_logit_gradient = parameter_guard_logit_gradients.get(
+                        source_name
                     )
+                    if guard_logit_gradient is None:
+                        continue
+                    self.optimizer.zero_grad()
+                    direct_optimizer_logits.backward(
+                        gradient=direct_weight * guard_logit_gradient,
+                        retain_graph=True,
+                    )
+                    student_topology_guard_gradients[guard_name] = (
+                        capture_gradients(student_parameters)
+                    )
+                    clear_gradients(student_parameters)
+                direct_optimizer_logits.backward(
+                    gradient=direct_weight * direct_logit_gradient
                 )
                 student_direct_gradients = capture_gradients(student_parameters)
                 clear_gradients(student_parameters)
@@ -5563,6 +5731,10 @@ class OptimizedDiffusionTrainer:
                     if self.training_config.project_conflicting_direct_gradient
                     else ()
                 ),
+                final_guard_branches={
+                    "data": student_data_gradients,
+                    **student_topology_guard_gradients,
+                },
             )
             student_gradient_cosines = {
                 "data_consistency": gradient_cosine_similarity(

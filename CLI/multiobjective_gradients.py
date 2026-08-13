@@ -568,8 +568,17 @@ def combine_gradient_branches(
     *,
     conflict_anchor: Optional[str] = None,
     project_conflicting_branches: Sequence[str] = (),
+    final_guard_branches: Optional[
+        Mapping[str, Sequence[Optional[torch.Tensor]]]
+    ] = None,
 ) -> dict[str, BranchGradientTelemetry]:
-    """Independently limit named branches and replace target ``.grad`` buffers."""
+    """Independently limit branches and enforce final parameter-space guards.
+
+    ``final_guard_branches`` are the already-measured parameter-space guard
+    directions.  They remain separate through the final combination so a
+    topology guard cannot be lost when voxel-space direct components are
+    collapsed into one student branch.
+    """
 
     parameter_list = tuple(parameters)
     unknown_limits = set(max_norms).difference(branches)
@@ -600,6 +609,14 @@ def combine_gradient_branches(
         )
         telemetry[branch_name] = branch_telemetry
         applied_branches[branch_name] = applied
+
+    final_guards = dict(final_guard_branches or {})
+    for guard_name, gradients in final_guards.items():
+        _validate_branch_against_parameters(
+            parameter_list,
+            tuple(gradients),
+            branch_name=f"final guard {guard_name}",
+        )
 
     projected_names = tuple(project_conflicting_branches)
     if conflict_anchor is None and projected_names:
@@ -717,6 +734,38 @@ def combine_gradient_branches(
             anchor_cosine_after=final_anchor_cosine_after,
             conflict_projected=projected,
             projection_norm=final_projection_norm,
+        )
+
+    if final_guards:
+        accepted_final, final_guard_telemetry = (
+            project_improvement_gradients_against_guards(
+                {"final_update": tuple(combined)},
+                final_guards,
+                guard_order=("data", "reconstruction", "connectivity", "validity"),
+            )
+        )
+        combined = list(accepted_final["final_update"])
+        final_update_telemetry = final_guard_telemetry["final_update"]
+        telemetry["final_guard_invariant"] = BranchGradientTelemetry(
+            raw_norm=gradient_l2_norm(
+                tuple(combined), branch_name="final_update"
+            ),
+            applied_norm=gradient_l2_norm(
+                tuple(combined), branch_name="final_update"
+            ),
+            scale=1.0,
+            present=any(value is not None for value in combined),
+            nonzero=gradient_l2_norm(
+                tuple(combined), branch_name="final_update"
+            ) > 0.0,
+            anchor_cosine_before=float(
+                final_update_telemetry["pre_cosines"].get("data", 0.0)
+            ),
+            anchor_cosine_after=float(
+                final_update_telemetry["post_cosines"].get("data", 0.0)
+            ),
+            conflict_projected=bool(final_update_telemetry["projected"]),
+            projection_norm=float(final_update_telemetry["projection_norm"]),
         )
 
     gradient_l2_norm(combined, branch_name="<combined>")
