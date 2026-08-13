@@ -76,6 +76,10 @@ class TrainingConfig:
     precision: str = 'float32'
     save_interval: int = 5
     val_interval: int = 2
+    threshold_positive_margin: float = 0.05
+    threshold_negative_margin: float = 0.05
+    threshold_positive_margin_weight: float = 1.0
+    threshold_negative_margin_weight: float = 1.0
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages

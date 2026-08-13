@@ -142,6 +142,10 @@ training:
   geometry_materialization_threshold: 0.5
   calibrate_geometry_materialization_threshold: true
   geometry_threshold_calibration_samples: 16
+  threshold_positive_margin: 0.05
+  threshold_negative_margin: 0.05
+  threshold_positive_margin_weight: 1.0
+  threshold_negative_margin_weight: 1.0
   require_direct_solver_every_iteration: true
 
 cfd:

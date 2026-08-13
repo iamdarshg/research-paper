@@ -3,6 +3,7 @@ import random
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -34,6 +35,8 @@ from aircraft_diffusion_cfd import (
     capture_rng_state,
     restore_rng_state,
     validate_run_state_compatibility,
+    grounded_threshold_margin_loss,
+    validate_solver_integrated_training_config,
 )
 
 
@@ -96,6 +99,87 @@ def test_run_state_compatibility_reports_all_immutable_mismatches():
         "split",
         "sample_count",
     ]
+
+
+def test_threshold_margin_loss_is_zero_when_both_classes_clear_fixed_threshold():
+    probabilities = torch.tensor([0.9, 0.8, 0.1, 0.2], requires_grad=True)
+    target = torch.tensor([1.0, 1.0, 0.0, 0.0])
+
+    loss = grounded_threshold_margin_loss(
+        probabilities,
+        target,
+        threshold=0.5,
+        positive_margin=0.1,
+        negative_margin=0.1,
+    )
+
+    assert loss.item() == 0.0
+    loss.backward()
+    assert torch.isfinite(probabilities.grad).all()
+
+
+def test_threshold_margin_loss_penalizes_disappearing_and_false_solid_voxels():
+    probabilities = torch.tensor([0.51, 0.99], requires_grad=True)
+    target = torch.tensor([1.0, 0.0])
+
+    loss = grounded_threshold_margin_loss(
+        probabilities,
+        target,
+        threshold=0.7,
+        positive_margin=0.1,
+        negative_margin=0.1,
+    )
+
+    assert loss.item() > 0.0
+    loss.backward()
+    assert torch.isfinite(probabilities.grad).all()
+    assert probabilities.grad[0] < 0
+    assert probabilities.grad[1] > 0
+
+
+def test_threshold_margin_loss_normalizes_positive_and_negative_regions_independently():
+    balanced = grounded_threshold_margin_loss(
+        torch.tensor([0.7, 0.7, 0.7, 0.7]),
+        torch.tensor([1.0, 1.0, 0.0, 0.0]),
+        threshold=0.5,
+        positive_margin=0.2,
+        negative_margin=0.2,
+    )
+    sparse = grounded_threshold_margin_loss(
+        torch.tensor([0.7, 0.7, 0.7, 0.7]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        threshold=0.5,
+        positive_margin=0.2,
+        negative_margin=0.2,
+    )
+
+    assert balanced.item() == pytest.approx(sparse.item())
+
+
+def test_threshold_margin_loss_uses_configured_threshold_not_batch_topk():
+    loss = grounded_threshold_margin_loss(
+        torch.tensor([0.55, 0.54, 0.01, 0.0]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        threshold=0.5,
+        positive_margin=0.1,
+        negative_margin=0.1,
+    )
+
+    assert loss.item() > 0.0
+
+
+def test_threshold_margin_configuration_rejects_invalid_values():
+    with pytest.raises(ValueError, match="threshold_positive_margin"):
+        validate_solver_integrated_training_config(
+            TrainingConfig(threshold_positive_margin=-0.1)
+        )
+    with pytest.raises(ValueError, match="threshold_positive_margin"):
+        validate_solver_integrated_training_config(
+            TrainingConfig(
+                geometry_materialization_threshold=0.9,
+                threshold_positive_margin=0.1,
+            )
+        )
 
 
 def test_grouped_query_attention_shares_key_value_heads_and_preserves_shape():

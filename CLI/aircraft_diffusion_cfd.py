@@ -439,6 +439,18 @@ class TrainingConfig:
     geometry_threshold_calibration_samples: int = int(
         config_value("training", "geometry_threshold_calibration_samples", 16)
     )
+    threshold_positive_margin: float = float(
+        config_value("training", "threshold_positive_margin", 0.05)
+    )
+    threshold_negative_margin: float = float(
+        config_value("training", "threshold_negative_margin", 0.05)
+    )
+    threshold_positive_margin_weight: float = float(
+        config_value("training", "threshold_positive_margin_weight", 1.0)
+    )
+    threshold_negative_margin_weight: float = float(
+        config_value("training", "threshold_negative_margin_weight", 1.0)
+    )
     require_direct_solver_every_iteration: bool = bool(config_value("training", "require_direct_solver_every_iteration", True))
     overfit_stop_enabled: bool = False
     overfit_stop_metric: str = "optimization_loss"
@@ -519,6 +531,22 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
         errors.append("geometry_materialization_threshold must be in (0, 1)")
     if int(training_config.geometry_threshold_calibration_samples) <= 0:
         errors.append("geometry_threshold_calibration_samples must be greater than 0")
+    if float(training_config.threshold_positive_margin) < 0.0:
+        errors.append("threshold_positive_margin must be nonnegative")
+    if float(training_config.threshold_negative_margin) < 0.0:
+        errors.append("threshold_negative_margin must be nonnegative")
+    if float(training_config.threshold_positive_margin_weight) < 0.0:
+        errors.append("threshold_positive_margin_weight must be nonnegative")
+    if float(training_config.threshold_negative_margin_weight) < 0.0:
+        errors.append("threshold_negative_margin_weight must be nonnegative")
+    if (
+        float(training_config.geometry_materialization_threshold)
+        + float(training_config.threshold_positive_margin)
+        >= 1.0
+    ):
+        errors.append(
+            "geometry_materialization_threshold + threshold_positive_margin must be less than 1"
+        )
     if not (
         0.0
         <= float(training_config.overfit_min_generated_mean_occupied_fraction)
@@ -913,6 +941,74 @@ def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -
     if not class_terms:
         return losses.mean()
     return torch.stack(class_terms).mean()
+
+
+def grounded_threshold_margin_loss(
+    probabilities_or_logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    threshold: float,
+    positive_margin: float,
+    negative_margin: float,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    from_logits: bool = False,
+    return_components: bool = False,
+) -> Union[torch.Tensor, Dict[str, Any]]:
+    """Keep both target classes separated from the fixed materialization threshold."""
+    threshold_value = float(threshold)
+    positive_margin_value = float(positive_margin)
+    negative_margin_value = float(negative_margin)
+    positive_weight_value = float(positive_weight)
+    negative_weight_value = float(negative_weight)
+    if not 0.0 < threshold_value < 1.0:
+        raise ValueError("threshold must be in (0, 1)")
+    if positive_margin_value < 0.0 or negative_margin_value < 0.0:
+        raise ValueError("margins must be nonnegative")
+    if positive_weight_value < 0.0 or negative_weight_value < 0.0:
+        raise ValueError("weights must be nonnegative")
+    if threshold_value + positive_margin_value >= 1.0:
+        raise ValueError("threshold + positive_margin must be less than 1")
+
+    target_tensor = target.to(
+        device=probabilities_or_logits.device,
+        dtype=torch.float32,
+    )
+    values = (
+        torch.sigmoid(probabilities_or_logits.float())
+        if from_logits
+        else probabilities_or_logits.float()
+    ).clamp(0.0, 1.0)
+    if values.shape != target_tensor.shape:
+        raise ValueError(
+            "threshold margin probabilities and target must have matching shapes"
+        )
+    positive_mask = target_tensor > 0.5
+    negative_mask = ~positive_mask
+    positive_boundary = min(1.0 - torch.finfo(values.dtype).eps, threshold_value + positive_margin_value)
+    negative_boundary = max(0.0, threshold_value - negative_margin_value)
+    positive_penalty = (positive_boundary - values).clamp_min(0.0).square()
+    negative_penalty = (values - negative_boundary).clamp_min(0.0).square()
+    zero = values.sum() * 0.0
+    positive_loss = positive_penalty[positive_mask].mean() if bool(positive_mask.any()) else zero
+    negative_loss = negative_penalty[negative_mask].mean() if bool(negative_mask.any()) else zero
+    loss = positive_weight_value * positive_loss + negative_weight_value * negative_loss
+    if not torch.isfinite(loss):
+        raise FloatingPointError("threshold margin loss is nonfinite")
+    if return_components:
+        return {
+            "loss": loss,
+            "threshold_positive_margin_loss": positive_loss,
+            "threshold_negative_margin_loss": negative_loss,
+            "threshold_positive_voxel_count": int(positive_mask.sum().item()),
+            "threshold_negative_voxel_count": int(negative_mask.sum().item()),
+            "threshold_positive_margin": positive_margin_value,
+            "threshold_negative_margin": negative_margin_value,
+            "threshold_positive_margin_weight": positive_weight_value,
+            "threshold_negative_margin_weight": negative_weight_value,
+            "geometry_probability_threshold": threshold_value,
+        }
+    return loss
 
 
 def soft_dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -4312,6 +4408,7 @@ class OptimizedDiffusionTrainer:
             "source": "config",
             "threshold": self.geometry_probability_threshold,
         }
+        self.last_threshold_margin_components: Dict[str, Any] = {}
         self.direct_solver_loss = DirectSolverSPSALoss(
             cfd_steps=training_config.direct_solver_steps,
             perturbation=training_config.direct_solver_perturbation,
@@ -4684,6 +4781,8 @@ class OptimizedDiffusionTrainer:
         negative_count = (flat_target.numel() - positive_count).clamp_min(0.0)
         positive_bce_sum = flat_target.new_zeros(())
         negative_bce_sum = flat_target.new_zeros(())
+        positive_margin_sum = flat_target.new_zeros(())
+        negative_margin_sum = flat_target.new_zeros(())
         intersection = flat_target.new_zeros((batch_size,))
         prediction_mass = flat_target.new_zeros((batch_size,))
         target_mass = flat_target.sum(dim=1)
@@ -4701,6 +4800,24 @@ class OptimizedDiffusionTrainer:
                     positive_bce_sum += bce[positive_mask].sum()
                 if bool((~positive_mask).any().item()):
                     negative_bce_sum += bce[~positive_mask].sum()
+                positive_boundary = min(
+                    1.0 - torch.finfo(probabilities.dtype).eps,
+                    float(self.geometry_probability_threshold)
+                    + float(self.training_config.threshold_positive_margin),
+                )
+                negative_boundary = max(
+                    0.0,
+                    float(self.geometry_probability_threshold)
+                    - float(self.training_config.threshold_negative_margin),
+                )
+                positive_margin_sum += (
+                    (positive_boundary - probabilities).clamp_min(0.0).square()
+                    * positive_mask
+                ).sum()
+                negative_margin_sum += (
+                    (probabilities - negative_boundary).clamp_min(0.0).square()
+                    * (~positive_mask)
+                ).sum()
                 intersection += (probabilities * target_chunk).sum(dim=1)
                 prediction_mass += probabilities.sum(dim=1)
 
@@ -4717,6 +4834,35 @@ class OptimizedDiffusionTrainer:
         denominator = prediction_mass + target_mass + 1.0
         dice_loss = (1.0 - numerator / denominator).mean()
         full_loss = balanced_bce + self.training_config.geometry_dice_weight * dice_loss
+        margin_enabled = bool(self.geometry_threshold_calibrated)
+        positive_margin_loss = (
+            positive_margin_sum / positive_count
+            if margin_enabled and float(positive_count.item()) > 0.0
+            else flat_target.new_zeros(())
+        )
+        negative_margin_loss = (
+            negative_margin_sum / negative_count
+            if margin_enabled and float(negative_count.item()) > 0.0
+            else flat_target.new_zeros(())
+        )
+        threshold_margin_loss = (
+            float(self.training_config.threshold_positive_margin_weight)
+            * positive_margin_loss
+            + float(self.training_config.threshold_negative_margin_weight)
+            * negative_margin_loss
+        )
+        full_loss = full_loss + threshold_margin_loss
+        self.last_threshold_margin_components = {
+            "threshold_positive_margin_loss": float(positive_margin_loss.detach().item()),
+            "threshold_negative_margin_loss": float(negative_margin_loss.detach().item()),
+            "threshold_positive_voxel_count": int(positive_count.item()),
+            "threshold_negative_voxel_count": int(negative_count.item()),
+            "threshold_positive_margin": float(self.training_config.threshold_positive_margin),
+            "threshold_negative_margin": float(self.training_config.threshold_negative_margin),
+            "threshold_positive_margin_weight": float(self.training_config.threshold_positive_margin_weight),
+            "threshold_negative_margin_weight": float(self.training_config.threshold_negative_margin_weight),
+            "geometry_probability_threshold": float(self.geometry_probability_threshold),
+        }
 
         positive_dice_coefficient = -(
             2.0 * denominator - numerator
@@ -4739,6 +4885,25 @@ class OptimizedDiffusionTrainer:
             if float(negative_count.item()) > 0.0:
                 chunk_bce = chunk_bce + bce[~positive_mask].sum() / negative_count
             chunk_bce = chunk_bce / max(class_count, 1)
+            chunk_margin = logits.new_zeros(())
+            if margin_enabled and float(positive_count.item()) > 0.0:
+                chunk_margin = chunk_margin + (
+                    float(self.training_config.threshold_positive_margin_weight)
+                    * (
+                        (positive_boundary - probabilities).clamp_min(0.0).square()
+                        * positive_mask
+                    ).sum()
+                    / positive_count
+                )
+            if margin_enabled and float(negative_count.item()) > 0.0:
+                chunk_margin = chunk_margin + (
+                    float(self.training_config.threshold_negative_margin_weight)
+                    * (
+                        (probabilities - negative_boundary).clamp_min(0.0).square()
+                        * (~positive_mask)
+                    ).sum()
+                    / negative_count
+                )
             dice_coefficients = torch.where(
                 positive_mask,
                 positive_dice_coefficient[:, None],
@@ -4753,6 +4918,7 @@ class OptimizedDiffusionTrainer:
                     chunk_bce
                     + self.training_config.geometry_dice_weight
                     * chunk_dice_gradient_objective
+                    + chunk_margin
                 )
             ).backward()
         return full_loss.detach()
@@ -4768,6 +4934,7 @@ class OptimizedDiffusionTrainer:
         self.diffusion_model.train()
         self.converter.train()
         self.consistency_model.student_model.train()
+        self.last_threshold_margin_components = {}
 
         total_optimization_loss = 0.0
         total_mse = 0.0
@@ -5154,6 +5321,27 @@ class OptimizedDiffusionTrainer:
                     geometry_target.float(),
                     dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
+                if self.geometry_threshold_calibrated:
+                    margin_components = grounded_threshold_margin_loss(
+                        torch.sigmoid(grounded_full_logits.float()),
+                        geometry_target.float(),
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        return_components=True,
+                    )
+                    grounded_full_loss = grounded_full_loss + margin_components["loss"]
+                    self.last_threshold_margin_components = {
+                        key: (
+                            float(value.detach().item())
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                        for key, value in margin_components.items()
+                        if key != "loss"
+                    }
                 (
                     self.training_config.clean_geometry_reconstruction_weight
                     * grounded_full_loss
@@ -5361,7 +5549,20 @@ class OptimizedDiffusionTrainer:
                                 latent_reconstruction_loss_val.item()
                             ),
                             "direct_solver": float(direct_solver_loss_val.item()),
+                            "threshold_positive_margin_loss": float(
+                                self.last_threshold_margin_components.get(
+                                    "threshold_positive_margin_loss", 0.0
+                                )
+                            ),
+                            "threshold_negative_margin_loss": float(
+                                self.last_threshold_margin_components.get(
+                                    "threshold_negative_margin_loss", 0.0
+                                )
+                            ),
                         },
+                        "threshold_margin": dict(
+                            self.last_threshold_margin_components
+                        ),
                         "consistency": {
                             "evaluated": bool(consistency_loss.requires_grad),
                             **(
