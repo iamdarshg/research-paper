@@ -2,6 +2,10 @@
 
 Status: `DONE_WITH_CONCERNS`
 
+Review-round status: the implementation fixes from `f4e29c0` passed the fresh
+full suite, but this report's real-smoke artifacts predate that fix round. No
+new real smoke was run.
+
 ## Scope
 
 This record covers the single permitted bounded real smoke for Tasks 1 through
@@ -47,12 +51,24 @@ python -u CLI/run_monitored_training.py --manifest build/grounded_combined_1k_20
 - Promotion result: `NOT RUN`. The process did not complete an epoch and no
   candidate was promoted.
 
+## Review-Round Verification Boundary
+
+The focused review suite passed `13 tests`, the combined focused suites passed
+`120 tests`, and the fresh full suite passed `423 tests` with three existing
+warnings. These tests verify deterministic interrupted-versus-uninterrupted
+trajectory continuation, processed-suffix coverage, durable JSONL/run-state
+reconciliation, `.previous` recovery, fail-closed validation split handling,
+promotion-baseline identity preservation, objective/epoch compatibility, the
+final parameter-space guard invariant, and calibrated-threshold margin
+clamping. They do not substitute for a real 96-cubed interruption/resume.
+
 ## Integrity Boundary
 
 `--resume-run-state` remains distinct from model-only `--resume-from`.
 Run-state compatibility, RNG restoration, atomic replacement, bounded cadence,
-and processed-prefix solver coverage have focused tests. The real smoke did
-not produce a state file from which to demonstrate a live continuation.
+processed-prefix solver coverage, durable log reconciliation, and promotion
+baseline identity have focused tests. The real smoke did not produce a state
+file from which to demonstrate a live continuation.
 
 The run used measured LBM evaluations and did not introduce a surrogate. No
 solver component or evaluator was removed. The transient smoke reported

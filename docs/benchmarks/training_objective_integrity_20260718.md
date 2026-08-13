@@ -169,3 +169,8 @@ completed within the execution window. No promotion result is claimed.
 This remains an internal recovery-training result. The smoke's five-step raw
 LBM force was transient (`lbm_converged=0`) and is not external-PDE ground
 truth or a claim-bearing aerodynamic coefficient.
+
+The review round (`f4e29c0`) added deterministic trajectory,
+crash-reconciliation, promotion-baseline, compatibility, final-guard, and
+calibrated-margin tests. Fresh verification passed `423` tests with three
+warnings. No additional real smoke was run in that round.
