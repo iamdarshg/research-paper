@@ -6,12 +6,11 @@ Status: `DONE_WITH_CONCERNS`
 
 Tasks 1 through 5 were implemented in order on branch
 `codex/constrained-aircraft-recovery`, based at `feef092`. Tasks 1 through 4
-are complete and committed. The review round's Critical and Important
-findings are addressed in `f4e29c0`. Task 5's focused and full-suite gates were run;
-the permitted real `96^3` smoke was started twice with the exact measured
-solver configuration, but execution time did not allow the requested
-8-update interruption/resume proof or promotion evaluation. No full epoch was
-launched.
+are complete and committed. Round 2's scoped Critical and Important findings
+are addressed in `432c8a9` and covered by production-path regressions. Task 5's
+focused and full-suite gates were run; no real `96^3` smoke was run in this
+round, so live interruption/resume and promotion remain unverified. No full
+epoch was launched.
 
 ## Commits
 
@@ -22,6 +21,7 @@ launched.
 - `9da675c` `fix: honor bounded interrupted training segments`
 - `1368133` `fix: stabilize measured guard projection`
 - `f4e29c0` `fix: close reviewed constrained recovery invariants`
+- `432c8a9` `fix: close round-two recovery integration defects`
 - documentation evidence commit containing this report
 
 Changed implementation and test paths across these commits:
@@ -61,18 +61,27 @@ Each task followed red/green TDD evidence:
    `pytest tests/test_training_stability.py tests/test_geometry_promotion_integrity.py tests/test_watch_training_progress.py -q` -> `21 passed`.
 5. Task 5 pre-smoke gate: `pytest -q` -> `409 passed, 3 warnings in 255.50s (0:04:15)`.
    Review-round focused suites -> `120 passed, 3 warnings`; dedicated review
-   regressions -> `13 passed, 3 warnings`. Fresh post-fix full suite:
+   regressions -> `13 passed, 3 warnings`. Fresh post-round-1 full suite:
    `pytest -q` -> `423 passed, 3 warnings in 281.04s (0:04:41)`.
 
 ## Review-Round Red/Green
 
-The new review regression module was initially red at collection because the
-required RNG-neutral loader helper did not exist. After implementation, its
-full set passed: `13 passed, 3 warnings`. The combined focused review suites
-passed `120 passed, 3 warnings`, including the deterministic 2+2 trajectory,
-8+24 JSONL reconciliation, final parameter-space invariant, missing validation
-split, original promotion-baseline identity, objective/epoch compatibility,
-and calibrated-margin tests. The fresh full suite then passed `423 passed`.
+The first review regression module was initially red at collection because the
+required RNG-neutral loader helper did not exist. That round's full set passed
+`13 passed, 3 warnings`. For round 2, the new production-path tests were
+initially red at collection because the final guard, runner fingerprint, saved
+threshold, cadence-reset, and data-anchor APIs did not exist. After
+`432c8a9`, the dedicated review module passed `18 passed, 3 warnings`.
+Affected solver/trainer/promotion suites passed `84 passed, 3 warnings`.
+The fresh full suite passed `428 passed, 3 warnings in 284.9s`.
+
+Round 2 specifically verifies that the final parameter update remains
+non-uphill against separate data, connectivity, and validity parameter-space
+guards; exact resume restores the saved threshold before compatibility
+comparison; the nested fingerprint covers model, objective, optimizer,
+consistency, clipping, EMA, branch limits, reconstruction, and margin
+settings; resumed next-epoch cadence starts at zero; and the exact
+full-lattice calibrated margin is present in the captured student data anchor.
 
 ## Smoke, Resume, and Promotion
 
@@ -103,21 +112,26 @@ handling, `.previous` recovery, and exact-vs-model-only resume distinctions
 are tested. No real `latest_run_state.pt` was created because neither smoke
 reached update 8.
 
-Promotion result: `NOT RUN`. No candidate was promoted, and no promotion
-claim is made.
+Round 2 smoke command: `NOT RUN BY INSTRUCTION`. The exact bounded command
+and exact `--resume-run-state` continuation command remain recorded in the
+smoke evidence document. The earlier one-update real attempt provides only
+historical evidence of 33 measured solver calls; it predates `432c8a9` and is
+not a validation of the current final-guard integration. Promotion result:
+`NOT RUN`. No candidate was promoted, and no promotion claim is made.
 
 ## Scientific and Engineering Concerns
 
-- The requested real smoke did not complete the 8-update interruption point,
-  so live exact-resume behavior and condition-based promotion remain
-  unverified on the 96-cubed run. Deterministic exact-resume behavior,
-  crash-safe reconciliation, split integrity, and promotion-baseline identity
-  are verified in focused tests only.
+- No real smoke was run in round 2, so live exact-resume behavior and
+  condition-based promotion remain unverified on the 96-cubed run.
+  Deterministic exact-resume behavior, crash-safe reconciliation, split
+  integrity, saved-threshold compatibility, complete objective fingerprint,
+  next-epoch cadence reset, and promotion-baseline identity are verified in
+  focused tests only.
 - The internal five-step LBM smoke reported `lbm_converged=0`; its measured
   forces are optimization inputs, not external-PDE ground truth or
   claim-bearing aerodynamic coefficients.
-- No real smoke was run in the review round by instruction. The fresh full
-  pytest result after the review fixes is `423 passed`.
+- No real smoke was run in round 2 by instruction. The fresh full pytest result
+  after the round-two fixes is `428 passed`.
 - The fixed global materialization threshold, held-out promotion split, and
   full validity objective remain intact. The `0.70` largest-component value is
   a hard guard and was not substituted for the validity objective.

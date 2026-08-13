@@ -2,9 +2,9 @@
 
 Status: `DONE_WITH_CONCERNS`
 
-Review-round status: the implementation fixes from `f4e29c0` passed the fresh
-full suite, but this report's real-smoke artifacts predate that fix round. No
-new real smoke was run.
+Round-2 status: the implementation fixes from `432c8a9` passed the fresh full
+suite. This document's real-smoke artifacts predate both review-fix rounds;
+no new real smoke was run by instruction.
 
 ## Scope
 
@@ -53,14 +53,16 @@ python -u CLI/run_monitored_training.py --manifest build/grounded_combined_1k_20
 
 ## Review-Round Verification Boundary
 
-The focused review suite passed `13 tests`, the combined focused suites passed
-`120 tests`, and the fresh full suite passed `423 tests` with three existing
-warnings. These tests verify deterministic interrupted-versus-uninterrupted
-trajectory continuation, processed-suffix coverage, durable JSONL/run-state
-reconciliation, `.previous` recovery, fail-closed validation split handling,
-promotion-baseline identity preservation, objective/epoch compatibility, the
-final parameter-space guard invariant, and calibrated-threshold margin
-clamping. They do not substitute for a real 96-cubed interruption/resume.
+The round-1 focused review suite passed `13 tests`, the round-1 combined
+focused suites passed `120 tests`, and its fresh full suite passed `423 tests`
+with three existing warnings. Round 2's dedicated review suite passed `18
+tests`, the affected solver/trainer/promotion suites passed `84 tests`, and a
+fresh full suite passed `428 tests` with the same three warnings. Round 2 tests
+verify separate data/connectivity/validity parameter-space guards, saved
+threshold restoration before compatibility comparison, complete nested
+objective fingerprinting, next-epoch cadence reset, and exact full-lattice
+margin participation in the student data anchor. These tests do not
+substitute for a real 96-cubed interruption/resume.
 
 ## Integrity Boundary
 

@@ -170,7 +170,12 @@ This remains an internal recovery-training result. The smoke's five-step raw
 LBM force was transient (`lbm_converged=0`) and is not external-PDE ground
 truth or a claim-bearing aerodynamic coefficient.
 
-The review round (`f4e29c0`) added deterministic trajectory,
+The first review round (`f4e29c0`) added deterministic trajectory,
 crash-reconciliation, promotion-baseline, compatibility, final-guard, and
-calibrated-margin tests. Fresh verification passed `423` tests with three
-warnings. No additional real smoke was run in that round.
+calibrated-margin tests. Round 2 (`432c8a9`) closes the scoped integration
+findings with production-path tests for separate parameter-space topology
+guards, saved-threshold compatibility, complete objective fingerprinting,
+next-epoch cadence reset, and exact full-lattice margin capture in the student
+data anchor. Fresh round-2 verification passed `428` tests with three
+warnings. No additional real smoke was run in round 2, and no live 96^3
+resume or promotion result is claimed.
