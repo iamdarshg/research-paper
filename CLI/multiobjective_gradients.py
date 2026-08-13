@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -271,6 +271,191 @@ def project_conflicting_gradient(
         True,
         projection_norm,
     )
+
+
+def project_improvement_gradients_against_guards(
+    improvements: Mapping[str, Sequence[Optional[torch.Tensor]]],
+    guards: Mapping[str, Sequence[Optional[torch.Tensor]]],
+    *,
+    guard_order: Sequence[str] = ("reconstruction", "connectivity", "validity"),
+    tolerance: float = 1.0e-10,
+    max_passes: int = 16,
+) -> tuple[dict[str, GradientBuffer], dict[str, dict[str, Any]]]:
+    """Project measured improvement directions into all active guard half-spaces."""
+    if tolerance < 0.0 or not math.isfinite(float(tolerance)):
+        raise ValueError("tolerance must be finite and nonnegative")
+    if int(max_passes) <= 0:
+        raise ValueError("max_passes must be greater than zero")
+    ordered_guards = tuple(
+        name for name in guard_order if name in guards
+    ) + tuple(sorted(set(guards).difference(guard_order)))
+    if not ordered_guards:
+        return {
+            name: tuple(
+                None
+                if value is None
+                else value.detach().clone(memory_format=torch.preserve_format)
+                for value in gradient
+            )
+            for name, gradient in improvements.items()
+        }, {
+            name: {
+                "pre_cosines": {},
+                "post_cosines": {},
+                "active_guard_set": [],
+                "projected": False,
+                "projection_norm": 0.0,
+                "accepted_norm": gradient_l2_norm(gradient, branch_name=name),
+            }
+            for name, gradient in improvements.items()
+        }
+
+    accepted: dict[str, GradientBuffer] = {}
+    telemetry: dict[str, dict[str, Any]] = {}
+    for name, gradient in improvements.items():
+        current = tuple(
+            None
+            if value is None
+            else value.detach().clone(memory_format=torch.preserve_format)
+            for value in gradient
+        )
+        pre_cosines = {
+            guard_name: gradient_cosine_similarity(
+                current,
+                guards[guard_name],
+                first_name=name,
+                second_name=guard_name,
+            )
+            for guard_name in ordered_guards
+        }
+        projection_norm = 0.0
+        projected = False
+        for _ in range(int(max_passes)):
+            changed = False
+            for guard_name in ordered_guards:
+                dot = _gradient_dot_product(
+                    current,
+                    guards[guard_name],
+                    first_name=name,
+                    second_name=guard_name,
+                )
+                if dot >= -float(tolerance):
+                    continue
+                guard_norm = gradient_l2_norm(
+                    guards[guard_name], branch_name=guard_name
+                )
+                if guard_norm == 0.0:
+                    continue
+                coefficient = dot / max(guard_norm * guard_norm, 1.0e-300)
+                projected_values: list[Optional[torch.Tensor]] = []
+                for value, guard_value in zip(current, guards[guard_name]):
+                    if value is None and guard_value is None:
+                        projected_values.append(None)
+                    elif value is None:
+                        projected_values.append(
+                            guard_value.detach().clone().mul(-coefficient)
+                        )
+                    elif guard_value is None:
+                        projected_values.append(value.detach().clone())
+                    else:
+                        projected_values.append(
+                            value.detach().clone().add(guard_value, alpha=-coefficient)
+                        )
+                current = tuple(projected_values)
+                projection_norm += abs(dot) / max(guard_norm, 1.0e-300)
+                projected = True
+                changed = True
+            if not changed:
+                break
+        post_cosines = {
+            guard_name: gradient_cosine_similarity(
+                current,
+                guards[guard_name],
+                first_name=name,
+                second_name=guard_name,
+            )
+            for guard_name in ordered_guards
+        }
+        for guard_name in ordered_guards:
+            final_dot = _gradient_dot_product(
+                current,
+                guards[guard_name],
+                first_name=name,
+                second_name=guard_name,
+            )
+            if final_dot < -float(tolerance):
+                raise NonFiniteGradientError(
+                    f"guard projection left {name!r} uphill on {guard_name!r}"
+                )
+        accepted[name] = current
+        telemetry[name] = {
+            "pre_cosines": pre_cosines,
+            "post_cosines": post_cosines,
+            "active_guard_set": list(ordered_guards),
+            "projected": projected,
+            "projection_norm": float(projection_norm),
+            "accepted_norm": gradient_l2_norm(current, branch_name=name),
+        }
+    return accepted, telemetry
+
+
+def combine_constrained_measured_gradients(
+    components: Mapping[str, Sequence[Optional[torch.Tensor]]],
+    *,
+    guard_names: Sequence[str] = ("reconstruction", "connectivity", "validity"),
+    improvement_names: Sequence[str] = ("occupancy", "aero"),
+) -> tuple[GradientBuffer, dict[str, Any]]:
+    """Retain every measured component while constraining improvement directions."""
+    guards = {
+        name: components[name]
+        for name in guard_names
+        if name in components
+    }
+    improvements = {
+        name: components[name]
+        for name in improvement_names
+        if name in components
+    }
+    accepted, telemetry = project_improvement_gradients_against_guards(
+        improvements,
+        guards,
+    )
+    all_buffers = list(components.values())
+    if not all_buffers:
+        return tuple(), {
+            "active_guard_set": list(guards),
+            "components": telemetry,
+            "accepted_norm": 0.0,
+        }
+    buffer_count = len(all_buffers[0])
+    combined: list[Optional[torch.Tensor]] = [None] * buffer_count
+    for name, gradient in components.items():
+        selected = accepted.get(name, gradient)
+        for index, value in enumerate(selected):
+            if value is None:
+                continue
+            combined[index] = (
+                value.detach().clone(memory_format=torch.preserve_format)
+                if combined[index] is None
+                else combined[index] + value
+            )
+    result = tuple(combined)
+    for guard_name, guard in guards.items():
+        dot = _gradient_dot_product(
+            result,
+            guard,
+            first_name="accepted",
+            second_name=guard_name,
+        )
+        if dot < -1.0e-10:
+            raise NonFiniteGradientError(
+                f"accepted measured direction is uphill on guard {guard_name!r}"
+            )
+    return result, {
+        "active_guard_set": list(guards),
+        "components": telemetry,
+        "accepted_norm": gradient_l2_norm(result, branch_name="accepted"),
+    }
 
 
 def apply_max_norm(

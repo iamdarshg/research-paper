@@ -17,7 +17,68 @@ from multiobjective_gradients import (
     combine_gradient_branches,
     gradient_cosine_similarity,
     gradient_l2_norm,
+    project_improvement_gradients_against_guards,
+    combine_constrained_measured_gradients,
 )
+
+
+def test_constrained_projection_preserves_aligned_improvement_and_logs_no_projection():
+    accepted, telemetry = project_improvement_gradients_against_guards(
+        {"occupancy": (torch.tensor([1.0, 0.0]),)},
+        {"reconstruction": (torch.tensor([1.0, 0.0]),)},
+    )
+
+    assert torch.equal(accepted["occupancy"][0], torch.tensor([1.0, 0.0]))
+    assert not telemetry["occupancy"]["projected"]
+    assert telemetry["occupancy"]["active_guard_set"] == ["reconstruction"]
+
+
+def test_constrained_projection_removes_one_conflicting_component():
+    accepted, telemetry = project_improvement_gradients_against_guards(
+        {"aero": (torch.tensor([-1.0, 1.0]),)},
+        {"connectivity": (torch.tensor([1.0, 0.0]),)},
+    )
+
+    assert torch.allclose(accepted["aero"][0], torch.tensor([0.0, 1.0]))
+    assert telemetry["aero"]["projected"]
+    assert telemetry["aero"]["post_cosines"]["connectivity"] == pytest.approx(0.0)
+
+
+def test_constrained_projection_handles_multiple_guards_and_exact_opposition():
+    accepted, _ = project_improvement_gradients_against_guards(
+        {"occupancy": (torch.tensor([-1.0, -1.0]),)},
+        {
+            "reconstruction": (torch.tensor([1.0, 0.0]),),
+            "validity": (torch.tensor([0.0, 1.0]),),
+        },
+    )
+
+    assert torch.equal(accepted["occupancy"][0], torch.zeros(2))
+    for guard in ((torch.tensor([1.0, 0.0]),), (torch.tensor([0.0, 1.0]),)):
+        assert float(torch.dot(accepted["occupancy"][0], guard[0])) >= -1.0e-10
+
+
+def test_constrained_combination_is_deterministic_and_keeps_guard_components():
+    components = {
+        "reconstruction": (torch.tensor([1.0, 0.0]),),
+        "connectivity": (torch.tensor([0.0, 1.0]),),
+        "validity": (torch.tensor([1.0, 1.0]),),
+        "occupancy": (torch.tensor([-2.0, 0.5]),),
+        "aero": (torch.tensor([0.5, -2.0]),),
+    }
+    first, first_telemetry = combine_constrained_measured_gradients(components)
+    second, second_telemetry = combine_constrained_measured_gradients(components)
+
+    assert torch.equal(first[0], second[0])
+    assert torch.isfinite(first[0]).all()
+    for guard in (torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0]), torch.tensor([1.0, 1.0])):
+        assert float(torch.dot(first[0], guard)) >= -1.0e-10
+    assert first_telemetry == second_telemetry
+    assert set(first_telemetry["active_guard_set"]) == {
+        "reconstruction",
+        "connectivity",
+        "validity",
+    }
 
 
 def test_capture_clones_current_gradients_and_clear_removes_them():

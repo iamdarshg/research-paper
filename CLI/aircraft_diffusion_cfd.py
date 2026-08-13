@@ -60,6 +60,7 @@ from multiobjective_gradients import (
     clear_gradients,
     combine_gradient_branches,
     gradient_cosine_similarity,
+    project_improvement_gradients_against_guards,
 )
 from validate_manifest import validate_manifest_file
 
@@ -3897,6 +3898,20 @@ def _direct_measured_objective_for_single(
         "occupancy": float(occupancy),
         "occupancy_loss": float(weighted_occupancy_loss),
         "connectivity_loss": float(connectivity_weight) * float(connectivity_loss),
+        "largest_component_fraction": float(
+            validity_report.get("metrics", {}).get(
+                "largest_component_fraction", 0.0
+            )
+        ),
+        "connectivity_guard_shortfall": max(
+            0.0,
+            0.70
+            - float(
+                validity_report.get("metrics", {}).get(
+                    "largest_component_fraction", 0.0
+                )
+            ),
+        ),
         "aircraft_validity_loss": float(aircraft_validity_weight) * float(validity_loss),
         "aircraft_validity_mean_violation": (
             float(aircraft_validity_weight) * float(validity_mean_violation)
@@ -3966,7 +3981,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         directions: int,
         seed: int,
         input_is_logits: bool,
-        component_sink: Dict[str, float],
+        component_sink: Dict[str, Any],
     ) -> torch.Tensor:
         original_ndim = voxel_grid.ndim
         fields = voxel_grid.detach().float()
@@ -4154,6 +4169,75 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     component_limit
                 )
 
+            active_guard_names = []
+            if (
+                float(base_components.get("connectivity_guard_shortfall", 0.0)) > 0.0
+                and "connectivity_loss" in applied_component_grads
+            ):
+                active_guard_names.append("connectivity_loss")
+            if (
+                float(base_components.get("aircraft_validity_loss", 0.0)) > 0.0
+                and "aircraft_validity_loss" in applied_component_grads
+            ):
+                active_guard_names.append("aircraft_validity_loss")
+            guard_gradients = {
+                name: (applied_component_grads[name],)
+                for name in ("connectivity_loss", "aircraft_validity_loss")
+                if name in active_guard_names
+            }
+            improvement_gradients = {
+                name: (gradient,)
+                for name, gradient in applied_component_grads.items()
+                if name not in guard_gradients
+            }
+            accepted_improvements, projection_telemetry = (
+                project_improvement_gradients_against_guards(
+                    improvement_gradients,
+                    guard_gradients,
+                    guard_order=(
+                        "connectivity_loss",
+                        "aircraft_validity_loss",
+                    ),
+                )
+                if guard_gradients
+                else (improvement_gradients, {})
+            )
+            accepted_component_grads = {
+                name: gradient[0]
+                for name, gradient in guard_gradients.items()
+            }
+            accepted_component_grads.update(
+                {name: gradient[0] for name, gradient in accepted_improvements.items()}
+            )
+            base_components["active_guard_set"] = list(active_guard_names)
+            base_components["guard_active_connectivity"] = float(
+                "connectivity_loss" in active_guard_names
+            )
+            base_components["guard_active_validity"] = float(
+                "aircraft_validity_loss" in active_guard_names
+            )
+            for component_name, telemetry in projection_telemetry.items():
+                prefix = component_name.removesuffix("_loss")
+                base_components[f"{prefix}_guard_projection_norm"] = float(
+                    telemetry["projection_norm"]
+                )
+                base_components[f"{prefix}_accepted_gradient_norm"] = float(
+                    telemetry["accepted_norm"]
+                )
+                base_components[f"{prefix}_guard_projected"] = float(
+                    telemetry["projected"]
+                )
+                for guard_name, cosine in telemetry["pre_cosines"].items():
+                    guard_prefix = guard_name.removesuffix("_loss")
+                    base_components[
+                        f"{prefix}_guard_cosine_before_{guard_prefix}"
+                    ] = float(cosine)
+                for guard_name, cosine in telemetry["post_cosines"].items():
+                    guard_prefix = guard_name.removesuffix("_loss")
+                    base_components[
+                        f"{prefix}_guard_cosine_after_{guard_prefix}"
+                    ] = float(cosine)
+
             for first_index, first_name in enumerate(component_names):
                 for second_name in component_names[first_index + 1:]:
                     first_gradient = raw_component_grads[first_name]
@@ -4182,7 +4266,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         f"{first_prefix}_{second_prefix}_spsa_gradient_cosine"
                     ] = cosine
 
-            sample_grad = sum(applied_component_grads.values())
+            sample_grad = sum(accepted_component_grads.values())
             grad_norm = sample_grad.norm()
             clip_value = float(gradient_clip)
             # SPSA estimates the gradient of one global measured objective, not
@@ -4217,9 +4301,13 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         component_sink.clear()
         if base_component_records:
             for key in base_component_records[0]:
-                values = [float(record[key]) for record in base_component_records if key in record]
-                if values:
+                values = [record[key] for record in base_component_records if key in record]
+                if not values:
+                    continue
+                if all(isinstance(value, (int, float, np.floating)) for value in values):
                     component_sink[key] = float(np.mean(values))
+                else:
+                    component_sink[key] = values[0]
         return voxel_grid.new_tensor(mean_loss)
 
     @staticmethod
@@ -4273,7 +4361,7 @@ class DirectSolverSPSALoss(nn.Module):
         self.directions = max(1, int(directions))
         self.seed = int(seed)
         self.input_is_logits = bool(input_is_logits)
-        self.last_components: Dict[str, float] = {}
+        self.last_components: Dict[str, Any] = {}
 
     def forward(
         self,
