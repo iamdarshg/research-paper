@@ -5262,7 +5262,10 @@ class OptimizedDiffusionTrainer:
                     ).sum()
                     / negative_count
                 )
-            (scale * chunk_loss).backward()
+            # Every coordinate chunk has its own decoder graph, but all chunks
+            # share the upstream latent graph. Keep that shared graph alive
+            # until the final chunk has contributed its exact gradient.
+            (scale * chunk_loss).backward(retain_graph=stop < total_voxels)
         return detached_loss.detach()
 
     def train_epoch(

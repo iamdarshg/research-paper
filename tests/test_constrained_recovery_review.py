@@ -1190,6 +1190,45 @@ def test_captured_student_data_anchor_includes_exact_margin_and_blocks_direct_co
     assert float(torch.dot(parameter.grad, captured[0])) >= -1.0e-10
 
 
+def test_coordinate_threshold_margin_backpropagates_all_chunks_after_data_backward():
+    class CoordinateConverter(torch.nn.Module):
+        decoder_mode = "coordinate"
+
+        def forward_flat_indices(self, latent, indices):
+            return latent[:, :1] + indices.float().unsqueeze(0) * 0.0
+
+    trainer = object.__new__(OptimizedDiffusionTrainer)
+    trainer.converter = CoordinateConverter()
+    trainer.device = torch.device("cpu")
+    trainer.geometry_threshold_calibrated = True
+    trainer.geometry_probability_threshold = 0.5
+    trainer.model_config = type("ModelConfig", (), {"coordinate_chunk_size": 2})()
+    trainer.training_config = type(
+        "MarginConfig",
+        (),
+        {
+            "threshold_positive_margin": 0.2,
+            "threshold_negative_margin": 0.2,
+            "threshold_positive_margin_weight": 1.0,
+            "threshold_negative_margin_weight": 1.0,
+        },
+    )()
+    parameter = torch.nn.Parameter(torch.tensor([[0.0]]))
+    latent = parameter * 1.0
+    target = torch.ones((1, 1, 1, 5))
+
+    (latent.square().sum() * 0.0).backward(retain_graph=True)
+    margin_value = trainer._backward_full_grounded_threshold_margin(
+        latent,
+        target,
+        loss_scale=1.0,
+    )
+
+    assert margin_value.item() > 0.0
+    assert parameter.grad is not None
+    assert parameter.grad.item() < 0.0
+
+
 def test_interrupted_two_plus_two_resume_is_trajectory_equivalent(tmp_path):
     config = ModelConfig(
         latent_dim=4,
