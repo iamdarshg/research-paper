@@ -179,3 +179,16 @@ next-epoch cadence reset, and exact full-lattice margin capture in the student
 data anchor. Fresh round-2 verification passed `428` tests with three
 warnings. No additional real smoke was run in round 2, and no live 96^3
 resume or promotion result is claimed.
+
+Round 3 (`36d73f8`) repaired the production gradient lifecycle across the
+diffusion, converter, and consistency-student optimizer groups. Production
+`train_epoch` tests now verify that all required gradients survive branch
+replay, only measured active topology guards are transported, each replay is
+isolated, and the gradients at the actual optimizer step satisfy the active
+guard invariant after clipping. The three shape-drag LBM configuration fields
+were also restored as dataclass fields and covered by payload construction
+tests. These are bounded CPU fixture results; no live 96^3 resume or promotion
+claim is made. The round-3 dedicated production suite passed `21 tests`, the
+affected focused suites passed `101 tests`, and the fresh full suite passed
+`431 tests` with three existing warnings. These bounded tests do not replace
+the unrun live smoke.

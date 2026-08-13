@@ -8,9 +8,11 @@ Tasks 1 through 5 were implemented in order on branch
 `codex/constrained-aircraft-recovery`, based at `feef092`. Tasks 1 through 4
 are complete and committed. Round 2's scoped Critical and Important findings
 are addressed in `432c8a9` and covered by production-path regressions. Task 5's
-focused and full-suite gates were run; no real `96^3` smoke was run in this
-round, so live interruption/resume and promotion remain unverified. No full
-epoch was launched.
+focused and full-suite gates were run. Round 3's scoped production lifecycle
+findings are addressed in `36d73f8` and covered by train_epoch/runner
+integration regressions. No real `96^3` smoke was run in rounds 2 or 3, so
+live interruption/resume and promotion remain unverified. No full epoch was
+launched.
 
 ## Commits
 
@@ -22,6 +24,7 @@ epoch was launched.
 - `1368133` `fix: stabilize measured guard projection`
 - `f4e29c0` `fix: close reviewed constrained recovery invariants`
 - `432c8a9` `fix: close round-two recovery integration defects`
+- `36d73f8` `fix: repair production gradient lifecycle`
 - documentation evidence commit containing this report
 
 Changed implementation and test paths across these commits:
@@ -83,6 +86,15 @@ consistency, clipping, EMA, branch limits, reconstruction, and margin
 settings; resumed next-epoch cadence starts at zero; and the exact
 full-lattice calibrated margin is present in the captured student data anchor.
 
+Round 3 initially failed with the required production tests: the shape-drag
+fields were outside `LBMPhysicsConfig`, and the one-update trainer path had no
+all-group gradient lifecycle or active-guard replay invariant. After
+`36d73f8`, dedicated production regressions passed `6 passed, 3 warnings` and
+the affected suites passed `101 passed, 3 warnings`. The train_epoch fixture
+observes diffusion, converter, and consistency-student parameters at the
+actual optimizer step, confirms inactive validity is not replayed, checks
+replay isolation, and verifies post-clip active-guard dot products.
+
 ## Smoke, Resume, and Promotion
 
 The exact smoke command and exact intended resume command are recorded in
@@ -112,7 +124,7 @@ handling, `.previous` recovery, and exact-vs-model-only resume distinctions
 are tested. No real `latest_run_state.pt` was created because neither smoke
 reached update 8.
 
-Round 2 smoke command: `NOT RUN BY INSTRUCTION`. The exact bounded command
+Round 3 smoke command: `NOT RUN BY INSTRUCTION`. The exact bounded command
 and exact `--resume-run-state` continuation command remain recorded in the
 smoke evidence document. The earlier one-update real attempt provides only
 historical evidence of 33 measured solver calls; it predates `432c8a9` and is
@@ -121,7 +133,7 @@ not a validation of the current final-guard integration. Promotion result:
 
 ## Scientific and Engineering Concerns
 
-- No real smoke was run in round 2, so live exact-resume behavior and
+- No real smoke was run in rounds 2 or 3, so live exact-resume behavior and
   condition-based promotion remain unverified on the 96-cubed run.
   Deterministic exact-resume behavior, crash-safe reconciliation, split
   integrity, saved-threshold compatibility, complete objective fingerprint,
@@ -130,8 +142,9 @@ not a validation of the current final-guard integration. Promotion result:
 - The internal five-step LBM smoke reported `lbm_converged=0`; its measured
   forces are optimization inputs, not external-PDE ground truth or
   claim-bearing aerodynamic coefficients.
-- No real smoke was run in round 2 by instruction. The fresh full pytest result
-  after the round-two fixes is `428 passed`.
+- No real smoke was run in rounds 2 or 3 by instruction. The round-2 fresh
+  full pytest result was `428 passed`; the round-3 fresh full pytest result was
+  `431 passed, 3 warnings in 298.29s (0:04:58)`.
 - The fixed global materialization threshold, held-out promotion split, and
   full validity objective remain intact. The `0.70` largest-component value is
   a hard guard and was not substituted for the validity objective.

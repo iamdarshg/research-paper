@@ -2,9 +2,9 @@
 
 Status: `DONE_WITH_CONCERNS`
 
-Round-2 status: the implementation fixes from `432c8a9` passed the fresh full
-suite. This document's real-smoke artifacts predate both review-fix rounds;
-no new real smoke was run by instruction.
+Round-3 status: the implementation fixes from `36d73f8` passed the dedicated
+and affected focused suites. This document's real-smoke artifacts predate all
+three review-fix rounds; no new real smoke was run by instruction.
 
 ## Scope
 
@@ -76,3 +76,13 @@ The run used measured LBM evaluations and did not introduce a surrogate. No
 solver component or evaluator was removed. The transient smoke reported
 `lbm_converged=0`; its internal force values are optimization inputs only, not
 external-PDE ground truth or publication claims.
+
+Round-3 production-boundary regressions cover the complete optimizer parameter
+groups, active measured guard transport, replay isolation, saved threshold and
+cadence orchestration, and restoration of the LBM shape-drag configuration
+fields. They remain test evidence only and do not establish live 96^3 resume
+or promotion behavior.
+
+The round-3 dedicated review suite passed `21 tests`; affected focused suites
+passed `101 tests`; and the fresh full suite passed `431 tests` with three
+existing environment warnings. No real smoke was run.
