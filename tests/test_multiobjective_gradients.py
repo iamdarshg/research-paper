@@ -58,6 +58,16 @@ def test_constrained_projection_handles_multiple_guards_and_exact_opposition():
         assert float(torch.dot(accepted["occupancy"][0], guard[0])) >= -1.0e-10
 
 
+def test_constrained_projection_is_stable_for_low_precision_residuals():
+    accepted, telemetry = project_improvement_gradients_against_guards(
+        {"aero": (torch.tensor([-1.0e-4, 1.0], dtype=torch.float16),)},
+        {"validity": (torch.tensor([1.0, 0.0], dtype=torch.float16),)},
+    )
+
+    assert float(torch.dot(accepted["aero"][0].float(), torch.tensor([1.0, 0.0]))) >= 0.0
+    assert telemetry["aero"]["projected"]
+
+
 def test_constrained_combination_is_deterministic_and_keeps_guard_components():
     components = {
         "reconstruction": (torch.tensor([1.0, 0.0]),),

@@ -313,10 +313,13 @@ def project_improvement_gradients_against_guards(
     accepted: dict[str, GradientBuffer] = {}
     telemetry: dict[str, dict[str, Any]] = {}
     for name, gradient in improvements.items():
+        original_dtypes = tuple(
+            None if value is None else value.dtype for value in gradient
+        )
         current = tuple(
             None
             if value is None
-            else value.detach().clone(memory_format=torch.preserve_format)
+            else value.detach().to(dtype=torch.float64)
             for value in gradient
         )
         pre_cosines = {
@@ -353,13 +356,16 @@ def project_improvement_gradients_against_guards(
                         projected_values.append(None)
                     elif value is None:
                         projected_values.append(
-                            guard_value.detach().clone().mul(-coefficient)
+                            guard_value.detach().to(dtype=torch.float64).mul(-coefficient)
                         )
                     elif guard_value is None:
                         projected_values.append(value.detach().clone())
                     else:
                         projected_values.append(
-                            value.detach().clone().add(guard_value, alpha=-coefficient)
+                            value.detach().clone().add(
+                                guard_value.detach().to(dtype=torch.float64),
+                                alpha=-coefficient,
+                            )
                         )
                 current = tuple(projected_values)
                 projection_norm += abs(dot) / max(guard_norm, 1.0e-300)
@@ -367,9 +373,16 @@ def project_improvement_gradients_against_guards(
                 changed = True
             if not changed:
                 break
+        accepted_current = tuple(
+            None
+            if value is None
+            else value.to(dtype=original_dtypes[index])
+            for index, value in enumerate(current)
+        )
+        projection_fallback_zero = False
         post_cosines = {
             guard_name: gradient_cosine_similarity(
-                current,
+                accepted_current,
                 guards[guard_name],
                 first_name=name,
                 second_name=guard_name,
@@ -378,23 +391,37 @@ def project_improvement_gradients_against_guards(
         }
         for guard_name in ordered_guards:
             final_dot = _gradient_dot_product(
-                current,
+                accepted_current,
                 guards[guard_name],
                 first_name=name,
                 second_name=guard_name,
             )
             if final_dot < -float(tolerance):
-                raise NonFiniteGradientError(
-                    f"guard projection left {name!r} uphill on {guard_name!r}"
+                accepted_current = tuple(
+                    None if value is None else torch.zeros_like(value)
+                    for value in accepted_current
                 )
-        accepted[name] = current
+                projection_fallback_zero = True
+                break
+        if projection_fallback_zero:
+            post_cosines = {
+                guard_name: gradient_cosine_similarity(
+                    accepted_current,
+                    guards[guard_name],
+                    first_name=name,
+                    second_name=guard_name,
+                )
+                for guard_name in ordered_guards
+            }
+        accepted[name] = accepted_current
         telemetry[name] = {
             "pre_cosines": pre_cosines,
             "post_cosines": post_cosines,
             "active_guard_set": list(ordered_guards),
             "projected": projected,
+            "projection_fallback_zero": projection_fallback_zero,
             "projection_norm": float(projection_norm),
-            "accepted_norm": gradient_l2_norm(current, branch_name=name),
+            "accepted_norm": gradient_l2_norm(accepted_current, branch_name=name),
         }
     return accepted, telemetry
 
