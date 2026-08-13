@@ -59,6 +59,7 @@ from multiobjective_gradients import (
     capture_gradients,
     clear_gradients,
     combine_gradient_branches,
+    combine_constrained_measured_gradients,
     gradient_cosine_similarity,
     project_improvement_gradients_against_guards,
 )
@@ -89,6 +90,14 @@ def restore_rng_state(state: Mapping[str, Any]) -> None:
         torch.cuda.set_rng_state_all(cuda_state)
 
 
+def iter_loader_without_rng_advance(loader: DataLoader):
+    """Create a loader iterator without consuming continuation RNG state."""
+    state = capture_rng_state()
+    iterator = iter(loader)
+    restore_rng_state(state)
+    return iterator
+
+
 def atomic_save_run_state(path: Union[str, Path], state: Mapping[str, Any]) -> None:
     """Atomically replace a bounded latest-run-state artifact.
 
@@ -114,6 +123,17 @@ def atomic_save_run_state(path: Union[str, Path], state: Mapping[str, Any]) -> N
         raise
 
 
+def resolve_run_state_path(path: Union[str, Path]) -> Path:
+    """Use the last-known-good sibling when a replacement was interrupted."""
+    target = Path(path)
+    if target.exists():
+        return target
+    previous = target.with_name(target.name + ".previous")
+    if previous.exists():
+        return previous
+    raise FileNotFoundError(f"Run-state and its previous fallback are missing: {target}")
+
+
 def validate_run_state_compatibility(
     actual: Mapping[str, Any],
     expected: Mapping[str, Any],
@@ -126,11 +146,21 @@ def validate_run_state_compatibility(
         "split",
         "sample_count",
     )
-    return [
+    mismatches = [
         field_name
         for field_name in fields_to_compare
         if actual.get(field_name) != expected.get(field_name)
     ]
+    actual_configuration = actual.get("configuration", {})
+    expected_configuration = expected.get("configuration", {})
+    mismatches.extend(
+        f"configuration.{field_name}"
+        for field_name in sorted(
+            set(actual_configuration) | set(expected_configuration)
+        )
+        if actual_configuration.get(field_name) != expected_configuration.get(field_name)
+    )
+    return mismatches
 
 
 def _make_grad_scaler(device_type: str):
@@ -968,8 +998,6 @@ def grounded_threshold_margin_loss(
         raise ValueError("margins must be nonnegative")
     if positive_weight_value < 0.0 or negative_weight_value < 0.0:
         raise ValueError("weights must be nonnegative")
-    if threshold_value + positive_margin_value >= 1.0:
-        raise ValueError("threshold + positive_margin must be less than 1")
 
     target_tensor = target.to(
         device=probabilities_or_logits.device,
@@ -986,7 +1014,10 @@ def grounded_threshold_margin_loss(
         )
     positive_mask = target_tensor > 0.5
     negative_mask = ~positive_mask
-    positive_boundary = min(1.0 - torch.finfo(values.dtype).eps, threshold_value + positive_margin_value)
+    positive_boundary = min(
+        1.0 - torch.finfo(values.dtype).eps,
+        threshold_value + positive_margin_value,
+    )
     negative_boundary = max(0.0, threshold_value - negative_margin_value)
     positive_penalty = (positive_boundary - values).clamp_min(0.0).square()
     negative_penalty = (values - negative_boundary).clamp_min(0.0).square()
@@ -4202,13 +4233,25 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 if guard_gradients
                 else (improvement_gradients, {})
             )
-            accepted_component_grads = {
-                name: gradient[0]
-                for name, gradient in guard_gradients.items()
-            }
-            accepted_component_grads.update(
-                {name: gradient[0] for name, gradient in accepted_improvements.items()}
+            accepted_component_grads, constrained_telemetry = (
+                combine_constrained_measured_gradients(
+                    {
+                        **guard_gradients,
+                        **accepted_improvements,
+                    },
+                    guard_names=tuple(guard_gradients),
+                    improvement_names=tuple(accepted_improvements),
+                )
+                if guard_gradients
+                else (
+                    {
+                        name: gradient[0]
+                        for name, gradient in accepted_improvements.items()
+                    },
+                    {},
+                )
             )
+            accepted_component_grads = {"combined": accepted_component_grads[0]}
             base_components["active_guard_set"] = list(active_guard_names)
             base_components["guard_active_connectivity"] = float(
                 "connectivity_loss" in active_guard_names
@@ -4216,6 +4259,17 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             base_components["guard_active_validity"] = float(
                 "aircraft_validity_loss" in active_guard_names
             )
+            if constrained_telemetry:
+                final_invariant = constrained_telemetry["final_invariant"]
+                base_components["final_guard_active_set"] = list(
+                    final_invariant["active_guard_set"]
+                )
+                base_components["final_guard_projection_norm"] = float(
+                    final_invariant["projection_norm"]
+                )
+                base_components["final_guard_accepted_norm"] = float(
+                    final_invariant["accepted_norm"]
+                )
             for component_name, telemetry in projection_telemetry.items():
                 prefix = component_name.removesuffix("_loss")
                 base_components[f"{prefix}_guard_projection_norm"] = float(
@@ -4266,7 +4320,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         f"{first_prefix}_{second_prefix}_spsa_gradient_cosine"
                     ] = cosine
 
-            sample_grad = sum(accepted_component_grads.values())
+            sample_grad = accepted_component_grads["combined"]
             grad_norm = sample_grad.norm()
             clip_value = float(gradient_clip)
             # SPSA estimates the gradient of one global measured objective, not
@@ -4550,6 +4604,8 @@ class OptimizedDiffusionTrainer:
             Callable[[int, int], Optional[str]]
         ] = None
         self.stop_after_updates: Optional[int] = None
+        self.run_state_metadata: Dict[str, Any] = {}
+        self.run_state_log_metadata: Dict[str, Any] = {}
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -4608,6 +4664,8 @@ class OptimizedDiffusionTrainer:
                 self.geometry_threshold_calibration
             ),
             "compatibility": dict(compatibility),
+            "run_state_metadata": dict(self.run_state_metadata),
+            "log_reconciliation": dict(self.run_state_log_metadata),
         }
 
     def save_run_state(
@@ -4636,31 +4694,26 @@ class OptimizedDiffusionTrainer:
         expected_compatibility: Mapping[str, Any],
     ) -> Dict[str, Any]:
         """Restore an interrupted run after its original scheduler is configured."""
-        state = torch.load(path, map_location=self.device, weights_only=False)
+        resolved_path = resolve_run_state_path(path)
+        state = torch.load(resolved_path, map_location=self.device, weights_only=False)
         actual_compatibility = state.get("compatibility", {})
         mismatches = validate_run_state_compatibility(
             actual_compatibility,
             expected_compatibility,
         )
         if mismatches:
+            actual_configuration = actual_compatibility.get("configuration", {})
+            expected_configuration = expected_compatibility.get("configuration", {})
+            def mismatch_value(values: Mapping[str, Any], name: str) -> Any:
+                if name.startswith("configuration."):
+                    return values.get("configuration", {}).get(
+                        name.removeprefix("configuration.")
+                    )
+                return values.get(name)
             details = ", ".join(
-                f"{name}={actual_compatibility.get(name)!r}"
-                f" (expected {expected_compatibility.get(name)!r})"
+                f"{name}={mismatch_value(actual_compatibility, name)!r}"
+                f" (expected {mismatch_value(expected_compatibility, name)!r})"
                 for name in mismatches
-            )
-            raise ValueError(f"Incompatible run-state resume: {details}")
-        actual_configuration = actual_compatibility.get("configuration", {})
-        expected_configuration = expected_compatibility.get("configuration", {})
-        configuration_mismatches = [
-            name
-            for name in sorted(set(actual_configuration) | set(expected_configuration))
-            if actual_configuration.get(name) != expected_configuration.get(name)
-        ]
-        if configuration_mismatches:
-            details = ", ".join(
-                f"configuration.{name}={actual_configuration.get(name)!r}"
-                f" (expected {expected_configuration.get(name)!r})"
-                for name in configuration_mismatches
             )
             raise ValueError(f"Incompatible run-state resume: {details}")
         if int(state.get("run_state_version", 0)) != 1:
@@ -4691,6 +4744,8 @@ class OptimizedDiffusionTrainer:
             "sample_order": [int(value) for value in state["sample_order"]],
             "global_step": self.global_step,
             "run_state_checkpoint_path": str(Path(path).resolve()),
+            "run_state_metadata": dict(state.get("run_state_metadata", {})),
+            "log_reconciliation": dict(state.get("log_reconciliation", {})),
         }
 
     def _set_geometry_probability_threshold(
@@ -5068,7 +5123,8 @@ class OptimizedDiffusionTrainer:
 
         start_batch = max(0, int(start_batch))
         processed_updates = 0
-        pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
+        loader_iterator = iter_loader_without_rng_advance(train_loader)
+        pbar = tqdm(loader_iterator, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
 
         for batch_idx, batch in enumerate(pbar):
             if batch_idx < start_batch:
@@ -5247,6 +5303,27 @@ class OptimizedDiffusionTrainer:
                     population_positive_counts=population_positive_counts,
                     population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
+                if self.geometry_threshold_calibrated:
+                    geometry_loss_val = geometry_loss_val + grounded_threshold_margin_loss(
+                        geom_logits_sample,
+                        target_sample,
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        from_logits=True,
+                    )
+                    generation_geometry_loss_val = generation_geometry_loss_val + grounded_threshold_margin_loss(
+                        generation_geom_logits_sample,
+                        target_sample,
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        from_logits=True,
+                    )
                 if run_optimizer_grid_loss:
                     with torch.no_grad():
                         direct_solver_field = self.converter(
@@ -5276,6 +5353,27 @@ class OptimizedDiffusionTrainer:
                     geometry_target.float(),
                     dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
+                if self.geometry_threshold_calibrated:
+                    geometry_loss_val = geometry_loss_val + grounded_threshold_margin_loss(
+                        geom_logits.float(),
+                        geometry_target.float(),
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        from_logits=True,
+                    )
+                    generation_geometry_loss_val = generation_geometry_loss_val + grounded_threshold_margin_loss(
+                        generation_geom_logits.float(),
+                        geometry_target.float(),
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        from_logits=True,
+                    )
 
             direct_solver_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_evaluated = False
@@ -5745,9 +5843,7 @@ class OptimizedDiffusionTrainer:
             if direct_solver_eval_count > 0
             else 0.0
         )
-        optimizer_iterations = (
-            processed_updates if interrupted_early else len(train_loader)
-        )
+        optimizer_iterations = processed_updates
         validate_direct_solver_iteration_coverage(
             direct_solver_eval_count,
             optimizer_iterations,

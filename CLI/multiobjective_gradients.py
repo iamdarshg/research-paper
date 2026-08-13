@@ -467,20 +467,16 @@ def combine_constrained_measured_gradients(
                 else combined[index] + value
             )
     result = tuple(combined)
-    for guard_name, guard in guards.items():
-        dot = _gradient_dot_product(
-            result,
-            guard,
-            first_name="accepted",
-            second_name=guard_name,
-        )
-        if dot < -1.0e-10:
-            raise NonFiniteGradientError(
-                f"accepted measured direction is uphill on guard {guard_name!r}"
-            )
+    final_accepted, final_telemetry = project_improvement_gradients_against_guards(
+        {"combined": result},
+        guards,
+        guard_order=tuple(guard_names),
+    )
+    result = final_accepted["combined"]
     return result, {
         "active_guard_set": list(guards),
         "components": telemetry,
+        "final_invariant": final_telemetry["combined"],
         "accepted_norm": gradient_l2_norm(result, branch_name="accepted"),
     }
 
@@ -656,6 +652,72 @@ def combine_gradient_branches(
                 combined[parameter_index] = gradient
             else:
                 combined[parameter_index] = combined[parameter_index] + gradient
+
+    final_anchor_cosine_before = 0.0
+    final_anchor_cosine_after = 0.0
+    final_projection_norm = 0.0
+    if conflict_anchor is not None:
+        anchor_gradients = applied_branches[conflict_anchor]
+        non_anchor_values: list[Optional[torch.Tensor]] = []
+        for index in range(len(parameter_list)):
+            value: Optional[torch.Tensor] = None
+            for branch_name, branch_values in applied_branches.items():
+                if branch_name == conflict_anchor:
+                    continue
+                branch_value = branch_values[index]
+                if branch_value is not None:
+                    value = (
+                        branch_value.detach().clone()
+                        if value is None
+                        else value + branch_value
+                    )
+            non_anchor_values.append(value)
+        non_anchor = tuple(non_anchor_values)
+        final_before = tuple(
+            None
+            if anchor_gradients[index] is None and non_anchor[index] is None
+            else (
+                non_anchor[index]
+                if anchor_gradients[index] is None
+                else (
+                    anchor_gradients[index]
+                    if non_anchor[index] is None
+                    else anchor_gradients[index] + non_anchor[index]
+                )
+            )
+            for index in range(len(parameter_list))
+        )
+        final_anchor_cosine_before = gradient_cosine_similarity(
+            final_before,
+            anchor_gradients,
+            first_name="final_update",
+            second_name=conflict_anchor,
+        )
+        projected_non_anchor, _, final_anchor_cosine_after, projected, final_projection_norm = (
+            project_conflicting_gradient(
+                non_anchor,
+                anchor_gradients,
+                branch_name="final_update_non_anchor",
+                anchor_name=conflict_anchor,
+            )
+        )
+        for index, anchor_value in enumerate(anchor_gradients):
+            value = anchor_value
+            other = projected_non_anchor[index]
+            if other is not None:
+                value = other if value is None else value + other
+            combined[index] = value
+        telemetry["final_invariant"] = BranchGradientTelemetry(
+            raw_norm=gradient_l2_norm(non_anchor, branch_name="final_non_anchor"),
+            applied_norm=gradient_l2_norm(projected_non_anchor, branch_name="final_non_anchor"),
+            scale=1.0,
+            present=any(value is not None for value in non_anchor),
+            nonzero=gradient_l2_norm(projected_non_anchor, branch_name="final_non_anchor") > 0.0,
+            anchor_cosine_before=final_anchor_cosine_before,
+            anchor_cosine_after=final_anchor_cosine_after,
+            conflict_projected=projected,
+            projection_norm=final_projection_norm,
+        )
 
     gradient_l2_norm(combined, branch_name="<combined>")
 

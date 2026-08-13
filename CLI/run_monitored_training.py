@@ -24,7 +24,9 @@ from aircraft_diffusion_cfd import (
     OptimizedDiffusionTrainer,
     TrainingConfig,
     aircraft_collate_fn,
+    capture_rng_state,
     infer_conditioning_dim,
+    restore_rng_state,
     resolve_grounded_grid_size,
 )
 from experiment_config import GLOBAL_CONFIG_PATH, config_value
@@ -36,12 +38,75 @@ from training_stability import (
 from sdf_utils import prepare_edt_workspace
 
 
-def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+def _append_jsonl(path: Path, record: Dict[str, Any]) -> Dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, sort_keys=True, allow_nan=False)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(line + "\n")
+    encoded = (line + "\n").encode("utf-8")
+    with path.open("ab") as handle:
+        handle.seek(0, os.SEEK_END)
+        start = handle.tell()
+        handle.write(encoded)
         handle.flush()
+        os.fsync(handle.fileno())
+        end = handle.tell()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as record_handle:
+        record_count = sum(1 for _ in record_handle)
+    return {
+        "offset": int(end),
+        "sha256": digest,
+        "global_step": int(record.get("global_step", 0)),
+        "record_count": int(record_count),
+        "start_offset": int(start),
+    }
+
+
+def _reconcile_updates_log(path: Path, checkpoint_log: Dict[str, Any]) -> Dict[str, Any]:
+    """Reconcile append-only updates to the last durable run-state boundary."""
+    expected_offset = int(checkpoint_log.get("offset", -1))
+    expected_digest = str(checkpoint_log.get("sha256", ""))
+    if expected_offset < 0 or not expected_digest:
+        raise ValueError("run-state is missing durable updates-log metadata")
+    if not path.exists():
+        if expected_offset > 0:
+            raise ValueError("checkpoint is ahead of missing updates log")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    payload = path.read_bytes()
+    if len(payload) < expected_offset:
+        raise ValueError(
+            "checkpoint is ahead of durable updates log: "
+            f"{expected_offset} > {len(payload)} bytes"
+        )
+    prefix = payload[:expected_offset]
+    if hashlib.sha256(prefix).hexdigest() != expected_digest:
+        raise ValueError("updates log disagrees with durable run-state prefix")
+    if prefix and not prefix.endswith(b"\n"):
+        raise ValueError("durable updates-log boundary is not a complete JSONL record")
+    trailing_records = 0
+    for line in payload[expected_offset:].splitlines():
+        if line.strip():
+            json.loads(line)
+            trailing_records += 1
+    if len(payload) > expected_offset:
+        with path.open("r+b") as handle:
+            handle.truncate(expected_offset)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return {
+        "truncated_records": trailing_records,
+        "offset": expected_offset,
+        "sha256": expected_digest,
+        "global_step": int(checkpoint_log.get("global_step", 0)),
+    }
+
+
+def _iter_loader_without_rng_advance(loader: DataLoader):
+    """Create a deterministic loader iterator without consuming training RNG."""
+    state = capture_rng_state()
+    iterator = iter(loader)
+    restore_rng_state(state)
+    return iterator
 
 
 def _manifest_identity(path: str) -> str:
@@ -72,6 +137,48 @@ def _run_state_checkpoint_due(
         and completed_since_start > 0
         and completed_since_start % cadence == 0
     )
+
+
+def _resume_epoch_position(
+    epoch_index: int,
+    completed_in_epoch: int,
+    updates_in_epoch: int,
+) -> tuple[int, int]:
+    if int(completed_in_epoch) >= int(updates_in_epoch):
+        return int(epoch_index) + 1, 0
+    return int(epoch_index), int(completed_in_epoch)
+
+
+def restore_promotion_baseline(
+    resume_state_info: Dict[str, Any],
+    *,
+    promotion_split: str,
+    promotion_sample_order: list[int],
+    evaluation_samples: int,
+    generation_seeds: int,
+) -> Dict[str, Any]:
+    metadata = dict(resume_state_info.get("run_state_metadata", {}))
+    baseline = dict(metadata.get("promotion_baseline", {}))
+    if not baseline:
+        raise ValueError(
+            "Exact resume requires the original promotion baseline in run-state"
+        )
+    identity = dict(metadata.get("promotion_baseline_identity", {}))
+    expected = {
+        "split": str(promotion_split),
+        "sample_order": list(promotion_sample_order),
+        "evaluation_samples": int(evaluation_samples),
+        "generation_seeds": int(generation_seeds),
+    }
+    mismatches = [
+        key for key, value in expected.items() if identity.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "Exact resume promotion baseline identity mismatch: "
+            + ", ".join(mismatches)
+        )
+    return baseline
 
 
 class RunLocalCosineScheduler:
@@ -636,14 +743,7 @@ def main() -> int:
         subset_seed=args.subset_seed,
         split=args.training_split,
     )
-    try:
-        promotion_dataset = _build_split_dataset(dataset, args.promotion_split)
-    except ValueError:
-        promotion_dataset = epoch_dataset
-        args.promotion_split = args.training_split
-        print(
-            f"Requested promotion split was unavailable; using {args.training_split!r}."
-        )
+    promotion_dataset = _build_split_dataset(dataset, args.promotion_split)
     args.training_sample_count = len(epoch_dataset)
     args.promotion_sample_count = len(promotion_dataset)
     sample_order = _dataset_sample_order(epoch_dataset)
@@ -733,15 +833,52 @@ def main() -> int:
         "split": str(args.training_split),
         "sample_count": int(len(epoch_dataset)),
         "configuration": {
+            "num_epochs": int(args.num_epochs),
             "planned_optimizer_updates": int(args.planned_optimizer_updates),
             "batch_size": int(args.batch_size),
             "subset_seed": int(args.subset_seed),
             "sample_order": list(sample_order),
+            "promotion_split": str(args.promotion_split),
+            "promotion_sample_order": _dataset_sample_order(promotion_dataset),
+            "promotion_evaluation_samples": int(args.promotion_evaluation_samples),
+            "promotion_generation_seeds": int(args.promotion_generation_seeds),
             "solver": str(args.solver),
             "lbm_stream_bfl_backend": str(args.lbm_stream_bfl_backend),
+            "direct_solver_loss_weight": float(args.direct_solver_loss_weight),
             "direct_solver_steps": int(args.direct_solver_steps),
             "direct_solver_directions": int(args.direct_solver_directions),
             "direct_solver_perturbation": float(args.direct_solver_perturbation),
+            "direct_connectivity_weight": float(args.direct_connectivity_weight),
+            "direct_aircraft_validity_weight": float(args.direct_aircraft_validity_weight),
+            "direct_solver_perturbation_grid_size": int(
+                args.direct_solver_perturbation_grid_size
+            ),
+            "geometry_materialization_threshold": float(
+                trainer.geometry_probability_threshold
+            ),
+            "threshold_positive_margin": float(training_config.threshold_positive_margin),
+            "threshold_negative_margin": float(training_config.threshold_negative_margin),
+            "threshold_positive_margin_weight": float(
+                training_config.threshold_positive_margin_weight
+            ),
+            "threshold_negative_margin_weight": float(
+                training_config.threshold_negative_margin_weight
+            ),
+            "direct_solver_gradient_clip": float(
+                training_config.direct_solver_gradient_clip
+            ),
+            "direct_aero_gradient_max_norm": float(
+                training_config.direct_aero_gradient_max_norm
+            ),
+            "direct_occupancy_gradient_max_norm": float(
+                training_config.direct_occupancy_gradient_max_norm
+            ),
+            "direct_connectivity_gradient_max_norm": float(
+                training_config.direct_connectivity_gradient_max_norm
+            ),
+            "direct_validity_gradient_max_norm": float(
+                training_config.direct_validity_gradient_max_norm
+            ),
         },
     }
 
@@ -778,10 +915,27 @@ def main() -> int:
             args.resume_run_state,
             expected_compatibility=run_compatibility,
         )
+        _reconcile_updates_log(
+            updates_output,
+            resume_state_info.get("log_reconciliation", {}),
+        )
         if resume_state_info["sample_order"] != sample_order:
             raise ValueError(
                 "Incompatible run-state resume: sample_order differs from the current epoch"
             )
+        resume_state_info["epoch_index"], resume_state_info["completed_in_epoch"] = (
+            _resume_epoch_position(
+                resume_state_info["epoch_index"],
+                resume_state_info.get("completed_in_epoch", 0),
+                len(train_loader),
+            )
+        )
+
+    def record_update(record: Dict[str, Any]) -> None:
+        trainer.run_state_log_metadata = _append_jsonl(updates_output, record)
+
+    trainer.update_metrics_callback = record_update
+    current_epoch_index = int(resume_state_info.get("epoch_index", 0))
 
     def maybe_save_run_state(completed_in_epoch: int, total_in_epoch: int) -> Optional[str]:
         if not _run_state_checkpoint_due(
@@ -792,7 +946,7 @@ def main() -> int:
             return None
         trainer.save_run_state(
             run_state_target,
-            epoch_index=int(resume_state_info["epoch_index"]),
+            epoch_index=current_epoch_index,
             completed_in_epoch=int(completed_in_epoch),
             sample_order=sample_order,
             compatibility=run_compatibility,
@@ -820,7 +974,27 @@ def main() -> int:
     initial_geometry_promotion_report = None
     promotion_baseline: Dict[str, Any] = {}
 
-    if args.resume_from or args.warm_start_from or not promotion_baseline:
+    if args.resume_run_state:
+        resumed_metadata = dict(resume_state_info.get("run_state_metadata", {}))
+        promotion_baseline = restore_promotion_baseline(
+            resume_state_info,
+            promotion_split=args.promotion_split,
+            promotion_sample_order=_dataset_sample_order(promotion_dataset),
+            evaluation_samples=args.promotion_evaluation_samples,
+            generation_seeds=args.promotion_generation_seeds,
+        )
+        initial_geometry_promotion_report = (
+            dict(resumed_metadata.get("promotion_baseline_report", {}))
+            or dict(promotion_baseline)
+        )
+        initial_geometry_promotion = dict(
+            resumed_metadata.get("promotion_baseline_metrics", {})
+        ) or None
+        trainer.run_state_metadata = resumed_metadata
+
+    if not args.resume_run_state and (
+        args.resume_from or args.warm_start_from or not promotion_baseline
+    ):
         python_rng_state = random.getstate()
         numpy_rng_state = np.random.get_state()
         torch_rng_state = torch.get_rng_state()
@@ -845,6 +1019,23 @@ def main() -> int:
                 if (args.resume_from or args.warm_start_from)
                 else "fresh_run_initial_state"
             ),
+        }
+        trainer.run_state_metadata = {
+            "promotion_baseline": dict(promotion_baseline),
+            "promotion_baseline_report": dict(initial_geometry_promotion_report),
+            "promotion_baseline_metrics": dict(baseline_metrics),
+            "promotion_baseline_identity": {
+                "split": str(args.promotion_split),
+                "sample_order": _dataset_sample_order(promotion_dataset),
+                "evaluation_samples": int(args.promotion_evaluation_samples),
+                "generation_seeds": int(args.promotion_generation_seeds),
+                "materialization_mode": baseline_promotion.get(
+                    "materialization_mode"
+                ),
+                "geometry_probability_threshold": baseline_promotion.get(
+                    "geometry_probability_threshold"
+                ),
+            },
         }
         best_checkpoint_path = (
             str(Path(args.resume_from or args.warm_start_from).resolve())
@@ -871,8 +1062,10 @@ def main() -> int:
             f"mean_recall={baseline_metrics['promotion_generated_recall']:.6g}"
         )
 
-    for epoch in range(args.num_epochs):
+    start_epoch = int(resume_state_info.get("epoch_index", 0))
+    for epoch in range(start_epoch, args.num_epochs):
         print(f"Epoch {epoch + 1}/{args.num_epochs}")
+        current_epoch_index = epoch
         start_batch = 0
         if epoch == int(resume_state_info.get("epoch_index", 0)):
             start_batch = int(resume_state_info.get("completed_in_epoch", 0))
@@ -890,6 +1083,14 @@ def main() -> int:
                 f"{run_state_target}"
             )
             break
+        if args.checkpoint_every_updates > 0:
+            trainer.save_run_state(
+                run_state_target,
+                epoch_index=epoch + 1,
+                completed_in_epoch=0,
+                sample_order=sample_order,
+                compatibility=run_compatibility,
+            )
         metrics = {
             "epoch": epoch + 1,
             **{key: float(value) for key, value in metrics.items()},
