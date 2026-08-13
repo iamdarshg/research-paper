@@ -2,6 +2,7 @@ import json
 import os
 import random
 import sys
+from dataclasses import fields
 
 import pytest
 import torch
@@ -40,6 +41,7 @@ from run_monitored_training import (
     _reconcile_updates_log,
     restore_promotion_baseline,
 )
+import run_monitored_training as monitored_training
 
 
 def test_resumed_suffix_coverage_uses_processed_suffix():
@@ -120,6 +122,285 @@ def test_final_parameter_update_respects_each_active_topology_guard():
         torch.tensor([1.0, 0.0]),
     ):
         assert float(torch.dot(parameter.grad, guard)) >= -1.0e-10
+
+
+def test_lbm_shape_drag_configuration_remains_dataclass_and_serializable():
+    names = {field.name for field in fields(__import__("aircraft_diffusion_cfd").LBMPhysicsConfig)}
+    assert {
+        "shape_drag_correction_coefficients",
+        "shape_drag_correction_min",
+        "shape_drag_correction_max",
+    } <= names
+
+    config = __import__("aircraft_diffusion_cfd").LBMPhysicsConfig(
+        shape_drag_correction_coefficients=(1.0, 2.0),
+        shape_drag_correction_min=0.2,
+        shape_drag_correction_max=2.5,
+    )
+    assert config.shape_drag_correction_coefficients == (1.0, 2.0)
+    payload = {
+        "shape_drag_correction_coefficients": [-1.0, 0.5],
+        "shape_drag_correction_min": 0.3,
+        "shape_drag_correction_max": 2.0,
+    }
+    restored = __import__("aircraft_diffusion_cfd").LBMPhysicsConfig(**payload)
+    assert restored.shape_drag_correction_coefficients == (-1.0, 0.5)
+
+
+def test_train_epoch_preserves_all_group_gradients_and_active_guard_invariant():
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    diffusion = DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4)
+    training = TrainingConfig(
+        num_epochs=1,
+        consistency_interval=100,
+        direct_solver_steps=1,
+        direct_solver_directions=1,
+        direct_solver_interval=1,
+        offload_optimizer_state_between_steps=False,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        config,
+        diffusion,
+        training,
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    trainer.geometry_threshold_calibrated = True
+    trainer.geometry_probability_threshold = 0.5
+
+    class ControlledMeasuredObjective(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.last_components = {}
+
+        def forward(self, logits, design_spec, simulator, seed=None, reference_occupancy=None):
+            self.last_components = {
+                "aero_loss": 0.2,
+                "occupancy_loss": 0.1,
+                "connectivity_loss": 0.3,
+                "aircraft_validity_loss": 0.0,
+                "active_guard_names": ["connectivity_loss"],
+                "_accepted_guard_gradients": {
+                    "connectivity_loss": torch.ones_like(logits),
+                    "aircraft_validity_loss": -torch.ones_like(logits),
+                },
+                "spsa_gradient_norm": 1.0,
+                "spsa_gradient_norm_unclipped": 1.0,
+                "aero_spsa_gradient_norm": 0.1,
+                "aero_spsa_gradient_norm_unclipped": 0.1,
+                "connectivity_spsa_gradient_norm": 0.1,
+                "connectivity_spsa_gradient_norm_unclipped": 0.1,
+                "aircraft_validity_spsa_gradient_norm": 0.0,
+                "aircraft_validity_spsa_gradient_norm_unclipped": 0.0,
+            }
+            return logits.mean()
+
+    trainer.direct_solver_loss = ControlledMeasuredObjective()
+    batch = {
+        "latent": torch.full((1, 4), 0.2),
+        "geometry": torch.zeros((1, 4, 4, 4)),
+        "design_spec": [DesignSpec()],
+    }
+    captured_steps = []
+    original_step = trainer.optimizer.step
+
+    def capture_step(*args, **kwargs):
+        captured_steps.append(
+            tuple(
+                None if parameter.grad is None else parameter.grad.detach().clone()
+                for group in trainer.optimizer.param_groups
+                for parameter in group["params"]
+            )
+        )
+        return original_step(*args, **kwargs)
+
+    trainer.optimizer.step = capture_step
+    trainer.train_epoch([batch], grid_size=4)
+
+    lifecycle = trainer.last_gradient_lifecycle
+    assert lifecycle["replayed_guard_names"] == ["connectivity"]
+    assert lifecycle["replay_isolated"] is True
+    assert captured_steps and all(gradient is not None for gradient in captured_steps[0])
+    assert lifecycle["data_group_norms"]["diffusion"] > 0.0
+    assert lifecycle["data_group_norms"]["coordinate_converter"] > 0.0
+    assert lifecycle["exact_margin_loss"] > 0.0
+    assert lifecycle["data_margin_gradient_norm"] > 0.0
+
+    actual = captured_steps[0]
+    for guard_name, guard in lifecycle["active_guard_gradients"].items():
+        dot = sum(
+            float((gradient * guard_value).sum().item())
+            for gradient, guard_value in zip(actual, guard)
+            if gradient is not None and guard_value is not None
+        )
+        assert dot >= -1.0e-8, (guard_name, dot)
+
+
+def test_runner_main_restores_saved_threshold_and_resets_cadence(tmp_path, monkeypatch):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("{}\n", encoding="utf-8")
+    run_state = tmp_path / "latest_run_state.pt"
+    atomic_save_run_state(
+        run_state,
+        {
+            "geometry_probability_threshold": 0.37,
+            "geometry_threshold_calibrated": True,
+            "geometry_threshold_calibration": {"source": "saved"},
+        },
+    )
+    updates = tmp_path / "updates.jsonl"
+    updates.write_text("", encoding="utf-8")
+
+    class FakeDataset(torch.utils.data.Dataset):
+        def __init__(self, **kwargs):
+            self.grid_size = 4
+            self.latent_dim = 4
+            self.metadata = {
+                "split_assignments": ["train", "train", "val"],
+                "unique_geometry_count": 3,
+            }
+            self.records = [
+                {
+                    "latent": torch.zeros(4),
+                    "geometry": torch.zeros((4, 4, 4)),
+                    "design_spec": DesignSpec(),
+                }
+                for _ in range(3)
+            ]
+
+        def __len__(self):
+            return len(self.records)
+
+        def __getitem__(self, index):
+            return self.records[index]
+
+    class FakeTrainer:
+        instances = []
+
+        def __init__(self, *args, device=None, **kwargs):
+            self.device = device or torch.device("cpu")
+            self.geometry_probability_threshold = 0.91
+            self.geometry_threshold_calibrated = False
+            self.threshold_calls = []
+            self.parameter = torch.nn.Parameter(torch.zeros(()))
+            self.optimizer = torch.optim.SGD([self.parameter], lr=1.0)
+            self.scheduler = None
+            self.scheduler_step_per_update = True
+            self.global_step = 1
+            self.run_state_metadata = {}
+            self.stop_after_updates = None
+            self.starts = []
+            self.saved_states = []
+            FakeTrainer.instances.append(self)
+
+        def _set_geometry_probability_threshold(self, threshold, *, calibrated, calibration):
+            self.threshold_calls.append(float(threshold))
+            self.geometry_probability_threshold = float(threshold)
+            self.geometry_threshold_calibrated = bool(calibrated)
+
+        def calibrate_geometry_materialization_threshold(self, loader):
+            raise AssertionError("resume-run-state must use the saved threshold")
+
+        def load_run_state(self, path, *, expected_compatibility):
+            assert expected_compatibility["configuration"][
+                "geometry_materialization_threshold"
+            ] == pytest.approx(0.37)
+            assert "training_config" in expected_compatibility["configuration"]
+            return {
+                "epoch_index": 0,
+                "completed_in_epoch": 1,
+                "sample_order": [0, 1],
+                "global_step": 1,
+                "run_state_metadata": {
+                    "promotion_baseline": {"generated_unique_fraction": 0.5},
+                    "promotion_baseline_report": {},
+                    "promotion_baseline_metrics": {},
+                    "promotion_baseline_identity": {
+                        "split": "val",
+                        "sample_order": [2],
+                        "evaluation_samples": 16,
+                        "generation_seeds": 6,
+                    },
+                },
+                "log_reconciliation": {
+                    "offset": 0,
+                    "sha256": __import__("hashlib").sha256(b"").hexdigest(),
+                },
+            }
+
+        def train_epoch(self, train_loader, *, grid_size, start_batch):
+            self.starts.append(int(start_batch))
+            if self.run_state_checkpoint_callback is not None:
+                completed = 2 if len(self.starts) == 1 else 1
+                self.run_state_checkpoint_callback(completed, 2)
+            return {
+                "loss": 1.0,
+                "optimization_loss": 1.0,
+                "mse": 0.1,
+                "geometry_reconstruction": 0.1,
+                "generation_reconstruction": 0.1,
+                "clean_geometry_reconstruction": 0.1,
+                "consistency": 0.1,
+                "direct_solver_loss": 0.1,
+            }
+
+        def evaluate_geometry_promotion_gate(self, loader):
+            return {
+                "status": "fail",
+                "reconstruction_recall": 0.5,
+                "generated_recall": 0.5,
+                "generated_worst_recall": 0.5,
+                "generated_mean_occupied_fraction": 0.1,
+                "target_mean_occupied_fraction": 0.1,
+                "generated_aircraft_valid_fraction": 0.5,
+                "generated_unique_fraction": 0.5,
+                "generated_mean_largest_component_fraction": 0.7,
+                "generated_mean_normalization_boundary_fraction": 0.0,
+            }
+
+        def save_run_state(self, path, **kwargs):
+            self.saved_states.append(dict(kwargs))
+
+        def save_checkpoint(self, path):
+            return None
+
+    monkeypatch.setattr(monitored_training, "AircraftDesignDataset", FakeDataset)
+    monkeypatch.setattr(monitored_training, "OptimizedDiffusionTrainer", FakeTrainer)
+    monkeypatch.setattr(monitored_training, "prepare_edt_workspace", lambda shape: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_monitored_training.py",
+            "--manifest", str(manifest),
+            "--num-epochs", "2",
+            "--batch-size", "1",
+            "--latent-dim", "4",
+            "--grid-size", "4",
+            "--resume-run-state", str(run_state),
+            "--history-output", str(tmp_path / "history.json"),
+            "--updates-output", str(updates),
+            "--checkpoint-every-updates", "1",
+            "--save-every", "0",
+            "--no-save-final-checkpoint",
+            "--no-stop-on-promotion-pass",
+        ],
+    )
+
+    assert monitored_training.main() == 0
+    trainer = FakeTrainer.instances[-1]
+    assert trainer.threshold_calls == [0.37]
+    assert trainer.starts == [1, 0]
+    assert 2 in [state["completed_in_epoch"] for state in trainer.saved_states]
+    assert 1 in [state["completed_in_epoch"] for state in trainer.saved_states]
 
 
 def test_log_ahead_is_reconciled_to_checkpoint_boundary(tmp_path):

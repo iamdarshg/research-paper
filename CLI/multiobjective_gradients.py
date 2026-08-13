@@ -51,6 +51,26 @@ def clear_gradients(parameters: Iterable[torch.nn.Parameter]) -> None:
         parameter.grad = None
 
 
+def add_gradient_buffers(
+    first: Sequence[Optional[torch.Tensor]],
+    second: Sequence[Optional[torch.Tensor]],
+) -> GradientBuffer:
+    """Add two aligned gradient buffers without mutating either input."""
+    if len(first) != len(second):
+        raise ValueError("gradient branches must have the same buffer count")
+    result: list[Optional[torch.Tensor]] = []
+    for first_value, second_value in zip(first, second):
+        if first_value is None and second_value is None:
+            result.append(None)
+        elif first_value is None:
+            result.append(second_value.detach().clone())
+        elif second_value is None:
+            result.append(first_value.detach().clone())
+        else:
+            result.append(first_value.detach().clone() + second_value.detach())
+    return tuple(result)
+
+
 def _validate_gradient_tensor(
     gradient: torch.Tensor,
     *,

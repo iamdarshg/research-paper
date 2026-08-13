@@ -58,8 +58,10 @@ from geometry_store import CompactGeometryStore
 from multiobjective_gradients import (
     capture_gradients,
     clear_gradients,
+    add_gradient_buffers,
     combine_gradient_branches,
     combine_constrained_measured_gradients,
+    gradient_l2_norm,
     gradient_cosine_similarity,
     project_improvement_gradients_against_guards,
 )
@@ -1207,6 +1209,19 @@ class LBMPhysicsConfig:
     use_shape_drag_correction: bool = bool(
         config_value("cfd", "use_shape_drag_correction", False)
     )
+    shape_drag_correction_coefficients: Tuple[float, ...] = (
+        -12.633030612111941, 27.87582461044955, -10.247055184812014,
+        22.962648171191816, -17.337224317584685, -3.946645931513679,
+        0.08323209768046214, 4.548014973469924, -5.179313884992105,
+        -7.623947231425998,
+    )
+    shape_drag_correction_min: float = 0.1
+    shape_drag_correction_max: float = 3.0
+
+    def __post_init__(self) -> None:
+        self.shape_drag_correction_coefficients = tuple(
+            float(value) for value in self.shape_drag_correction_coefficients
+        )
 
 
 def capture_data_anchor_gradients(
@@ -1216,14 +1231,6 @@ def capture_data_anchor_gradients(
     gradients = capture_gradients(parameters)
     clear_gradients(parameters)
     return gradients
-    shape_drag_correction_coefficients: Tuple[float, ...] = (
-        -12.633030612111941, 27.87582461044955, -10.247055184812014,
-        22.962648171191816, -17.337224317584685, -3.946645931513679,
-        0.08323209768046214, 4.548014973469924, -5.179313884992105,
-        -7.623947231425998,
-    )
-    shape_drag_correction_min: float = 0.1
-    shape_drag_correction_max: float = 3.0
 
 @dataclass
 class CFDConfig:
@@ -4279,6 +4286,8 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         else combined_component_gradient + component_value
                     )
             for guard_name in accepted_guard_gradients:
+                if guard_name not in active_guard_names:
+                    continue
                 guard_value = guard_component_values.get(guard_name)
                 if isinstance(guard_value, tuple):
                     guard_value = guard_value[0]
@@ -4291,6 +4300,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 combined_component_gradient = torch.zeros_like(sample_field)
             accepted_component_grads = {"combined": combined_component_gradient}
             base_components["active_guard_set"] = list(active_guard_names)
+            base_components["active_guard_names"] = list(active_guard_names)
             base_components["guard_active_connectivity"] = float(
                 "connectivity_loss" in active_guard_names
             )
@@ -4396,6 +4406,14 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             for name, values in accepted_guard_gradients.items()
             if values
         }
+        component_sink["active_guard_names"] = [
+            name
+            for name in ("connectivity_loss", "aircraft_validity_loss")
+            if any(
+                name in record.get("active_guard_names", [])
+                for record in base_component_records
+            )
+        ]
         if base_component_records:
             for key in base_component_records[0]:
                 values = [record[key] for record in base_component_records if key in record]
@@ -4649,6 +4667,7 @@ class OptimizedDiffusionTrainer:
         self.stop_after_updates: Optional[int] = None
         self.run_state_metadata: Dict[str, Any] = {}
         self.run_state_log_metadata: Dict[str, Any] = {}
+        self.last_gradient_lifecycle: Dict[str, Any] = {}
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -5274,6 +5293,20 @@ class OptimizedDiffusionTrainer:
         student_parameters = tuple(
             self.consistency_model.student_model.parameters()
         )
+        optimizer_parameters = tuple(
+            parameter
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        )
+        optimizer_group_indices = {}
+        parameter_index = 0
+        for group in self.optimizer.param_groups:
+            name = str(group.get("name", "unnamed"))
+            count = len(group["params"])
+            optimizer_group_indices[name] = tuple(
+                range(parameter_index, parameter_index + count)
+            )
+            parameter_index += count
 
         start_batch = max(0, int(start_batch))
         processed_updates = 0
@@ -5527,8 +5560,11 @@ class OptimizedDiffusionTrainer:
             # Backpropagate independent student branches sequentially. The
             # branch combiner limits only extreme gradients and never amplifies
             # a small finite contribution.
-            self.optimizer.zero_grad()
-            data_optimization_loss_val.backward()
+            clear_gradients(optimizer_parameters)
+            data_optimization_loss_val.backward(
+                retain_graph=bool(self.geometry_threshold_calibrated)
+            )
+            ordinary_data_gradients = capture_gradients(optimizer_parameters)
             exact_generation_margin_loss_val = (
                 self._backward_full_grounded_threshold_margin(
                     generation_latent,
@@ -5552,20 +5588,33 @@ class OptimizedDiffusionTrainer:
                     generation_geometry_loss_val.detach()
                     + exact_generation_margin_loss_val / generation_weight
                 )
-            student_data_gradients = capture_data_anchor_gradients(student_parameters)
+            data_gradients = capture_data_anchor_gradients(optimizer_parameters)
+            margin_gradient_delta = tuple(
+                None
+                if after is None and before is None
+                else (
+                    after.detach().clone()
+                    if before is None
+                    else (
+                        before.detach().clone().mul(-1.0)
+                        if after is None
+                        else after.detach() - before.detach()
+                    )
+                )
+                for before, after in zip(ordinary_data_gradients, data_gradients)
+            )
 
+            clear_gradients(optimizer_parameters)
             if consistency_loss.requires_grad:
                 consistency_loss.backward()
-                student_consistency_gradients = capture_gradients(
-                    student_parameters
-                )
+                consistency_gradients = capture_gradients(optimizer_parameters)
             else:
-                student_consistency_gradients = tuple(
-                    None for _ in student_parameters
+                consistency_gradients = tuple(
+                    None for _ in optimizer_parameters
                 )
-            clear_gradients(student_parameters)
-            student_direct_gradients = tuple(None for _ in student_parameters)
-            student_topology_guard_gradients: Dict[
+            clear_gradients(optimizer_parameters)
+            direct_gradients = tuple(None for _ in optimizer_parameters)
+            topology_guard_gradients: Dict[
                 str, Tuple[Optional[torch.Tensor], ...]
             ] = {}
             optimization_loss_val = (
@@ -5615,30 +5664,47 @@ class OptimizedDiffusionTrainer:
                 direct_weight = float(
                     self.training_config.direct_solver_loss_weight
                 )
+                active_guard_names = tuple(
+                    str(name)
+                    for name in self.direct_solver_loss.last_components.get(
+                        "active_guard_names", []
+                    )
+                )
                 topology_guard_names = {
                     "connectivity_loss": "connectivity",
                     "aircraft_validity_loss": "validity",
                 }
                 for source_name, guard_name in topology_guard_names.items():
+                    if source_name not in active_guard_names:
+                        continue
                     guard_logit_gradient = parameter_guard_logit_gradients.get(
                         source_name
                     )
                     if guard_logit_gradient is None:
                         continue
-                    self.optimizer.zero_grad()
+                    if any(parameter.grad is not None for parameter in optimizer_parameters):
+                        raise RuntimeError(
+                            "topology guard replay started with stale optimizer gradients"
+                        )
                     direct_optimizer_logits.backward(
                         gradient=direct_weight * guard_logit_gradient,
                         retain_graph=True,
                     )
-                    student_topology_guard_gradients[guard_name] = (
-                        capture_gradients(student_parameters)
+                    topology_guard_gradients[guard_name] = capture_gradients(
+                        optimizer_parameters
                     )
-                    clear_gradients(student_parameters)
+                    clear_gradients(optimizer_parameters)
+                    if any(parameter.grad is not None for parameter in optimizer_parameters):
+                        raise RuntimeError(
+                            "topology guard replay left optimizer gradients behind"
+                        )
+                if any(parameter.grad is not None for parameter in optimizer_parameters):
+                    raise RuntimeError("direct replay started with stale optimizer gradients")
                 direct_optimizer_logits.backward(
                     gradient=direct_weight * direct_logit_gradient
                 )
-                student_direct_gradients = capture_gradients(student_parameters)
-                clear_gradients(student_parameters)
+                direct_gradients = capture_gradients(optimizer_parameters)
+                clear_gradients(optimizer_parameters)
                 direct_solver_evaluated = True
                 direct_solver_call_count += int(latent.shape[0]) * (
                     1 + 2 * int(self.training_config.direct_solver_directions)
@@ -5694,13 +5760,19 @@ class OptimizedDiffusionTrainer:
                     * grounded_full_loss
                 ).backward()
             clean_geometry_loss_val = grounded_full_loss.detach()
+            clean_data_gradients = capture_gradients(optimizer_parameters)
+            clear_gradients(optimizer_parameters)
+            data_gradients = add_gradient_buffers(
+                data_gradients,
+                clean_data_gradients,
+            )
 
             branch_telemetry = combine_gradient_branches(
-                student_parameters,
+                optimizer_parameters,
                 {
-                    "data": student_data_gradients,
-                    "consistency": student_consistency_gradients,
-                    "direct": student_direct_gradients,
+                    "data": data_gradients,
+                    "consistency": consistency_gradients,
+                    "direct": direct_gradients,
                 },
                 {
                     "data": float(
@@ -5724,26 +5796,48 @@ class OptimizedDiffusionTrainer:
                     else ()
                 ),
                 final_guard_branches={
-                    "data": student_data_gradients,
-                    **student_topology_guard_gradients,
+                    "data": data_gradients,
+                    **topology_guard_gradients,
                 },
             )
+            self.last_gradient_lifecycle = {
+                "replayed_guard_names": list(topology_guard_gradients),
+                "replay_isolated": True,
+                "active_guard_gradients": {
+                    "data": data_gradients,
+                    **topology_guard_gradients,
+                },
+                "data_group_norms": {
+                    name: gradient_l2_norm(
+                        tuple(data_gradients[index] for index in indices),
+                        branch_name=f"data_{name}",
+                    )
+                    for name, indices in optimizer_group_indices.items()
+                },
+                "data_margin_gradient_norm": gradient_l2_norm(
+                    margin_gradient_delta,
+                    branch_name="exact_threshold_margin",
+                ),
+                "exact_margin_loss": float(
+                    exact_generation_margin_loss_val.detach().item()
+                ),
+            }
             student_gradient_cosines = {
                 "data_consistency": gradient_cosine_similarity(
-                    student_data_gradients,
-                    student_consistency_gradients,
+                    data_gradients,
+                    consistency_gradients,
                     first_name="data",
                     second_name="consistency",
                 ),
                 "data_direct": gradient_cosine_similarity(
-                    student_data_gradients,
-                    student_direct_gradients,
+                    data_gradients,
+                    direct_gradients,
                     first_name="data",
                     second_name="direct",
                 ),
                 "consistency_direct": gradient_cosine_similarity(
-                    student_consistency_gradients,
-                    student_direct_gradients,
+                    consistency_gradients,
+                    direct_gradients,
                     first_name="consistency",
                     second_name="direct",
                 ),
@@ -5753,6 +5847,40 @@ class OptimizedDiffusionTrainer:
             torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), self.training_config.gradient_clip)
             torch.nn.utils.clip_grad_norm_(self.converter.parameters(), self.training_config.gradient_clip)
             torch.nn.utils.clip_grad_norm_(self.consistency_model.student_model.parameters(), self.training_config.gradient_clip)
+            clipped_gradients = capture_gradients(optimizer_parameters)
+            accepted_step_gradients, _ = project_improvement_gradients_against_guards(
+                {"step": clipped_gradients},
+                self.last_gradient_lifecycle["active_guard_gradients"],
+                guard_order=("data", "connectivity", "validity"),
+            )
+            for parameter, gradient in zip(
+                optimizer_parameters,
+                accepted_step_gradients["step"],
+            ):
+                parameter.grad = gradient
+            step_gradients = capture_gradients(optimizer_parameters)
+            for guard_name, guard_gradients in self.last_gradient_lifecycle[
+                "active_guard_gradients"
+            ].items():
+                guard_dot = sum(
+                    float(
+                        torch.sum(
+                            update_gradient.detach().double()
+                            * guard_gradient.detach().double()
+                        ).item()
+                    )
+                    for update_gradient, guard_gradient in zip(
+                        step_gradients,
+                        guard_gradients,
+                    )
+                    if update_gradient is not None and guard_gradient is not None
+                )
+                if guard_dot < -1.0e-8:
+                    raise RuntimeError(
+                        f"final optimizer gradient is uphill on active {guard_name} guard: "
+                        f"dot={guard_dot:.6g}"
+                    )
+            self.last_gradient_lifecycle["step_gradients"] = step_gradients
 
             # Optimizer step
             if self.training_config.offload_optimizer_state_between_steps:
