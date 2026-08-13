@@ -59,6 +59,21 @@ def _dataset_sample_order(dataset: Dataset) -> list[int]:
     return [int(index) for index in indices]
 
 
+def _run_state_checkpoint_due(
+    completed_in_epoch: int,
+    segment_start_batch: int,
+    checkpoint_every_updates: int,
+) -> bool:
+    """Use a bounded cadence relative to the current invocation's start."""
+    cadence = int(checkpoint_every_updates)
+    completed_since_start = int(completed_in_epoch) - int(segment_start_batch)
+    return (
+        cadence > 0
+        and completed_since_start > 0
+        and completed_since_start % cadence == 0
+    )
+
+
 class RunLocalCosineScheduler:
     """Cosine decay over successful optimizer updates with a nonzero floor."""
 
@@ -769,9 +784,10 @@ def main() -> int:
             )
 
     def maybe_save_run_state(completed_in_epoch: int, total_in_epoch: int) -> Optional[str]:
-        if (
-            args.checkpoint_every_updates <= 0
-            or trainer.global_step % int(args.checkpoint_every_updates) != 0
+        if not _run_state_checkpoint_due(
+            completed_in_epoch,
+            int(resume_state_info["completed_in_epoch"]),
+            args.checkpoint_every_updates,
         ):
             return None
         trainer.save_run_state(
@@ -786,7 +802,9 @@ def main() -> int:
     trainer.run_state_checkpoint_callback = maybe_save_run_state
     trainer.resumed_from_update = int(trainer.global_step) if args.resume_run_state else 0
     trainer.stop_after_updates = (
-        int(args.stop_after_updates) if args.stop_after_updates > 0 else None
+        int(trainer.global_step) + int(args.stop_after_updates)
+        if args.stop_after_updates > 0
+        else None
     )
 
     history: List[Dict[str, Any]] = []

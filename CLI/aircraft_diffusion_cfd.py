@@ -5061,6 +5061,7 @@ class OptimizedDiffusionTrainer:
         total_student_direct_gradient_applied = 0.0
         direct_solver_eval_count = 0
         direct_solver_call_count = 0
+        interrupted_early = False
         student_parameters = tuple(
             self.consistency_model.student_model.parameters()
         )
@@ -5713,6 +5714,7 @@ class OptimizedDiffusionTrainer:
                 self.stop_after_updates is not None
                 and self.global_step >= int(self.stop_after_updates)
             ):
+                interrupted_early = True
                 break
 
             # Clear memory
@@ -5743,7 +5745,9 @@ class OptimizedDiffusionTrainer:
             if direct_solver_eval_count > 0
             else 0.0
         )
-        optimizer_iterations = len(train_loader)
+        optimizer_iterations = (
+            processed_updates if interrupted_early else len(train_loader)
+        )
         validate_direct_solver_iteration_coverage(
             direct_solver_eval_count,
             optimizer_iterations,

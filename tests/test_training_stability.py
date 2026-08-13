@@ -13,6 +13,7 @@ if CLI_DIR not in sys.path:
 from run_monitored_training import (
     RunLocalCosineScheduler,
     _build_epoch_dataset,
+    _run_state_checkpoint_due,
     _geometry_non_regression,
     _geometry_promotion_metrics,
 )
@@ -99,6 +100,12 @@ class TestTrainingStability(unittest.TestCase):
         self.assertAlmostEqual(observed[-1][0], 2.0e-5)
         self.assertAlmostEqual(observed[-1][1], 5.0e-6)
         self.assertTrue(all(value > 0.0 for row in observed for value in row))
+
+    def test_run_state_checkpoint_cadence_is_relative_to_segment_start(self):
+        self.assertFalse(_run_state_checkpoint_due(7, 0, 8))
+        self.assertTrue(_run_state_checkpoint_due(8, 0, 8))
+        self.assertFalse(_run_state_checkpoint_due(15, 8, 8))
+        self.assertTrue(_run_state_checkpoint_due(16, 8, 8))
 
     def test_geometry_promotion_rank_includes_validity_diversity_and_shape(self):
         metrics, rank = _geometry_promotion_metrics(

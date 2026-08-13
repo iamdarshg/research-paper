@@ -834,3 +834,75 @@ def test_coordinate_decoder_checkpointed_chunks_backpropagate_to_latent():
     assert latent.grad is not None
     assert torch.isfinite(latent.grad).all()
     assert float(latent.grad.abs().sum()) > 0.0
+
+
+def test_train_epoch_bounded_interruption_validates_only_processed_updates():
+    class DifferentiableDirectLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.last_components = {}
+
+        def forward(
+            self,
+            logits,
+            design_spec,
+            simulator,
+            seed=None,
+            reference_occupancy=None,
+        ):
+            self.calls += 1
+            value = torch.sigmoid(logits).mean()
+            self.last_components = {
+                "aero_loss": float(value.detach()),
+                "connectivity_loss": 0.1,
+                "aircraft_validity_loss": 0.2,
+                "spsa_gradient_norm": 0.3,
+                "spsa_gradient_norm_unclipped": 0.4,
+                "aero_spsa_gradient_norm": 0.1,
+                "aero_spsa_gradient_norm_unclipped": 0.2,
+                "connectivity_spsa_gradient_norm": 0.1,
+                "connectivity_spsa_gradient_norm_unclipped": 0.2,
+                "aircraft_validity_spsa_gradient_norm": 0.1,
+                "aircraft_validity_spsa_gradient_norm_unclipped": 0.2,
+            }
+            return value
+
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        config,
+        DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4),
+        TrainingConfig(
+            num_epochs=1,
+            consistency_interval=1,
+            direct_solver_steps=1,
+            direct_solver_directions=1,
+            direct_solver_interval=1,
+            offload_optimizer_state_between_steps=False,
+        ),
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    fake_direct = DifferentiableDirectLoss()
+    trainer.direct_solver_loss = fake_direct
+    trainer.stop_after_updates = 1
+    batch = {
+        "latent": torch.zeros((1, 4)),
+        "geometry": torch.zeros((1, 4, 4, 4)),
+        "design_spec": [DesignSpec()],
+    }
+
+    metrics = trainer.train_epoch([batch, batch], grid_size=4)
+
+    assert fake_direct.calls == 1
+    assert metrics["direct_solver_eval_count"] == 1
+    assert metrics["direct_solver_iteration_coverage"] == 1.0
+    assert trainer.global_step == 1
