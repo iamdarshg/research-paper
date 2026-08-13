@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -37,6 +38,21 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(line + "\n")
         handle.flush()
+
+
+def _manifest_identity(path: str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _dataset_sample_order(dataset: Dataset) -> list[int]:
+    indices = getattr(dataset, "indices", None)
+    if indices is None:
+        return list(range(len(dataset)))
+    return [int(index) for index in indices]
 
 
 class RunLocalCosineScheduler:
@@ -333,6 +349,11 @@ def _build_history_payload(
         "config": {
             "manifest": str(Path(args.manifest).resolve()) if args.manifest else None,
             "resume_from": str(Path(args.resume_from).resolve()) if args.resume_from else None,
+            "resume_run_state": (
+                str(Path(args.resume_run_state).resolve())
+                if args.resume_run_state
+                else None
+            ),
             "warm_start_from": (
                 str(Path(args.warm_start_from).resolve())
                 if args.warm_start_from
@@ -374,6 +395,8 @@ def _build_history_payload(
             "oscillation_cv_threshold": args.oscillation_cv_threshold,
             "early_stop_on_convergence": args.early_stop_on_convergence,
             "save_every": args.save_every,
+            "checkpoint_every_updates": args.checkpoint_every_updates,
+            "stop_after_updates": args.stop_after_updates,
             "save_final_checkpoint": args.save_final_checkpoint,
             "direct_solver_loss_weight": args.direct_solver_loss_weight,
             "direct_solver_steps": args.direct_solver_steps,
@@ -438,6 +461,11 @@ def main() -> int:
     )
     parser.add_argument("--save-dir", default="./checkpoints_monitored")
     parser.add_argument("--resume-from", default=None)
+    parser.add_argument(
+        "--resume-run-state",
+        default=None,
+        help="Resume an interrupted run exactly at its next unprocessed update.",
+    )
     parser.add_argument("--warm-start-from", default=None)
     parser.add_argument("--history-output", default="./build/monitored_training/history.json")
     parser.add_argument(
@@ -446,6 +474,18 @@ def main() -> int:
         help="Append-only per-optimizer-update JSONL; defaults beside history.json.",
     )
     parser.add_argument("--save-every", type=int, default=int(config_value("training", "save_interval", 25)))
+    parser.add_argument(
+        "--checkpoint-every-updates",
+        type=int,
+        default=0,
+        help="Atomically save latest_run_state.pt every N optimizer updates; 0 disables it.",
+    )
+    parser.add_argument(
+        "--stop-after-updates",
+        type=int,
+        default=0,
+        help="Bounded interruption hook for smoke tests; 0 runs the configured horizon.",
+    )
     parser.add_argument(
         "--save-final-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -492,14 +532,18 @@ def main() -> int:
     parser.add_argument("--direct-solver-perturbation", type=float, default=float(config_value("training", "direct_solver_perturbation", 0.15)))
     parser.add_argument("--direct-solver-perturbation-grid-size", type=int, default=int(config_value("training", "direct_solver_perturbation_grid_size", 12)))
     args = parser.parse_args()
-    if args.resume_from and args.warm_start_from:
-        parser.error("--resume-from and --warm-start-from are mutually exclusive")
+    if sum(bool(value) for value in (args.resume_from, args.resume_run_state, args.warm_start_from)) > 1:
+        parser.error("--resume-run-state, --resume-from, and --warm-start-from are mutually exclusive")
     if not 0.0 < float(args.lr_min_ratio) <= 1.0:
         parser.error("--lr-min-ratio must be in (0, 1]")
     if args.promotion_evaluation_samples <= 0:
         parser.error("--promotion-evaluation-samples must be greater than 0")
     if args.promotion_generation_seeds <= 0:
         parser.error("--promotion-generation-seeds must be greater than 0")
+    if args.checkpoint_every_updates < 0:
+        parser.error("--checkpoint-every-updates must be nonnegative")
+    if args.stop_after_updates < 0:
+        parser.error("--stop-after-updates must be nonnegative")
 
     os.environ["OMP_NUM_THREADS"] = str(args.cpu_threads)
     os.environ["MKL_NUM_THREADS"] = str(args.cpu_threads)
@@ -583,6 +627,7 @@ def main() -> int:
         )
     args.training_sample_count = len(epoch_dataset)
     args.promotion_sample_count = len(promotion_dataset)
+    sample_order = _dataset_sample_order(epoch_dataset)
 
     print(f"Using device: {device}")
     print(f"CPU threads capped at: {args.cpu_threads}")
@@ -619,7 +664,7 @@ def main() -> int:
     train_loader = DataLoader(
         epoch_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=0,
         collate_fn=aircraft_collate_fn,
     )
@@ -659,6 +704,28 @@ def main() -> int:
     )
     trainer.scheduler_step_per_update = True
 
+    run_state_target = Path(
+        args.resume_run_state or (Path(args.save_dir) / "latest_run_state.pt")
+    ).resolve()
+    run_compatibility = {
+        "manifest_identity": _manifest_identity(args.manifest),
+        "grid_size": int(resolved_grid_size),
+        "latent_dim": int(model_config.latent_dim),
+        "split": str(args.training_split),
+        "sample_count": int(len(epoch_dataset)),
+        "configuration": {
+            "planned_optimizer_updates": int(args.planned_optimizer_updates),
+            "batch_size": int(args.batch_size),
+            "subset_seed": int(args.subset_seed),
+            "sample_order": list(sample_order),
+            "solver": str(args.solver),
+            "lbm_stream_bfl_backend": str(args.lbm_stream_bfl_backend),
+            "direct_solver_steps": int(args.direct_solver_steps),
+            "direct_solver_directions": int(args.direct_solver_directions),
+            "direct_solver_perturbation": float(args.direct_solver_perturbation),
+        },
+    }
+
     save_dir = Path(args.save_dir).resolve()
     save_dir.mkdir(parents=True, exist_ok=True)
     history_output = Path(args.history_output).resolve()
@@ -669,11 +736,53 @@ def main() -> int:
         else history_output.with_name("updates.jsonl")
     )
     updates_output.parent.mkdir(parents=True, exist_ok=True)
-    updates_output.write_text("", encoding="utf-8")
+    if not args.resume_run_state:
+        updates_output.write_text("", encoding="utf-8")
+    elif not updates_output.exists():
+        raise FileNotFoundError(
+            f"Exact resume requires the existing updates JSONL: {updates_output}"
+        )
     args.updates_output = str(updates_output)
+    trainer.run_state_checkpoint_path = str(run_state_target)
     trainer.update_metrics_callback = lambda record: _append_jsonl(
         updates_output,
         record,
+    )
+
+    resume_state_info = {
+        "epoch_index": 0,
+        "completed_in_epoch": 0,
+        "sample_order": list(sample_order),
+    }
+    if args.resume_run_state:
+        resume_state_info = trainer.load_run_state(
+            args.resume_run_state,
+            expected_compatibility=run_compatibility,
+        )
+        if resume_state_info["sample_order"] != sample_order:
+            raise ValueError(
+                "Incompatible run-state resume: sample_order differs from the current epoch"
+            )
+
+    def maybe_save_run_state(completed_in_epoch: int, total_in_epoch: int) -> Optional[str]:
+        if (
+            args.checkpoint_every_updates <= 0
+            or trainer.global_step % int(args.checkpoint_every_updates) != 0
+        ):
+            return None
+        trainer.save_run_state(
+            run_state_target,
+            epoch_index=int(resume_state_info["epoch_index"]),
+            completed_in_epoch=int(completed_in_epoch),
+            sample_order=sample_order,
+            compatibility=run_compatibility,
+        )
+        return str(run_state_target)
+
+    trainer.run_state_checkpoint_callback = maybe_save_run_state
+    trainer.resumed_from_update = int(trainer.global_step) if args.resume_run_state else 0
+    trainer.stop_after_updates = (
+        int(args.stop_after_updates) if args.stop_after_updates > 0 else None
     )
 
     history: List[Dict[str, Any]] = []
@@ -738,7 +847,23 @@ def main() -> int:
 
     for epoch in range(args.num_epochs):
         print(f"Epoch {epoch + 1}/{args.num_epochs}")
-        metrics = trainer.train_epoch(train_loader, grid_size=resolved_grid_size)
+        start_batch = 0
+        if epoch == int(resume_state_info.get("epoch_index", 0)):
+            start_batch = int(resume_state_info.get("completed_in_epoch", 0))
+        metrics = trainer.train_epoch(
+            train_loader,
+            grid_size=resolved_grid_size,
+            start_batch=start_batch,
+        )
+        if (
+            trainer.stop_after_updates is not None
+            and trainer.global_step >= trainer.stop_after_updates
+        ):
+            print(
+                "Stopped at the requested bounded interruption point after writing "
+                f"{run_state_target}"
+            )
+            break
         metrics = {
             "epoch": epoch + 1,
             **{key: float(value) for key, value in metrics.items()},

@@ -1,6 +1,8 @@
 import os
+import random
 import sys
 
+import numpy as np
 import torch
 
 
@@ -28,7 +30,72 @@ from aircraft_diffusion_cfd import (
     GroupedQueryAttention,
     load_width_expanded_state_dict,
     move_optimizer_state,
+    atomic_save_run_state,
+    capture_rng_state,
+    restore_rng_state,
+    validate_run_state_compatibility,
 )
+
+
+def test_run_state_round_trip_restores_rng_and_is_atomic(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    parameter.grad = torch.tensor([0.5, -0.25])
+    optimizer.step()
+    state = {
+        "model": {"value": parameter.detach().clone()},
+        "optimizer": optimizer.state_dict(),
+        "rng": capture_rng_state(),
+        "completed_in_epoch": 2,
+    }
+    path = tmp_path / "latest_run_state.pt"
+    atomic_save_run_state(path, state)
+
+    expected_python = random.random()
+    expected_numpy = float(np.random.random())
+    expected_torch = torch.rand(3)
+    parameter.data.add_(10.0)
+    random.random()
+    np.random.random()
+    torch.rand(3)
+
+    restored = torch.load(path, map_location="cpu", weights_only=False)
+    parameter.data.copy_(restored["model"]["value"])
+    restore_rng_state(restored["rng"])
+
+    assert torch.equal(parameter, state["model"]["value"])
+    assert random.random() == expected_python
+    assert float(np.random.random()) == expected_numpy
+    assert torch.equal(torch.rand(3), expected_torch)
+    assert path.exists()
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_run_state_compatibility_reports_all_immutable_mismatches():
+    expected = {
+        "manifest_identity": "manifest-a",
+        "grid_size": 96,
+        "latent_dim": 192,
+        "split": "train",
+        "sample_count": 32,
+    }
+    actual = {
+        "manifest_identity": "manifest-b",
+        "grid_size": 32,
+        "latent_dim": 64,
+        "split": "val",
+        "sample_count": 16,
+    }
+
+    errors = validate_run_state_compatibility(actual, expected)
+
+    assert errors == [
+        "manifest_identity",
+        "grid_size",
+        "latent_dim",
+        "split",
+        "sample_count",
+    ]
 
 
 def test_grouped_query_attention_shares_key_value_heads_and_preserves_shape():

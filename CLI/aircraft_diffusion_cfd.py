@@ -66,6 +66,72 @@ from validate_manifest import validate_manifest_file
 warnings.filterwarnings('ignore')
 
 
+def capture_rng_state() -> Dict[str, Any]:
+    """Capture every RNG stream used by a deterministic training continuation."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore a snapshot produced by :func:`capture_rng_state`."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def atomic_save_run_state(path: Union[str, Path], state: Mapping[str, Any]) -> None:
+    """Atomically replace a bounded latest-run-state artifact.
+
+    The temporary file is fsynced before replacement. A single previous copy is
+    retained so an interrupted replacement cannot destroy the last good state.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    previous = target.with_name(target.name + ".previous")
+    try:
+        with temporary.open("wb") as handle:
+            torch.save(dict(state), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if target.exists():
+            os.replace(target, previous)
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        if not target.exists() and previous.exists():
+            os.replace(previous, target)
+        raise
+
+
+def validate_run_state_compatibility(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> List[str]:
+    """Return immutable run fields that differ, in deterministic order."""
+    fields_to_compare = (
+        "manifest_identity",
+        "grid_size",
+        "latent_dim",
+        "split",
+        "sample_count",
+    )
+    return [
+        field_name
+        for field_name in fields_to_compare
+        if actual.get(field_name) != expected.get(field_name)
+    ]
+
+
 def _make_grad_scaler(device_type: str):
     """Use the modern AMP GradScaler API when available without breaking older torch versions."""
     enabled = device_type == "cuda"
@@ -4295,6 +4361,10 @@ class OptimizedDiffusionTrainer:
         self.update_metrics_callback: Optional[
             Callable[[Dict[str, Any]], None]
         ] = None
+        self.run_state_checkpoint_callback: Optional[
+            Callable[[int, int], Optional[str]]
+        ] = None
+        self.stop_after_updates: Optional[int] = None
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -4312,6 +4382,131 @@ class OptimizedDiffusionTrainer:
         teacher_model.eval()
         for parameter in teacher_model.parameters():
             parameter.requires_grad_(False)
+
+    def build_run_state(
+        self,
+        *,
+        epoch_index: int,
+        completed_in_epoch: int,
+        sample_order: Sequence[int],
+        compatibility: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the complete state needed to continue at the next sample."""
+        self._sync_consistency_teacher()
+        return {
+            "run_state_version": 1,
+            "epoch_index": int(epoch_index),
+            "completed_in_epoch": int(completed_in_epoch),
+            "sample_order": [int(value) for value in sample_order],
+            "global_step": int(self.global_step),
+            "consistency_update_step": int(self.consistency_update_step),
+            "model": {
+                "diffusion_model": self.diffusion_model.state_dict(),
+                "consistency_model": self.consistency_model.state_dict(),
+                "converter": self.converter.state_dict(),
+                "ema_model": self.ema_model.state_dict(),
+            },
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "scheduler_step_per_update": bool(
+                getattr(self, "scheduler_step_per_update", False)
+            ),
+            "scaler": self.scaler.state_dict(),
+            "rng": capture_rng_state(),
+            "geometry_probability_threshold": float(
+                self.geometry_probability_threshold
+            ),
+            "geometry_threshold_calibrated": bool(
+                self.geometry_threshold_calibrated
+            ),
+            "geometry_threshold_calibration": dict(
+                self.geometry_threshold_calibration
+            ),
+            "compatibility": dict(compatibility),
+        }
+
+    def save_run_state(
+        self,
+        path: Union[str, Path],
+        *,
+        epoch_index: int,
+        completed_in_epoch: int,
+        sample_order: Sequence[int],
+        compatibility: Mapping[str, Any],
+    ) -> None:
+        atomic_save_run_state(
+            path,
+            self.build_run_state(
+                epoch_index=epoch_index,
+                completed_in_epoch=completed_in_epoch,
+                sample_order=sample_order,
+                compatibility=compatibility,
+            ),
+        )
+
+    def load_run_state(
+        self,
+        path: Union[str, Path],
+        *,
+        expected_compatibility: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Restore an interrupted run after its original scheduler is configured."""
+        state = torch.load(path, map_location=self.device, weights_only=False)
+        actual_compatibility = state.get("compatibility", {})
+        mismatches = validate_run_state_compatibility(
+            actual_compatibility,
+            expected_compatibility,
+        )
+        if mismatches:
+            details = ", ".join(
+                f"{name}={actual_compatibility.get(name)!r}"
+                f" (expected {expected_compatibility.get(name)!r})"
+                for name in mismatches
+            )
+            raise ValueError(f"Incompatible run-state resume: {details}")
+        actual_configuration = actual_compatibility.get("configuration", {})
+        expected_configuration = expected_compatibility.get("configuration", {})
+        configuration_mismatches = [
+            name
+            for name in sorted(set(actual_configuration) | set(expected_configuration))
+            if actual_configuration.get(name) != expected_configuration.get(name)
+        ]
+        if configuration_mismatches:
+            details = ", ".join(
+                f"configuration.{name}={actual_configuration.get(name)!r}"
+                f" (expected {expected_configuration.get(name)!r})"
+                for name in configuration_mismatches
+            )
+            raise ValueError(f"Incompatible run-state resume: {details}")
+        if int(state.get("run_state_version", 0)) != 1:
+            raise ValueError("Unsupported run-state version")
+        model_state = state["model"]
+        self.diffusion_model.load_state_dict(model_state["diffusion_model"])
+        self.consistency_model.load_state_dict(model_state["consistency_model"])
+        self.converter.load_state_dict(model_state["converter"])
+        self.ema_model.load_state_dict(model_state["ema_model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        self.scheduler_step_per_update = bool(
+            state.get("scheduler_step_per_update", True)
+        )
+        self.scaler.load_state_dict(state.get("scaler", {}))
+        self.global_step = int(state["global_step"])
+        self.consistency_update_step = int(state.get("consistency_update_step", 0))
+        self._set_geometry_probability_threshold(
+            state["geometry_probability_threshold"],
+            calibrated=bool(state.get("geometry_threshold_calibrated", True)),
+            calibration=state.get("geometry_threshold_calibration"),
+        )
+        restore_rng_state(state["rng"])
+        self._sync_consistency_teacher()
+        return {
+            "epoch_index": int(state["epoch_index"]),
+            "completed_in_epoch": int(state["completed_in_epoch"]),
+            "sample_order": [int(value) for value in state["sample_order"]],
+            "global_step": self.global_step,
+            "run_state_checkpoint_path": str(Path(path).resolve()),
+        }
 
     def _set_geometry_probability_threshold(
         self,
@@ -4562,7 +4757,13 @@ class OptimizedDiffusionTrainer:
             ).backward()
         return full_loss.detach()
 
-    def train_epoch(self, train_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
+    def train_epoch(
+        self,
+        train_loader: DataLoader,
+        grid_size: int = 32,
+        *,
+        start_batch: int = 0,
+    ) -> Dict[str, float]:
         """Train for one epoch with all optimizations"""
         self.diffusion_model.train()
         self.converter.train()
@@ -4609,9 +4810,14 @@ class OptimizedDiffusionTrainer:
             self.consistency_model.student_model.parameters()
         )
 
+        start_batch = max(0, int(start_batch))
+        processed_updates = 0
         pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
 
         for batch_idx, batch in enumerate(pbar):
+            if batch_idx < start_batch:
+                continue
+            processed_updates += 1
             batch = transfer_training_batch_to_device(
                 batch,
                 self.device,
@@ -5133,6 +5339,15 @@ class OptimizedDiffusionTrainer:
                         "global_step": int(self.global_step),
                         "completed_in_epoch": int(batch_idx + 1),
                         "total_in_epoch": int(len(train_loader)),
+                        "run_state_checkpoint_path": getattr(
+                            self, "run_state_checkpoint_path", None
+                        ),
+                        "resumed_from_update": (
+                            int(getattr(self, "resumed_from_update", 0))
+                            if start_batch > 0
+                            else None
+                        ),
+                        "remaining_in_epoch": int(len(train_loader) - batch_idx - 1),
                         "losses": {
                             "optimization": float(optimization_loss_val.item()),
                             "mse": float(mse_loss_val.item()),
@@ -5203,21 +5418,30 @@ class OptimizedDiffusionTrainer:
                     }
                 )
 
+            if self.run_state_checkpoint_callback is not None:
+                self.run_state_checkpoint_callback(batch_idx + 1, len(train_loader))
+            if (
+                self.stop_after_updates is not None
+                and self.global_step >= int(self.stop_after_updates)
+            ):
+                break
+
             # Clear memory
             if batch_idx % 10 == 0:
                 torch.cuda.empty_cache()
 
-        avg_optimization_loss = total_optimization_loss / len(train_loader)
+        denominator = max(processed_updates, 1)
+        avg_optimization_loss = total_optimization_loss / denominator
 
         # Log to tensorboard
         self.writer.add_scalar('Loss/total', avg_optimization_loss, self.global_step)
         self.writer.add_scalar('Loss/optimization', avg_optimization_loss, self.global_step)
-        self.writer.add_scalar('Loss/mse', total_mse / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/clean_geometry_reconstruction', total_clean_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/direct_solver', total_direct_solver / len(train_loader), self.global_step)
+        self.writer.add_scalar('Loss/mse', total_mse / denominator, self.global_step)
+        self.writer.add_scalar('Loss/clean_geometry_reconstruction', total_clean_geometry / denominator, self.global_step)
+        self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / denominator, self.global_step)
+        self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / denominator, self.global_step)
+        self.writer.add_scalar('Loss/consistency', total_consistency / denominator, self.global_step)
+        self.writer.add_scalar('Loss/direct_solver', total_direct_solver / denominator, self.global_step)
         if direct_solver_eval_count > 0:
             self.writer.add_scalar('Loss/direct_solver_eval', total_direct_solver_eval / direct_solver_eval_count, self.global_step)
             self.writer.add_scalar('Loss/direct_occupancy', total_direct_occupancy / direct_solver_eval_count, self.global_step)
@@ -5240,11 +5464,11 @@ class OptimizedDiffusionTrainer:
         return {
             'loss': avg_optimization_loss,
             'optimization_loss': avg_optimization_loss,
-            'mse': total_mse / len(train_loader),
-            'clean_geometry_reconstruction': total_clean_geometry / len(train_loader),
-            'geometry_reconstruction': total_geometry / len(train_loader),
-            'generation_reconstruction': total_generation_geometry / len(train_loader),
-            'consistency': total_consistency / len(train_loader),
+            'mse': total_mse / denominator,
+            'clean_geometry_reconstruction': total_clean_geometry / denominator,
+            'geometry_reconstruction': total_geometry / denominator,
+            'generation_reconstruction': total_generation_geometry / denominator,
+            'consistency': total_consistency / denominator,
             'consistency_raw_mse': (
                 total_consistency_raw_mse / max(consistency_eval_count, 1)
             ),
@@ -5256,10 +5480,10 @@ class OptimizedDiffusionTrainer:
             ),
             'consistency_eval_count': consistency_eval_count,
             'student_data_gradient_norm_raw': (
-                total_student_data_gradient_raw / len(train_loader)
+                total_student_data_gradient_raw / denominator
             ),
             'student_data_gradient_norm_applied': (
-                total_student_data_gradient_applied / len(train_loader)
+                total_student_data_gradient_applied / denominator
             ),
             'student_consistency_gradient_norm_raw': (
                 total_student_consistency_gradient_raw
@@ -5276,12 +5500,12 @@ class OptimizedDiffusionTrainer:
                 total_student_direct_gradient_applied
                 / max(direct_solver_eval_count, 1)
             ),
-            'latent_reconstruction': total_latent_reconstruction / len(train_loader),
+            'latent_reconstruction': total_latent_reconstruction / denominator,
             'denoising_geometry_confidence': (
-                total_denoising_geometry_confidence / len(train_loader)
+                total_denoising_geometry_confidence / denominator
             ),
-            'diffusion_timestep': total_diffusion_timestep / len(train_loader),
-            'direct_solver_loss': total_direct_solver / len(train_loader),
+            'diffusion_timestep': total_diffusion_timestep / denominator,
+            'direct_solver_loss': total_direct_solver / denominator,
             'direct_solver_eval_loss': avg_direct_solver_eval,
             'direct_solver_eval_count': direct_solver_eval_count,
             'direct_solver_call_count': direct_solver_call_count,

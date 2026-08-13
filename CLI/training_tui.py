@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -50,6 +51,9 @@ def _latest_update(path: Optional[Path]) -> Optional[Dict[str, Any]]:
             "total": total,
             "fraction": done / max(total, 1),
             "timing": f"global step {int(record.get('global_step', 0))}",
+            "run_state_checkpoint_path": record.get("run_state_checkpoint_path"),
+            "resumed_from_update": record.get("resumed_from_update"),
+            "remaining_in_epoch": int(record.get("remaining_in_epoch", max(total - done, 0))),
             "metrics": {
                 "opt_loss": losses.get("optimization"),
                 "mse": losses.get("mse"),
@@ -212,6 +216,13 @@ def _live_batch_table(live_batch: Optional[Dict[str, Any]]) -> Table:
     filled = min(width, max(0, round(width * float(live_batch["fraction"]))))
     progress = f"[green]{'#' * filled}[/green][dim]{'-' * (width - filled)}[/dim]"
     metrics = live_batch["metrics"]
+    run_state_path = live_batch.get("run_state_checkpoint_path")
+    run_state_age = "-"
+    if run_state_path:
+        try:
+            run_state_age = f"{max(0.0, time.time() - Path(run_state_path).stat().st_mtime):.0f}s"
+        except OSError:
+            run_state_age = "unavailable"
     rows = [
         ("Progress", f"{done}/{total} ({100.0 * done / max(total, 1):.1f}%)"),
         ("Batch bar", progress),
@@ -226,6 +237,10 @@ def _live_batch_table(live_batch: Optional[Dict[str, Any]]) -> Table:
         ("Consistency gradient", _number(metrics.get("grad_cons"), 5)),
         ("Direct gradient", _number(metrics.get("grad_direct"), 5)),
         ("MSE", _number(metrics.get("mse"), 5)),
+        ("Run mode", "exact resume" if live_batch.get("resumed_from_update") else "fresh run"),
+        ("Remaining in epoch", str(live_batch.get("remaining_in_epoch", "-"))),
+        ("Run-state checkpoint", str(run_state_path or "-")),
+        ("Checkpoint age", run_state_age),
     ]
     for name, value in rows:
         table.add_row(name, value)
