@@ -269,7 +269,7 @@ class ModelConfig:
     coordinate_decoder_width: int = 256
     coordinate_decoder_depth: int = 2
     coordinate_fourier_bands: int = int(config_value("model", "coordinate_fourier_bands", 6))
-    coordinate_chunk_size: int = int(config_value("model", "coordinate_chunk_size", 32768))
+    coordinate_chunk_size: int = int(config_value("model", "coordinate_chunk_size", 65536))
 
     def __post_init__(self):
         if self.encoder_channels is None:
@@ -359,7 +359,7 @@ class ModelConfig:
             coordinate_decoder_width=decoder_width,
             coordinate_decoder_depth=decoder_depth,
             coordinate_fourier_bands=int(config_value("model", "coordinate_fourier_bands", 6)),
-            coordinate_chunk_size=int(config_value("model", "coordinate_chunk_size", 32768)),
+            coordinate_chunk_size=int(config_value("model", "coordinate_chunk_size", 65536)),
         )
 
 @dataclass
@@ -2943,10 +2943,20 @@ class LatentTo3DConverter(nn.Module):
         self,
         latent: torch.Tensor,
         encoded_coordinates: torch.Tensor,
+        latent_expanded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Expand one compact coordinate chunk only while it is being evaluated."""
+        """Expand one compact coordinate chunk only while it is being evaluated.
+
+        ``latent_expanded`` is the pre-unsqueezed ``latent[:, None, :]`` view,
+        hoisted by the callers so the ``[B, 1, D]`` view is created once per
+        decode call rather than once per chunk. It is bit-identical to
+        recomputing ``latent[:, None, :]`` here (both are views over the same
+        storage), and ``None`` preserves the exact pre-hoist behavior.
+        """
         batch_size = latent.shape[0]
-        latent_chunk = latent[:, None, :].expand(-1, encoded_coordinates.shape[0], -1)
+        if latent_expanded is None:
+            latent_expanded = latent[:, None, :]
+        latent_chunk = latent_expanded.expand(-1, encoded_coordinates.shape[0], -1)
         coord_batch = encoded_coordinates[None, :, :].expand(batch_size, -1, -1)
         decoder_input = torch.cat((latent_chunk, coord_batch), dim=-1).reshape(
             batch_size * encoded_coordinates.shape[0],
@@ -2961,19 +2971,30 @@ class LatentTo3DConverter(nn.Module):
         self,
         latent: torch.Tensor,
         encoded_coordinates: torch.Tensor,
+        latent_expanded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if (
             self.enable_coordinate_gradient_checkpointing
             and self.training
             and torch.is_grad_enabled()
         ):
+            if latent_expanded is None:
+                return activation_checkpoint(
+                    self._decode_latent_coordinate_chunk,
+                    latent,
+                    encoded_coordinates,
+                    use_reentrant=False,
+                )
             return activation_checkpoint(
                 self._decode_latent_coordinate_chunk,
                 latent,
                 encoded_coordinates,
+                latent_expanded,
                 use_reentrant=False,
             )
-        return self._decode_latent_coordinate_chunk(latent, encoded_coordinates)
+        return self._decode_latent_coordinate_chunk(
+            latent, encoded_coordinates, latent_expanded
+        )
 
     def _effective_coordinate_chunk_size(self, device: torch.device) -> int:
         """Bound CPU matrix temporaries while retaining configured GPU chunks."""
@@ -2997,9 +3018,10 @@ class LatentTo3DConverter(nn.Module):
         encoded_coords = encoded_full.index_select(0, flat_indices)
         chunks = []
         chunk_size = self._effective_coordinate_chunk_size(latent.device)
+        latent_expanded = latent[:, None, :]
         for start in range(0, encoded_coords.shape[0], chunk_size):
             coord_chunk = encoded_coords[start:start + chunk_size]
-            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk)
+            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk, latent_expanded)
             chunks.append(chunk_logits)
         return torch.cat(chunks, dim=1)
 
@@ -3013,9 +3035,10 @@ class LatentTo3DConverter(nn.Module):
         coords = self._encode_full_coordinate_grid(latent.device, latent.dtype)
         chunks = []
         chunk_size = self._effective_coordinate_chunk_size(latent.device)
+        latent_expanded = latent[:, None, :]
         for start in range(0, coords.shape[0], chunk_size):
             coord_chunk = coords[start:start + chunk_size]
-            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk)
+            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk, latent_expanded)
             chunks.append(chunk_logits)
         voxels = torch.cat(chunks, dim=1)
         voxels = voxels.view(batch_size, *self.output_shape)
