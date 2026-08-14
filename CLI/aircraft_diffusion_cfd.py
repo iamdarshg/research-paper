@@ -5584,14 +5584,16 @@ class OptimizedDiffusionTrainer:
                 target_sample = flat_target.index_select(1, flat_indices)
                 population_positive_counts = flat_target.sum(dim=1)
                 population_negative_counts = total_voxels - population_positive_counts
-                clean_geom_logits_sample = self.converter.forward_flat_indices(
-                    latent,
+                latent_stacked = torch.cat((latent, x0_pred, generation_latent), dim=0)
+                stacked = self.converter.forward_flat_indices(
+                    latent_stacked,
                     flat_indices,
                 ).nan_to_num(0.0)
-                geom_logits_sample = self.converter.forward_flat_indices(
-                    x0_pred,
-                    flat_indices,
-                ).nan_to_num(0.0)
+                (
+                    clean_geom_logits_sample,
+                    geom_logits_sample,
+                    generation_geom_logits_sample,
+                ) = torch.chunk(stacked, 3, dim=0)
                 clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     clean_geom_logits_sample,
                     target_sample,
@@ -5605,10 +5607,6 @@ class OptimizedDiffusionTrainer:
                     dice_weight=self.training_config.geometry_dice_weight,
                     population_positive_counts=population_positive_counts,
                     population_negative_counts=population_negative_counts,
-                ).nan_to_num(0.0)
-                generation_geom_logits_sample = self.converter.forward_flat_indices(
-                    generation_latent,
-                    flat_indices,
                 ).nan_to_num(0.0)
                 generation_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     generation_geom_logits_sample,
