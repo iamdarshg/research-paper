@@ -71,7 +71,7 @@ def add_gradient_buffers(
     return tuple(result)
 
 
-def _validate_gradient_tensor(
+def _validate_gradient_layout(
     gradient: torch.Tensor,
     *,
     branch_name: str,
@@ -82,11 +82,34 @@ def _validate_gradient_tensor(
             f"gradient branch {branch_name!r} parameter {parameter_index} "
             f"uses unsupported layout {gradient.layout}"
         )
-    if not bool(torch.isfinite(gradient).all().item()):
-        raise NonFiniteGradientError(
-            f"gradient branch {branch_name!r} parameter {parameter_index} "
-            "contains nonfinite values"
+
+
+def _flatten_present_gradients(
+    gradients: Sequence[Optional[torch.Tensor]],
+    *,
+    branch_name: str,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Concatenate every present gradient into one 1-D tensor of ``dtype``.
+
+    ``None`` entries are skipped and every present tensor is validated as
+    strided before flattening, so the caller can reduce over a single tensor
+    with a single ``.item()`` sync.  Returns an empty 1-D tensor when no
+    gradient is present.
+    """
+    pieces: list[torch.Tensor] = []
+    for parameter_index, gradient in enumerate(gradients):
+        if gradient is None:
+            continue
+        _validate_gradient_layout(
+            gradient,
+            branch_name=branch_name,
+            parameter_index=parameter_index,
         )
+        pieces.append(gradient.detach().to(dtype=dtype).reshape(-1))
+    if not pieces:
+        return torch.empty(0, dtype=dtype)
+    return torch.cat(pieces)
 
 
 def gradient_l2_norm(
@@ -96,36 +119,16 @@ def gradient_l2_norm(
 ) -> float:
     """Return a finite L2 norm, rejecting any nonfinite gradient."""
 
-    total_norm = 0.0
-    for parameter_index, gradient in enumerate(gradients):
-        if gradient is None:
-            continue
-        _validate_gradient_tensor(
-            gradient,
-            branch_name=branch_name,
-            parameter_index=parameter_index,
+    flat = _flatten_present_gradients(
+        gradients,
+        branch_name=branch_name,
+        dtype=torch.float64,
+    )
+    if not bool(torch.isfinite(flat).all().item()):
+        raise NonFiniteGradientError(
+            f"gradient branch {branch_name!r} contains nonfinite values"
         )
-        magnitudes = gradient.detach().abs()
-        max_magnitude = (
-            float(magnitudes.max().item()) if magnitudes.numel() else 0.0
-        )
-        if max_magnitude == 0.0:
-            tensor_norm = 0.0
-        else:
-            normalized_norm = float(
-                torch.linalg.vector_norm(
-                    magnitudes / max_magnitude,
-                    ord=2,
-                    dtype=torch.float64,
-                ).item()
-            )
-            tensor_norm = max_magnitude * normalized_norm
-        if not math.isfinite(tensor_norm):
-            raise NonFiniteGradientError(
-                f"gradient branch {branch_name!r} has a nonfinite L2 norm"
-            )
-        total_norm = math.hypot(total_norm, tensor_norm)
-
+    total_norm = float(torch.linalg.vector_norm(flat, ord=2).item())
     if not math.isfinite(total_norm):
         raise NonFiniteGradientError(
             f"gradient branch {branch_name!r} has a nonfinite L2 norm"
@@ -149,28 +152,12 @@ def gradient_cosine_similarity(
     if first_norm == 0.0 or second_norm == 0.0:
         return 0.0
 
-    dot = 0.0
-    for parameter_index, (first_gradient, second_gradient) in enumerate(
-        zip(first, second)
-    ):
-        if first_gradient is None or second_gradient is None:
-            continue
-        _validate_gradient_tensor(
-            first_gradient,
-            branch_name=first_name,
-            parameter_index=parameter_index,
-        )
-        _validate_gradient_tensor(
-            second_gradient,
-            branch_name=second_name,
-            parameter_index=parameter_index,
-        )
-        dot += float(
-            torch.sum(
-                first_gradient.detach().double()
-                * second_gradient.detach().double()
-            ).item()
-        )
+    dot = _gradient_dot_product(
+        first,
+        second,
+        first_name=first_name,
+        second_name=second_name,
+    )
     cosine = dot / (first_norm * second_norm)
     if not math.isfinite(cosine):
         raise NonFiniteGradientError("gradient cosine similarity is nonfinite")
@@ -187,28 +174,45 @@ def _gradient_dot_product(
     if len(first) != len(second):
         raise ValueError("gradient branches must have the same buffer count")
 
-    dot = 0.0
+    first_pieces: list[torch.Tensor] = []
+    second_pieces: list[torch.Tensor] = []
     for parameter_index, (first_gradient, second_gradient) in enumerate(
         zip(first, second)
     ):
         if first_gradient is None or second_gradient is None:
             continue
-        _validate_gradient_tensor(
+        _validate_gradient_layout(
             first_gradient,
             branch_name=first_name,
             parameter_index=parameter_index,
         )
-        _validate_gradient_tensor(
+        _validate_gradient_layout(
             second_gradient,
             branch_name=second_name,
             parameter_index=parameter_index,
         )
-        dot += float(
-            torch.sum(
-                first_gradient.detach().double()
-                * second_gradient.detach().double()
-            ).item()
+        first_pieces.append(
+            first_gradient.detach().to(dtype=torch.float64).reshape(-1)
         )
+        second_pieces.append(
+            second_gradient.detach().to(dtype=torch.float64).reshape(-1)
+        )
+    if not first_pieces:
+        return 0.0
+
+    first_flat = torch.cat(first_pieces)
+    second_flat = torch.cat(second_pieces)
+    if not bool(
+        torch.logical_and(
+            torch.isfinite(first_flat),
+            torch.isfinite(second_flat),
+        ).all().item()
+    ):
+        raise NonFiniteGradientError(
+            f"gradient dot product for {first_name!r} and {second_name!r} "
+            "contains nonfinite values"
+        )
+    dot = float(torch.dot(first_flat, second_flat).item())
     if not math.isfinite(dot):
         raise NonFiniteGradientError(
             f"gradient dot product for {first_name!r} and {second_name!r} "

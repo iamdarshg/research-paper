@@ -5960,19 +5960,33 @@ class OptimizedDiffusionTrainer:
             for guard_name, guard_gradients in self.last_gradient_lifecycle[
                 "active_guard_gradients"
             ].items():
-                guard_dot = sum(
-                    float(
-                        torch.sum(
-                            update_gradient.detach().double()
-                            * guard_gradient.detach().double()
-                        ).item()
-                    )
+                aligned_pairs = [
+                    (update_gradient, guard_gradient)
                     for update_gradient, guard_gradient in zip(
                         step_gradients,
                         guard_gradients,
                     )
                     if update_gradient is not None and guard_gradient is not None
-                )
+                ]
+                if aligned_pairs:
+                    guard_dot = float(
+                        torch.dot(
+                            torch.cat(
+                                [
+                                    update_gradient.detach().double().reshape(-1)
+                                    for update_gradient, _ in aligned_pairs
+                                ]
+                            ),
+                            torch.cat(
+                                [
+                                    guard_gradient.detach().double().reshape(-1)
+                                    for guard_gradient, _ in aligned_pairs
+                                ]
+                            ),
+                        ).item()
+                    )
+                else:
+                    guard_dot = 0.0
                 if guard_dot < -1.0e-8:
                     raise RuntimeError(
                         f"final optimizer gradient is uphill on active {guard_name} guard: "
