@@ -78,7 +78,18 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     occupied_indices = torch.nonzero(grid > 0.5, as_tuple=False)
     largest_component_fraction = 0.0
     if occupied > 0.0:
-        occupied_mask = grid.numpy() > 0.5
+        # largest_component_fraction is invariant under the solid-bbox crop:
+        # the crop contains every solid cell, and scipy's local-connectivity
+        # labeling neither loses nor creates a connection outside it. Cropping
+        # shrinks the label work to the aircraft occupancy instead of the full
+        # 96^3 lattice. All other metrics stay on the full grid.
+        mins = occupied_indices.min(dim=0).values
+        maxs = occupied_indices.max(dim=0).values + 1
+        occupied_mask = grid[
+            mins[0]:maxs[0],
+            mins[1]:maxs[1],
+            mins[2]:maxs[2],
+        ].numpy() > 0.5
         labeled, component_count = connected_component_labels(occupied_mask)
         if component_count > 0:
             # np.bincount coerces its complete input to int64. Counting only

@@ -3830,6 +3830,13 @@ def _aggregate_aircraft_validity_violations(
     return mean_violation, worst_violation, mean_violation + worst_violation
 
 
+# Validity is a pure function of the CPU geometry and has no dependency on the
+# LBM results, so each direct-solver probe submits it to a small thread pool
+# before the GPU solve and collects it afterward. The GPU solve leaves the CPU
+# free to run the scipy connected-component labeling concurrently.
+_VALIDITY_POOL = ThreadPoolExecutor(max_workers=2)
+
+
 def _direct_measured_objective_for_single(
     probability_grid: torch.Tensor,
     design_spec: DesignSpec,
@@ -3854,10 +3861,28 @@ def _direct_measured_objective_for_single(
     solver_geometry = _canonical_training_geometry_to_solver_xyz(
         geometry_cpu
     ).to(solver_device)
+
+    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    validity_report: Dict[str, Any] = {}
+    validity_future = None
+    if needs_shape_metrics:
+        # Generated tensors already use the canonical [Z, Y, X] training frame.
+        # Searching all axis permutations here both hides orientation errors and
+        # repeats connected-component work for every finite-difference probe.
+        # Validity is a pure function of geometry_cpu (independent of the LBM
+        # results), so it is submitted to the pool before the GPU solve and the
+        # result is identical to computing it serially after the solve.
+        validity_future = _VALIDITY_POOL.submit(
+            evaluate_aircraft_validity, geometry_cpu, canonicalize=False
+        )
+
     cfd_results = cfd_simulator.simulate_aerodynamics(
         solver_geometry,
         steps=max(1, int(cfd_steps)),
     )
+
+    if validity_future is not None:
+        validity_report = validity_future.result()
 
     occupancy = float(geometry_cpu.mean().item())
     raw_drag = cfd_results.get("drag_coefficient")
@@ -3894,13 +3919,6 @@ def _direct_measured_objective_for_single(
         float(design_spec.drag_weight) * float(drag_coefficient)
         + float(design_spec.lift_weight) * lift_term
     )
-    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
-    validity_report: Dict[str, Any] = {}
-    if needs_shape_metrics:
-        # Generated tensors already use the canonical [Z, Y, X] training frame.
-        # Searching all axis permutations here both hides orientation errors and
-        # repeats connected-component work for every finite-difference probe.
-        validity_report = evaluate_aircraft_validity(geometry_cpu, canonicalize=False)
 
     connectivity_loss = 0.0
     if connectivity_weight > 0.0:
