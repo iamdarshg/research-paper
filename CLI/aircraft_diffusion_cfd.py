@@ -2885,6 +2885,8 @@ class LatentTo3DConverter(nn.Module):
             )
             self.coordinate_output = nn.Linear(self.coordinate_decoder_width, 1)
         self.register_buffer("_coordinate_grid", torch.empty(0), persistent=False)
+        self.register_buffer("_encoded_coordinate_grid", torch.empty(0), persistent=False)
+        self._cached_coordinate_fourier_bands = -1
 
     def _coordinates(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if (
@@ -2907,6 +2909,29 @@ class LatentTo3DConverter(nn.Module):
         phases = coordinates.unsqueeze(-1) * frequencies
         encoded = torch.cat((coordinates, phases.sin().flatten(start_dim=-2), phases.cos().flatten(start_dim=-2)), dim=-1)
         return encoded
+
+    def _encode_full_coordinate_grid(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return the Fourier-encoded full grid, cached across calls.
+
+        The encoding is elementwise per row of the coordinate grid, so the
+        cached full-grid encoding is bit-identical to re-encoding per call,
+        and ``index_select`` of the cache reproduces the subset encoding
+        exactly. The identity path (``coordinate_fourier_bands <= 0``) is
+        returned directly and is never cached.
+        """
+        if self.coordinate_fourier_bands <= 0:
+            return self._coordinates(device, dtype)
+        grid = self._coordinates(device, dtype)
+        if (
+            self._encoded_coordinate_grid.numel()
+            != grid.numel() * (1 + 2 * self.coordinate_fourier_bands)
+            or self._encoded_coordinate_grid.device != device
+            or self._encoded_coordinate_grid.dtype != dtype
+            or self._cached_coordinate_fourier_bands != self.coordinate_fourier_bands
+        ):
+            self._encoded_coordinate_grid = self._encode_coordinates(grid)
+            self._cached_coordinate_fourier_bands = int(self.coordinate_fourier_bands)
+        return self._encoded_coordinate_grid
 
     def _decode_coordinate_features(self, decoder_input: torch.Tensor) -> torch.Tensor:
         hidden = self.coordinate_input(decoder_input)
@@ -2968,11 +2993,11 @@ class LatentTo3DConverter(nn.Module):
             return dense.index_select(1, flat_indices.to(device=latent.device, dtype=torch.long))
 
         flat_indices = flat_indices.to(device=latent.device, dtype=torch.long)
-        coords = self._coordinates(latent.device, latent.dtype).index_select(0, flat_indices)
-        encoded_coords = self._encode_coordinates(coords)
+        encoded_full = self._encode_full_coordinate_grid(latent.device, latent.dtype)
+        encoded_coords = encoded_full.index_select(0, flat_indices)
         chunks = []
         chunk_size = self._effective_coordinate_chunk_size(latent.device)
-        for start in range(0, coords.shape[0], chunk_size):
+        for start in range(0, encoded_coords.shape[0], chunk_size):
             coord_chunk = encoded_coords[start:start + chunk_size]
             chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk)
             chunks.append(chunk_logits)
@@ -2985,7 +3010,7 @@ class LatentTo3DConverter(nn.Module):
             voxels = self.decoder(latent)
             return voxels.view(batch_size, *self.output_shape)
 
-        coords = self._encode_coordinates(self._coordinates(latent.device, latent.dtype))
+        coords = self._encode_full_coordinate_grid(latent.device, latent.dtype)
         chunks = []
         chunk_size = self._effective_coordinate_chunk_size(latent.device)
         for start in range(0, coords.shape[0], chunk_size):
