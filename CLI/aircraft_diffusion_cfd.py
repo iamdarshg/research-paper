@@ -269,7 +269,7 @@ class ModelConfig:
     coordinate_decoder_width: int = 256
     coordinate_decoder_depth: int = 2
     coordinate_fourier_bands: int = int(config_value("model", "coordinate_fourier_bands", 6))
-    coordinate_chunk_size: int = int(config_value("model", "coordinate_chunk_size", 65536))
+    coordinate_chunk_size: int = int(config_value("model", "coordinate_chunk_size", 32768))
 
     def __post_init__(self):
         if self.encoder_channels is None:
@@ -359,7 +359,7 @@ class ModelConfig:
             coordinate_decoder_width=decoder_width,
             coordinate_decoder_depth=decoder_depth,
             coordinate_fourier_bands=int(config_value("model", "coordinate_fourier_bands", 6)),
-            coordinate_chunk_size=int(config_value("model", "coordinate_chunk_size", 65536)),
+            coordinate_chunk_size=int(config_value("model", "coordinate_chunk_size", 32768)),
         )
 
 @dataclass

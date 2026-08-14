@@ -18,7 +18,7 @@ model:
   attention_kv_groups: 4
   num_attention_layers: 4
   coordinate_decoder_threshold: 96
-  coordinate_chunk_size: 65536
+  coordinate_chunk_size: 16384
   coordinate_fourier_bands: 6
   coordinate_gradient_checkpointing: true
   enable_gradient_checkpointing: true
