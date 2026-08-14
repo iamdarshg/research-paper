@@ -5060,55 +5060,102 @@ class OptimizedDiffusionTrainer:
         intersection = flat_target.new_zeros((batch_size,))
         prediction_mass = flat_target.new_zeros((batch_size,))
         target_mass = flat_target.sum(dim=1)
+        # Grad-carrying accumulators for the single final backward: the positive
+        # dice mass is `intersection` (probabilities*target == probabilities on
+        # the target voxels), so only the negative dice mass is tracked here.
+        neg_dice_mass = flat_target.new_zeros((batch_size,))
+        total_chunk_loss = flat_target.new_zeros(())
 
-        with torch.no_grad():
-            for start in range(0, total_voxels, chunk_size):
-                stop = min(start + chunk_size, total_voxels)
-                indices = torch.arange(start, stop, device=self.device)
-                target_chunk = flat_target.index_select(1, indices)
-                logits = self.converter.forward_flat_indices(latent, indices).float().nan_to_num(0.0)
-                probabilities = torch.sigmoid(logits).nan_to_num(0.0)
-                bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
-                positive_mask = target_chunk > 0.5
-                if bool(positive_mask.any().item()):
-                    positive_bce_sum += bce[positive_mask].sum()
-                if bool((~positive_mask).any().item()):
-                    negative_bce_sum += bce[~positive_mask].sum()
-                positive_boundary = min(
-                    1.0 - torch.finfo(probabilities.dtype).eps,
-                    float(self.geometry_probability_threshold)
-                    + float(self.training_config.threshold_positive_margin),
-                )
-                negative_boundary = max(
-                    0.0,
-                    float(self.geometry_probability_threshold)
-                    - float(self.training_config.threshold_negative_margin),
-                )
-                positive_margin_sum += (
-                    (positive_boundary - probabilities).clamp_min(0.0).square()
-                    * positive_mask
-                ).sum()
-                negative_margin_sum += (
-                    (probabilities - negative_boundary).clamp_min(0.0).square()
-                    * (~positive_mask)
-                ).sum()
-                intersection += (probabilities * target_chunk).sum(dim=1)
-                prediction_mass += probabilities.sum(dim=1)
-
-        balanced_bce = flat_target.new_zeros(())
+        margin_enabled = bool(self.geometry_threshold_calibrated)
+        positive_boundary = min(
+            1.0 - torch.finfo(flat_target.dtype).eps,
+            float(self.geometry_probability_threshold)
+            + float(self.training_config.threshold_positive_margin),
+        )
+        negative_boundary = max(
+            0.0,
+            float(self.geometry_probability_threshold)
+            - float(self.training_config.threshold_negative_margin),
+        )
         class_count = 0
         if float(positive_count.item()) > 0.0:
-            balanced_bce += positive_bce_sum / positive_count
             class_count += 1
         if float(negative_count.item()) > 0.0:
-            balanced_bce += negative_bce_sum / negative_count
             class_count += 1
+
+        # Single grad-enabled pass over the lattice. The removed no_grad decode
+        # existed only for detached scalar metrics; those sums are accumulated
+        # here without a graph (.detach()) while the grad-carrying per-batch dice
+        # masses and per-chunk bce/margin losses accumulate for one final
+        # .backward(). Memory-safe because coordinate gradient checkpointing is
+        # enabled in training (coordinate_gradient_checkpointing=true), so each
+        # chunk's decoder graph is a small checkpoint reference recomputed on
+        # backward.
+        for start in range(0, total_voxels, chunk_size):
+            stop = min(start + chunk_size, total_voxels)
+            indices = torch.arange(start, stop, device=self.device)
+            target_chunk = flat_target.index_select(1, indices)
+            logits = self.converter.forward_flat_indices(latent, indices).float().nan_to_num(0.0)
+            probabilities = torch.sigmoid(logits).nan_to_num(0.0)
+            bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
+            positive_mask = target_chunk > 0.5
+            negative_mask = ~positive_mask
+            # Metric-only sums, detached so they never feed the gradient graph
+            # (same arithmetic as the removed no_grad pass).
+            if bool(positive_mask.any().item()):
+                positive_bce_sum = positive_bce_sum + bce[positive_mask].sum().detach()
+            if bool(negative_mask.any().item()):
+                negative_bce_sum = negative_bce_sum + bce[negative_mask].sum().detach()
+            positive_margin_sum = positive_margin_sum + (
+                (positive_boundary - probabilities).clamp_min(0.0).square()
+                * positive_mask
+            ).sum().detach()
+            negative_margin_sum = negative_margin_sum + (
+                (probabilities - negative_boundary).clamp_min(0.0).square()
+                * negative_mask
+            ).sum().detach()
+            # Grad-carrying per-batch dice masses accumulated across chunks.
+            intersection = intersection + (probabilities * target_chunk).sum(dim=1)
+            prediction_mass = prediction_mass + probabilities.sum(dim=1)
+            neg_dice_mass = neg_dice_mass + (probabilities * negative_mask).sum(dim=1)
+            # Per-chunk bce/margin losses, same arithmetic as the old grad pass.
+            chunk_bce = logits.new_zeros(())
+            if float(positive_count.item()) > 0.0:
+                chunk_bce = chunk_bce + bce[positive_mask].sum() / positive_count
+            if float(negative_count.item()) > 0.0:
+                chunk_bce = chunk_bce + bce[negative_mask].sum() / negative_count
+            chunk_bce = chunk_bce / max(class_count, 1)
+            chunk_margin = logits.new_zeros(())
+            if margin_enabled and float(positive_count.item()) > 0.0:
+                chunk_margin = chunk_margin + (
+                    float(self.training_config.threshold_positive_margin_weight)
+                    * (
+                        (positive_boundary - probabilities).clamp_min(0.0).square()
+                        * positive_mask
+                    ).sum()
+                    / positive_count
+                )
+            if margin_enabled and float(negative_count.item()) > 0.0:
+                chunk_margin = chunk_margin + (
+                    float(self.training_config.threshold_negative_margin_weight)
+                    * (
+                        (probabilities - negative_boundary).clamp_min(0.0).square()
+                        * negative_mask
+                    ).sum()
+                    / negative_count
+                )
+            total_chunk_loss = total_chunk_loss + (chunk_bce + chunk_margin)
+
+        balanced_bce = flat_target.new_zeros(())
+        if float(positive_count.item()) > 0.0:
+            balanced_bce += positive_bce_sum / positive_count
+        if float(negative_count.item()) > 0.0:
+            balanced_bce += negative_bce_sum / negative_count
         balanced_bce = balanced_bce / max(class_count, 1)
-        numerator = 2.0 * intersection + 1.0
-        denominator = prediction_mass + target_mass + 1.0
+        numerator = 2.0 * intersection.detach() + 1.0
+        denominator = prediction_mass.detach() + target_mass + 1.0
         dice_loss = (1.0 - numerator / denominator).mean()
         full_loss = balanced_bce + self.training_config.geometry_dice_weight * dice_loss
-        margin_enabled = bool(self.geometry_threshold_calibrated)
         positive_margin_loss = (
             positive_margin_sum / positive_count
             if margin_enabled and float(positive_count.item()) > 0.0
@@ -5145,56 +5192,25 @@ class OptimizedDiffusionTrainer:
             numerator / denominator.square() / max(batch_size, 1)
         )
         clean_weight = float(self.training_config.clean_geometry_reconstruction_weight)
-        for start in range(0, total_voxels, chunk_size):
-            stop = min(start + chunk_size, total_voxels)
-            indices = torch.arange(start, stop, device=self.device)
-            target_chunk = flat_target.index_select(1, indices)
-            logits = self.converter.forward_flat_indices(latent, indices).float().nan_to_num(0.0)
-            probabilities = torch.sigmoid(logits).nan_to_num(0.0)
-            bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
-            positive_mask = target_chunk > 0.5
-            chunk_bce = logits.new_zeros(())
-            if float(positive_count.item()) > 0.0:
-                chunk_bce = chunk_bce + bce[positive_mask].sum() / positive_count
-            if float(negative_count.item()) > 0.0:
-                chunk_bce = chunk_bce + bce[~positive_mask].sum() / negative_count
-            chunk_bce = chunk_bce / max(class_count, 1)
-            chunk_margin = logits.new_zeros(())
-            if margin_enabled and float(positive_count.item()) > 0.0:
-                chunk_margin = chunk_margin + (
-                    float(self.training_config.threshold_positive_margin_weight)
-                    * (
-                        (positive_boundary - probabilities).clamp_min(0.0).square()
-                        * positive_mask
-                    ).sum()
-                    / positive_count
-                )
-            if margin_enabled and float(negative_count.item()) > 0.0:
-                chunk_margin = chunk_margin + (
-                    float(self.training_config.threshold_negative_margin_weight)
-                    * (
-                        (probabilities - negative_boundary).clamp_min(0.0).square()
-                        * (~positive_mask)
-                    ).sum()
-                    / negative_count
-                )
-            dice_coefficients = torch.where(
-                positive_mask,
-                positive_dice_coefficient[:, None],
-                negative_dice_coefficient[:, None],
+        # One final backward over the whole lattice. The dice objective uses the
+        # (detached) analytic per-batch coefficients against the grad-carrying
+        # dice masses, reproducing the old per-chunk dice gradient objective.
+        # Gradient accumulation order differs from per-chunk interleaved
+        # backwards (bce+margin accumulate chunk-wise; dice accumulates through
+        # the per-batch masses), so gradients are last-ulp (~1e-7 relative)
+        # while the returned loss is bit-identical.
+        dice_obj = (
+            positive_dice_coefficient.detach() * intersection
+        ).sum() + (
+            negative_dice_coefficient.detach() * neg_dice_mass
+        ).sum()
+        (
+            clean_weight
+            * (
+                total_chunk_loss
+                + self.training_config.geometry_dice_weight * dice_obj
             )
-            chunk_dice_gradient_objective = (
-                probabilities * dice_coefficients.detach()
-            ).sum()
-            (
-                clean_weight
-                * (
-                    chunk_bce
-                    + self.training_config.geometry_dice_weight
-                    * chunk_dice_gradient_objective
-                    + chunk_margin
-                )
-            ).backward()
+        ).backward()
         return full_loss.detach()
 
     def _backward_full_grounded_threshold_margin(
@@ -5244,40 +5260,6 @@ class OptimizedDiffusionTrainer:
 
         positive_sum = flat_target.new_zeros(())
         negative_sum = flat_target.new_zeros(())
-        with torch.no_grad():
-            for start in range(0, total_voxels, chunk_size):
-                stop = min(start + chunk_size, total_voxels)
-                indices = torch.arange(start, stop, device=self.device)
-                target_chunk = flat_target.index_select(1, indices)
-                logits = self.converter.forward_flat_indices(latent, indices).float()
-                probabilities = torch.sigmoid(logits).nan_to_num(0.0)
-                positive_mask = target_chunk > 0.5
-                negative_mask = ~positive_mask
-                positive_sum += (
-                    (positive_boundary - probabilities).clamp_min(0.0).square()
-                    * positive_mask
-                ).sum()
-                negative_sum += (
-                    (probabilities - negative_boundary).clamp_min(0.0).square()
-                    * negative_mask
-                ).sum()
-
-        positive_loss = (
-            positive_sum / positive_count
-            if float(positive_count.item()) > 0.0
-            else flat_target.new_zeros(())
-        )
-        negative_loss = (
-            negative_sum / negative_count
-            if float(negative_count.item()) > 0.0
-            else flat_target.new_zeros(())
-        )
-        detached_loss = scale * (
-            float(self.training_config.threshold_positive_margin_weight)
-            * positive_loss
-            + float(self.training_config.threshold_negative_margin_weight)
-            * negative_loss
-        )
         for start in range(0, total_voxels, chunk_size):
             stop = min(start + chunk_size, total_voxels)
             indices = torch.arange(start, stop, device=self.device)
@@ -5286,6 +5268,18 @@ class OptimizedDiffusionTrainer:
             probabilities = torch.sigmoid(logits).nan_to_num(0.0)
             positive_mask = target_chunk > 0.5
             negative_mask = ~positive_mask
+            # The detached margin sums formerly computed in a separate no_grad
+            # full-lattice decode are accumulated here; .detach() keeps them out
+            # of the gradient graph so the per-chunk backward below stays
+            # byte-identical to the previous implementation.
+            positive_sum = positive_sum + (
+                (positive_boundary - probabilities).clamp_min(0.0).square()
+                * positive_mask
+            ).sum().detach()
+            negative_sum = negative_sum + (
+                (probabilities - negative_boundary).clamp_min(0.0).square()
+                * negative_mask
+            ).sum().detach()
             chunk_loss = logits.new_zeros(())
             if float(positive_count.item()) > 0.0:
                 chunk_loss = chunk_loss + (
@@ -5309,6 +5303,22 @@ class OptimizedDiffusionTrainer:
             # share the upstream latent graph. Keep that shared graph alive
             # until the final chunk has contributed its exact gradient.
             (scale * chunk_loss).backward(retain_graph=stop < total_voxels)
+        positive_loss = (
+            positive_sum / positive_count
+            if float(positive_count.item()) > 0.0
+            else flat_target.new_zeros(())
+        )
+        negative_loss = (
+            negative_sum / negative_count
+            if float(negative_count.item()) > 0.0
+            else flat_target.new_zeros(())
+        )
+        detached_loss = scale * (
+            float(self.training_config.threshold_positive_margin_weight)
+            * positive_loss
+            + float(self.training_config.threshold_negative_margin_weight)
+            * negative_loss
+        )
         return detached_loss.detach()
 
     def train_epoch(
