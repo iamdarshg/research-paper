@@ -5884,6 +5884,11 @@ class OptimizedDiffusionTrainer:
         intersection = flat_target.new_zeros((batch_size,))
         prediction_mass = flat_target.new_zeros((batch_size,))
         target_mass = flat_target.sum(dim=1)
+        # Hoisted immutable global voxel counts (positive/negative totals never
+        # change after the clamp above). Read once per update instead of once
+        # per chunk, replacing every in-loop/post-loop .item() read below.
+        positive_count_float = float(positive_count.item())
+        negative_count_float = float(negative_count.item())
         # Grad-carrying accumulators for the single final backward: the positive
         # dice mass is `intersection` (probabilities*target == probabilities on
         # the target voxels), so only the negative dice mass is tracked here.
@@ -5902,9 +5907,9 @@ class OptimizedDiffusionTrainer:
             - float(self.training_config.threshold_negative_margin),
         )
         class_count = 0
-        if float(positive_count.item()) > 0.0:
+        if positive_count_float > 0.0:
             class_count += 1
-        if float(negative_count.item()) > 0.0:
+        if negative_count_float > 0.0:
             class_count += 1
 
         # Single grad-enabled pass over the lattice. The removed no_grad decode
@@ -5926,10 +5931,11 @@ class OptimizedDiffusionTrainer:
             negative_mask = ~positive_mask
             # Metric-only sums, detached so they never feed the gradient graph
             # (same arithmetic as the removed no_grad pass).
-            if bool(positive_mask.any().item()):
-                positive_bce_sum = positive_bce_sum + bce[positive_mask].sum().detach()
-            if bool(negative_mask.any().item()):
-                negative_bce_sum = negative_bce_sum + bce[negative_mask].sum().detach()
+            # Masked sum of an all-False mask is 0.0, so dropping the
+            # bool(...any().item()) guards is bit-identical and removes a
+            # per-chunk device->host sync.
+            positive_bce_sum = positive_bce_sum + bce[positive_mask].sum().detach()
+            negative_bce_sum = negative_bce_sum + bce[negative_mask].sum().detach()
             positive_margin_sum = positive_margin_sum + (
                 (positive_boundary - probabilities).clamp_min(0.0).square()
                 * positive_mask
@@ -5944,13 +5950,13 @@ class OptimizedDiffusionTrainer:
             neg_dice_mass = neg_dice_mass + (probabilities * negative_mask).sum(dim=1)
             # Per-chunk bce/margin losses, same arithmetic as the old grad pass.
             chunk_bce = logits.new_zeros(())
-            if float(positive_count.item()) > 0.0:
+            if positive_count_float > 0.0:
                 chunk_bce = chunk_bce + bce[positive_mask].sum() / positive_count
-            if float(negative_count.item()) > 0.0:
+            if negative_count_float > 0.0:
                 chunk_bce = chunk_bce + bce[negative_mask].sum() / negative_count
             chunk_bce = chunk_bce / max(class_count, 1)
             chunk_margin = logits.new_zeros(())
-            if margin_enabled and float(positive_count.item()) > 0.0:
+            if margin_enabled and positive_count_float > 0.0:
                 chunk_margin = chunk_margin + (
                     float(self.training_config.threshold_positive_margin_weight)
                     * (
@@ -5959,7 +5965,7 @@ class OptimizedDiffusionTrainer:
                     ).sum()
                     / positive_count
                 )
-            if margin_enabled and float(negative_count.item()) > 0.0:
+            if margin_enabled and negative_count_float > 0.0:
                 chunk_margin = chunk_margin + (
                     float(self.training_config.threshold_negative_margin_weight)
                     * (
@@ -5971,9 +5977,9 @@ class OptimizedDiffusionTrainer:
             total_chunk_loss = total_chunk_loss + (chunk_bce + chunk_margin)
 
         balanced_bce = flat_target.new_zeros(())
-        if float(positive_count.item()) > 0.0:
+        if positive_count_float > 0.0:
             balanced_bce += positive_bce_sum / positive_count
-        if float(negative_count.item()) > 0.0:
+        if negative_count_float > 0.0:
             balanced_bce += negative_bce_sum / negative_count
         balanced_bce = balanced_bce / max(class_count, 1)
         numerator = 2.0 * intersection.detach() + 1.0
@@ -5982,12 +5988,12 @@ class OptimizedDiffusionTrainer:
         full_loss = balanced_bce + self.training_config.geometry_dice_weight * dice_loss
         positive_margin_loss = (
             positive_margin_sum / positive_count
-            if margin_enabled and float(positive_count.item()) > 0.0
+            if margin_enabled and positive_count_float > 0.0
             else flat_target.new_zeros(())
         )
         negative_margin_loss = (
             negative_margin_sum / negative_count
-            if margin_enabled and float(negative_count.item()) > 0.0
+            if margin_enabled and negative_count_float > 0.0
             else flat_target.new_zeros(())
         )
         threshold_margin_loss = (
@@ -6000,8 +6006,8 @@ class OptimizedDiffusionTrainer:
         self.last_threshold_margin_components = {
             "threshold_positive_margin_loss": float(positive_margin_loss.detach().item()),
             "threshold_negative_margin_loss": float(negative_margin_loss.detach().item()),
-            "threshold_positive_voxel_count": int(positive_count.item()),
-            "threshold_negative_voxel_count": int(negative_count.item()),
+            "threshold_positive_voxel_count": int(positive_count_float),
+            "threshold_negative_voxel_count": int(negative_count_float),
             "threshold_positive_margin": float(self.training_config.threshold_positive_margin),
             "threshold_negative_margin": float(self.training_config.threshold_negative_margin),
             "threshold_positive_margin_weight": float(self.training_config.threshold_positive_margin_weight),
