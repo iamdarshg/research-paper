@@ -300,14 +300,6 @@ def test_spsa_path_parity_batched_vs_sequential():
     perturbation = 0.15
     perturbation_grid_size = 12
 
-    # (a) Draw the 16 deltas through the exact forward draw code path twice and
-    # assert byte-identical RNG behavior. Combined with (b)-(d) below this pins
-    # that the batched forward consumes the SAME probes as the sequential one.
-    deltas_a = _draw_spsa_deltas(seed, directions, (GRID, GRID, GRID), perturbation_grid_size)
-    deltas_b = _draw_spsa_deltas(seed, directions, (GRID, GRID, GRID), perturbation_grid_size)
-    for da, db in zip(deltas_a, deltas_b):
-        assert torch.equal(da, db), "delta draw is not reproducible for the same seed"
-
     def _run(chunk):
         old = adc._DIRECT_SOLVER_BATCH_CHUNK
         adc._DIRECT_SOLVER_BATCH_CHUNK = chunk
@@ -344,11 +336,46 @@ def test_spsa_path_parity_batched_vs_sequential():
     seq_loss, seq_grad, seq_sink = _run(1)  # sequential verbatim fallback
     bat_loss, bat_grad, bat_sink = _run(4)  # batched chunked
 
-    # (d) total loss within LOSS_ATOL
+    # (a) The deltas each forward actually consumed are byte-identical. The
+    # forward records them in the sink, so this pins per-forward delta identity
+    # (not merely that the RNG draw is reproducible).
+    seq_deltas = seq_sink.get("_spsa_deltas")
+    bat_deltas = bat_sink.get("_spsa_deltas")
+    assert seq_deltas is not None and bat_deltas is not None, (
+        "forward did not record _spsa_deltas; per-forward delta identity unverifiable"
+    )
+    assert len(seq_deltas) == directions and len(bat_deltas) == directions
+    for i, (da, db) in enumerate(zip(seq_deltas, bat_deltas)):
+        assert torch.equal(da, db), (
+            f"delta {i}: sequential and batched forwards consumed different deltas"
+        )
+
+    # (b) Per-probe loss parity for every plus/minus probe (32 probes in
+    # direction order, plus/minus interleaved). Comparing each probe's component
+    # dict between the two paths catches a systematic loss-assembly error in
+    # _assemble_direct_solver_components that inflates plus and minus equally
+    # (which would cancel in (L+ - L-) and evade the gradient gates).
+    seq_probes = seq_sink.get("_probe_components")
+    bat_probes = bat_sink.get("_probe_components")
+    assert seq_probes is not None and bat_probes is not None, (
+        "forward did not record _probe_components; per-probe parity unverifiable"
+    )
+    assert len(seq_probes) == 2 * directions and len(bat_probes) == 2 * directions, (
+        f"expected {2 * directions} per-probe records, got {len(seq_probes)} and {len(bat_probes)}"
+    )
+    for i, (sp, bp) in enumerate(zip(seq_probes, bat_probes)):
+        where = f"probe {i} (dir {i // 2} {'plus' if i % 2 == 0 else 'minus'})"
+        for key in ("occupancy_loss", "aero_loss", "connectivity_loss", "aircraft_validity_loss", "total_loss"):
+            assert key in sp and key in bp, f"{where}: missing component {key}"
+            assert math.isclose(
+                float(sp[key]), float(bp[key]), rel_tol=COMPONENT_RTOL, abs_tol=COMPONENT_ATOL
+            ), f"{where}: {key} sequential={sp[key]} batched={bp[key]}"
+
+    # (c) total loss within LOSS_ATOL
     assert math.isclose(seq_loss, bat_loss, rel_tol=COMPONENT_RTOL, abs_tol=LOSS_ATOL), (
         f"loss: sequential={seq_loss} batched={bat_loss}"
     )
-    # (c) total gradient within GRAD_ATOL
+    # (d) total gradient within GRAD_ATOL
     grad_diff = float((seq_grad - bat_grad).abs().max().item())
     grad_scale = float(seq_grad.abs().max().item())
     assert grad_diff <= max(GRAD_ATOL, 1e-3 * grad_scale), (
@@ -361,7 +388,9 @@ def test_spsa_path_parity_batched_vs_sequential():
     )
     # Component sink means stay within COMPONENT_RTOL/ATOL.
     for key in seq_sink:
-        if key in {"active_guard_names", "active_guard_set"} or not isinstance(seq_sink[key], (int, float, np.floating)):
+        if key in {"active_guard_names", "active_guard_set", "_probe_components", "_spsa_deltas"} or not isinstance(
+            seq_sink[key], (int, float, np.floating)
+        ):
             continue
         if key not in bat_sink:
             continue

@@ -4617,6 +4617,11 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             )
             base_loss = float(base_components["total_loss"])
             base_component_records.append(base_components)
+            # Task 10: per-probe component telemetry, in direction order
+            # (dir0 plus, dir0 minus, dir1 plus, ...) shared by both the
+            # sequential and batched probe branches, so a parity test can
+            # compare every plus/minus probe dict between the two paths.
+            probe_component_records: List[Dict[str, float]] = []
             raw_component_grads = {
                 name: torch.zeros_like(sample_field) for name in component_names
             }
@@ -4655,6 +4660,10 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         threshold,
                         sample_target,
                     )
+                    # chunk_components is indexed exactly like probe_grids
+                    # (interleaved plus/minus per direction); extending in chunk
+                    # order reproduces the sequential global order.
+                    probe_component_records.extend(chunk_components)
                     for local_index, delta in enumerate(chunk_deltas):
                         plus_components = chunk_components[2 * local_index]
                         minus_components = chunk_components[2 * local_index + 1]
@@ -4707,6 +4716,8 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         sample_target,
                         return_components=True,
                     )
+                    probe_component_records.append(plus_components)
+                    probe_component_records.append(minus_components)
                     legacy_total_grad.add_(
                         (
                             (plus_components["total_loss"] - minus_components["total_loss"])
@@ -4957,6 +4968,12 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         ctx.original_ndim = original_ndim
         mean_loss = float(np.mean(base_losses)) if base_losses else 0.0
         component_sink.clear()
+        # Task 10 parity telemetry: the per-probe component dicts (direction
+        # order, plus/minus interleaved) and the 16 deltas each forward consumed,
+        # so the parity test can assert per-probe loss parity and byte-identical
+        # delta consumption between the sequential and batched forward paths.
+        component_sink["_probe_components"] = list(probe_component_records)
+        component_sink["_spsa_deltas"] = [delta.detach().clone() for delta in deltas]
         active_guard_names = [
             name
             for name in ("connectivity_loss", "aircraft_validity_loss")
