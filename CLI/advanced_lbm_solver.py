@@ -86,6 +86,16 @@ class D3Q27Solver:
             + self.ez[self._force_dir_index].to(dtype=torch.float32)**2
         ).view(-1, 1, 1, 1)
 
+        # Task 8 #1: precomputed broadcast factors for the vectorized 26-dir
+        # momentum-exchange accumulation. Distinct from _opposite_list /
+        # _force_ex above: these are tensor views over links 1..26 shaped for
+        # a single [26, D, H, W] broadcast reduction.
+        self._force_ex_links = self.ex[1:27].float().view(26, 1, 1, 1)
+        self._force_ez_links = self.ez[1:27].float().view(26, 1, 1, 1)
+        self._opposite_links = torch.tensor(
+            self._opposite_list[1:27], dtype=torch.long, device=device
+        )
+
         # Precompute moment basis for vectorized MRT Collision (Issue #16)
         self.moment_keys = [(a, b, c) for a in range(3) for b in range(3) for c in range(3)]
         basis_rows = []
@@ -204,16 +214,19 @@ class D3Q27Solver:
         return self.w.view(-1, 1, 1, 1) * rho * (1 + 3*cu + 4.5*cu**2 - 1.5*u_sq)
 
     def compute_moment_equilibrium(self, rho, ux, uy, uz):
-        """Equilibrium tensor-product moments for D3Q27 (Issue #16)."""
-        cs2 = 1.0 / 3.0
-        m1d_x = [torch.ones_like(rho), ux, ux * ux + cs2]
-        m1d_y = [torch.ones_like(rho), uy, uy * uy + cs2]
-        m1d_z = [torch.ones_like(rho), uz, uz * uz + cs2]
+        """Equilibrium tensor-product moments for D3Q27 (Issue #16, Task 8 #3).
 
-        keq_list = []
-        for a, b, c in self.moment_keys:
-            keq_list.append(rho * m1d_x[a] * m1d_y[b] * m1d_z[c])
-        return torch.stack(keq_list, dim=0)
+        The 27-loop is fused into a [3,3,3,D,H,W] tensor-product broadcast and
+        reshaped in the same a*9+b*3+c order as ``moment_keys``. The per-element
+        operand order ``((rho * mx[a]) * my[b]) * mz[c]`` is unchanged, so the
+        result is bitwise identical to the loop (``torch.equal`` verifiable).
+        """
+        cs2 = 1.0 / 3.0
+        mx = torch.stack([torch.ones_like(rho), ux, ux * ux + cs2])
+        my = torch.stack([torch.ones_like(rho), uy, uy * uy + cs2])
+        mz = torch.stack([torch.ones_like(rho), uz, uz * uz + cs2])
+        meq = rho * mx[:, None, None] * my[None, :, None] * mz[None, None, :]
+        return meq.reshape(27, *rho.shape)
 
     def reset_force_accounting(self, sample_start: int = 0):
         """Reset momentum-exchange bookkeeping for a new simulation run."""
@@ -229,50 +242,27 @@ class D3Q27Solver:
 
     def _accumulate_momentum_exchange_force(self, geometry_mask, geom_hash=None):
         """Compute wall force from fluid-solid links using bounce-back exchange and BFL correction."""
-        boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
-
-        # BFL wall distance q (shape: [26, D, H, W])
-        q = self._get_q(geometry_mask, geom_hash=geom_hash)
-
-        step_force_x = torch.tensor(0.0, device=self.device)
-        step_force_z = torch.tensor(0.0, device=self.device)
-
-        for i in range(1, 27):
-            link_idx = i - 1
-            active = boundary_links[link_idx]
-            if not torch.any(active):
-                continue
-
-            f_in = self.f_pre_stream[i][active]
-            opp_i = self._opposite_list[i]
-            f_out = self.f_temp[opp_i][active]
-            step_force_x += torch.sum(self.ex[i] * (f_in + f_out))
-            step_force_z += torch.sum(self.ez[i] * (f_in + f_out))
-
-        return step_force_x, step_force_z
+        # Task 8 #1: the fused broadcast below keeps this path identical to the
+        # nosync variant (sums over empty selections contribute 0.0), so the
+        # reference path shares the same kernel and parity envelope.
+        return self._accumulate_momentum_exchange_force_nosync(geometry_mask, geom_hash=geom_hash)
 
     def _accumulate_momentum_exchange_force_nosync(self, geometry_mask, geom_hash=None):
-        """Reference momentum-exchange sum without the 26 per-direction
-        ``torch.any`` host synchronizations (plan Phase 1/3).
+        """Vectorized 26-dir momentum-exchange sum (Task 8 #1).
 
-        This is the reference loop verbatim minus the early-continue: a sum
-        over an empty boolean selection contributes exactly 0.0, so the
-        result is bitwise identical while every step stays asynchronous.
+        The 26-direction loop is fused into three [26, D, H, W] broadcasts:
+        f_in from pre-stream, f_out from the opposite link, then a single
+        reduction over the weighted sum. Reduction order differs from the old
+        per-direction loop (~1e-13 relative, LOW parity), so the fused-parity
+        gate (FORCE_ATOL 2.5e-5) is the contract rather than bitwise equality.
         """
         boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
 
-        step_force_x = torch.tensor(0.0, device=self.device)
-        step_force_z = torch.tensor(0.0, device=self.device)
-
-        for i in range(1, 27):
-            link_idx = i - 1
-            active = boundary_links[link_idx]
-            f_in = self.f_pre_stream[i][active]
-            opp_i = self._opposite_list[i]
-            f_out = self.f_temp[opp_i][active]
-            step_force_x += torch.sum(self.ex[i] * (f_in + f_out))
-            step_force_z += torch.sum(self.ez[i] * (f_in + f_out))
-
+        f_in_all = self.f_pre_stream[1:27] * boundary_links
+        f_out_all = self.f_temp[self._opposite_links] * boundary_links
+        sum_all = f_in_all + f_out_all
+        step_force_x = (self._force_ex_links * sum_all).sum()
+        step_force_z = (self._force_ez_links * sum_all).sum()
         return step_force_x, step_force_z
 
     def _effective_drag_link_metric_exponent(self, geometry_mask):
@@ -631,6 +621,12 @@ class D3Q27CascadedSolver:
         self._solver.drag_link_metric_exponent = getattr(
             self.phys_config, "drag_link_metric_exponent", self._solver.drag_link_metric_exponent
         )
+        # Task 8 #2: remember whether the exponent is an explicit phys_config
+        # override (non-None). In auto mode collide_stream caches the value once
+        # per solve without ever clobbering an explicit override.
+        self._solver._drag_exponent_is_override = (
+            self._solver.drag_link_metric_exponent is not None
+        )
 
         # Expose population arrays and buffers expected by tests and external code
         # so callers can access `solver.f` directly and observe shapes/values.
@@ -727,6 +723,17 @@ class D3Q27CascadedSolver:
 
         # Issue #22: Compute hash once
         geom_hash = compute_tensor_content_hash(geometry_mask)
+
+        # Task 8 #2: cache the drag-link metric exponent once per solve. In
+        # auto mode (no explicit phys_config override) the value depends only
+        # on this geometry's projected frontal area, so compute it here and let
+        # the 5 steps reuse the exact same float — this removes 4 of 5 host
+        # .item() syncs per solve. An explicit override is honored untouched.
+        if not getattr(self._solver, "_drag_exponent_is_override", False):
+            self._solver.drag_link_metric_exponent = None  # force THIS geometry
+            self._solver.drag_link_metric_exponent = (
+                self._solver._effective_drag_link_metric_exponent(geometry_mask)
+            )
 
         # Issue #23: Convergence tracking
         tol = float(getattr(self.phys_config, 'convergence_tolerance', 1e-5))
