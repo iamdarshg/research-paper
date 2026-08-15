@@ -9,7 +9,9 @@ import hashlib
 import json
 import math
 import os
+import queue
 import random
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +81,133 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> Dict[str, Any]:
         "global_step": int(record.get("global_step", 0)),
         "record_count": int(_JSONL_RECORD_COUNTS[key]),
     }
+
+
+class _AsyncRecordWriter:
+    """Single-owner background writer for JSONL records and tensorboard scalars.
+
+    All file and SummaryWriter I/O runs on one daemon thread fed by a bounded
+    FIFO queue. The producer assigns monotonic integer sequence numbers; work
+    items are ``('jsonl', seq, path, record)`` and ``('tb', seq, step, tags)``.
+    The worker performs the EXACT byte sequence the synchronous ``_append_jsonl``
+    used today -- same ``json.dumps(record, sort_keys=True, allow_nan=False)``
+    + newline encode, same ``open("ab")``/seek/write/flush/tell, same
+    ``_JSONL_RECORD_COUNTS`` increments -- one record at a time, so file bytes,
+    offsets, and counter state are byte-identical to the synchronous writer.
+
+    ``flush_barrier(seq)`` blocks until every item with ``seq' <= seq`` is
+    durably finished and returns the metadata of the latest completed record,
+    which is what run-state saves use for the updates-log reconciliation prefix.
+    """
+
+    def __init__(self, summary_writer: Any, *, maxsize: int = 64) -> None:
+        self._summary_writer = summary_writer
+        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=maxsize)
+        self._lock = threading.Lock()
+        self._notify = threading.Condition(self._lock)
+        self._next_seq = 0
+        self._last_jsonl_seq: Optional[int] = None
+        self._completed_seq = 0
+        self._last_meta: Dict[str, Any] = {}
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="async-records-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def enqueue_jsonl(self, path: Path, record: Dict[str, Any]) -> int:
+        """Enqueue one JSONL append; returns its monotonic sequence number."""
+        seq = self._next_sequence()
+        self._queue.put(("jsonl", seq, path, record))
+        with self._lock:
+            self._last_jsonl_seq = seq
+        return seq
+
+    def enqueue_tb_batch(self, step: int, tags: Dict[str, float]) -> int:
+        """Enqueue a batch of scalar tags to be written at ``step``."""
+        seq = self._next_sequence()
+        self._queue.put(("tb", seq, int(step), dict(tags)))
+        return seq
+
+    def flush_barrier(self, seq: Optional[int] = None) -> Dict[str, Any]:
+        """Block until all items with ``seq' <= seq`` are durable.
+
+        Returns the metadata of the latest completed JSONL record (``{}`` when
+        no record has been written yet). When ``seq`` is ``None`` the barrier
+        targets the most recently enqueued JSONL sequence.
+        """
+        with self._lock:
+            target = self._last_jsonl_seq if seq is None else int(seq)
+            if target is None:
+                return dict(self._last_meta)
+            while self._completed_seq < target and not self._closed:
+                self._notify.wait(timeout=30.0)
+            return dict(self._last_meta)
+
+    def close(self, timeout: float = 30.0) -> None:
+        """Drain pending work (after a final barrier) and stop the worker.
+
+        The SummaryWriter is flushed and closed only after the queue drains, so
+        no trailing record is lost on normal run end or handled exceptions.
+        """
+        with self._lock:
+            target = self._last_jsonl_seq
+        if target is not None:
+            self.flush_barrier(target)
+        with self._lock:
+            self._closed = True
+            self._notify.notify_all()
+        try:
+            # Sentinel wakes the worker to exit; queued items behind it are
+            # still processed first (FIFO), so trailing telemetry is drained.
+            self._queue.put(None)
+        except Exception:
+            pass
+        self._thread.join(timeout=timeout)
+        writer = self._summary_writer
+        if writer is not None:
+            try:
+                writer.flush()
+            except Exception:
+                pass
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    def _next_sequence(self) -> int:
+        with self._lock:
+            seq = self._next_seq
+            self._next_seq += 1
+            return seq
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    break
+                kind = item[0]
+                if kind == "jsonl":
+                    _, seq, path, record = item
+                    meta = _append_jsonl(path, record)
+                    with self._lock:
+                        self._completed_seq = max(self._completed_seq, seq)
+                        self._last_meta = dict(meta)
+                        self._notify.notify_all()
+                elif kind == "tb":
+                    _, seq, step, tags = item
+                    writer = self._summary_writer
+                    if writer is not None:
+                        for tag, value in tags.items():
+                            writer.add_scalar(str(tag), float(value), step)
+                    with self._lock:
+                        self._completed_seq = max(self._completed_seq, seq)
+                        self._notify.notify_all()
+            finally:
+                self._queue.task_done()
 
 
 def _updates_log_reconciliation_metadata(
@@ -1030,8 +1159,25 @@ def main() -> int:
             )
         )
 
+    writer = _AsyncRecordWriter(trainer.writer)
+    trainer.records_writer = writer
+    pending_jsonl_seq: List[Optional[int]] = [None]
+
+    def _drain_updates_log_for_save() -> None:
+        """Flush the async writer before any run-state save (load-bearing).
+
+        The run-state resume path sha256s the updates JSONL prefix up to the
+        recorded byte-offset; the barrier guarantees the writer has durably
+        produced every record through ``pending_jsonl_seq[0]`` (and its offset)
+        before save_run_state snapshots it.
+        """
+        trainer.run_state_log_metadata = writer.flush_barrier(pending_jsonl_seq[0])
+
     def record_update(record: Dict[str, Any]) -> None:
-        trainer.run_state_log_metadata = _append_jsonl(updates_output, record)
+        # Enqueue-and-return: the writer thread performs the append and computes
+        # the offset off the CPU update path. run_state_log_metadata is
+        # populated by _drain_updates_log_for_save at save time, never here.
+        pending_jsonl_seq[0] = writer.enqueue_jsonl(updates_output, record)
 
     trainer.update_metrics_callback = record_update
     current_epoch_index = int(resume_state_info.get("epoch_index", 0))
@@ -1043,6 +1189,7 @@ def main() -> int:
             args.checkpoint_every_updates,
         ):
             return None
+        _drain_updates_log_for_save()
         trainer.save_run_state(
             run_state_target,
             epoch_index=current_epoch_index,
@@ -1060,255 +1207,262 @@ def main() -> int:
         else None
     )
 
-    history: List[Dict[str, Any]] = []
-    final_checkpoint_path = str((save_dir / "final_monitored_model.pt").resolve())
-    candidate_best_checkpoint_path = str(
-        (save_dir / "best_geometry_model.pt").resolve()
-    )
-    best_checkpoint_path: str | None = None
-    best_geometry_metric = float("inf")
-    best_promotion_rank = (-1.0,) * 8
-    selection_interval = max(1, int(training_config.promotion_interval_epochs))
-    initial_geometry_promotion = None
-    initial_geometry_promotion_report = None
-    promotion_baseline: Dict[str, Any] = {}
+    try:
 
-    if args.resume_run_state:
-        resumed_metadata = dict(resume_state_info.get("run_state_metadata", {}))
-        promotion_baseline = restore_promotion_baseline(
-            resume_state_info,
-            promotion_split=args.promotion_split,
-            promotion_sample_order=_dataset_sample_order(promotion_dataset),
-            evaluation_samples=args.promotion_evaluation_samples,
-            generation_seeds=args.promotion_generation_seeds,
+        history: List[Dict[str, Any]] = []
+        final_checkpoint_path = str((save_dir / "final_monitored_model.pt").resolve())
+        candidate_best_checkpoint_path = str(
+            (save_dir / "best_geometry_model.pt").resolve()
         )
-        initial_geometry_promotion_report = (
-            dict(resumed_metadata.get("promotion_baseline_report", {}))
-            or dict(promotion_baseline)
-        )
-        initial_geometry_promotion = dict(
-            resumed_metadata.get("promotion_baseline_metrics", {})
-        ) or None
-        trainer.run_state_metadata = resumed_metadata
+        best_checkpoint_path: str | None = None
+        best_geometry_metric = float("inf")
+        best_promotion_rank = (-1.0,) * 8
+        selection_interval = max(1, int(training_config.promotion_interval_epochs))
+        initial_geometry_promotion = None
+        initial_geometry_promotion_report = None
+        promotion_baseline: Dict[str, Any] = {}
 
-    if not args.resume_run_state and (
-        args.resume_from or args.warm_start_from or not promotion_baseline
-    ):
-        python_rng_state = random.getstate()
-        numpy_rng_state = np.random.get_state()
-        torch_rng_state = torch.get_rng_state()
-        cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
-        baseline_promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
-        promotion_baseline = dict(baseline_promotion)
-        initial_geometry_promotion_report = dict(baseline_promotion)
-        random.setstate(python_rng_state)
-        np.random.set_state(numpy_rng_state)
-        torch.set_rng_state(torch_rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state_all(cuda_rng_state)
-        baseline_metrics, best_promotion_rank = _geometry_promotion_metrics(
-            baseline_promotion
-        )
-        best_geometry_metric = baseline_metrics["geometry_selection_metric"]
-        initial_geometry_promotion = {
-            **baseline_metrics,
-            "status": str(baseline_promotion.get("status", "fail")),
-            "source_checkpoint": (
-                str(Path(args.resume_from or args.warm_start_from).resolve())
-                if (args.resume_from or args.warm_start_from)
-                else "fresh_run_initial_state"
-            ),
-        }
-        trainer.run_state_metadata = {
-            "promotion_baseline": dict(promotion_baseline),
-            "promotion_baseline_report": dict(initial_geometry_promotion_report),
-            "promotion_baseline_metrics": dict(baseline_metrics),
-            "promotion_baseline_identity": {
-                "split": str(args.promotion_split),
-                "sample_order": _dataset_sample_order(promotion_dataset),
-                "evaluation_samples": int(args.promotion_evaluation_samples),
-                "generation_seeds": int(args.promotion_generation_seeds),
-                "materialization_mode": baseline_promotion.get(
-                    "materialization_mode"
-                ),
-                "geometry_probability_threshold": baseline_promotion.get(
-                    "geometry_probability_threshold"
-                ),
-            },
-        }
-        best_checkpoint_path = (
-            str(Path(args.resume_from or args.warm_start_from).resolve())
-            if (args.resume_from or args.warm_start_from)
-            else None
-        )
-        initial_promotion_path = history_output.with_name(
-            "initial_geometry_promotion.json"
-        )
-        initial_promotion_path.write_text(
-            json.dumps(initial_geometry_promotion_report, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        print(
-            "Initial geometry promotion baseline: "
-            "valid_fraction="
-            f"{baseline_metrics['promotion_generated_aircraft_valid_fraction']:.6g}, "
-            "occupancy_error="
-            f"{baseline_metrics['promotion_generated_occupancy_error']:.6g}, "
-            "unique_fraction="
-            f"{baseline_metrics['promotion_generated_unique_fraction']:.6g}, "
-            "worst_recall="
-            f"{baseline_metrics['promotion_generated_worst_recall']:.6g}, "
-            f"mean_recall={baseline_metrics['promotion_generated_recall']:.6g}"
-        )
+        if args.resume_run_state:
+            resumed_metadata = dict(resume_state_info.get("run_state_metadata", {}))
+            promotion_baseline = restore_promotion_baseline(
+                resume_state_info,
+                promotion_split=args.promotion_split,
+                promotion_sample_order=_dataset_sample_order(promotion_dataset),
+                evaluation_samples=args.promotion_evaluation_samples,
+                generation_seeds=args.promotion_generation_seeds,
+            )
+            initial_geometry_promotion_report = (
+                dict(resumed_metadata.get("promotion_baseline_report", {}))
+                or dict(promotion_baseline)
+            )
+            initial_geometry_promotion = dict(
+                resumed_metadata.get("promotion_baseline_metrics", {})
+            ) or None
+            trainer.run_state_metadata = resumed_metadata
 
-    start_epoch = int(resume_state_info.get("epoch_index", 0))
-    for epoch in range(start_epoch, args.num_epochs):
-        print(f"Epoch {epoch + 1}/{args.num_epochs}")
-        current_epoch_index = epoch
-        start_batch = 0
-        if epoch == int(resume_state_info.get("epoch_index", 0)):
-            start_batch = int(resume_state_info.get("completed_in_epoch", 0))
-        metrics = trainer.train_epoch(
-            train_loader,
-            grid_size=resolved_grid_size,
-            start_batch=start_batch,
-        )
-        if (
-            trainer.stop_after_updates is not None
-            and trainer.global_step >= trainer.stop_after_updates
+        if not args.resume_run_state and (
+            args.resume_from or args.warm_start_from or not promotion_baseline
         ):
-            print(
-                "Stopped at the requested bounded interruption point after writing "
-                f"{run_state_target}"
+            python_rng_state = random.getstate()
+            numpy_rng_state = np.random.get_state()
+            torch_rng_state = torch.get_rng_state()
+            cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+            baseline_promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
+            promotion_baseline = dict(baseline_promotion)
+            initial_geometry_promotion_report = dict(baseline_promotion)
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
+            torch.set_rng_state(torch_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+            baseline_metrics, best_promotion_rank = _geometry_promotion_metrics(
+                baseline_promotion
             )
-            break
-        _reset_epoch_checkpoint_segment(
-            resume_state_info,
-            next_epoch=epoch + 1,
-        )
-        if args.checkpoint_every_updates > 0:
-            trainer.save_run_state(
-                run_state_target,
-                epoch_index=epoch + 1,
-                completed_in_epoch=0,
-                sample_order=sample_order,
-                compatibility=run_compatibility,
-            )
-        metrics = {
-            "epoch": epoch + 1,
-            **{key: float(value) for key, value in metrics.items()},
-        }
-        if not getattr(trainer, "scheduler_step_per_update", False):
-            trainer.scheduler.step()
-        for group in trainer.optimizer.param_groups:
-            group_name = str(group.get("name", "unnamed"))
-            metrics[f"learning_rate_{group_name}"] = float(group.get("lr", 0.0))
-        metrics["core_loss"] = compute_core_loss(metrics)
-        metrics["selected_as_best_geometry_checkpoint"] = 0.0
-        metrics["geometry_selection_evaluated"] = 0.0
-        promotion_passed = False
-        if (epoch + 1) % selection_interval == 0:
-            promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
-            directional_gate = (
-                evaluate_directional_promotion_gate(promotion, promotion_baseline)
-                if promotion_baseline
-                else {"status": "pass", "failed_conditions": [], "conditions": {}}
-            )
-            non_regression = {
-                **directional_gate,
-                "failed_checks": list(
-                    directional_gate.get("failed_conditions", [])
+            best_geometry_metric = baseline_metrics["geometry_selection_metric"]
+            initial_geometry_promotion = {
+                **baseline_metrics,
+                "status": str(baseline_promotion.get("status", "fail")),
+                "source_checkpoint": (
+                    str(Path(args.resume_from or args.warm_start_from).resolve())
+                    if (args.resume_from or args.warm_start_from)
+                    else "fresh_run_initial_state"
                 ),
             }
-            promotion_passed = (
-                promotion.get("status") == "pass"
-                and non_regression.get("status") == "pass"
+            trainer.run_state_metadata = {
+                "promotion_baseline": dict(promotion_baseline),
+                "promotion_baseline_report": dict(initial_geometry_promotion_report),
+                "promotion_baseline_metrics": dict(baseline_metrics),
+                "promotion_baseline_identity": {
+                    "split": str(args.promotion_split),
+                    "sample_order": _dataset_sample_order(promotion_dataset),
+                    "evaluation_samples": int(args.promotion_evaluation_samples),
+                    "generation_seeds": int(args.promotion_generation_seeds),
+                    "materialization_mode": baseline_promotion.get(
+                        "materialization_mode"
+                    ),
+                    "geometry_probability_threshold": baseline_promotion.get(
+                        "geometry_probability_threshold"
+                    ),
+                },
+            }
+            best_checkpoint_path = (
+                str(Path(args.resume_from or args.warm_start_from).resolve())
+                if (args.resume_from or args.warm_start_from)
+                else None
             )
-            metrics["geometry_selection_evaluated"] = 1.0
-            promotion_metrics, promotion_rank = _geometry_promotion_metrics(promotion)
-            metrics.update(promotion_metrics)
-            metrics["promotion_gate_passed"] = float(promotion_passed)
-            metrics["promotion_non_regression_passed"] = float(
-                non_regression.get("status") == "pass"
+            initial_promotion_path = history_output.with_name(
+                "initial_geometry_promotion.json"
             )
-            metrics["promotion_non_regression_failed_count"] = float(
-                len(non_regression.get("failed_checks", []))
+            initial_promotion_path.write_text(
+                json.dumps(initial_geometry_promotion_report, indent=2) + "\n",
+                encoding="utf-8",
             )
-            metrics["promotion_report"] = dict(promotion)
-            metrics["promotion_non_regression_report"] = dict(non_regression)
-            metrics["promotion_directional_gate"] = dict(directional_gate)
-            candidate_improved = promotion_passed
-            if candidate_improved:
-                best_promotion_rank = promotion_rank
-                best_geometry_metric = metrics["geometry_selection_metric"]
-                trainer.save_checkpoint(candidate_best_checkpoint_path)
-                best_checkpoint_path = candidate_best_checkpoint_path
-                metrics["selected_as_best_geometry_checkpoint"] = 1.0
-        else:
-            metrics["geometry_selection_metric"] = float("nan")
-        history.append(metrics)
-
-        stability = summarize_stability(
-            history,
-            metric=args.stability_metric,
-            window=args.convergence_window,
-            convergence_target=args.convergence_target,
-            convergence_cv_threshold=args.convergence_cv_threshold,
-            convergence_drift_threshold=args.convergence_drift_threshold,
-            oscillation_cv_threshold=args.oscillation_cv_threshold,
-            required_geometry_loss_max=args.required_geometry_loss_max,
-        )
-
-        metric_stats = stability.get("metric_stats", {})
-        latest_metric = metrics.get(args.stability_metric, 0.0)
-        print(
-            "Stability "
-            f"status={stability['status']} "
-            f"metric={args.stability_metric} "
-            f"mean={metric_stats.get('mean', latest_metric):.4f} "
-            f"cv={metric_stats.get('cv', 0.0):.4f}"
-        )
-        if stability.get("suspected_root_cause"):
-            print(f"Suspected instability root cause: {stability['suspected_root_cause']}")
-
-        payload = _build_history_payload(
-            args=args,
-            device=device,
-            history=history,
-            stability=stability,
-            checkpoint_path=(
-                final_checkpoint_path if args.save_final_checkpoint else None
-            ),
-            model_config=model_config,
-            best_checkpoint_path=best_checkpoint_path,
-            best_geometry_metric=(
-                best_geometry_metric if np.isfinite(best_geometry_metric) else None
-            ),
-            initial_geometry_promotion=initial_geometry_promotion,
-            initial_geometry_promotion_report=initial_geometry_promotion_report,
-        )
-        history_output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-            checkpoint_path = save_dir / f"checkpoint_monitored_ep{epoch + 1}.pt"
-            trainer.save_checkpoint(str(checkpoint_path))
-
-        if args.stop_on_promotion_pass and promotion_passed:
             print(
-                f"Stopping after epoch {epoch + 1}: validation geometry promotion gate passed."
+                "Initial geometry promotion baseline: "
+                "valid_fraction="
+                f"{baseline_metrics['promotion_generated_aircraft_valid_fraction']:.6g}, "
+                "occupancy_error="
+                f"{baseline_metrics['promotion_generated_occupancy_error']:.6g}, "
+                "unique_fraction="
+                f"{baseline_metrics['promotion_generated_unique_fraction']:.6g}, "
+                "worst_recall="
+                f"{baseline_metrics['promotion_generated_worst_recall']:.6g}, "
+                f"mean_recall={baseline_metrics['promotion_generated_recall']:.6g}"
             )
-            break
 
-        if args.early_stop_on_convergence and stability["converged"]:
-            print(f"Early stopping at epoch {epoch + 1}: convergence criteria met.")
-            break
+        start_epoch = int(resume_state_info.get("epoch_index", 0))
+        for epoch in range(start_epoch, args.num_epochs):
+            print(f"Epoch {epoch + 1}/{args.num_epochs}")
+            current_epoch_index = epoch
+            start_batch = 0
+            if epoch == int(resume_state_info.get("epoch_index", 0)):
+                start_batch = int(resume_state_info.get("completed_in_epoch", 0))
+            metrics = trainer.train_epoch(
+                train_loader,
+                grid_size=resolved_grid_size,
+                start_batch=start_batch,
+            )
+            if (
+                trainer.stop_after_updates is not None
+                and trainer.global_step >= trainer.stop_after_updates
+            ):
+                print(
+                    "Stopped at the requested bounded interruption point after writing "
+                    f"{run_state_target}"
+                )
+                break
+            _reset_epoch_checkpoint_segment(
+                resume_state_info,
+                next_epoch=epoch + 1,
+            )
+            if args.checkpoint_every_updates > 0:
+                _drain_updates_log_for_save()
+                trainer.save_run_state(
+                    run_state_target,
+                    epoch_index=epoch + 1,
+                    completed_in_epoch=0,
+                    sample_order=sample_order,
+                    compatibility=run_compatibility,
+                )
+            metrics = {
+                "epoch": epoch + 1,
+                **{key: float(value) for key, value in metrics.items()},
+            }
+            if not getattr(trainer, "scheduler_step_per_update", False):
+                trainer.scheduler.step()
+            for group in trainer.optimizer.param_groups:
+                group_name = str(group.get("name", "unnamed"))
+                metrics[f"learning_rate_{group_name}"] = float(group.get("lr", 0.0))
+            metrics["core_loss"] = compute_core_loss(metrics)
+            metrics["selected_as_best_geometry_checkpoint"] = 0.0
+            metrics["geometry_selection_evaluated"] = 0.0
+            promotion_passed = False
+            if (epoch + 1) % selection_interval == 0:
+                promotion = trainer.evaluate_geometry_promotion_gate(promotion_loader)
+                directional_gate = (
+                    evaluate_directional_promotion_gate(promotion, promotion_baseline)
+                    if promotion_baseline
+                    else {"status": "pass", "failed_conditions": [], "conditions": {}}
+                )
+                non_regression = {
+                    **directional_gate,
+                    "failed_checks": list(
+                        directional_gate.get("failed_conditions", [])
+                    ),
+                }
+                promotion_passed = (
+                    promotion.get("status") == "pass"
+                    and non_regression.get("status") == "pass"
+                )
+                metrics["geometry_selection_evaluated"] = 1.0
+                promotion_metrics, promotion_rank = _geometry_promotion_metrics(promotion)
+                metrics.update(promotion_metrics)
+                metrics["promotion_gate_passed"] = float(promotion_passed)
+                metrics["promotion_non_regression_passed"] = float(
+                    non_regression.get("status") == "pass"
+                )
+                metrics["promotion_non_regression_failed_count"] = float(
+                    len(non_regression.get("failed_checks", []))
+                )
+                metrics["promotion_report"] = dict(promotion)
+                metrics["promotion_non_regression_report"] = dict(non_regression)
+                metrics["promotion_directional_gate"] = dict(directional_gate)
+                candidate_improved = promotion_passed
+                if candidate_improved:
+                    best_promotion_rank = promotion_rank
+                    best_geometry_metric = metrics["geometry_selection_metric"]
+                    trainer.save_checkpoint(candidate_best_checkpoint_path)
+                    best_checkpoint_path = candidate_best_checkpoint_path
+                    metrics["selected_as_best_geometry_checkpoint"] = 1.0
+            else:
+                metrics["geometry_selection_metric"] = float("nan")
+            history.append(metrics)
 
-    if args.save_final_checkpoint:
-        trainer.save_checkpoint(final_checkpoint_path)
-        print(f"Final monitored checkpoint saved to {final_checkpoint_path}")
-    else:
-        print("Final checkpoint save disabled for this smoke run.")
-    print(f"History written to {history_output}")
+            stability = summarize_stability(
+                history,
+                metric=args.stability_metric,
+                window=args.convergence_window,
+                convergence_target=args.convergence_target,
+                convergence_cv_threshold=args.convergence_cv_threshold,
+                convergence_drift_threshold=args.convergence_drift_threshold,
+                oscillation_cv_threshold=args.oscillation_cv_threshold,
+                required_geometry_loss_max=args.required_geometry_loss_max,
+            )
+
+            metric_stats = stability.get("metric_stats", {})
+            latest_metric = metrics.get(args.stability_metric, 0.0)
+            print(
+                "Stability "
+                f"status={stability['status']} "
+                f"metric={args.stability_metric} "
+                f"mean={metric_stats.get('mean', latest_metric):.4f} "
+                f"cv={metric_stats.get('cv', 0.0):.4f}"
+            )
+            if stability.get("suspected_root_cause"):
+                print(f"Suspected instability root cause: {stability['suspected_root_cause']}")
+
+            payload = _build_history_payload(
+                args=args,
+                device=device,
+                history=history,
+                stability=stability,
+                checkpoint_path=(
+                    final_checkpoint_path if args.save_final_checkpoint else None
+                ),
+                model_config=model_config,
+                best_checkpoint_path=best_checkpoint_path,
+                best_geometry_metric=(
+                    best_geometry_metric if np.isfinite(best_geometry_metric) else None
+                ),
+                initial_geometry_promotion=initial_geometry_promotion,
+                initial_geometry_promotion_report=initial_geometry_promotion_report,
+            )
+            history_output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+            if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+                checkpoint_path = save_dir / f"checkpoint_monitored_ep{epoch + 1}.pt"
+                trainer.save_checkpoint(str(checkpoint_path))
+
+            if args.stop_on_promotion_pass and promotion_passed:
+                print(
+                    f"Stopping after epoch {epoch + 1}: validation geometry promotion gate passed."
+                )
+                break
+
+            if args.early_stop_on_convergence and stability["converged"]:
+                print(f"Early stopping at epoch {epoch + 1}: convergence criteria met.")
+                break
+
+        if args.save_final_checkpoint:
+            trainer.save_checkpoint(final_checkpoint_path)
+            print(f"Final monitored checkpoint saved to {final_checkpoint_path}")
+        else:
+            print("Final checkpoint save disabled for this smoke run.")
+        print(f"History written to {history_output}")
+    finally:
+
+        writer.close()
+
     return 0
 
 
