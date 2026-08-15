@@ -54,7 +54,12 @@ import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
 from sdf_utils import compute_all_link_distances
 from utils import compute_tensor_content_hash
-from aircraft_validity import evaluate_aircraft_validity
+from aircraft_validity import (
+    _bbox_component_fraction,
+    _heuristic_metrics_gpu,
+    _validity_report_from_metrics,
+    evaluate_aircraft_validity,
+)
 from condition_feasibility import validate_condition_feasibility
 from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
 from geometry_store import CompactGeometryStore
@@ -4219,21 +4224,20 @@ def _direct_measured_objective_for_single(
     )
 
     needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
-    # Build the 3.5 MB CPU copy only when the CPU connected-components validity
-    # eval below will consume it; otherwise keep the solve D2H-free.
-    geometry_cpu = binary.detach().to("cpu") if needs_shape_metrics else None
+    # OFFLOAD-1: validity metrics are computed by a composed GPU pass over the
+    # already-resident `binary` (one .cpu().tolist()), with only the scipy
+    # connected-component label staying on CPU in the pool, fed by the tiny
+    # solid-bbox crop. This drops the 3.5 MB per-solve D2H copy and the ~26-192
+    # .item()/any() drains of the old CPU _heuristic_metrics path.
     validity_report: Dict[str, Any] = {}
     validity_future = None
+    metrics = None
     if needs_shape_metrics:
-        # Generated tensors already use the canonical [Z, Y, X] training frame.
-        # Searching all axis permutations here both hides orientation errors and
-        # repeats connected-component work for every finite-difference probe.
-        # Validity is a pure function of geometry_cpu (independent of the LBM
-        # results), so it is submitted to the pool before the GPU solve and the
-        # result is identical to computing it serially after the solve.
-        validity_future = _VALIDITY_POOL.submit(
-            evaluate_aircraft_validity, geometry_cpu, canonicalize=False
-        )
+        metrics, bbox_crop_cpu, occupied = _heuristic_metrics_gpu(binary)
+        if bbox_crop_cpu is not None:
+            validity_future = _VALIDITY_POOL.submit(
+                _bbox_component_fraction, bbox_crop_cpu, occupied
+            )
 
     cfd_results = cfd_simulator.simulate_aerodynamics(
         solver_geometry,
@@ -4241,7 +4245,12 @@ def _direct_measured_objective_for_single(
     )
 
     if validity_future is not None:
-        validity_report = validity_future.result()
+        metrics["largest_component_fraction"] = validity_future.result()
+    if needs_shape_metrics:
+        validity_report = _validity_report_from_metrics(
+            metrics,
+            occupancy_upper_bound=(0.04 if min(binary.shape) < 64 else 0.02),
+        )
 
     occupancy = float(binary.float().mean().item())
     raw_drag = cfd_results.get("drag_coefficient")
