@@ -6165,6 +6165,7 @@ class OptimizedDiffusionTrainer:
 
         positive_sum = flat_target.new_zeros(())
         negative_sum = flat_target.new_zeros(())
+        total_chunk_loss = flat_target.new_zeros(())
         for start in range(0, total_voxels, chunk_size):
             stop = min(start + chunk_size, total_voxels)
             indices = torch.arange(start, stop, device=self.device)
@@ -6175,8 +6176,9 @@ class OptimizedDiffusionTrainer:
             negative_mask = ~positive_mask
             # The detached margin sums formerly computed in a separate no_grad
             # full-lattice decode are accumulated here; .detach() keeps them out
-            # of the gradient graph so the per-chunk backward below stays
-            # byte-identical to the previous implementation.
+            # of the gradient graph (they feed only the returned telemetry loss,
+            # not the gradient-carrying total) so the single backward below
+            # backpropagates exactly the chunk-loss margin gradient.
             positive_sum = positive_sum + (
                 (positive_boundary - probabilities).clamp_min(0.0).square()
                 * positive_mask
@@ -6203,9 +6205,11 @@ class OptimizedDiffusionTrainer:
                 / safe_negative_count
             ) * has_negative
             # Every coordinate chunk has its own decoder graph, but all chunks
-            # share the upstream latent graph. Keep that shared graph alive
-            # until the final chunk has contributed its exact gradient.
-            (scale * chunk_loss).backward(retain_graph=stop < total_voxels)
+            # share the upstream latent graph. Accumulate the per-chunk margin
+            # loss in-graph and run one backward after the loop so a single
+            # autograd walk replaces the former 54 per-chunk backwards.
+            total_chunk_loss = total_chunk_loss + chunk_loss
+        (scale * total_chunk_loss).backward()
         positive_loss = (positive_sum / safe_positive_count) * has_positive
         negative_loss = (negative_sum / safe_negative_count) * has_negative
         detached_loss = scale * (
