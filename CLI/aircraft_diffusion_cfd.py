@@ -7765,7 +7765,11 @@ class OptimizedDiffusionTrainer:
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = _load_checkpoint_metadata(
+            path,
+            map_location=self.device,
+            authorized_paths=(path,),
+        )
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
         self.converter.load_state_dict(checkpoint['converter'])
@@ -7892,7 +7896,11 @@ class OptimizedAircraftGenerator:
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = _load_checkpoint_metadata(
+            checkpoint_path,
+            map_location=self.device,
+            authorized_paths=(checkpoint_path,),
+        )
 
         self.model_config = ModelConfig(**checkpoint['model_config'])
         self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
@@ -8812,7 +8820,11 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     # Load checkpoint if resuming
     model_config_override = None
     if resume_from:
-        checkpoint = torch.load(resume_from, map_location=device)
+        checkpoint = _load_checkpoint_metadata(
+            resume_from,
+            map_location=device,
+            authorized_paths=(resume_from,),
+        )
         model_config_override = ModelConfig(**checkpoint['model_config'])
         print(f"Loaded model config from checkpoint: latent_dim={model_config_override.latent_dim}")
 
