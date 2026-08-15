@@ -7163,21 +7163,41 @@ class OptimizedDiffusionTrainer:
         denominator = max(processed_updates, 1)
         avg_optimization_loss = total_optimization_loss / denominator
 
-        # Log to tensorboard
-        self.writer.add_scalar('Loss/total', avg_optimization_loss, self.global_step)
-        self.writer.add_scalar('Loss/optimization', avg_optimization_loss, self.global_step)
-        self.writer.add_scalar('Loss/mse', total_mse / denominator, self.global_step)
-        self.writer.add_scalar('Loss/clean_geometry_reconstruction', total_clean_geometry / denominator, self.global_step)
-        self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / denominator, self.global_step)
-        self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / denominator, self.global_step)
-        self.writer.add_scalar('Loss/consistency', total_consistency / denominator, self.global_step)
-        self.writer.add_scalar('Loss/direct_solver', total_direct_solver / denominator, self.global_step)
-        if direct_solver_eval_count > 0:
-            self.writer.add_scalar('Loss/direct_solver_eval', total_direct_solver_eval / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_occupancy', total_direct_occupancy / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_aero', total_direct_aero / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_connectivity', total_direct_connectivity / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_aircraft_validity', total_direct_validity / direct_solver_eval_count, self.global_step)
+        # Log to tensorboard. When the async records writer is wired in by
+        # CLI/run_monitored_training.py, the two scalar batches below are
+        # enqueued so protobuf serialization runs on the writer thread, off the
+        # per-epoch CPU path. The writer expands each batch back into the same
+        # add_scalar tags/values/steps in the same order, so the event stream is
+        # identical to the synchronous path (torch's add_scalars would NOT
+        # preserve the "Loss/..." subtags, so batches are expanded per-tag).
+        _tb_unconditional = {
+            'Loss/total': avg_optimization_loss,
+            'Loss/optimization': avg_optimization_loss,
+            'Loss/mse': total_mse / denominator,
+            'Loss/clean_geometry_reconstruction': total_clean_geometry / denominator,
+            'Loss/geometry_reconstruction': total_geometry / denominator,
+            'Loss/generation_reconstruction': total_generation_geometry / denominator,
+            'Loss/consistency': total_consistency / denominator,
+            'Loss/direct_solver': total_direct_solver / denominator,
+        }
+        _tb_direct = {
+            'Loss/direct_solver_eval': total_direct_solver_eval / direct_solver_eval_count,
+            'Loss/direct_occupancy': total_direct_occupancy / direct_solver_eval_count,
+            'Loss/direct_aero': total_direct_aero / direct_solver_eval_count,
+            'Loss/direct_connectivity': total_direct_connectivity / direct_solver_eval_count,
+            'Loss/direct_aircraft_validity': total_direct_validity / direct_solver_eval_count,
+        }
+        _records_writer = getattr(self, "records_writer", None)
+        if _records_writer is not None:
+            _records_writer.enqueue_tb_batch(int(self.global_step), _tb_unconditional)
+            if direct_solver_eval_count > 0:
+                _records_writer.enqueue_tb_batch(int(self.global_step), _tb_direct)
+        else:
+            for _tag, _value in _tb_unconditional.items():
+                self.writer.add_scalar(_tag, _value, self.global_step)
+            if direct_solver_eval_count > 0:
+                for _tag, _value in _tb_direct.items():
+                    self.writer.add_scalar(_tag, _value, self.global_step)
 
         avg_direct_solver_eval = (
             total_direct_solver_eval / direct_solver_eval_count
