@@ -109,19 +109,54 @@ def _is_trusted_checkpoint_path(path) -> bool:
     return resolved == trusted_root or trusted_root in resolved.parents
 
 
-def _load_checkpoint_metadata(checkpoint: Path):
+def _is_authorized_checkpoint_path(path, authorized_paths) -> bool:
+    """True when ``path`` resolves to one of the explicitly-authorized paths.
+
+    Operator-specified checkpoint paths (e.g. ``--resume-from``,
+    ``--warm-start-from``) may legitimately point outside the build/ root. When
+    the caller passes such a path explicitly, it is authorized for the
+    ``weights_only=False`` fallback (a trusted local artifact at an explicit
+    operator-chosen path); anything not explicitly authorized keeps the
+    fail-closed default.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    for candidate in authorized_paths or ():
+        try:
+            if resolved == Path(candidate).resolve():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _load_checkpoint_metadata(
+    checkpoint: Path,
+    *,
+    map_location="cpu",
+    authorized_paths=(),
+):
     """Load checkpoint metadata preferring the safe weights_only=True loader.
 
     ``weights_only=True`` rejects any checkpoint that embeds non-whitelisted
     globals by raising one of ``_WEIGHTS_ONLY_FALLBACK_EXCEPTIONS``. We fall back
     to the unsafe ``weights_only=False`` loader ONLY for a trusted local
-    artifact that resolves under the build/ root, and we log a warning when we
-    do. Untrusted paths re-raise: we never deserialize untrusted input.
+    artifact that resolves under the build/ root OR is one of the
+    ``authorized_paths`` the caller explicitly passed (operator-specified
+    ``--resume-from`` / ``--warm-start-from`` checkpoints may live outside
+    build/); we log a warning when we do. Untrusted paths re-raise: we never
+    deserialize untrusted input. ``map_location`` is forwarded to torch.load so
+    callers keep their existing load-device semantics.
     """
     try:
-        return torch.load(checkpoint, map_location="cpu", weights_only=True)
+        return torch.load(checkpoint, map_location=map_location, weights_only=True)
     except _WEIGHTS_ONLY_FALLBACK_EXCEPTIONS as exc:
-        if not _is_trusted_checkpoint_path(checkpoint):
+        if not (
+            _is_trusted_checkpoint_path(checkpoint)
+            or _is_authorized_checkpoint_path(checkpoint, authorized_paths)
+        ):
             logging.getLogger(__name__).error(
                 "weights_only=True rejected %s (%s); refusing weights_only=False "
                 "fallback for an untrusted checkpoint path",
@@ -136,7 +171,7 @@ def _load_checkpoint_metadata(checkpoint: Path):
             exc,
             _TRUSTED_CHECKPOINT_ROOT,
         )
-        return torch.load(checkpoint, map_location="cpu", weights_only=False)
+        return torch.load(checkpoint, map_location=map_location, weights_only=False)
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -7696,7 +7731,11 @@ class OptimizedDiffusionTrainer:
 
     def warm_start_checkpoint(self, path: str) -> Dict[str, Any]:
         """Warm-start a widened decoder while preserving compatible learned models."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = _load_checkpoint_metadata(
+            path,
+            map_location=self.device,
+            authorized_paths=(Path(path).resolve(),),
+        )
         self.diffusion_model.load_state_dict(checkpoint["diffusion_model"])
         self.consistency_model.load_state_dict(checkpoint["consistency_model"])
         converter_report = load_width_expanded_state_dict(

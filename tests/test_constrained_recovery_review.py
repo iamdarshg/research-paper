@@ -1178,6 +1178,36 @@ def test_config_fixed_load_run_state_preserves_config_threshold(tmp_path, monkey
     )
 
 
+def test_checkpoint_metadata_loader_authorizes_operator_passed_paths(tmp_path):
+    """Round-2 I1: operator-passed checkpoint paths outside build/ are authorized.
+
+    ``--resume-from`` and ``--warm-start-from`` are raw operator-specified CLI
+    paths used directly with torch.load, so they may legitimately point OUTSIDE
+    the trusted build/ root. The trust-gated loader must accept such an
+    explicitly-passed path for the ``weights_only=False`` fallback (a trusted
+    local artifact at an operator-chosen path) while a path that was NOT
+    explicitly authorized keeps the fail-closed default.
+    """
+    # An artifact that weights_only=True rejects (embedded random.Random global,
+    # mirroring the run-state checkpoints that embed numpy/random RNG globals).
+    artifact_path = tmp_path / "resume_from_checkpoint.pt"
+    torch.save(
+        {"model_config": {"grid_resolution": 4}, "rng": random.Random(42)},
+        artifact_path,
+    )
+
+    # (a) Explicitly-passed path (outside build/) loads via the fallback.
+    loaded = recovery._load_checkpoint_metadata(
+        artifact_path,
+        authorized_paths=(artifact_path.resolve(),),
+    )
+    assert loaded["model_config"]["grid_resolution"] == 4
+
+    # (b) Same path without explicit authorization fails closed (no fallback).
+    with pytest.raises(recovery._WEIGHTS_ONLY_FALLBACK_EXCEPTIONS):
+        recovery._load_checkpoint_metadata(artifact_path)
+
+
 def test_analytic_occupancy_logit_gradient_behavior():
     """Deterministic one-sided brake, soft anchor, clipping, and ref handling."""
     import math as _math

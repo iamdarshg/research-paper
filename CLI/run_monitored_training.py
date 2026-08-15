@@ -848,10 +848,9 @@ def main() -> int:
         latent_dim=args.latent_dim,
     )
     if args.resume_from:
-        checkpoint_metadata = torch.load(
+        checkpoint_metadata = _load_checkpoint_metadata(
             args.resume_from,
-            map_location="cpu",
-            weights_only=False,
+            authorized_paths=(Path(args.resume_from).resolve(),),
         )
         checkpoint_model_config = ModelConfig(**checkpoint_metadata["model_config"])
         if int(checkpoint_model_config.grid_resolution) != int(resolved_grid_size):
