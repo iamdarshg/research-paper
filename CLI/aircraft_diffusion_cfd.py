@@ -4580,10 +4580,11 @@ def _direct_measured_objectives_batch(
 def _clear_direct_solver_batch_workspace(cfd_simulator: "AdvancedCFDSimulator") -> None:
     """Drop the private batched-workspace buffers after a chunked SPSA solve.
 
-    The batched path allocates ``[C, 27, D, H, W]`` populations and q tensors on
-    the inner D3Q27 solver. This releases them so a later chunk (or the next
-    training batch) reallocates for its own C, and so peak VRAM reflects only
-    the current chunk rather than accumulating chunk after chunk.
+    The batched path allocates ``[C, 27, D, H, W]`` population buffers (two,
+    since Task 34) plus the compact active-voxel BFL tables on the inner D3Q27
+    solver. This releases them so a later chunk (or the next training batch)
+    reallocates for its own C, and so peak VRAM reflects only the current chunk
+    rather than accumulating chunk after chunk.
     """
     root_solver = getattr(cfd_simulator, "lbm_solver", None)
     nested_solver = getattr(root_solver, "_solver", None) if root_solver is not None else None
@@ -4592,8 +4593,7 @@ def _clear_direct_solver_batch_workspace(cfd_simulator: "AdvancedCFDSimulator") 
         return
     for name in (
         "_f_batch",
-        "_f_pre_batch",
-        "_f_temp_batch",
+        "_f_swap_batch",
         "_velocity_x_batch",
         "_velocity_y_batch",
         "_velocity_z_batch",
@@ -4602,6 +4602,8 @@ def _clear_direct_solver_batch_workspace(cfd_simulator: "AdvancedCFDSimulator") 
     ):
         if hasattr(solver, name):
             setattr(solver, name, None)
+    if hasattr(solver, "_bfl_sparse_cache"):
+        solver._bfl_sparse_cache = {}
 
 
 def _clear_direct_solver_geometry_caches(cfd_simulator: "AdvancedCFDSimulator") -> None:
@@ -4618,6 +4620,8 @@ def _clear_direct_solver_geometry_caches(cfd_simulator: "AdvancedCFDSimulator") 
         q_cache = getattr(solver, "_q_cache", None)
         if isinstance(q_cache, dict):
             q_cache.clear()
+        if hasattr(solver, "_bfl_sparse_cache"):
+            solver._bfl_sparse_cache = {}
         if hasattr(solver, "_boundary_cache_key"):
             solver._boundary_cache_key = None
         if hasattr(solver, "_boundary_link_cache"):

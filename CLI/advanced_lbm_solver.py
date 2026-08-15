@@ -31,6 +31,11 @@ try:
 except Exception:  # pragma: no cover - optional acceleration path
     stream_bfl_d3q27_batch = None
 
+try:
+    from d3q27_kernels import stream_bfl_d3q27_batch_compressed
+except Exception:  # pragma: no cover - optional acceleration path
+    stream_bfl_d3q27_batch_compressed = None
+
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
     """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
@@ -187,6 +192,11 @@ class D3Q27Solver:
         self._f_batch = None
         self._f_pre_batch = None
         self._f_temp_batch = None
+        self._f_swap_batch = None
+        # Task 34: compact boundary-link (active-voxel) tables keyed by
+        # (geom_hash tuple, C, res). Only boundary q crosses to GPU; the
+        # full-lattice [C, 27, D, H, W] q-field is never resident here.
+        self._bfl_sparse_cache = {}
         self._velocity_x_batch = None
         self._velocity_y_batch = None
         self._velocity_z_batch = None
@@ -635,6 +645,98 @@ class D3Q27Solver:
             q_list.append(q)
         return torch.stack(q_list, dim=0).contiguous()
 
+    def _get_q_single_batch(self, geometry_mask, geom_hash):
+        """Pop/compute the full ``[27, D, H, W]`` q for one batch geometry.
+
+        Same per-geometry body as ``_get_q_batch`` (warm-cache pop or cold EDT
+        fallback, refill hook) but returns a single full-lattice tensor. The
+        Task 34 sparse-table builder extracts boundary-link q from this and lets
+        the full tensor be freed immediately, so no ``[C, 27, D, H, W]`` stack
+        is ever resident on GPU.
+        """
+        warm_entry = self._warm_sdf_cache.pop(geom_hash, None)
+        if warm_entry is not None:
+            q_cpu = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
+            q = q_cpu.to(geometry_mask.device)
+            refill = getattr(self, "_sdf_refill", None)
+            if callable(refill):
+                refill(self)
+        else:
+            q = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
+        return q
+
+    def _build_bfl_sparse_tables(self, mask_stack, geom_hashes, q_stack=None, boundary_links_batch=None):
+        """Build compact active-voxel (boundary-link) q tables for the batch.
+
+        The fused BFL kernel only ever consumes q at fluid voxels whose in-domain
+        neighbor in the incoming direction is solid — exactly
+        ``_boundary_links_batch``. For each (c, i) pair this extracts the flat
+        voxel offsets and the q values at those voxels into a compact
+        concatenation:
+
+            q_flat       [N_active] fp32  q values at active voxels
+            active_flat  [N_active] int32 flat voxel offsets
+            pair_start   [C*26]     int32 start index per (c, i) pair
+            pair_count   [C*26]     int32 active-voxel count per (c, i) pair
+
+        Pair ``p`` is item ``p // 26``, direction ``p % 26 + 1``. The values are
+        bit-identical to today's ``q_field[i]`` at active voxels. Tables are
+        geometry-static and cached keyed by ``(geom_hashes, C, res)`` so the
+        per-step solve loop never rebuilds them. ``q_stack`` (a caller-owned full
+        stack) is honored when supplied; otherwise q is computed per geometry and
+        the full tensor is freed immediately (only boundary q crosses to GPU).
+        """
+        C = mask_stack.shape[0]
+        res = int(mask_stack.shape[1])
+        key = (tuple(geom_hashes), C, res)
+        cached = self._bfl_sparse_cache.get(key)
+        if cached is not None:
+            return cached
+        if boundary_links_batch is None:
+            boundary_links_batch = self._boundary_links_batch(mask_stack, geom_hashes)
+        N = res * res * res
+        starts = []
+        counts = []
+        offs_list = []
+        q_list = []
+        cum = 0
+        for c in range(C):
+            if q_stack is not None:
+                q_c_flat = q_stack[c].reshape(27, N)
+            else:
+                q_c = self._get_q_single_batch(mask_stack[c], geom_hashes[c])
+                q_c_flat = q_c.reshape(27, N)
+            for i in range(1, 27):
+                link_idx = i - 1
+                idx = boundary_links_batch[c, link_idx].reshape(-1).nonzero(as_tuple=False).reshape(-1)
+                n_i = idx.numel()
+                starts.append(cum)
+                counts.append(n_i)
+                if n_i:
+                    offs_list.append(idx.to(torch.int32))
+                    q_list.append(q_c_flat[i][idx])
+                    cum += n_i
+            if q_stack is None:
+                del q_c
+        if offs_list:
+            active_flat = torch.cat(offs_list, dim=0).contiguous()
+            q_flat = torch.cat(q_list, dim=0).contiguous()
+        else:
+            active_flat = torch.zeros(0, dtype=torch.int32, device=self.device)
+            q_flat = torch.zeros(0, dtype=torch.float32, device=self.device)
+        pair_start = torch.tensor(starts, dtype=torch.int32, device=self.device)
+        pair_count = torch.tensor(counts, dtype=torch.int32, device=self.device)
+        sparse = {
+            "active_flat": active_flat,
+            "q_flat": q_flat,
+            "pair_start": pair_start,
+            "pair_count": pair_count,
+        }
+        if len(self._bfl_sparse_cache) > 64:
+            self._bfl_sparse_cache.clear()
+        self._bfl_sparse_cache[key] = sparse
+        return sparse
+
     def compute_moment_equilibrium_batch(self, rho, ux, uy, uz):
         """Batched equilibrium tensor-product moments for D3Q27.
 
@@ -672,11 +774,18 @@ class D3Q27Solver:
     def _init_batch_equilibrium(self, C):
         """Allocate (if needed) and initialize the private batch buffers to the
         same equilibrium state ``_initialize_equilibrium`` uses for a single
-        solve, so every item starts byte-identically to the sequential path."""
+        solve, so every item starts byte-identically to the sequential path.
+
+        Task 34: only two live population buffers (ping-pong roles). ``_f_batch``
+        is the current state at step start (collide in-place, then the pre-stream
+        source); ``_f_swap_batch`` is the stream destination (post-stream state,
+        becomes the next current after the swap). The legacy ``_f_pre_batch`` /
+        ``_f_temp_batch`` are retained as None so old external cleanup paths that
+        reference them stay harmless.
+        """
         if self._f_batch is None or self._f_batch.shape[0] != C:
             self._f_batch = torch.empty(C, 27, self.res, self.res, self.res, device=self.device)
-            self._f_pre_batch = torch.empty_like(self._f_batch)
-            self._f_temp_batch = torch.empty_like(self._f_batch)
+            self._f_swap_batch = torch.empty_like(self._f_batch)
         rho = torch.ones(self.res, self.res, self.res, device=self.device)
         ux = torch.zeros_like(rho)
         uy = torch.zeros_like(rho)
@@ -685,8 +794,7 @@ class D3Q27Solver:
             ux = torch.full_like(rho, self.inlet_velocity_lu)
         feq = self.compute_equilibrium(rho, ux, uy, uz)
         self._f_batch.copy_(feq.unsqueeze(0).expand(C, -1, -1, -1, -1))
-        self._f_pre_batch.copy_(self._f_batch)
-        self._f_temp_batch.copy_(self._f_batch)
+        self._f_swap_batch.copy_(self._f_batch)
         self._velocity_x_batch = ux.unsqueeze(0).expand(C, -1, -1, -1).clone()
         self._velocity_y_batch = uy.unsqueeze(0).expand(C, -1, -1, -1).clone()
         self._velocity_z_batch = uz.unsqueeze(0).expand(C, -1, -1, -1).clone()
@@ -739,8 +847,12 @@ class D3Q27Solver:
         """
         if boundary_links_batch is None:
             boundary_links_batch = self._boundary_links_batch(mask_stack, geom_hashes)
-        f_in_all = self._f_pre_batch[:, 1:27] * boundary_links_batch
-        f_out_all = self._f_temp_batch[:, self._opposite_links] * boundary_links_batch
+        # Task 34: at force-accumulation time the ping-pong buffers are A
+        # (_f_batch = pre-stream source, untouched by streaming) and B
+        # (_f_swap_batch = post-stream destination). Reads the same population
+        # values the 3-buffer path read from _f_pre_batch/_f_temp_batch.
+        f_in_all = self._f_batch[:, 1:27] * boundary_links_batch
+        f_out_all = self._f_swap_batch[:, self._opposite_links] * boundary_links_batch
         sum_all = f_in_all + f_out_all
         step_force_x = (self._force_ex_links[None, ...] * sum_all).sum(dim=(1, 2, 3, 4))
         step_force_z = (self._force_ez_links[None, ...] * sum_all).sum(dim=(1, 2, 3, 4))
@@ -768,7 +880,7 @@ class D3Q27Solver:
             2.0
             * torch.abs(self._force_ex).view(1, 26, 1, 1, 1)
             * metric.unsqueeze(-1)
-            * self._f_pre_batch[:, self._force_dir_index]
+            * self._f_batch[:, self._force_dir_index]
         )
         return torch.sum(
             torch.where(upwind[None, ...], projected * boundary_links_batch, torch.zeros_like(projected)),
@@ -776,8 +888,13 @@ class D3Q27Solver:
         )
 
     def _apply_domain_boundaries_batch(self):
-        """Batched inlet/outlet/mirror domain boundaries (leading batch dim)."""
-        f = self._f_temp_batch
+        """Batched inlet/outlet/mirror domain boundaries (leading batch dim).
+
+        Operates on the post-stream destination buffer ``_f_swap_batch`` (B in
+        the 2-buffer ping-pong), matching the sequential path which applies
+        domain boundaries to ``self.f_temp`` after streaming.
+        """
+        f = self._f_swap_batch
         C = f.shape[0]
         if self.inlet_velocity_lu != 0.0:
             inlet_shape = f[:, :, 0, :, :].shape[2:]
@@ -808,22 +925,25 @@ class D3Q27Solver:
         f[:, :, :, :, -1] = f[:, :, :, :, -2]
 
     def _stream_batch_fallback(self):
-        """Reference streaming fallback (27x roll) writing f_temp_batch."""
+        """Reference streaming fallback (27x roll): pre-stream source (buffer A,
+        ``_f_batch``) -> post-stream destination (buffer B, ``_f_swap_batch``)."""
         for c in range(self._f_batch.shape[0]):
             for i in range(27):
-                self._f_temp_batch[c][i] = torch.roll(
+                self._f_swap_batch[c][i] = torch.roll(
                     self._f_batch[c][i], shifts=self._stream_shifts[i], dims=(0, 1, 2)
                 )
 
-    def _apply_bfl_boundary_batch_item(self, c, mask, q):
-        """Reference BFL for one batch item (fallback-only path).
+    def _apply_bfl_boundary_batch_item(self, c, mask, sparse):
+        """Reference BFL for one batch item (fallback-only path) using compact q.
 
-        Reads ``f_pre_batch[c]`` and writes ``f_temp_batch[c]``. Boundary links
-        are recomputed per item (no single-geometry cache), so the fallback
-        never populates ``_boundary_link_cache``.
+        Reads the pre-stream source (buffer A, ``_f_batch[c]``) and the
+        plain-streamed post-stream buffer (B, ``_f_swap_batch[c]``), and
+        overwrites B at the boundary-link voxels. ``sparse`` is the
+        ``_build_bfl_sparse_tables`` dict; the compact per-(c, i) q slice is
+        bit-identical to the full q at those voxels.
         """
-        f_pre = self._f_pre_batch[c]
-        f_temp = self._f_temp_batch[c]
+        f_pre = self._f_batch[c]
+        f_temp = self._f_swap_batch[c]
         boundary_links = self._boundary_links_batch(mask.unsqueeze(0))[0]
         D, H, W = mask.shape
         f_pre_padded = torch.nn.functional.pad(f_pre, (1, 1, 1, 1, 1, 1), mode='constant', value=0)
@@ -833,17 +953,23 @@ class D3Q27Solver:
             active = boundary_links[link_idx]
             if not torch.any(active):
                 continue
-            qi = q[i][active]
+            pair = c * 26 + (i - 1)
+            start = int(sparse["pair_start"][pair].item())
+            cnt = int(sparse["pair_count"][pair].item())
+            qi = sparse["q_flat"][start:start + cnt]
+            active_idx = sparse["active_flat"][start:start + cnt]
             dx, dy, dz = self._stream_shifts[i]
-            f_neighbor = f_pre_padded[i, 1 - dx:1 - dx + D, 1 - dy:1 - dy + H, 1 - dz:1 - dz + W][active]
+            f_neighbor = f_pre_padded[i, 1 - dx:1 - dx + D, 1 - dy:1 - dy + H, 1 - dz:1 - dz + W].reshape(-1)[active_idx]
+            f_i_here = f_pre[i].reshape(-1)[active_idx]
+            f_opp_streamed = f_temp[opp_i].reshape(-1)[active_idx]
             q_low = qi < 0.5
             q_high = ~q_low
             res = torch.zeros_like(qi)
             if torch.any(q_low):
-                res[q_low] = (1 - 2 * qi[q_low]) * f_neighbor[q_low] + 2 * qi[q_low] * f_pre[i][active][q_low]
+                res[q_low] = (1 - 2 * qi[q_low]) * f_neighbor[q_low] + 2 * qi[q_low] * f_i_here[q_low]
             if torch.any(q_high):
-                res[q_high] = (1 / (2 * qi[q_high])) * f_pre[i][active][q_high] + (1 - 1 / (2 * qi[q_high])) * f_temp[opp_i][active][q_high]
-            f_temp[opp_i][active] = res
+                res[q_high] = (1 / (2 * qi[q_high])) * f_i_here[q_high] + (1 - 1 / (2 * qi[q_high])) * f_opp_streamed[q_high]
+            f_temp[opp_i].reshape(-1)[active_idx] = res
 
     def _compute_guo_forcing_batch(self, rho, u, F, omega):
         """Batched Guo forcing source term (ext_force is unused by training)."""
@@ -856,19 +982,27 @@ class D3Q27Solver:
         term2 = (ei_u * ei_F) / (cs2**2)
         return factor * self.w.view(27, 1, 1, 1) * (term1 + term2)
 
-    def collide_and_stream_batch(self, omega, mask_stack, ext_force=None, geom_hashes=None, q_stack=None, boundary_links_batch=None, exponents_batch=None):
+    def collide_and_stream_batch(self, omega, mask_stack, ext_force=None, geom_hashes=None, q_stack=None, boundary_links_batch=None, exponents_batch=None, bfl_sparse=None):
         """One collide/stream step for C geometries at once.
 
-        ``mask_stack`` is ``[C, D, H, W]``; ``q_stack`` is ``[C, 27, D, H, W]``.
-        All workspaces are private (``_f_batch``/``_f_pre_batch``/``_f_temp_batch``
-        and the ``_*_batch`` accumulators); the sequential ``self.f`` state and
+        ``mask_stack`` is ``[C, D, H, W]``; ``q_stack`` (legacy) is a full
+        ``[C, 27, D, H, W]`` q stack honored for backward-compatible callers.
+        ``bfl_sparse`` is the compact active-voxel table from
+        ``_build_bfl_sparse_tables``; when None it is built (and cached) on
+        first use. Workspaces are private (``_f_batch``/``_f_swap_batch`` and
+        the ``_*_batch`` accumulators); the sequential ``self.f`` state and
         single-geometry caches are never touched.
         """
         C = mask_stack.shape[0]
         device = self.device
+        # Task 34 two-buffer ping-pong:
+        #   A = self._f_batch      current at step start; collide in-place; then
+        #                          the pre-stream source (untouched by streaming)
+        #   B = self._f_swap_batch stream destination; post-stream state; every
+        #                          post-stream reader uses B; then B becomes the
+        #                          next step's current after the pointer swap.
         f_batch = self._f_batch
-        f_pre_batch = self._f_pre_batch
-        f_temp_batch = self._f_temp_batch
+        f_swap_batch = self._f_swap_batch
         ex_b = self.ex_f.view(1, 27, 1, 1, 1)
         ey_b = self.ey_f.view(1, 27, 1, 1, 1)
         ez_b = self.ez_f.view(1, 27, 1, 1, 1)
@@ -920,21 +1054,19 @@ class D3Q27Solver:
         f_new = torch.matmul(self.moment_basis_inv, K_post)
         f_batch.copy_(f_new.reshape_as(f_batch))
         f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
-
-        f_pre_batch.copy_(f_batch)
+        # No copy into a separate pre-stream buffer: A (f_batch) remains the
+        # pre-stream source after streaming below.
 
         used_fused_bfl = False
-        if self.use_fused_stream_bfl and stream_bfl_d3q27_batch is not None:
-            if q_stack is None:
-                q_stack = self._get_q_batch(
-                    geom_hashes, [mask_stack[c] for c in range(C)]
+        if self.use_fused_stream_bfl and stream_bfl_d3q27_batch_compressed is not None:
+            if bfl_sparse is None:
+                bfl_sparse = self._build_bfl_sparse_tables(
+                    mask_stack, geom_hashes, q_stack, boundary_links_batch
                 )
-            solid_u8_batch = (mask_stack > 0.5).to(torch.uint8).contiguous()
-            used_fused_bfl = stream_bfl_d3q27_batch(
-                f_pre_batch,
-                f_temp_batch,
-                solid_u8_batch,
-                q_stack.contiguous(),
+            used_fused_bfl = stream_bfl_d3q27_batch_compressed(
+                f_batch,
+                f_swap_batch,
+                bfl_sparse,
                 self.ex,
                 self.ey,
                 self.ez,
@@ -943,12 +1075,12 @@ class D3Q27Solver:
 
         if not used_fused_bfl:
             self._stream_batch_fallback()
-            if q_stack is None:
-                q_stack = self._get_q_batch(
-                    geom_hashes, [mask_stack[c] for c in range(C)]
+            if bfl_sparse is None:
+                bfl_sparse = self._build_bfl_sparse_tables(
+                    mask_stack, geom_hashes, q_stack, boundary_links_batch
                 )
             for c in range(C):
-                self._apply_bfl_boundary_batch_item(c, mask_stack[c], q_stack[c])
+                self._apply_bfl_boundary_batch_item(c, mask_stack[c], bfl_sparse)
 
         self._apply_domain_boundaries_batch()
 
@@ -962,8 +1094,13 @@ class D3Q27Solver:
             exponents_batch=exponents_batch,
         )
 
-        f_batch.copy_(f_temp_batch)
-        f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+        # B (f_swap_batch) is now the post-stream, domain-boundary-corrected
+        # state and becomes the next step's current. nan_to_num, swap the
+        # pointer roles, then recompute the macroscopic fields from the new
+        # current buffer.
+        f_swap_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+        self._f_batch, self._f_swap_batch = self._f_swap_batch, self._f_batch
+        f_batch = self._f_batch
 
         rho_new = torch.sum(f_batch, dim=1).clamp_min(1e-8)
         if has_ext_force:
@@ -1498,14 +1635,20 @@ class D3Q27CascadedSolver:
 
         if geom_hashes is None:
             geom_hashes = [compute_tensor_content_hash(geometry_masks[c]) for c in range(C)]
-        if q_stack is None:
-            q_stack = self._solver._get_q_batch(geom_hashes, [geometry_masks[c] for c in range(C)])
 
         # Geometry-only precompute, reused across all steps: stacked boundary
         # links and the per-item drag-link metric exponent. Never populates the
         # single-geometry _boundary_link_cache or drag_link_metric_exponent.
         boundary_links_batch = self._solver._boundary_links_batch(geometry_masks, geom_hashes)
         exponents_batch = self._solver._effective_drag_link_metric_exponent_batch(geometry_masks)
+
+        # Task 34: build the compact active-voxel q tables once (geometry-static)
+        # instead of materializing a [C, 27, D, H, W] q stack on GPU. If the
+        # caller supplied a q_stack it is honored; otherwise per-geometry q is
+        # computed transiently and only boundary q survives on GPU.
+        bfl_sparse = self._solver._build_bfl_sparse_tables(
+            geometry_masks, geom_hashes, q_stack, boundary_links_batch
+        )
 
         self._solver._init_batch_equilibrium(C)
 
@@ -1518,6 +1661,7 @@ class D3Q27CascadedSolver:
                 q_stack=q_stack,
                 boundary_links_batch=boundary_links_batch,
                 exponents_batch=exponents_batch,
+                bfl_sparse=bfl_sparse,
             )
             # Mirror the single-solve field aliasing for diagnostics (item 0).
             self.velocity_x = ux[0]

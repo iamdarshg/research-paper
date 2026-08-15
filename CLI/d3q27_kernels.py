@@ -342,6 +342,213 @@ def stream_bfl_d3q27_batch(
     return True
 
 
+if triton is not None:
+    @triton.jit
+    def _stream_kernel_batch(
+        f_pre,
+        f_out,
+        ex,
+        ey,
+        ez,
+        n: tl.constexpr,
+        total: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Plain full-lattice periodic pull-stream for a batch of geometries.
+
+        Writes ``f_out[k, x] = f_pre[k, x - e_k]`` for every voxel with
+        ``torch.roll`` parity. This is exactly the ``streamed`` branch of
+        ``_stream_bfl_kernel_batch`` with the q-dependent BFL branch removed, so
+        per-voxel values are bit-identical to that kernel's non-active output.
+        """
+        c = tl.program_id(0)
+        k = tl.program_id(1)
+        pid = tl.program_id(2)
+        offsets = pid * block + tl.arange(0, block)
+        valid = offsets < total
+
+        n2 = n * n
+        x = offsets // n2
+        rem = offsets - x * n2
+        y = rem // n
+        z = rem - y * n
+
+        dxk = tl.load(ex + k)
+        dyk = tl.load(ey + k)
+        dzk = tl.load(ez + k)
+
+        sx = (x - dxk + n) % n
+        sy = (y - dyk + n) % n
+        sz = (z - dzk + n) % n
+
+        f_pre_c = f_pre + c * 27 * total
+        streamed = tl.load(f_pre_c + k * total + (sx * n2 + sy * n + sz), mask=valid, other=0.0)
+        tl.store(f_out + c * 27 * total + k * total + offsets, streamed, mask=valid)
+
+
+if triton is not None:
+    @triton.jit
+    def _bfl_correct_kernel_batch(
+        f_pre,
+        f_out,
+        ex,
+        ey,
+        ez,
+        opposite,
+        q_flat,
+        active_flat,
+        pair_start,
+        pair_count,
+        n: tl.constexpr,
+        total: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Sparse Bouzidi-Firdaouss-Lallemand boundary correction.
+
+        Grid over ``C * 26`` (c, i) pairs; each pair corrects the active
+        (boundary-link) voxels for incoming direction ``i``, overwriting the
+        plain-streamed value at ``f_out[k, x]`` (``k = opposite[i]``) with the
+        exact ``res_low``/``res_high``/``res`` formulas from
+        ``_stream_bfl_kernel_batch``. ``q_flat``/``active_flat`` are compact
+        per-pair concatenations indexed by ``pair_start``/``pair_count``; pair
+        ``p`` is item ``p // 26``, direction ``p % 26 + 1``. Must run AFTER the
+        plain full-lattice ``_stream_kernel_batch`` so ``f_out[k, x]`` already
+        holds the periodically streamed value used by the q >= 0.5 branch.
+        """
+        pair = tl.program_id(0)
+        pid = tl.program_id(1)
+
+        c = pair // 26
+        i = (pair % 26) + 1
+        k = tl.load(opposite + i)
+        dxk = tl.load(ex + k)
+        dyk = tl.load(ey + k)
+        dzk = tl.load(ez + k)
+        dxi = tl.load(ex + i)
+        dyi = tl.load(ey + i)
+        dzi = tl.load(ez + i)
+
+        start = tl.load(pair_start + pair)
+        cnt = tl.load(pair_count + pair)
+        idx = pid * block + tl.arange(0, block)
+        valid = idx < cnt
+
+        x = tl.load(active_flat + start + idx, mask=valid, other=0)
+        qi = tl.load(q_flat + start + idx, mask=valid, other=0.0)
+
+        n2 = n * n
+        x3 = x // n2
+        rem = x - x3 * n2
+        y3 = rem // n
+        z3 = rem - y3 * n
+
+        f_pre_c = f_pre + c * 27 * total
+        f_out_c = f_out + c * 27 * total
+
+        # f_i_here = f_pre[c, i, x]
+        f_i_here = tl.load(f_pre_c + i * total + x, mask=valid, other=0.0)
+
+        # f_i_up = f_pre[c, i, x - e_i], zero-padded outside the domain.
+        up_x = x3 - dxi
+        up_y = y3 - dyi
+        up_z = z3 - dzi
+        up_in = (up_x >= 0) & (up_x < n) & (up_y >= 0) & (up_y < n) & (up_z >= 0) & (up_z < n)
+        f_i_up = tl.load(
+            f_pre_c + i * total + (up_x * n2 + up_y * n + up_z),
+            mask=valid & up_in,
+            other=0.0,
+        )
+
+        # streamed = f_out[k, x] already written by _stream_kernel_batch (the
+        # periodically pulled value f_pre[k, x - e_k]).
+        streamed = tl.load(f_out_c + k * total + x, mask=valid, other=0.0)
+
+        res_low = (1.0 - 2.0 * qi) * f_i_up + 2.0 * qi * f_i_here
+        inv_2q = 1.0 / (2.0 * qi)
+        res_high = inv_2q * f_i_here + (1.0 - inv_2q) * streamed
+        res = tl.where(qi < 0.5, res_low, res_high)
+
+        tl.store(f_out_c + k * total + x, res, mask=valid)
+
+
+def stream_bfl_d3q27_batch_compressed(
+    f_pre: torch.Tensor,
+    f_out: torch.Tensor,
+    sparse: dict,
+    ex: torch.Tensor,
+    ey: torch.Tensor,
+    ez: torch.Tensor,
+    opposite: torch.Tensor,
+    block_size: int = 256,
+) -> bool:
+    """Batched D3Q27 streaming + BFL via a plain stream kernel and a sparse
+    boundary-correction kernel (Task 34 compressed workspace).
+
+    ``f_pre``/``f_out`` are ``[C, 27, D, H, W]`` fp32 contiguous tensors.
+    ``sparse`` is the compact active-voxel table produced by
+    ``D3Q27Solver._build_bfl_sparse_tables``:
+
+        q_flat       [N_active] fp32  boundary-link q values, concatenated
+        active_flat  [N_active] int32 flat voxel offsets, concatenated
+        pair_start   [C*26]     int32 start index per (c, i) pair
+        pair_count   [C*26]     int32 active-voxel count per (c, i) pair
+
+    Kernel 1 (plain full-lattice pull stream) runs first and writes every
+    voxel; kernel 2 (sparse BFL correction) then overwrites only the
+    boundary-link voxels with the identical per-voxel formulas the fused
+    ``_stream_bfl_kernel_batch`` uses. The full-lattice ``[C, 27, D, H, W]``
+    q-field never exists here. Returns True when the compressed path executed.
+    """
+    if triton is None or not f_pre.is_cuda:
+        return False
+    if f_pre.dim() != 5 or f_pre.shape[1] != 27:
+        return False
+    n = int(f_pre.shape[2])
+    if f_pre.shape[2] != f_pre.shape[3] or f_pre.shape[2] != f_pre.shape[4]:
+        return False
+    if not (f_pre.is_contiguous() and f_out.is_contiguous()):
+        return False
+    C = int(f_pre.shape[0])
+
+    total = n * n * n
+    grid = (C, 27, triton.cdiv(total, block_size))
+    _stream_kernel_batch[grid](
+        f_pre,
+        f_out,
+        ex,
+        ey,
+        ez,
+        n,
+        total,
+        block=block_size,
+    )
+
+    q_flat = sparse["q_flat"]
+    active_flat = sparse["active_flat"]
+    pair_start = sparse["pair_start"]
+    pair_count = sparse["pair_count"]
+    if q_flat.numel() > 0 and int(pair_count.max().item()) > 0:
+        max_count = int(pair_count.max().item())
+        n_pairs = int(pair_count.numel())
+        grid_correct = (n_pairs, triton.cdiv(max_count, block_size))
+        _bfl_correct_kernel_batch[grid_correct](
+            f_pre,
+            f_out,
+            ex,
+            ey,
+            ez,
+            opposite,
+            q_flat,
+            active_flat,
+            pair_start,
+            pair_count,
+            n,
+            total,
+            block=block_size,
+        )
+    return True
+
+
 def stream_bounce_d3q27(
     f: torch.Tensor,
     f_pre: torch.Tensor,
