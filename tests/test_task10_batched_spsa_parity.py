@@ -284,6 +284,7 @@ def _simulator():
 
     config = CFDConfig(base_grid_resolution=GRID, resolution=GRID)
     config.use_amr = False
+    config.use_fused_stream_bfl = True
     simulator = AdvancedCFDSimulator(config, torch.device("cuda"))
     assert simulator.lbm_solver._solver.use_fused_stream_bfl is True
     return simulator
