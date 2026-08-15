@@ -400,6 +400,57 @@ def test_spsa_path_parity_batched_vs_sequential():
 
 
 # ---------------------------------------------------------------------------
+# Test 3b: the Task 10 telemetry keys must not leak into the JSONL metrics
+# record. In production the sink passed to the forward IS
+# DirectSolverSPSALoss.last_components, and the trainer builds
+# direct_components = dict(last_components) for the metrics callback, which the
+# JSONL writer serializes with json.dumps(record, sort_keys=True, allow_nan=False)
+# (run_monitored_training._append_jsonl). _spsa_deltas holds CUDA tensors and
+# _probe_components holds per-probe dicts, so either key surviving into the
+# callback record crashes every optimizer_update. The trainer sanitizes by
+# popping both keys when building direct_components (mirroring the existing
+# _accepted_guard_gradients pop); this test pins that contract.
+# ---------------------------------------------------------------------------
+@requires_fused
+def test_direct_components_jsonl_serialization():
+    import json
+
+    last_components = {
+        "_spsa_deltas": [torch.randn(3, 3, 3, device="cuda") for _ in range(16)],
+        "_probe_components": [
+            {
+                "total_loss": 0.5,
+                "occupancy_loss": 0.1,
+                "aero_loss": 0.3,
+                "connectivity_loss": 0.05,
+                "aircraft_validity_loss": 0.05,
+            }
+            for _ in range(32)
+        ],
+        "total_loss": 1.2345,
+        "aero_loss": 0.5678,
+        "drag_coefficient": 0.77,
+        "active_guard_names": ["connectivity_loss"],
+    }
+    # Sanitize exactly as OptimizedDiffusionTrainer.optimizer_update does at the
+    # callback-consumption site (direct_components = dict(last_components), then
+    # pop the telemetry-internal keys so they never reach the JSONL record).
+    direct_components = dict(last_components)
+    direct_components.pop("_spsa_deltas", None)
+    direct_components.pop("_probe_components", None)
+    record = {
+        "kind": "optimizer_update",
+        "global_step": 7,
+        "direct_solver": {"evaluated": True, "components": direct_components},
+    }
+    line = json.dumps(record, sort_keys=True, allow_nan=False)
+    assert "_spsa_deltas" not in line, "telemetry key leaked into JSONL record"
+    assert "_probe_components" not in line, "telemetry key leaked into JSONL record"
+    assert '"total_loss": 1.2345' in line
+    assert '"drag_coefficient": 0.77' in line
+
+
+# ---------------------------------------------------------------------------
 # Test 4: empty/full masks batched vs sequential
 # ---------------------------------------------------------------------------
 @requires_fused

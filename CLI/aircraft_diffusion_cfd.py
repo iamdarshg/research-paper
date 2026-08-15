@@ -6694,6 +6694,14 @@ class OptimizedDiffusionTrainer:
                     if direct_solver_evaluated
                     else {}
                 )
+                # Task 10 parity-telemetry keys carry non-JSON-serializable
+                # payloads (_spsa_deltas: CUDA tensors, _probe_components:
+                # per-probe dicts) and exist only for in-process parity
+                # assertions. Drop them before the JSONL metrics callback,
+                # mirroring the _accepted_guard_gradients pop above; the sink
+                # itself still retains them for the parity test.
+                direct_components.pop("_spsa_deltas", None)
+                direct_components.pop("_probe_components", None)
                 self.update_metrics_callback(
                     {
                         "kind": "optimizer_update",
