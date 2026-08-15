@@ -854,6 +854,10 @@ def test_runner_main_restores_saved_threshold_and_resets_cadence(tmp_path, monke
             self.optimizer = torch.optim.SGD([self.parameter], lr=1.0)
             self.scheduler = None
             self.scheduler_step_per_update = True
+            # The runner wraps trainer.writer in an _AsyncRecordWriter (NONBLOCK-1).
+            # None exercises the JSONL-only path this test drives; the tensorboard
+            # path is covered by test_nonblock1_async_writer_parity.py.
+            self.writer = None
             self.global_step = 1
             self.run_state_metadata = {}
             self.stop_after_updates = None
