@@ -3904,7 +3904,17 @@ _SDF_WARM_TARGET_INFLIGHT = 8
 # this to 1 to force the verbatim sequential fallback or to 4 for the batched
 # chunked path). C < 2 disables batching entirely and the per-direction loop
 # runs the original sequential code verbatim.
-_DIRECT_SOLVER_BATCH_CHUNK = 4
+#
+# DEFAULT IS 1 (sequential) on purpose: on the 8 GiB RTX 4060 Laptop the
+# batched path pages. Measured full-update (Task 12 fix round,
+# --warmup 1 --iterations 3, step-1305 checkpoint): C=1 = 62.66 s/u (recovers
+# the Task 9 floor ~60 s/u), C=2 = 117.22 s/u, C=4 = 183.63 s/u. The C>=2
+# batched workspaces (~2.7 GB at C=2, ~5.4-7 GB at C=4) do not fit alongside
+# the training model on 8 GiB: the GPU hits ~97% VRAM, the OS pages, and CPU
+# validity (scipy label) slows 2-6x (7.83 / 14.63 / 23.75 s/u at C=1/2/4). The
+# batched path stays available and parity-gated for boxes with >= 16 GiB VRAM
+# (isolated probe win: C=4 1.12x real / 1.09-1.10x isolated).
+_DIRECT_SOLVER_BATCH_CHUNK = 1
 
 
 def _direct_solver_supports_batch(cfd_simulator) -> bool:

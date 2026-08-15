@@ -26,8 +26,8 @@ the 7,580-update continuation is a single-figure-hour job on a mid-tier box.
 | 7 | 2026-08-15 | metric-sync dedup + JSONL O(n²)→O(1) + optimizer-state on-GPU (Task 7, `dd31852`) | losses byte-identical; item-3 grads ~1-ULP (4.0e-8 rel, ~4-5 orders inside GRAD gates — flagged) | 75.37 s/u | 74.12 s/u (residual flat; item-2 excluded from profiler) | JSONL append ~22× at 5k records (≈308 s saved/10k updates); items 1/3/4 infra-level | SCALE WIN (item 2) | merged |
 | 8 | 2026-08-15 | thread the 33 per-solve SDF EDTs across SPSA probes (Task 9, `a481291`+`1326406`) | deltas byte-identical (0.0); SPSA objective bit-identical; 33/33 warm hits, 0 cold fallbacks | 77.04 s/u | 67.88 s/u | −9.16 s/u wall (−11.9%); `_get_q` 21.15→5.88 (−72%); validity +2.84 (core contention) | NOW WIN | merged |
 | 9 | 2026-08-15 | LBM kernel fusion: vectorized 26-dir force, cached drag exponent, fused moment-equilibrium (Task 8, `c347c73`+`0cdb9fa`) | #2/#3 `torch.equal` bit-exact (0.0); #1 LOW 6.7e-6 < FORCE_ATOL 2.5e-5 (vectorized-vs-loop pinned in committed test) | 69.76 s/u | 60.23 s/u | −9.53 s/u wall (−13.7%); `collide_and_stream` 20.46→11.49 (−8.97); validity +2.85 (Task-9 contention) | NOW WIN | merged |
-| 10 | 2026-08-15 | batch 33 SPSA GPU solves, chunked C=4 (Task 10, doc 6A) | new batched-vs-seq parity test (6/6 green) + JSONL-regression guard + capability gate | 60.23 s/u | 183.63 s/u | +123.40 s/u (+204.9%) at C=4 on 8 GB — full-path REGRESSION (memory pressure); isolated direct-solver call 17.555→15.686 s (1.12×); isolated probe 1.09–1.10× | NOT WORTH IT at C=4 on 8 GB (SCALE WIN on ≥16 GB) | merged — run continuation at C=2/C=1 |
-| Σ | 2026-08-15 | cumulative after Tasks 1-10 (merged C=4 default) | — | 112 s/u (baseline) | 183.63 s/u | +71.63 s/u (+63.95%, 0.61×) — REGRESSION as merged | REGRESSION as merged | run continuation at C=2/C=1 (Tasks 1-9 alone = 60.23 s/u = 1.86×) |
+| 10 | 2026-08-15 | batch 33 SPSA GPU solves, chunked (Task 10, doc 6A); default C=1 after fix round | new batched-vs-seq parity test (6/6 green) + JSONL-regression guard + capability gate | 60.23 s/u | 62.66 s/u (default C=1) | ~neutral on 8 GB: C=1 ≈ Task 9 floor; batched path REGRESSES on 8 GB (C=2 117.22, C=4 183.63 s/u — VRAM paging, CPU validity 2-6×); isolated probe 1.12× real / 1.09–1.10× | NOT WORTH IT on 8 GB (SCALE WIN on ≥16 GB); default C=1 | merged — default C=1 |
+| Σ | 2026-08-15 | cumulative after Tasks 1-10 (final default C=1) | — | 112 s/u (baseline) | 62.66 s/u | −49.34 s/u (−44.1%, 1.79×) | NOW WIN (cumulative) | final default C=1 (Task 9 milestone 1.86×; C=1 re-measure 1.79×) |
 
 ## Log
 
@@ -70,19 +70,28 @@ Isolated measurement (`task-10-report.md`): `direct_solver_loss` **17.555 s →
 (C=2 and C=4). Those isolated numbers are real and parity-gated (6/6 batched-vs-seq
 green), but **they do NOT transfer to the real full-update on this 8 GiB box**.
 
-Re-profile (Task 12, `--full-update --warmup 1 --iterations 3`, 4 updates,
-734.52 s): **183.63 s/u** vs the Task 9 row's **60.23 s/u** — a **3.05×
-regression**, not the plan's estimated −11–12 s/u win. Root cause: the C=4 batch
-workspace (~5.4 GB isolated, ~7 GB in the real path) does not fit alongside the
-training model + optimizer + decoder activations on 8 GiB → GPU 97%
-(7.9/8.2 GB), system ~0 free RAM (484 MB), profile process committing 22.8 GB
-private / 6.9 GB WS → OS paging. CPU validity (scipy `label`) regressed 6×
-(3.9 → 23.75 s/u); per-update 209/167/166/192 s. C=8 pages worse (10.3 GB peak).
+**Fix round (Task 12 R=1):** the merged default was C=4, which regressed the real
+full-update. Bounded re-profiles (`--full-update --warmup 1 --iterations 3`,
+step-1305 checkpoint, 4 updates each) via a module-attribute override harness
+(`build/perf/baseline/profile_chunk_override.py`, no source edit for the
+measurement runs):
 
-**Verdict: NOT WORTH IT at C=4 on 8 GB** (a genuine batching win, 1.12×, that
-only pays off where the workspace fits — ≥16 GB VRAM). **Recommendation: run the
-96³ continuation with `_DIRECT_SOLVER_BATCH_CHUNK = 2` (or 1)** — Task 10's own
-report called C=2 the "safer choice on memory-constrained runs" — and/or
-`empty_cache()` before the probe phase. No CLI/ code changed here (Task 12
-constraint). Cumulative at the merged default is 112 → 183.63 s/u = **0.61×**
-(regression); Tasks 1-9 alone = 60.23 s/u = **1.86×** at C=1/C=2.
+| chunk | full-update | CPU validity | diagnosis |
+|---|---|---|---|
+| C=1 (sequential) | **62.66 s/u** (63/67/61/59 s) | 7.83 s/u | recovers the Task 9 floor (~60 s/u) |
+| C=2 | 117.22 s/u (124/117/119/109 s) | 14.63 s/u | mild VRAM paging |
+| C=4 (old default) | 183.63 s/u (209/167/166/192 s) | 23.75 s/u | severe VRAM paging |
+
+Root cause of the regression: the C>=2 batched workspaces (~2.7 GB at C=2,
+~5.4-7 GB at C=4) do not fit alongside the training model + optimizer + decoder
+activations on 8 GiB → GPU ~97% VRAM, OS paging, CPU validity (scipy `label`)
+slows 2-6×. C=8 pages worse (10.3 GB peak).
+
+**Verdict + final default:** the batched path is a genuine SCALE WIN (1.12×
+isolated) that only pays off where the workspace fits (≥16 GB VRAM); on this
+8 GiB box it is NOT WORTH IT at C=2/4. **`_DIRECT_SOLVER_BATCH_CHUNK` is now
+`1` (sequential) by default** — the branch's default state is the best measured
+(62.66 s/u ≈ Task 9 floor), not a regression. The batched path stays available
+and parity-gated for larger-VRAM boxes. Cumulative vs baseline: 112 → 62.66 s/u
+= **1.79×** (Task 9 milestone measured 1.86×; the small gap is run-to-run
+variance).

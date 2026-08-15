@@ -71,37 +71,51 @@ Reaching the 8× target requires attacking the model phase (biggest), the EDT
 
 ---
 
-## Post-Optimization (2026-08-15) — Task 12 re-profile
+## Post-Optimization (2026-08-15) — Task 12 re-profile + fix round
 
-Same command, same checkpoint, same hardware, after Tasks 1-10 all merged:
-`CLI/profile_training_update.py --full-update --warmup 1 --iterations 3`
-(4 updates, 734.52 s total). Full report: `.superpowers/sdd/optimization-plan/task-12-report.md`.
+Same command, same checkpoint, same hardware, after Tasks 1-10 all merged, with
+the FINAL default `_DIRECT_SOLVER_BATCH_CHUNK = 1`. Full report:
+`.superpowers/sdd/optimization-plan/task-12-report.md`.
 
-| metric | baseline (112 s/u) | Task 9 milestone | Task 12 re-profile (merged C=4) |
+| metric | baseline (112 s/u) | Task 9 milestone | Task 12 final (default C=1) |
 |---|---|---|---|
-| per-update wall | 113.0 s/u | 60.23 s/u | **183.63 s/u** (209/167/166/192 s) |
+| per-update wall | 113.0 s/u | 60.23 s/u | **62.66 s/u** (63/67/61/59 s) |
 
-**Cumulative is a REGRESSION at the merged default**: 112 → 183.63 s/u =
-**0.61×** (slower). This is caused by Task 10's C=4 batch workspace (~5.4-7 GB)
-not fitting on 8 GiB alongside the training model → GPU 97%, system ~0 free RAM,
-OS paging. Tasks 1-9 alone measured **60.23 s/u = 1.86×** at the Task 9
-milestone; the C=4 default should be lowered to **C=2/C=1** for the 96³
-continuation to recover that.
+**Fix round (Task 12 R=1):** the old merged default (C=4) regressed the real
+full-update. Bounded re-profiles (`--warmup 1 --iterations 3`, 4 updates each)
+via a module-attribute override harness (`build/perf/baseline/profile_chunk_override.py`,
+no source edit for the measurement runs):
 
-Per-phase before/after (s/update; Task 12 captures only the 1 instrumented base
-solve — the 32 batched probes are in the un-instrumented residual):
-
-| phase | baseline | Task 12 (merged C=4) | note |
+| chunk | full-update | CPU validity | diagnosis |
 |---|---|---|---|
-| CPU validity (scipy `label`) | 3.9 | **23.75** | 6× regression — OS paging (memory pressure) |
-| coordinate decoder (`_checkpointed_coordinate_chunk`) | 14.85 | 17.29 | mildly elevated |
-| decoder `forward_flat_indices` | 19.96 | 12.47 | Task-6 fusion held |
-| EDT `_get_q` (base solve) | 21.9 (all solves) | 2.37 (base only) | Task-9 threading + batched probes un-instrumented |
-| GPU collision+stream (base solve) | 13.2 | 5.41 (base only) | Task-8 fusion held; batched probes un-instrumented |
-| un-instrumented residual | ~72.5 (model fwd/bwd+opt) | ~105.2 (incl. 32 batched probes) | model block still dominant |
+| C=1 (**final default**) | **62.66 s/u** | 7.83 s/u | recovers the Task 9 floor |
+| C=2 | 117.22 s/u (124/117/119/109 s) | 14.63 s/u | mild VRAM paging |
+| C=4 (old merged default) | 183.63 s/u (209/167/166/192 s) | 23.75 s/u | severe VRAM paging |
 
-**Top-line implication (unchanged, sharper):** the model fwd/bwd + optimizer
-residual is still the largest cost. The 3× update-level regression is a memory
-footprint problem (C=4 batching on 8 GiB), not a speed-of-light problem — the
-isolated direct-solver call is genuinely 1.12× faster. Fix the memory (C=2/C=1),
-then the model block is the next 8×-target bottleneck.
+**Cumulative vs baseline with the FINAL default: 112 → 62.66 s/u = 1.79×**
+(44.1% faster; Task 9 milestone measured 1.86× — the small gap is run-to-run
+variance). The Task 10 batched path is a SCALE WIN (isolated 1.12×) that is
+VRAM-bound on 8 GiB: the C>=2 batched workspaces (~2.7 GB at C=2, ~5.4-7 GB at
+C=4) do not fit alongside the training model → GPU ~97% VRAM, OS paging, CPU
+validity (scipy `label`) 2-6× slower. The default is therefore kept sequential
+(C=1); the batched path remains available and parity-gated for ≥16 GB VRAM boxes.
+
+Per-phase at the final default C=1 (s/update). Profiler phases are nested — the
+outer `_direct_measured_objective_for_single` wraps the inner solver phases
+(`_get_q`, `collide_and_stream`, `simulate_aerodynamics`), so do not sum rows:
+
+| phase | baseline | Task 12 (default C=1) | note |
+|---|---|---|---|
+| CPU validity (scipy `label`) | 3.9 | 7.83 | 2× baseline (mild residual memory pressure) |
+| `_direct_measured_objective_for_single` | 40.70 | 17.04 | Task-9 EDT threading win held |
+| coordinate decoder (`_checkpointed_coordinate_chunk`) | 14.85 | 15.52 | ~flat |
+| GPU collision+stream (all solves) | 13.2 | 13.83 | ~flat (sequential path) |
+| EDT `_get_q` (all solves, threaded) | 21.9 | 8.00 | Task-9 threading held |
+| decoder `forward_flat_indices` | 19.96 | 10.74 | Task-6 fusion held |
+| `forward` (full-grid decode) | 5.94 | 5.49 | ~flat |
+| `init_flow_field` | 0.64 | 0.44 | ~flat |
+
+**Top-line implication (unchanged):** the model fwd/bwd + optimizer residual is
+still the largest cost and the next 8×-target bottleneck. The fix round shows the
+Task 10 batching win does not transfer to 8 GiB — it is a memory-footprint
+problem, not a speed-of-light problem. Default C=1 restores the ~60 s/u floor.
