@@ -7180,22 +7180,27 @@ class OptimizedDiffusionTrainer:
             'Loss/consistency': total_consistency / denominator,
             'Loss/direct_solver': total_direct_solver / denominator,
         }
-        _tb_direct = {
-            'Loss/direct_solver_eval': total_direct_solver_eval / direct_solver_eval_count,
-            'Loss/direct_occupancy': total_direct_occupancy / direct_solver_eval_count,
-            'Loss/direct_aero': total_direct_aero / direct_solver_eval_count,
-            'Loss/direct_connectivity': total_direct_connectivity / direct_solver_eval_count,
-            'Loss/direct_aircraft_validity': total_direct_validity / direct_solver_eval_count,
-        }
+        # _tb_direct is only built when there was a direct-solver eval this
+        # epoch -- the per-division denominators would otherwise be 0.0/0.
+        # The original synchronous block guarded all five divisions the same way.
+        _tb_direct = None
+        if direct_solver_eval_count > 0:
+            _tb_direct = {
+                'Loss/direct_solver_eval': total_direct_solver_eval / direct_solver_eval_count,
+                'Loss/direct_occupancy': total_direct_occupancy / direct_solver_eval_count,
+                'Loss/direct_aero': total_direct_aero / direct_solver_eval_count,
+                'Loss/direct_connectivity': total_direct_connectivity / direct_solver_eval_count,
+                'Loss/direct_aircraft_validity': total_direct_validity / direct_solver_eval_count,
+            }
         _records_writer = getattr(self, "records_writer", None)
         if _records_writer is not None:
             _records_writer.enqueue_tb_batch(int(self.global_step), _tb_unconditional)
-            if direct_solver_eval_count > 0:
+            if _tb_direct is not None:
                 _records_writer.enqueue_tb_batch(int(self.global_step), _tb_direct)
         else:
             for _tag, _value in _tb_unconditional.items():
                 self.writer.add_scalar(_tag, _value, self.global_step)
-            if direct_solver_eval_count > 0:
+            if _tb_direct is not None:
                 for _tag, _value in _tb_direct.items():
                     self.writer.add_scalar(_tag, _value, self.global_step)
 

@@ -110,6 +110,10 @@ class _AsyncRecordWriter:
         self._completed_seq = 0
         self._last_meta: Dict[str, Any] = {}
         self._closed = False
+        # First worker failure is stashed here and re-raised to the producer at
+        # the next flush_barrier/enqueue so a dead writer can never hang the
+        # training loop (see _run/_flush_barrier_fail_fast).
+        self._error: Optional[BaseException] = None
         self._thread = threading.Thread(
             target=self._run,
             name="async-records-writer",
@@ -119,6 +123,7 @@ class _AsyncRecordWriter:
 
     def enqueue_jsonl(self, path: Path, record: Dict[str, Any]) -> int:
         """Enqueue one JSONL append; returns its monotonic sequence number."""
+        self._raise_stashed_error()
         seq = self._next_sequence()
         self._queue.put(("jsonl", seq, path, record))
         with self._lock:
@@ -127,6 +132,7 @@ class _AsyncRecordWriter:
 
     def enqueue_tb_batch(self, step: int, tags: Dict[str, float]) -> int:
         """Enqueue a batch of scalar tags to be written at ``step``."""
+        self._raise_stashed_error()
         seq = self._next_sequence()
         self._queue.put(("tb", seq, int(step), dict(tags)))
         return seq
@@ -137,51 +143,69 @@ class _AsyncRecordWriter:
         Returns the metadata of the latest completed JSONL record (``{}`` when
         no record has been written yet). When ``seq`` is ``None`` the barrier
         targets the most recently enqueued JSONL sequence.
+
+        If the worker thread dies (any I/O or serialization error), the stashed
+        error is re-raised here instead of hanging the caller forever.
         """
         with self._lock:
             target = self._last_jsonl_seq if seq is None else int(seq)
             if target is None:
+                self._raise_stashed_error()
                 return dict(self._last_meta)
             while self._completed_seq < target and not self._closed:
+                if self._error is not None or not self._thread.is_alive():
+                    break
                 self._notify.wait(timeout=30.0)
+            self._raise_stashed_error()
             return dict(self._last_meta)
 
     def close(self, timeout: float = 30.0) -> None:
         """Drain pending work (after a final barrier) and stop the worker.
 
         The SummaryWriter is flushed and closed only after the queue drains, so
-        no trailing record is lost on normal run end or handled exceptions.
+        no trailing record is lost on normal run end or handled exceptions. A
+        stashed worker failure is re-raised AFTER cleanup so it is never masked
+        by this finally-block close.
         """
         with self._lock:
             target = self._last_jsonl_seq
-        if target is not None:
-            self.flush_barrier(target)
-        with self._lock:
-            self._closed = True
-            self._notify.notify_all()
         try:
-            # Sentinel wakes the worker to exit; queued items behind it are
-            # still processed first (FIFO), so trailing telemetry is drained.
-            self._queue.put(None)
-        except Exception:
-            pass
-        self._thread.join(timeout=timeout)
-        writer = self._summary_writer
-        if writer is not None:
+            if target is not None:
+                self.flush_barrier(target)
+        finally:
+            with self._lock:
+                self._closed = True
+                self._notify.notify_all()
             try:
-                writer.flush()
+                # Sentinel wakes the worker to exit; queued items behind it are
+                # still processed first (FIFO), so trailing telemetry is drained.
+                # Bounded so a dead worker with a full queue cannot hang close().
+                self._queue.put(None, timeout=1.0)
             except Exception:
                 pass
-            try:
-                writer.close()
-            except Exception:
-                pass
+            self._thread.join(timeout=timeout)
+            writer = self._summary_writer
+            if writer is not None:
+                try:
+                    writer.flush()
+                except Exception:
+                    pass
+                try:
+                    writer.close()
+                except Exception:
+                    pass
 
     def _next_sequence(self) -> int:
         with self._lock:
             seq = self._next_seq
             self._next_seq += 1
             return seq
+
+    def _raise_stashed_error(self) -> None:
+        """Re-raise the worker's first failure to the producer, if any."""
+        error = self._error
+        if error is not None:
+            raise error
 
     def _run(self) -> None:
         while True:
@@ -206,6 +230,15 @@ class _AsyncRecordWriter:
                     with self._lock:
                         self._completed_seq = max(self._completed_seq, seq)
                         self._notify.notify_all()
+            except Exception as exc:
+                # Stash the first worker failure so the producer re-raises it at
+                # the next flush_barrier/enqueue instead of hanging on a dead
+                # thread; the loop then terminates so close() joins promptly.
+                with self._lock:
+                    if self._error is None:
+                        self._error = exc
+                    self._notify.notify_all()
+                break
             finally:
                 self._queue.task_done()
 
