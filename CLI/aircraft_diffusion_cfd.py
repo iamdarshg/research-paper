@@ -6176,7 +6176,7 @@ class OptimizedDiffusionTrainer:
         total_consistency = 0.0
         total_latent_reconstruction = 0.0
         total_denoising_geometry_confidence = 0.0
-        total_diffusion_timestep = 0.0
+        total_diffusion_timestep = torch.zeros((), device=self.device)
         total_direct_solver = 0.0
         total_direct_solver_eval = 0.0
         total_direct_occupancy = 0.0
@@ -6289,7 +6289,7 @@ class OptimizedDiffusionTrainer:
                 device=self.device,
                 mode=self.training_config.timestep_sampling,
             )
-            total_diffusion_timestep += float(t.float().mean().item())
+            total_diffusion_timestep = total_diffusion_timestep + t.float().mean()
 
             # Forward diffusion
             noise = torch.randn_like(latent)
@@ -6901,19 +6901,34 @@ class OptimizedDiffusionTrainer:
             # EMA update
             self._update_ema()
 
-            # Logging — read each loss .item() exactly once (GPU->CPU) and
-            # reuse the floats in the totals, the progress postfix, and the
-            # metrics callback. The loss tensors are untouched and still feed
-            # the optimization objective.
-            optimization_loss_float = optimization_loss_val.item()
-            mse_loss_float = mse_loss_val.item()
-            clean_geometry_loss_float = clean_geometry_loss_val.item()
-            geometry_loss_float = geometry_loss_val.item()
-            generation_geometry_loss_float = generation_geometry_loss_val.item()
-            consistency_float = consistency_loss.item()
-            latent_reconstruction_float = latent_reconstruction_loss_val.item()
-            denoising_confidence_float = denoising_geometry_confidence.item()
-            direct_solver_float = direct_solver_loss_val.item()
+            # Logging — read each loss exactly once (GPU->CPU) and reuse the
+            # floats in the totals, the progress postfix, and the metrics
+            # callback. A single stacked .tolist() (one sync) replaces nine
+            # separate .item() calls; each fp32 element converts to a Python
+            # float with exactly the same fp32->float conversion as .item().
+            # The loss tensors are untouched and still feed the optimization
+            # objective.
+            (
+                optimization_loss_float,
+                mse_loss_float,
+                clean_geometry_loss_float,
+                geometry_loss_float,
+                generation_geometry_loss_float,
+                consistency_float,
+                latent_reconstruction_float,
+                denoising_confidence_float,
+                direct_solver_float,
+            ) = torch.stack([
+                optimization_loss_val.detach(),
+                mse_loss_val.detach(),
+                clean_geometry_loss_val.detach(),
+                geometry_loss_val.detach(),
+                generation_geometry_loss_val.detach(),
+                consistency_loss.detach(),
+                latent_reconstruction_loss_val.detach(),
+                denoising_geometry_confidence.detach(),
+                direct_solver_loss_val.detach(),
+            ]).tolist()
 
             total_optimization_loss += optimization_loss_float
             total_mse += mse_loss_float
@@ -7210,7 +7225,7 @@ class OptimizedDiffusionTrainer:
             'denoising_geometry_confidence': (
                 total_denoising_geometry_confidence / denominator
             ),
-            'diffusion_timestep': total_diffusion_timestep / denominator,
+            'diffusion_timestep': float(total_diffusion_timestep.item() / denominator),
             'direct_solver_loss': total_direct_solver / denominator,
             'direct_solver_eval_loss': avg_direct_solver_eval,
             'direct_solver_eval_count': direct_solver_eval_count,
