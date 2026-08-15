@@ -51,6 +51,8 @@ from scipy.stats import pearsonr
 from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
+from sdf_utils import compute_all_link_distances
+from utils import compute_tensor_content_hash
 from aircraft_validity import evaluate_aircraft_validity
 from condition_feasibility import validate_condition_feasibility
 from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
@@ -3884,6 +3886,143 @@ def _aggregate_aircraft_validity_violations(
 # free to run the scipy connected-component labeling concurrently.
 _VALIDITY_POOL = ThreadPoolExecutor(max_workers=2)
 
+# Task 9: thread the 33 per-solve SDF (EDT) computations across the SPSA
+# direct-solver probes so the CPU EDT runs in parallel with the GPU LBM solves
+# instead of blocking them. scipy's distance_transform_edt releases the GIL and
+# _edt_workspace is thread-local (Task 2), so concurrent EDTs from this pool
+# never share buffers.
+_SDF_POOL = ThreadPoolExecutor(max_workers=8)
+
+# In-flight cap for the pre-warm: keeps only ~this many q tensors resident on
+# CPU at once (~0.8 GB), which is well inside the ~4.5 GiB free RAM on the
+# target box; holding all 33 (~3.1 GB) would OOM alongside the training process.
+_SDF_WARM_TARGET_INFLIGHT = 8
+
+
+def _find_q_solver(cfd_simulator: "AdvancedCFDSimulator"):
+    """Return the inner D3Q27 solver that owns _get_q/_warm_sdf_cache."""
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    if root_solver is None:
+        return None
+    if hasattr(root_solver, "_get_q"):
+        return root_solver
+    nested_solver = getattr(root_solver, "_solver", None)
+    if nested_solver is not None and hasattr(nested_solver, "_get_q"):
+        return nested_solver
+    return None
+
+
+def _refill_sdf_pool(solver) -> None:
+    """Keep ~_SDF_WARM_TARGET_INFLIGHT SDF futures in flight on the solver.
+
+    Called from _get_q after it pops a warm entry. Bounds CPU residency while
+    keeping the EDT pool busy: each solve's first _get_q pops one entry and
+    immediately submits the next pending probe's EDT.
+    """
+    pending = getattr(solver, "_pending_sdf_specs", None)
+    if not pending:
+        return
+    warm_cache = getattr(solver, "_warm_sdf_cache", None)
+    dirs_cpu = getattr(solver, "_sdf_dirs_cpu", None)
+    if warm_cache is None or dirs_cpu is None:
+        return
+    ex_cpu, ey_cpu, ez_cpu = dirs_cpu
+    while len(warm_cache) < _SDF_WARM_TARGET_INFLIGHT and pending:
+        geom_key, geometry_cpu = pending.pop(0)
+        if geom_key not in warm_cache:
+            warm_cache[geom_key] = _SDF_POOL.submit(
+                compute_all_link_distances, geometry_cpu, ex_cpu, ey_cpu, ez_cpu
+            )
+
+
+def _warm_direct_solver_sdfs(
+    sample_field: torch.Tensor,
+    sample_probs: torch.Tensor,
+    deltas: Sequence[torch.Tensor],
+    eps: float,
+    input_is_logits: bool,
+    threshold: float,
+    cfd_simulator: "AdvancedCFDSimulator",
+) -> None:
+    """Pre-compute the 33 per-solve EDT/SDF (q) tensors for one SPSA sample.
+
+    Each probe geometry is materialized exactly as
+    _direct_measured_objective_for_single does (same threshold, same canonical
+    [Z,Y,X] -> solver [X,Y,Z] transform), hashed on the CUDA solver-frame
+    tensor (matching the key simulate_aerodynamics computes), and submitted to
+    _SDF_POOL. The solver's _get_q then pops the CPU result on first use and
+    moves it to the GPU, so the 5 LBM steps of each solve reuse it. Submission
+    is bounded (_refill_sdf_pool keeps ~8 in flight) so CPU residency stays
+    ~0.8 GB instead of 3.1 GB.
+    """
+    solver = _find_q_solver(cfd_simulator)
+    if solver is None:
+        return
+    solver_device = getattr(cfd_simulator, "device", sample_field.device)
+    warm_cache = getattr(solver, "_warm_sdf_cache", None)
+    if warm_cache is None:
+        warm_cache = {}
+        solver._warm_sdf_cache = warm_cache
+
+    ex_cpu = solver.ex.cpu()
+    ey_cpu = solver.ey.cpu()
+    ez_cpu = solver.ez.cpu()
+
+    # Build every probe's geometry spec WITHOUT submitting yet (bounded in-flight).
+    # Order matches the solve order so the earliest solves' entries are ready first.
+    specs = []
+    probe_grids = [sample_probs]
+    for delta in deltas:
+        plus_field = sample_field + eps * delta
+        probe_grids.append(
+            torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0)
+        )
+        minus_field = sample_field - eps * delta
+        probe_grids.append(
+            torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0)
+        )
+    for grid in probe_grids:
+        geometry_cpu = _binarize_probability_grid_for_solver(
+            grid.detach().to("cpu"),
+            threshold=threshold,
+            target_occupancy=None,
+        )
+        solver_geometry_cpu = _canonical_training_geometry_to_solver_xyz(geometry_cpu)
+        solver_geometry_gpu = solver_geometry_cpu.to(solver_device)
+        geom_key = compute_tensor_content_hash(solver_geometry_gpu)
+        if geom_key not in warm_cache:
+            specs.append((geom_key, solver_geometry_cpu))
+
+    solver._pending_sdf_specs = specs
+    solver._sdf_dirs_cpu = (ex_cpu, ey_cpu, ez_cpu)
+    solver._sdf_refill = _refill_sdf_pool
+    _refill_sdf_pool(solver)
+
+
+def _clear_direct_solver_sdf_warm_cache(cfd_simulator: "AdvancedCFDSimulator") -> None:
+    """Drop the Task-9 pre-warm state after one SPSA sample's 33 probes.
+
+    Called at the END of each batch item, by which point every warm entry has
+    been popped by _get_q. It is deliberately separate from
+    _clear_direct_solver_geometry_caches, which runs per-direction inside the
+    16-direction loop and must NOT discard the still-pending futures for later
+    directions.
+    """
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    solvers = []
+    if root_solver is not None:
+        solvers.append(root_solver)
+        nested_solver = getattr(root_solver, "_solver", None)
+        if nested_solver is not None:
+            solvers.append(nested_solver)
+    for solver in solvers:
+        warm_cache = getattr(solver, "_warm_sdf_cache", None)
+        if isinstance(warm_cache, dict):
+            warm_cache.clear()
+        for attr in ("_pending_sdf_specs", "_sdf_dirs_cpu", "_sdf_refill"):
+            if hasattr(solver, attr):
+                delattr(solver, attr)
+
 
 def _direct_measured_objective_for_single(
     probability_grid: torch.Tensor,
@@ -4175,23 +4314,10 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 if detached_targets is not None
                 else target_occupancy
             )
-            base_components = _direct_measured_objective_for_single(
-                sample_probs,
-                sample_design_spec,
-                cfd_simulator,
-                cfd_steps,
-                connectivity_weight,
-                aircraft_validity_weight,
-                threshold,
-                sample_target,
-                return_components=True,
-            )
-            base_loss = float(base_components["total_loss"])
-            base_component_records.append(base_components)
-            raw_component_grads = {
-                name: torch.zeros_like(sample_field) for name in component_names
-            }
-            legacy_total_grad = torch.zeros_like(sample_field)
+            # Task 9: hoist ALL delta draws FIRST, in the original loop order with
+            # the same seeded generator, so the RNG call sequence is byte-identical
+            # to the old draw-one-use-one loop (parity: identical deltas).
+            deltas = []
             for _ in range(direction_count):
                 low_frequency_grid = int(perturbation_grid_size)
                 if low_frequency_grid > 1 and any(dim > low_frequency_grid for dim in sample_field.shape):
@@ -4222,6 +4348,38 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         dtype=torch.int8,
                     ).to(dtype=fields.dtype)
                     delta = delta.mul(2.0).sub(1.0)
+                deltas.append(delta)
+
+            # Task 9: pre-warm the 33 SDF (q) computations so the CPU EDTs run on
+            # the thread pool in parallel with the GPU solves below.
+            _warm_direct_solver_sdfs(
+                sample_field,
+                sample_probs,
+                deltas,
+                eps,
+                input_is_logits,
+                threshold,
+                cfd_simulator,
+            )
+
+            base_components = _direct_measured_objective_for_single(
+                sample_probs,
+                sample_design_spec,
+                cfd_simulator,
+                cfd_steps,
+                connectivity_weight,
+                aircraft_validity_weight,
+                threshold,
+                sample_target,
+                return_components=True,
+            )
+            base_loss = float(base_components["total_loss"])
+            base_component_records.append(base_components)
+            raw_component_grads = {
+                name: torch.zeros_like(sample_field) for name in component_names
+            }
+            legacy_total_grad = torch.zeros_like(sample_field)
+            for delta in deltas:
                 plus_field = sample_field + eps * delta
                 minus_field = sample_field - eps * delta
                 plus_components = _direct_measured_objective_for_single(
@@ -4485,6 +4643,10 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             base_components["spsa_gradient_norm"] = float(sample_grad.norm().item())
             base_components["spsa_gradient_norm_limit"] = float(gradient_norm_limit)
             _clear_direct_solver_geometry_caches(cfd_simulator)
+            # Task 9: drop the pre-warm state for this sample's 33 probes. Kept
+            # separate from _clear_direct_solver_geometry_caches (per-direction
+            # calls must not discard still-pending futures for later directions).
+            _clear_direct_solver_sdf_warm_cache(cfd_simulator)
 
         if original_ndim == 3:
             grad_estimate = grad_estimate[0]

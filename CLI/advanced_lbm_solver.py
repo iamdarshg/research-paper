@@ -1,6 +1,7 @@
 
 import torch
 import numpy as np
+from concurrent.futures import Future
 from typing import Dict
 from typing import TYPE_CHECKING
 
@@ -155,6 +156,14 @@ class D3Q27Solver:
         # Cache for BFL distances keyed by geometry hash (Fix A)
         self._q_cache = {}
 
+        # Task 9: pre-warmed SDF/q cache keyed by the same geometry hash. Each
+        # entry is a concurrent.futures.Future that produces a CPU q tensor (or,
+        # after the future resolves, the tensor itself once _get_q pops it). The
+        # SPSA probe pre-warm in aircraft_diffusion_cfd fills this so the CPU EDT
+        # runs on a thread pool in parallel with the GPU LBM solves. Entries stay
+        # on CPU; _get_q pops one and moves it to the solve device.
+        self._warm_sdf_cache = {}
+
         # Precompute Guo directions
         self.ei_guo = torch.stack([self.ex_f, self.ey_f, self.ez_f], dim=1).view(27, 3, 1, 1, 1)
 
@@ -165,8 +174,23 @@ class D3Q27Solver:
         geom_key = geom_hash if geom_hash is not None else compute_tensor_content_hash(geometry_mask)
 
         if geom_key not in self._q_cache:
-            # CPU/SciPy cost is explicit here.
-            self._q_cache[geom_key] = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
+            # Task 9: a warm entry is a pre-computed CPU q tensor, or an in-flight
+            # Future that will produce one, submitted by the SPSA probe pre-warm.
+            # Pop it, move it to the solve device, and store it in the per-solve
+            # _q_cache so the 5 solver steps reuse it. On a miss we fall back to
+            # the original compute-and-store path (the EDT then runs serially).
+            warm_entry = self._warm_sdf_cache.pop(geom_key, None)
+            if warm_entry is not None:
+                q_cpu = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
+                self._q_cache[geom_key] = q_cpu.to(geometry_mask.device)
+                # Keep the pre-warm pool topped up (bounded in-flight so the CPU
+                # does not accumulate all 33 q tensors at once).
+                refill = getattr(self, "_sdf_refill", None)
+                if callable(refill):
+                    refill(self)
+            else:
+                # CPU/SciPy cost is explicit here.
+                self._q_cache[geom_key] = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
 
         # Optional: Limit cache size to prevent OOM
         if len(self._q_cache) > 100:
