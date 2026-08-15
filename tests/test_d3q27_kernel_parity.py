@@ -35,14 +35,19 @@ requires_fused = pytest.mark.skipif(
 # Measured on 2026-07-16 (RTX 4060 Laptop, torch 2.x, triton 3.5.1):
 # - one-step max population diff: 1.9e-9 (a single ULP of the ~0.04 scale);
 # - five-step max population diff: < 1e-6 across all fixtures;
-# - force summation: computed on identical solver state, the fused-path
-#   accumulation is bitwise equal to the reference loop (diff 0.0; verified
-#   directly, 2026-07-16). The only force divergence is the FMA field drift
-#   projected through the momentum-exchange sum, whose gross term magnitude
-#   is ~380 while the net force is ~1e-2 (a ~4e4x sign cancellation). The
-#   measured 5-step accumulated force diff is <= 6.5e-6, consistent with
-#   gross_magnitude x fp32 drift, so the meaningful envelope is ABSOLUTE
-#   (scaled to gross magnitude), not relative to the small net value.
+# - force summation: since Task 8 both backends share the SAME vectorized
+#   26-dir momentum-exchange kernel (the non-fused path delegates to
+#   _accumulate_momentum_exchange_force_nosync), so this gate cannot detect a
+#   regression inside the force kernel itself -- it validates the two
+#   streaming/BFL backends (PyTorch _apply_bfl_boundary vs Triton
+#   stream_bfl_d3q27) against the ABSOLUTE FORCE_ATOL envelope. The only force
+#   divergence is the FMA field drift projected through the momentum-exchange
+#   sum, whose gross term magnitude is ~380 while the net force is ~1e-2 (a
+#   ~4e4x sign cancellation). The measured 5-step accumulated force diff is
+#   <= 6.5e-6, consistent with gross_magnitude x fp32 drift, so the meaningful
+#   envelope is ABSOLUTE (scaled to gross magnitude), not relative to the small
+#   net value. The vectorized-vs-loop reduction-order parity of the force
+#   kernel itself is pinned separately by test_task8_force_vectorize_parity.py.
 # Gates are set at roughly 4x the measured worst case; they are not tuned
 # to pass any later regression.
 FIELD_ATOL_1STEP = 1e-8
