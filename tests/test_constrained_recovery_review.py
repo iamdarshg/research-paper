@@ -52,12 +52,22 @@ def _force_sequential_direct_solver():
     """Pin the direct-solver forward loop to the sequential per-sample path.
 
     This trainer-integration suite predates Task 10 and drives the forward loop
-    with a mocked ``_direct_measured_objective_for_single`` and stub simulators
-    that provide no ``lbm_solver.collide_stream_batch``. The Task 10 module
-    default (``_DIRECT_SOLVER_BATCH_CHUNK = 4``) would route these tests into
-    the batched branch, which bypasses the mock and requires a real solver
-    backend the stubs do not provide. Forcing chunk=1 keeps them on the exact
-    sequential path they were written to exercise.
+    with a mocked ``_direct_measured_objective_for_single`` so it can assert
+    per-sample design-spec / guard semantics. That mock is only consulted by the
+    sequential branch; the batched branch calls ``_direct_measured_objectives_batch``
+    instead. Two cases need chunk=1 here:
+
+    - Direct-loss tests pass a stub simulator (``object()``) with no
+      ``lbm_solver``. The Task 10 capability fallback already routes these to
+      the sequential branch, so the pin is harmless for them.
+    - ``train_epoch``-level tests use the trainer's real
+      ``AdvancedCFDSimulator`` (batch-capable), so the capability fallback does
+      NOT apply: without the pin the probe loop would take the batched branch,
+      bypass the mocked objective, and the per-sample call-count assertions
+      (e.g. ``len(calls) == 6``) would fail.
+
+    Forcing chunk=1 keeps both cases on the exact sequential path they were
+    written to exercise.
     """
     old = recovery._DIRECT_SOLVER_BATCH_CHUNK
     recovery._DIRECT_SOLVER_BATCH_CHUNK = 1

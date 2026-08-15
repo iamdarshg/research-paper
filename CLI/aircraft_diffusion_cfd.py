@@ -3907,6 +3907,23 @@ _SDF_WARM_TARGET_INFLIGHT = 8
 _DIRECT_SOLVER_BATCH_CHUNK = 4
 
 
+def _direct_solver_supports_batch(cfd_simulator) -> bool:
+    """True if the simulator's LBM solver exposes the batched ``collide_stream_batch``.
+
+    Task 10 batches the SPSA probe solves via ``cfd_simulator.lbm_solver
+    .collide_stream_batch`` (see ``_direct_measured_objectives_batch``). Real
+    training simulators (``AdvancedCFDSimulator`` -> ``D3Q27CascadedSolver``)
+    expose it and keep the batched path. Unit tests drive the forward with stub
+    simulators that provide no such method (or no ``lbm_solver`` at all); for
+    those the forward must fall back to the verbatim sequential per-direction
+    loop rather than raising ``AttributeError``.
+    """
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    if root_solver is None:
+        return False
+    return hasattr(root_solver, "collide_stream_batch")
+
+
 def _find_q_solver(cfd_simulator: "AdvancedCFDSimulator"):
     """Return the inner D3Q27 solver that owns _get_q/_warm_sdf_cache."""
     root_solver = getattr(cfd_simulator, "lbm_solver", None)
@@ -4629,10 +4646,12 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             # Task 10: batch the 32 SPSA probes into chunks of
             # _DIRECT_SOLVER_BATCH_CHUNK simultaneous solves. The base solve is
             # always sequential; only this probe loop may batch. When the
-            # chunk is < 2 the loop below is the original sequential code
-            # verbatim (the batch path is never exercised).
+            # chunk is < 2, or the simulator's LBM solver has no batched
+            # collide_stream_batch (stub simulators in unit tests), the loop
+            # below is the original sequential code verbatim (the batch path is
+            # never exercised).
             _spsa_batch_chunk = int(_DIRECT_SOLVER_BATCH_CHUNK)
-            if _spsa_batch_chunk >= 2:
+            if _spsa_batch_chunk >= 2 and _direct_solver_supports_batch(cfd_simulator):
                 deltas_per_chunk = max(1, _spsa_batch_chunk // 2)
                 for chunk_start in range(0, direction_count, deltas_per_chunk):
                     chunk_deltas = deltas[chunk_start:chunk_start + deltas_per_chunk]
