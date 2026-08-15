@@ -379,6 +379,10 @@ class ModelConfig:
     coordinate_decoder_depth: int = 2
     coordinate_fourier_bands: int = int(config_value("model", "coordinate_fourier_bands", 6))
     coordinate_chunk_size: int = int(config_value("model", "coordinate_chunk_size", 32768))
+    # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP so inductor
+    # fuses post-GEMM add+SiLU epilogues into the GEMM kernels. Whole-model
+    # compile stays off (previously overflowed).
+    compile_converter_decoder: bool = bool(config_value("model", "compile_converter_decoder", False))
 
     def __post_init__(self):
         if self.encoder_channels is None:
@@ -2993,6 +2997,7 @@ class LatentTo3DConverter(nn.Module):
         coordinate_decoder_depth: int = 2,
         coordinate_fourier_bands: int = 0,
         enable_coordinate_gradient_checkpointing: bool = True,
+        enable_decoder_compile: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -3004,6 +3009,24 @@ class LatentTo3DConverter(nn.Module):
         self.coordinate_decoder_depth = int(coordinate_decoder_depth)
         self.coordinate_fourier_bands = int(coordinate_fourier_bands)
         self.enable_coordinate_gradient_checkpointing = bool(enable_coordinate_gradient_checkpointing)
+        self.enable_decoder_compile = bool(enable_decoder_compile)
+        self._compiled_decode_features = None
+        if self.enable_decoder_compile:
+            # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP so
+            # inductor fuses the post-GEMM add+SiLU epilogues into the GEMM
+            # kernels. Whole-model compile stays off (previously overflowed).
+            try:
+                self._compiled_decode_features = torch.compile(
+                    self._decode_coordinate_features_eager,
+                    dynamic=False,
+                )
+            except Exception as exc:  # pragma: no cover - wrapper construction
+                warnings.warn(
+                    f"torch.compile disabled for coordinate decoder "
+                    f"(construction error: {exc})",
+                    RuntimeWarning,
+                )
+                self._compiled_decode_features = None
         self.decoder_mode = "coordinate" if grid_resolution >= self.coordinate_decoder_threshold else "dense"
         total_voxels = grid_resolution ** 3
 
@@ -3082,6 +3105,19 @@ class LatentTo3DConverter(nn.Module):
         return self._encoded_coordinate_grid
 
     def _decode_coordinate_features(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        if self._compiled_decode_features is not None:
+            try:
+                return self._compiled_decode_features(decoder_input)
+            except Exception as exc:  # pragma: no cover - runtime compile fallback
+                self._compiled_decode_features = None
+                warnings.warn(
+                    f"torch.compile coordinate decoder disabled after runtime "
+                    f"error ({type(exc).__name__}: {exc}); falling back to eager",
+                    RuntimeWarning,
+                )
+        return self._decode_coordinate_features_eager(decoder_input)
+
+    def _decode_coordinate_features_eager(self, decoder_input: torch.Tensor) -> torch.Tensor:
         hidden = self.coordinate_input(decoder_input)
         for block in self.coordinate_blocks:
             hidden = F.silu(hidden + block(hidden))
@@ -5335,6 +5371,7 @@ class OptimizedDiffusionTrainer:
             enable_coordinate_gradient_checkpointing=bool(
                 config_value("model", "coordinate_gradient_checkpointing", True)
             ),
+            enable_decoder_compile=model_config.compile_converter_decoder,
         ).to(self.device).to(self.dtype)
 
         # 4-step consistency model
@@ -7890,6 +7927,7 @@ class OptimizedAircraftGenerator:
             coordinate_decoder_depth=self.model_config.coordinate_decoder_depth,
             coordinate_fourier_bands=self.model_config.coordinate_fourier_bands,
             enable_coordinate_gradient_checkpointing=False,
+            enable_decoder_compile=self.model_config.compile_converter_decoder,
         ).to(self.device)
 
         # Load consistency model

@@ -23,6 +23,10 @@ model:
   coordinate_gradient_checkpointing: true
   enable_gradient_checkpointing: true
   use_torch_compile: false
+  # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP only so
+  # inductor fuses the post-GEMM add+SiLU epilogues into the GEMM kernels.
+  # Opt-in, default off. Whole-model compile stays off (it previously overflowed).
+  compile_converter_decoder: false
 
 scaling:
   # This count selects the reported network widths. It is a capacity-planning
