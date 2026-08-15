@@ -1351,13 +1351,15 @@ class D3Q27CascadedSolver:
 
         return vorticity_mag
 
-    def _shape_drag_correction(self, geometry_mask: torch.Tensor, projected_area_lattice: float):
+    def _shape_drag_correction(self, geometry_mask: torch.Tensor, projected_area_lattice: float, solid_volume: float = None):
         """Geometry-aware drag correction for non-cube voxelized bodies."""
         if not bool(getattr(self.phys_config, 'use_shape_drag_correction', True)):
             return 1.0, {}
 
         solid = geometry_mask > 0.5
-        solid_volume = float(torch.sum(solid.float()).item())
+        if solid_volume is None:
+            # Fallback for callers that do not pre-extract (batched probe path).
+            solid_volume = float(torch.sum(solid.float()).item())
         if solid_volume <= 0.0:
             return 1.0, {
                 'shape_drag_fullness': 0.0,
@@ -1367,13 +1369,18 @@ class D3Q27CascadedSolver:
 
         x_presence = torch.any(solid, dim=(1, 2))
         x_idx = torch.where(x_presence)[0]
-        x_extent = int((x_idx[-1] - x_idx[0] + 1).item()) if x_idx.numel() > 0 else 1
+        # OFFLOAD-2: extract x_extent + the 3-axis surface proxy in one sync.
+        has_x_extent = x_idx.numel() > 0
+        extent_t = (x_idx[-1] - x_idx[0] + 1).double() if has_x_extent else solid.new_zeros(()).double()
+        proxy_t0 = (solid != torch.roll(solid, shifts=1, dims=0)).float().sum().double()
+        proxy_t1 = (solid != torch.roll(solid, shifts=1, dims=1)).float().sum().double()
+        proxy_t2 = (solid != torch.roll(solid, shifts=1, dims=2)).float().sum().double()
+        extent_val, proxy0, proxy1, proxy2 = torch.stack([extent_t, proxy_t0, proxy_t1, proxy_t2]).tolist()
+        x_extent = int(extent_val) if has_x_extent else 1
         fullness = float(solid_volume / max(projected_area_lattice * max(x_extent, 1), 1.0))
         blockage = float(projected_area_lattice / max(float(self.resolution * self.resolution), 1.0))
 
-        surface_proxy = 0.0
-        for axis in (0, 1, 2):
-            surface_proxy += float(torch.sum(solid != torch.roll(solid, shifts=1, dims=axis)).item())
+        surface_proxy = float(proxy0 + proxy1 + proxy2)
         surface_to_volume = float(surface_proxy / max(solid_volume, 1.0))
         projected_side = float(np.sqrt(max(projected_area_lattice, 1.0)))
         log_projected_side = float(np.log(max(projected_side, 1.0)))
@@ -1444,14 +1451,20 @@ class D3Q27CascadedSolver:
         # conservative reference area and freestream speed
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         solid = geometry_mask > 0.5
-        ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
-        ref_area = max(ref_area, h**2)
+
+        # OFFLOAD-2: collapse the ~25 per-solve GPU->CPU .item() reads into a
+        # single stacked .tolist() (one sync). Every reduction is computed on
+        # GPU and widened fp32->fp64 on GPU; fp64 widening is lossless, so each
+        # unpacked Python float is bit-identical to float(x.item()). All
+        # downstream coefficient arithmetic stays in Python fp64, unchanged.
+        mach_number = float(getattr(self.config, 'mach_number', 0.0))
+        force_samples = self._solver.force_samples
 
         # Issue #23: Handle zero-sample case for early convergence (Review Feedback)
-        if self._solver.force_samples > 0:
-            projected_drag = self._solver.projected_drag_accum / self._solver.force_samples
-            net_drag_force = self._solver.force_x_accum / self._solver.force_samples
-            lift_force = self._solver.force_z_accum / self._solver.force_samples
+        if force_samples > 0:
+            projected_drag = self._solver.projected_drag_accum / force_samples
+            net_drag_force = self._solver.force_x_accum / force_samples
+            lift_force = self._solver.force_z_accum / force_samples
             force_definition = 'raw bounce-back momentum exchange averaged over the last-quarter window'
         else:
             projected_drag = self._solver.projected_drag_last
@@ -1459,24 +1472,64 @@ class D3Q27CascadedSolver:
             lift_force = self._solver.force_z_last
             force_definition = 'raw bounce-back momentum exchange from last streaming step'
 
-        projected_area_lattice = max(torch.sum(torch.any(solid, dim=0).float()).item(), 1.0)
-        raw_projected_drag_coefficient = float(projected_drag.item() / projected_area_lattice)
-        freestream_speed = float(getattr(self.config, 'mach_number', 0.0) * 343.0)
+        # 1. Pure momentum exchange (Raw PDE Ground Truth)
+        physical_net_drag_force = _scale_momentum_exchange_force(net_drag_force, h, mach_number)
+        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, mach_number)
+
+        vorticity_mag = self._refresh_flow_diagnostics()
+
+        q_threshold = float(getattr(self.phys_config, 'q_threshold', 0.0))
+        (
+            projected_area_raw,
+            solid_volume_raw,
+            projected_drag_f,
+            net_drag_force_f,
+            lift_force_f,
+            physical_net_drag_force_f,
+            physical_lift_force_f,
+            force_x_accum_f,
+            force_x_last_f,
+            nu_turb_mean_f,
+            pressure_sum_f,
+            nu_turb_max_f,
+            vortex_cells_f,
+            vorticity_max_f,
+            nan_any_f,
+        ) = torch.stack([
+            torch.any(solid, dim=0).float().sum().double(),
+            solid.float().sum().double(),
+            projected_drag.double(),
+            net_drag_force.double(),
+            lift_force.double(),
+            physical_net_drag_force.double(),
+            physical_lift_force.double(),
+            self._solver.force_x_accum.double(),
+            self._solver.force_x_last.double(),
+            self.nu_turb.mean().double(),
+            self.pressure.sum().double(),
+            self.nu_turb.max().double(),
+            (self.q_criterion > q_threshold).float().sum().double(),
+            vorticity_mag.max().double(),
+            torch.isnan(self.velocity_x).any().double(),
+        ]).tolist()
+
+        ref_area = projected_area_raw * h**2
+        ref_area = max(ref_area, h**2)
+        projected_area_lattice = max(projected_area_raw, 1.0)
+        raw_projected_drag_coefficient = float(projected_drag_f / projected_area_lattice)
+        freestream_speed = float(mach_number * 343.0)
         drag_reference_speed = float(getattr(self.phys_config, 'drag_reference_speed', 80.0))
         speed_exponent = float(getattr(self.phys_config, 'drag_speed_normalization_exponent', 1.0))
         if freestream_speed > 1e-12 and drag_reference_speed > 0.0 and speed_exponent != 0.0:
             speed_normalization = (drag_reference_speed / freestream_speed) ** speed_exponent
         else:
             speed_normalization = 1.0
-        # 1. Pure momentum exchange (Raw PDE Ground Truth)
-        physical_net_drag_force = _scale_momentum_exchange_force(net_drag_force, h, getattr(self.config, 'mach_number', 0.0))
-        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, getattr(self.config, 'mach_number', 0.0))
 
         # 2. Upwind pressure proxy (Fallback/Diagnostic)
         physical_pressure_fallback_force = raw_projected_drag_coefficient * (0.5 * 1.225 * freestream_speed**2 * ref_area)
 
         # 3. Tuned Surrogate version (Heuristic correction)
-        shape_drag_scale, shape_drag_metrics = self._shape_drag_correction(geometry_mask, projected_area_lattice)
+        shape_drag_scale, shape_drag_metrics = self._shape_drag_correction(geometry_mask, projected_area_lattice, solid_volume_raw)
         drag_coefficient_surrogate = raw_projected_drag_coefficient * speed_normalization * shape_drag_scale
         physical_surrogate_force = drag_coefficient_surrogate * (0.5 * 1.225 * freestream_speed**2 * ref_area)
 
@@ -1488,43 +1541,48 @@ class D3Q27CascadedSolver:
         lbm_calibrated_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
 
         # Issue #16: Use pure PDE momentum exchange by default
-        physical_drag_force = lbm_raw_force
+        physical_drag_force_f = physical_net_drag_force_f
+        physical_lift_force_f = physical_lift_force_f
 
-        coeffs = _compute_force_coefficients(
-            physical_drag_force,
-            physical_lift_force,
-            getattr(self.config, 'mach_number', 0.0),
-            ref_area=max(ref_area, 1e-12),
-            rho_ref=1.225
-        )
+        # Replicates _compute_force_coefficients in Python fp64 (that helper
+        # calls force_x.item()/force_z.item() internally, which would re-insert
+        # two syncs; inlining keeps the exact fp64 arithmetic on the extracted
+        # floats).
+        v_inf = mach_number * 343.0
+        q_inf = 0.5 * 1.225 * v_inf**2
+        denom = q_inf * max(ref_area, 1e-12) + 1e-12
+        drag_coefficient = float(physical_drag_force_f / denom)
+        lift_coefficient = float(physical_lift_force_f / denom)
+        coeffs = {
+            "drag_coefficient": drag_coefficient,
+            "lift_coefficient": lift_coefficient,
+            "freestream_speed": v_inf,
+            "density": 1.225,
+        }
 
         # PINN-ready check: requires low divergence, stable forces, and sampling convergence
         force_stability = 1.0
-        if self._solver.force_samples > 20:
-            avg_fx = float(self._solver.force_x_accum.item()) / self._solver.force_samples
-            last_fx = float(self._solver.force_x_last.item())
+        if force_samples > 20:
+            avg_fx = force_x_accum_f / force_samples
+            last_fx = force_x_last_f
             force_stability = abs(last_fx - avg_fx) / (abs(avg_fx) + 1e-6)
 
         lbm_converged = bool(
-            not torch.isnan(self.velocity_x).any() and
-            abs(float(self.force_x_last.item())) < 1e5 and
-            self._solver.force_samples > 50 and
+            nan_any_f == 0.0 and
+            abs(force_x_last_f) < 1e5 and
+            force_samples > 50 and
             force_stability < 0.1 # Relaxed for small test resolutions
         )
         compressibility_metadata = build_lbm_compressibility_metadata(
-            mach_number=getattr(self.config, 'mach_number', 0.0),
+            mach_number=mach_number,
             u_lattice=self.inlet_velocity_lu,
             lbm_converged=lbm_converged,
             force_stability=force_stability,
         )
 
-        vorticity_mag = self._refresh_flow_diagnostics()
-        vortex_cells = torch.sum((self.q_criterion > getattr(self.phys_config, 'q_threshold', 0.0)).float()).item()
-        v_inf = coeffs.get('freestream_speed', 0.0)
-        nu_turb_mean = float(self.nu_turb.mean().item())
+        vortex_cells = vortex_cells_f
+        nu_turb_mean = nu_turb_mean_f
         reynolds_turbulent = float(v_inf * h * self.resolution / max(self.nu + nu_turb_mean, 1e-12))
-        drag_coefficient = float(coeffs['drag_coefficient'])
-        lift_coefficient = float(coeffs['lift_coefficient'])
         calibrated_drag_coefficient = float(drag_coefficient_surrogate)
         training_drag_coefficient = calibrated_drag_coefficient
         training_drag_label_source = 'lbm_calibrated'
@@ -1539,16 +1597,25 @@ class D3Q27CascadedSolver:
         solver_quality_checks = {
             'finite_coefficients': bool(np.isfinite(drag_coefficient) and np.isfinite(lift_coefficient)),
             'positive_reference_area': bool(ref_area > 0.0),
-            'nonempty_geometry': bool(torch.sum(solid.float()).item() > 0.0),
+            'nonempty_geometry': bool(solid_volume_raw > 0.0),
             'finite_force_outputs': bool(
-                np.isfinite(float(physical_net_drag_force.item()))
-                and np.isfinite(float(physical_lift_force.item()))
+                np.isfinite(physical_net_drag_force_f)
+                and np.isfinite(physical_lift_force_f)
             ),
         }
 
+        # Inline _effective_drag_link_metric_exponent (its internal .item() was
+        # the last per-call sync); identical cache check + formula, with the
+        # projected side read from the already-extracted area.
+        drag_link_metric_exponent = (
+            float(self._solver.drag_link_metric_exponent)
+            if self._solver.drag_link_metric_exponent is not None
+            else float(np.clip(1.68 - 0.295 * (float(np.sqrt(projected_area_lattice)) - 13.0), 0.5, 1.68))
+        )
+
         return {
-            'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
-            'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
+            'force_x': float(physical_drag_force_f),
+            'force_z': float(physical_lift_force_f),
 
             # Tiered Labeling (Issue #12)
             'label_source': 'lbm_d3q27',
@@ -1557,12 +1624,12 @@ class D3Q27CascadedSolver:
             'force_stability': force_stability,
             **compressibility_metadata,
 
-            'physical_force_source': float(physical_net_drag_force.item()),
+            'physical_force_source': float(physical_net_drag_force_f),
             'pressure_only_fallback': float(physical_pressure_fallback_force),
             'surrogate_proxy_force': float(physical_surrogate_force),
 
-            'raw_force_x': float(projected_drag.item() if isinstance(projected_drag, torch.Tensor) else projected_drag),
-            'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
+            'raw_force_x': float(projected_drag_f),
+            'raw_force_z': float(lift_force_f),
             'drag_coefficient': drag_coefficient,
             'calibrated_drag_coefficient': calibrated_drag_coefficient,
             'training_drag_coefficient': training_drag_coefficient,
@@ -1570,21 +1637,21 @@ class D3Q27CascadedSolver:
             'training_drag_label_source': training_drag_label_source,
             'lift_coefficient': lift_coefficient,
             'lift_to_drag': lift_to_drag,
-            'net_momentum_exchange_force_x': float(physical_net_drag_force.item() if isinstance(physical_net_drag_force, torch.Tensor) else physical_net_drag_force),
-            'raw_net_momentum_exchange_force_x': float(net_drag_force.item() if isinstance(net_drag_force, torch.Tensor) else net_drag_force),
+            'net_momentum_exchange_force_x': float(physical_net_drag_force_f),
+            'raw_net_momentum_exchange_force_x': float(net_drag_force_f),
             'projected_area_lattice': projected_area_lattice,
             'raw_projected_drag_coefficient': raw_projected_drag_coefficient,
             'drag_speed_normalization': speed_normalization,
             'drag_reference_speed': drag_reference_speed,
             'drag_speed_normalization_exponent': speed_exponent,
             'shape_drag_scale': shape_drag_scale,
-            'drag_link_metric_exponent': float(self._solver._effective_drag_link_metric_exponent(geometry_mask)),
+            'drag_link_metric_exponent': drag_link_metric_exponent,
             'force_definition': force_definition,
-            'pressure_sum': float(self.pressure.sum().item()),
-            'max_turbulent_viscosity': float(self.nu_turb.max().item()),
+            'pressure_sum': float(pressure_sum_f),
+            'max_turbulent_viscosity': float(nu_turb_max_f),
             'mean_smagorinsky_constant': float(getattr(self.phys_config, 'smagorinsky_constant', 0.17)),
-            'max_vorticity': float(vorticity_mag.max().item()),
-            'vortex_core_volume': float(vortex_cells * h**3),
+            'max_vorticity': float(vorticity_max_f),
+            'vortex_core_volume': float(vortex_cells_f * h**3),
             'reference_area': ref_area,
             'reference_area_source': 'projected_frontal_voxel_area_yz',
             'reference_area_lattice': projected_area_lattice,
@@ -1593,7 +1660,7 @@ class D3Q27CascadedSolver:
             'freestream_speed': v_inf,
             'density': coeffs['density'],
             'reynolds_number_turbulent': reynolds_turbulent,
-            'empty_geometry': bool(torch.sum(solid.float()).item() <= 0.0),
+            'empty_geometry': bool(solid_volume_raw <= 0.0),
             'claim_bearing_cfd': False,
             'solver_quality_checks': solver_quality_checks,
             'solver_provenance': {
@@ -1601,7 +1668,7 @@ class D3Q27CascadedSolver:
                 'label_tier': 'lbm_raw',
                 'lbm_converged': lbm_converged,
                 'grid_resolution': int(self.resolution),
-                'force_samples': int(self._solver.force_samples),
+                'force_samples': int(force_samples),
                 'reference_area_source': 'projected_frontal_voxel_area_yz',
             },
         } | shape_drag_metrics
