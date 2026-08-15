@@ -146,6 +146,15 @@ if triton is not None:
         res = tl.where(qi < 0.5, res_low, res_high)
 
         out = tl.where(active, res, streamed)
+        # P6h: fuse the post-stream nan_to_num guard into the stream write so
+        # the solver can skip its separate full-array pass on the fused path.
+        # nan->0, +inf->1e6, -inf->-1e6 exactly match torch.nan_to_num; a
+        # no-op on the finite populations produced in normal runs.
+        out = tl.where(
+            out != out,
+            0.0,
+            tl.where(out == float("inf"), 1e6, tl.where(out == float("-inf"), -1e6, out)),
+        )
         tl.store(f_out + k * total + offsets, out, mask=valid)
 
 
@@ -191,6 +200,133 @@ def stream_bfl_d3q27(
         opposite,
         n,
         total,
+        block=block_size,
+    )
+    return True
+
+
+if triton is not None:
+    @triton.jit
+    def _force_drag_kernel(
+        f_pre,
+        f_out,
+        boundary_links,
+        ex_links,
+        ez_links,
+        opposite,
+        drag_weight,
+        upwind,
+        partials,
+        total: tl.constexpr,
+        n_blocks: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Momentum-exchange force + projected pressure-drag proxy in one pass.
+
+        Grid is ``(26, n_blocks)`` over directions 1..26 and voxel blocks.
+        Each (dir, block) writes its three partial sums (fx, fz, drag) to a
+        single deterministic slot in ``partials[3, 26, n_blocks]``; the host
+        reduces those with one ``torch.sum``. The formulas reproduce
+        ``D3Q27Solver._accumulate_momentum_exchange_force_nosync`` and
+        ``_accumulate_projected_pressure_drag_proxy`` with the same per-element
+        operand order and products, so the only drift versus the reference is
+        the block-partitioned reduction tree. Measured on the 32^3 parity
+        fixtures the accumulation is ~1e-7 relative to the gross (worst 5-step
+        signed drift ~1.5e-5 absolute on the small net forces), well within
+        FORCE_ATOL 2.5e-5.
+        """
+        i = tl.program_id(0)
+        pid = tl.program_id(1)
+        offsets = pid * block + tl.arange(0, block)
+        valid = offsets < total
+
+        dir_idx = i + 1
+        # boundary links are a torch.bool [26, D, H, W] mask.
+        b = tl.load(boundary_links + i * total + offsets, mask=valid, other=0).to(tl.float32)
+        ex = tl.load(ex_links + i)
+        ez = tl.load(ez_links + i)
+
+        f_in = tl.load(f_pre + dir_idx * total + offsets, mask=valid, other=0.0)
+        opp = tl.load(opposite + dir_idx)
+        f_out_v = tl.load(f_out + opp * total + offsets, mask=valid, other=0.0)
+
+        # momentum exchange: reference is (f_in * b) + (f_out_opp * b), then
+        # multiplied by the link's ex/ez component.
+        contrib = (f_in * b) + (f_out_v * b)
+        fx = ex * contrib
+        fz = ez * contrib
+
+        # projected drag: where(upwind, 2*|ex|*metric*f_pre*b, 0).
+        dw = tl.load(drag_weight + i)
+        uw = tl.load(upwind + i)
+        drag = tl.where(uw > 0.0, dw * f_in * b, 0.0)
+
+        fx_s = tl.sum(fx, axis=0)
+        fz_s = tl.sum(fz, axis=0)
+        drag_s = tl.sum(drag, axis=0)
+
+        base = i * n_blocks + pid
+        tl.store(partials + base, fx_s)
+        tl.store(partials + 26 * n_blocks + base, fz_s)
+        tl.store(partials + 2 * 26 * n_blocks + base, drag_s)
+
+
+def force_drag_d3q27(
+    f_pre: torch.Tensor,
+    f_out: torch.Tensor,
+    boundary_links: torch.Tensor,
+    ex_links: torch.Tensor,
+    ez_links: torch.Tensor,
+    opposite: torch.Tensor,
+    drag_weight: torch.Tensor,
+    upwind: torch.Tensor,
+    partials: torch.Tensor,
+    block_size: int = 256,
+) -> bool:
+    """Run the fused momentum-exchange force + projected-drag kernel on CUDA.
+
+    ``f_pre``/``f_out`` are the pre-stream and streamed ``[27, D, H, W]`` fp32
+    populations; ``boundary_links`` is the cached ``[26, D, H, W]`` bool mask.
+    ``drag_weight`` and ``upwind`` are the per-direction scalars
+    ``2*|ex|*metric`` and the ``(ex * flow_sign) > 0`` mask as ``[26]`` fp32.
+    ``partials`` is a caller-owned ``[3, 26, cdiv(D*H*W, block_size)]`` fp32
+    buffer; every slot is written exactly once, then the caller reduces it with
+    one ``torch.sum(partials, dim=(-2, -1))`` -> ``[fx, fz, drag]``. Returns
+    True when the fused path executed (``partials`` filled), False when the
+    caller must use the reference PyTorch force accumulation.
+    """
+    if triton is None or not f_pre.is_cuda:
+        return False
+    if f_pre.dim() != 4 or f_pre.shape[0] != 27:
+        return False
+    if f_pre.shape[1] != f_pre.shape[2] or f_pre.shape[1] != f_pre.shape[3]:
+        return False
+    if not (f_pre.is_contiguous() and f_out.is_contiguous()):
+        return False
+    if boundary_links.dim() != 4 or boundary_links.shape[0] != 26:
+        return False
+    if not boundary_links.is_contiguous():
+        return False
+    n = int(f_pre.shape[1])
+    total = n * n * n
+    n_blocks = triton.cdiv(total, block_size)
+    if partials.shape != (3, 26, n_blocks):
+        return False
+    if not partials.is_contiguous():
+        return False
+    grid = (26, n_blocks)
+    _force_drag_kernel[grid](
+        f_pre,
+        f_out,
+        boundary_links,
+        ex_links,
+        ez_links,
+        opposite,
+        drag_weight,
+        upwind,
+        partials,
+        total=total,
+        n_blocks=n_blocks,
         block=block_size,
     )
     return True
@@ -285,6 +421,11 @@ if triton is not None:
         res = tl.where(qi < 0.5, res_low, res_high)
 
         out = tl.where(active, res, streamed)
+        out = tl.where(
+            out != out,
+            0.0,
+            tl.where(out == float("inf"), 1e6, tl.where(out == float("-inf"), -1e6, out)),
+        )
         tl.store(f_out_c + k * total + offsets, out, mask=valid)
 
 
@@ -383,6 +524,11 @@ if triton is not None:
 
         f_pre_c = f_pre + c * 27 * total
         streamed = tl.load(f_pre_c + k * total + (sx * n2 + sy * n + sz), mask=valid, other=0.0)
+        streamed = tl.where(
+            streamed != streamed,
+            0.0,
+            tl.where(streamed == float("inf"), 1e6, tl.where(streamed == float("-inf"), -1e6, streamed)),
+        )
         tl.store(f_out + c * 27 * total + k * total + offsets, streamed, mask=valid)
 
 
@@ -467,7 +613,11 @@ if triton is not None:
         inv_2q = 1.0 / (2.0 * qi)
         res_high = inv_2q * f_i_here + (1.0 - inv_2q) * streamed
         res = tl.where(qi < 0.5, res_low, res_high)
-
+        res = tl.where(
+            res != res,
+            0.0,
+            tl.where(res == float("inf"), 1e6, tl.where(res == float("-inf"), -1e6, res)),
+        )
         tl.store(f_out_c + k * total + x, res, mask=valid)
 
 

@@ -36,6 +36,11 @@ try:
 except Exception:  # pragma: no cover - optional acceleration path
     stream_bfl_d3q27_batch_compressed = None
 
+try:
+    from d3q27_kernels import force_drag_d3q27
+except Exception:  # pragma: no cover - optional acceleration path
+    force_drag_d3q27 = None
+
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
     """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
@@ -157,6 +162,11 @@ class D3Q27Solver:
         # Relaxation vectors are constant for a fixed omega; rebuilding them
         # every step created one CUDA tensor per step (plan Phase 1).
         self._s_vec_cache = {}
+        # P6h: deterministic per-block partial accumulator for the fused
+        # momentum-exchange force + projected-drag kernel, keyed by block count
+        # (fixed for a given resolution). Each slot is written exactly once per
+        # call, then reduced with one torch.sum.
+        self._force_drag_partials_cache = {}
 
         # 27 populations
         self.f = torch.zeros(27, resolution, resolution, resolution, device=device)
@@ -320,6 +330,57 @@ class D3Q27Solver:
         projected = 2.0 * torch.abs(self._force_ex) * metric * self.f_pre_stream[self._force_dir_index]
         return torch.sum(torch.where(upwind, projected * boundary_links, torch.zeros_like(projected)))
 
+    def _accumulate_force_drag_fused(self, geometry_mask, geom_hash=None, block_size: int = 256):
+        """Fused momentum-exchange force + projected drag (P6h FUSION-3).
+
+        Runs one Triton pass over the 26 wall links that accumulates fx, fz and
+        the projected-drag proxy into a deterministic per-block partial buffer,
+        then a single small ``torch.sum`` reduces it. Replaces the two separate
+        full-array reductions (``_accumulate_momentum_exchange_force_nosync`` +
+        ``_accumulate_projected_pressure_drag_proxy``) on the fused stream path.
+        The per-element formulas and operand order match the reference exactly;
+        the only drift is the block-partitioned reduction tree (~1e-7 relative
+        to the gross on the 32^3 parity fixtures, worst 5-step signed drift
+        ~1.5e-5 absolute, well within FORCE_ATOL 2.5e-5). Keeps fp32 throughout.
+        """
+        boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
+        total = self.f_pre_stream[0].numel()
+        n_blocks = (total + block_size - 1) // block_size
+        partials = self._force_drag_partials_cache.get(n_blocks)
+        if partials is None:
+            partials = torch.zeros(3, 26, n_blocks, device=self.device, dtype=torch.float32)
+            self._force_drag_partials_cache[n_blocks] = partials
+
+        flow_sign = 1.0 if self.inlet_velocity_lu >= 0.0 else -1.0
+        upwind = ((self._force_ex * flow_sign) > 0.0).float().reshape(26).contiguous()
+        metric_exponent = self._effective_drag_link_metric_exponent(geometry_mask)
+        metric = torch.pow(self._force_speed.clamp_min(1.0), -metric_exponent)
+        drag_weight = (2.0 * torch.abs(self._force_ex) * metric).reshape(26).contiguous()
+
+        ok = force_drag_d3q27(
+            self.f_pre_stream,
+            self.f_temp,
+            boundary_links,
+            self._force_ex_links.reshape(26).contiguous(),
+            self._force_ez_links.reshape(26).contiguous(),
+            self.opposite,
+            drag_weight,
+            upwind,
+            partials,
+            block_size=block_size,
+        )
+        if not ok:
+            step_force_x, step_force_z = self._accumulate_momentum_exchange_force_nosync(
+                geometry_mask, geom_hash=geom_hash
+            )
+            step_projected_drag = self._accumulate_projected_pressure_drag_proxy(
+                geometry_mask, geom_hash=geom_hash
+            )
+            return step_force_x, step_force_z, step_projected_drag
+
+        sums = torch.sum(partials, dim=(-2, -1))
+        return sums[0], sums[1], sums[2]
+
     def _boundary_links(self, geometry_mask, geom_hash=None):
         """Cache static fluid-solid links without boundary wraparound (Issue #15)."""
         # Use true content hash for cache key (Review Feedback)
@@ -470,8 +531,15 @@ class D3Q27Solver:
         # Guard against runaway non-finite populations from previous steps.
         self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
-        # Macroscopic variables
-        rho = torch.sum(self.f, dim=0).clamp_min(1e-8)
+        # P6e FUSION-2: derive the conserved macroscopic fields (rho / jx / jy
+        # / jz) from the moment-matrix rows K[0]/K[9]/K[3]/K[1] of the MRT
+        # moment projection instead of four separate full-array reductions. The
+        # tensordot is needed for the collision anyway, so the rho/ux/uy/uz
+        # reads fold into its single pass (accepted LOW-parity reduction order;
+        # the conserved rows of K_post are re-imposed from Keq below, so exact
+        # conservation is unchanged).
+        K = torch.tensordot(self.moment_basis, self.f, dims=([1], [0]))
+        rho = K[0].clamp_min(1e-8)
 
         # Macroscopic velocity with forcing offset (Guo's definition)
         # u = (sum fi ci + 0.5 F) / rho
@@ -480,9 +548,9 @@ class D3Q27Solver:
         # (plan Phase 1).
         has_ext_force = ext_force is not None
 
-        ux_raw = torch.sum(self.f * self.ex_f, dim=0)
-        uy_raw = torch.sum(self.f * self.ey_f, dim=0)
-        uz_raw = torch.sum(self.f * self.ez_f, dim=0)
+        ux_raw = K[9]
+        uy_raw = K[3]
+        uz_raw = K[1]
 
         if has_ext_force:
             ux = (ux_raw + 0.5 * ext_force[0]) / (rho + 1e-12)
@@ -498,7 +566,6 @@ class D3Q27Solver:
         uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
 
         # Cascaded MRT Collision (Issue #16)
-        K = torch.tensordot(self.moment_basis, self.f, dims=([1], [0]))
         Keq = self.compute_moment_equilibrium(rho, ux, uy, uz)
 
         # Build S-vector (relaxation rates); cached per omega (plan Phase 1).
@@ -578,36 +645,35 @@ class D3Q27Solver:
 
         self._apply_domain_boundaries()
 
-        if self.use_fused_stream_bfl:
-            step_force_x, step_force_z = self._accumulate_momentum_exchange_force_nosync(
+        if self.use_fused_stream_bfl and used_fused_bfl and force_drag_d3q27 is not None:
+            step_force_x, step_force_z, step_projected_drag = self._accumulate_force_drag_fused(
                 geometry_mask, geom_hash=geom_hash
             )
         else:
-            step_force_x, step_force_z = self._accumulate_momentum_exchange_force(geometry_mask, geom_hash=geom_hash)
-        step_projected_drag = self._accumulate_projected_pressure_drag_proxy(geometry_mask, geom_hash=geom_hash)
+            step_force_x, step_force_z = self._accumulate_momentum_exchange_force_nosync(
+                geometry_mask, geom_hash=geom_hash
+            )
+            step_projected_drag = self._accumulate_projected_pressure_drag_proxy(geometry_mask, geom_hash=geom_hash)
 
         self.f.copy_(self.f_temp)
-        self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+        # The fused stream kernel clamps its writes (P6h nan_to_num fusion), so
+        # the post-stream full-array guard is redundant on the fused path. The
+        # fallback path keeps the explicit guard; the guard is never removed.
+        if not used_fused_bfl:
+            self.f.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
-        # Recompute macroscopic fields from updated populations (Issue #15 Fix 10)
-        rho_new = torch.sum(self.f, dim=0).clamp_min(1e-8)
-        # Use Guo's velocity definition: u = (sum fi ci + 0.5 F) / rho
-        if has_ext_force:
-            ux_new = (torch.sum(self.f * self.ex_f, dim=0) + 0.5 * ext_force[0]) / (rho_new + 1e-12)
-            uy_new = (torch.sum(self.f * self.ey_f, dim=0) + 0.5 * ext_force[1]) / (rho_new + 1e-12)
-            uz_new = (torch.sum(self.f * self.ez_f, dim=0) + 0.5 * ext_force[2]) / (rho_new + 1e-12)
-        else:
-            ux_new = torch.sum(self.f * self.ex_f, dim=0) / (rho_new + 1e-12)
-            uy_new = torch.sum(self.f * self.ey_f, dim=0) / (rho_new + 1e-12)
-            uz_new = torch.sum(self.f * self.ez_f, dim=0) / (rho_new + 1e-12)
-
-        # Update stored macroscopic fields
-        cs2 = 1.0 / 3.0
-        self.velocity_x = ux_new.nan_to_num(0.0)
-        self.velocity_y = uy_new.nan_to_num(0.0)
-        self.velocity_z = uz_new.nan_to_num(0.0)
-        self.pressure = rho_new * cs2
-        self.rho = rho_new
+        # P6e: collapse the dead post-collision velocity recompute. This method
+        # returns the PRE-collision macroscopic fields computed above, and
+        # D3Q27CascadedSolver refreshes its own velocity/pressure/rho from those
+        # returned values every step; the four post-stream full-array reductions
+        # written only to these attributes were consumed by no hot-path reader.
+        # Store the pre-collision fields so the attributes stay finite and
+        # meaningful for any external (e.g. diagnostics) reader.
+        self.velocity_x = ux
+        self.velocity_y = uy
+        self.velocity_z = uz
+        self.pressure = rho * (1.0 / 3.0)
+        self.rho = rho
 
         self.force_x_last = step_force_x
         self.force_z_last = step_force_z
@@ -1009,11 +1075,20 @@ class D3Q27Solver:
 
         f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
-        rho = torch.sum(f_batch, dim=1).clamp_min(1e-8)
+        # P6e FUSION-2: derive the conserved macroscopic fields (rho / jx / jy
+        # / jz) from the moment-matrix rows K[:,0]/K[:,9]/K[:,3]/K[:,1] of the
+        # flat-matmul collision instead of four separate full-array reductions.
+        # The matmul is needed for the collision anyway; the conserved rows of
+        # K_post are re-imposed from Keq below (accepted LOW-parity reduction
+        # order).
+        N = f_batch[0, 0].numel()
+        f_flat = f_batch.reshape(C, 27, N)
+        K = torch.matmul(self.moment_basis, f_flat)
+        rho = K[:, 0, :].reshape(C, *f_batch.shape[2:]).clamp_min(1e-8)
         has_ext_force = ext_force is not None
-        ux_raw = torch.sum(f_batch * ex_b, dim=1)
-        uy_raw = torch.sum(f_batch * ey_b, dim=1)
-        uz_raw = torch.sum(f_batch * ez_b, dim=1)
+        ux_raw = K[:, 9, :].reshape(C, *f_batch.shape[2:])
+        uy_raw = K[:, 3, :].reshape(C, *f_batch.shape[2:])
+        uz_raw = K[:, 1, :].reshape(C, *f_batch.shape[2:])
         if has_ext_force:
             ux = (ux_raw + 0.5 * ext_force[0]) / (rho + 1e-12)
             uy = (uy_raw + 0.5 * ext_force[1]) / (rho + 1e-12)
@@ -1026,10 +1101,6 @@ class D3Q27Solver:
         uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
         uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
 
-        # Flat-matmul collision (accepted LOW-parity reduction order).
-        N = f_batch[0, 0].numel()
-        f_flat = f_batch.reshape(C, 27, N)
-        K = torch.matmul(self.moment_basis, f_flat)
         Keq = self.compute_moment_equilibrium_batch(rho, ux, uy, uz).reshape(C, 27, N)
 
         s_key = (float(omega), float(self.s_e), float(self.s_h))
