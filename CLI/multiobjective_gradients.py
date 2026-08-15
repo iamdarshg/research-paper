@@ -414,8 +414,17 @@ def project_improvement_gradients_against_guards(
             for guard_name in ordered_guards
         }
         for guard_name in ordered_guards:
+            # Evaluate the residual on the float64 `current` projection, NOT the
+            # float32-cast `accepted_current`. After projecting out a guard's
+            # direction the true residual is ~1e-16 (float64), but rounding the
+            # accepted gradient back to its original dtype leaves a residual dot
+            # of magnitude ~1e-7 whose sign is pure accumulation noise. Checking
+            # that noise against `tolerance` is a knife-edge that spuriously
+            # zeroes the whole improvement (fallback below) for otherwise-valid
+            # gradients; the float64 residual preserves the check's intent of
+            # catching projections that genuinely failed to remove a guard.
             final_dot = _gradient_dot_product(
-                accepted_current,
+                current,
                 guards[guard_name],
                 first_name=name,
                 second_name=guard_name,
