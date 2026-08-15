@@ -23,6 +23,7 @@ Usage:
 """
 import argparse
 import json
+import pickle
 import statistics
 import sys
 import time
@@ -132,11 +133,16 @@ def _stats(values):
 # Builders (mirror select_recovery_checkpoint / run_monitored_training wiring)
 # ---------------------------------------------------------------------------
 def build_trainer_and_loader(checkpoint: Path, manifest: Path, device, samples: int, solver: str):
-    # weights_only=False is required and intentional: the candidate may be an
-    # interruption-safe run-state checkpoint that embeds torch rng state and
-    # compatibility mappings. This is a trusted local artifact from our own
-    # run, never untrusted input.
-    metadata = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    # Prefer the safe weights_only=True loader (verified against the current
+    # plain checkpoint family). Fall back to weights_only=False ONLY when the
+    # candidate is an interruption-safe run-state checkpoint that embeds torch
+    # rng state / custom compatibility objects (pickle.UnpicklingError). Both
+    # paths load trusted local artifacts from our own runs at explicit paths,
+    # never untrusted input.
+    try:
+        metadata = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError:
+        metadata = torch.load(checkpoint, map_location="cpu", weights_only=False)
     model_config = (
         adc.ModelConfig(**metadata["model_config"])
         if "model_config" in metadata
