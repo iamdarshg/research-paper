@@ -1104,14 +1104,24 @@ def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -
     positive_mask = target > 0.5
     negative_mask = ~positive_mask
 
-    class_terms: List[torch.Tensor] = []
-    if bool(positive_mask.any().item()):
-        class_terms.append(losses[positive_mask].mean())
-    if bool(negative_mask.any().item()):
-        class_terms.append(losses[negative_mask].mean())
-    if not class_terms:
-        return losses.mean()
-    return torch.stack(class_terms).mean()
+    # Device-side class selection (no host syncs): an all-False mask's .mean()
+    # is NaN, so each class term is guarded on device with torch.where and the
+    # present-class count renormalizes the two-term average exactly like the
+    # original host-side bool(...any().item()) guards did.
+    positive_any = positive_mask.any()
+    negative_any = negative_mask.any()
+    positive_term = torch.where(
+        positive_any, losses[positive_mask].mean(), losses.new_zeros(())
+    )
+    negative_term = torch.where(
+        negative_any, losses[negative_mask].mean(), losses.new_zeros(())
+    )
+    class_count = positive_any.to(losses.dtype) + negative_any.to(losses.dtype)
+    return torch.where(
+        class_count > 0,
+        (positive_term + negative_term) / class_count.clamp_min(1.0),
+        losses.mean(),
+    )
 
 
 def grounded_threshold_margin_loss(
@@ -5897,11 +5907,16 @@ class OptimizedDiffusionTrainer:
         intersection = flat_target.new_zeros((batch_size,))
         prediction_mass = flat_target.new_zeros((batch_size,))
         target_mass = flat_target.sum(dim=1)
-        # Hoisted immutable global voxel counts (positive/negative totals never
-        # change after the clamp above). Read once per update instead of once
-        # per chunk, replacing every in-loop/post-loop .item() read below.
-        positive_count_float = float(positive_count.item())
-        negative_count_float = float(negative_count.item())
+        # Immutable global voxel counts as device tensors (no host sync). The
+        # >0 guards become device masks: an all-empty class contributes exactly
+        # 0 (division uses the clamped count and the mask zeroes the term), and
+        # class_count renormalizes the per-chunk and post-loop losses exactly
+        # like the original host-side int guards did.
+        has_positive = (positive_count > 0).to(flat_target.dtype)
+        has_negative = (negative_count > 0).to(flat_target.dtype)
+        safe_positive_count = positive_count.clamp_min(1.0)
+        safe_negative_count = negative_count.clamp_min(1.0)
+        class_count = (has_positive + has_negative).clamp_min(1.0)
         # Grad-carrying accumulators for the single final backward: the positive
         # dice mass is `intersection` (probabilities*target == probabilities on
         # the target voxels), so only the negative dice mass is tracked here.
@@ -5919,12 +5934,6 @@ class OptimizedDiffusionTrainer:
             float(self.geometry_probability_threshold)
             - float(self.training_config.threshold_negative_margin),
         )
-        class_count = 0
-        if positive_count_float > 0.0:
-            class_count += 1
-        if negative_count_float > 0.0:
-            class_count += 1
-
         # Single grad-enabled pass over the lattice. The removed no_grad decode
         # existed only for detached scalar metrics; those sums are accumulated
         # here without a graph (.detach()) while the grad-carrying per-batch dice
@@ -5962,51 +5971,54 @@ class OptimizedDiffusionTrainer:
             prediction_mass = prediction_mass + probabilities.sum(dim=1)
             neg_dice_mass = neg_dice_mass + (probabilities * negative_mask).sum(dim=1)
             # Per-chunk bce/margin losses, same arithmetic as the old grad pass.
+            # The class-count guards are device masks (has_positive/has_negative
+            # with clamped divisor counts), so an all-empty class contributes
+            # exactly 0 with no per-chunk host sync and no NaN gradient.
             chunk_bce = logits.new_zeros(())
-            if positive_count_float > 0.0:
-                chunk_bce = chunk_bce + bce[positive_mask].sum() / positive_count
-            if negative_count_float > 0.0:
-                chunk_bce = chunk_bce + bce[negative_mask].sum() / negative_count
-            chunk_bce = chunk_bce / max(class_count, 1)
+            chunk_bce = chunk_bce + (
+                bce[positive_mask].sum() / safe_positive_count
+            ) * has_positive
+            chunk_bce = chunk_bce + (
+                bce[negative_mask].sum() / safe_negative_count
+            ) * has_negative
+            chunk_bce = chunk_bce / class_count
             chunk_margin = logits.new_zeros(())
-            if margin_enabled and positive_count_float > 0.0:
+            if margin_enabled:
                 chunk_margin = chunk_margin + (
                     float(self.training_config.threshold_positive_margin_weight)
                     * (
                         (positive_boundary - probabilities).clamp_min(0.0).square()
                         * positive_mask
                     ).sum()
-                    / positive_count
-                )
-            if margin_enabled and negative_count_float > 0.0:
+                    / safe_positive_count
+                ) * has_positive
                 chunk_margin = chunk_margin + (
                     float(self.training_config.threshold_negative_margin_weight)
                     * (
                         (probabilities - negative_boundary).clamp_min(0.0).square()
                         * negative_mask
                     ).sum()
-                    / negative_count
-                )
+                    / safe_negative_count
+                ) * has_negative
             total_chunk_loss = total_chunk_loss + (chunk_bce + chunk_margin)
 
-        balanced_bce = flat_target.new_zeros(())
-        if positive_count_float > 0.0:
-            balanced_bce += positive_bce_sum / positive_count
-        if negative_count_float > 0.0:
-            balanced_bce += negative_bce_sum / negative_count
-        balanced_bce = balanced_bce / max(class_count, 1)
+        balanced_bce = (
+            (positive_bce_sum / safe_positive_count) * has_positive
+            + (negative_bce_sum / safe_negative_count) * has_negative
+        )
+        balanced_bce = balanced_bce / class_count
         numerator = 2.0 * intersection.detach() + 1.0
         denominator = prediction_mass.detach() + target_mass + 1.0
         dice_loss = (1.0 - numerator / denominator).mean()
         full_loss = balanced_bce + self.training_config.geometry_dice_weight * dice_loss
         positive_margin_loss = (
-            positive_margin_sum / positive_count
-            if margin_enabled and positive_count_float > 0.0
+            (positive_margin_sum / safe_positive_count) * has_positive
+            if margin_enabled
             else flat_target.new_zeros(())
         )
         negative_margin_loss = (
-            negative_margin_sum / negative_count
-            if margin_enabled and negative_count_float > 0.0
+            (negative_margin_sum / safe_negative_count) * has_negative
+            if margin_enabled
             else flat_target.new_zeros(())
         )
         threshold_margin_loss = (
@@ -6019,8 +6031,8 @@ class OptimizedDiffusionTrainer:
         self.last_threshold_margin_components = {
             "threshold_positive_margin_loss": float(positive_margin_loss.detach().item()),
             "threshold_negative_margin_loss": float(negative_margin_loss.detach().item()),
-            "threshold_positive_voxel_count": int(positive_count_float),
-            "threshold_negative_voxel_count": int(negative_count_float),
+            "threshold_positive_voxel_count": int(positive_count.item()),
+            "threshold_negative_voxel_count": int(negative_count.item()),
             "threshold_positive_margin": float(self.training_config.threshold_positive_margin),
             "threshold_negative_margin": float(self.training_config.threshold_negative_margin),
             "threshold_positive_margin_weight": float(self.training_config.threshold_positive_margin_weight),
@@ -6090,6 +6102,13 @@ class OptimizedDiffusionTrainer:
         chunk_size = max(1, int(self.model_config.coordinate_chunk_size))
         positive_count = flat_target.sum().clamp_min(0.0)
         negative_count = (flat_target.numel() - positive_count).clamp_min(0.0)
+        # Device-side class-count masks (no host sync), matching the grounded
+        # coordinate-loss loop: an all-empty class contributes exactly 0 with a
+        # clamped divisor so the masked term is gradient-safe.
+        has_positive = (positive_count > 0).to(flat_target.dtype)
+        has_negative = (negative_count > 0).to(flat_target.dtype)
+        safe_positive_count = positive_count.clamp_min(1.0)
+        safe_negative_count = negative_count.clamp_min(1.0)
         positive_boundary = min(
             1.0 - torch.finfo(flat_target.dtype).eps,
             float(self.geometry_probability_threshold)
@@ -6124,38 +6143,28 @@ class OptimizedDiffusionTrainer:
                 * negative_mask
             ).sum().detach()
             chunk_loss = logits.new_zeros(())
-            if float(positive_count.item()) > 0.0:
-                chunk_loss = chunk_loss + (
-                    float(self.training_config.threshold_positive_margin_weight)
-                    * (
-                        (positive_boundary - probabilities).clamp_min(0.0).square()
-                        * positive_mask
-                    ).sum()
-                    / positive_count
-                )
-            if float(negative_count.item()) > 0.0:
-                chunk_loss = chunk_loss + (
-                    float(self.training_config.threshold_negative_margin_weight)
-                    * (
-                        (probabilities - negative_boundary).clamp_min(0.0).square()
-                        * negative_mask
-                    ).sum()
-                    / negative_count
-                )
+            chunk_loss = chunk_loss + (
+                float(self.training_config.threshold_positive_margin_weight)
+                * (
+                    (positive_boundary - probabilities).clamp_min(0.0).square()
+                    * positive_mask
+                ).sum()
+                / safe_positive_count
+            ) * has_positive
+            chunk_loss = chunk_loss + (
+                float(self.training_config.threshold_negative_margin_weight)
+                * (
+                    (probabilities - negative_boundary).clamp_min(0.0).square()
+                    * negative_mask
+                ).sum()
+                / safe_negative_count
+            ) * has_negative
             # Every coordinate chunk has its own decoder graph, but all chunks
             # share the upstream latent graph. Keep that shared graph alive
             # until the final chunk has contributed its exact gradient.
             (scale * chunk_loss).backward(retain_graph=stop < total_voxels)
-        positive_loss = (
-            positive_sum / positive_count
-            if float(positive_count.item()) > 0.0
-            else flat_target.new_zeros(())
-        )
-        negative_loss = (
-            negative_sum / negative_count
-            if float(negative_count.item()) > 0.0
-            else flat_target.new_zeros(())
-        )
+        positive_loss = (positive_sum / safe_positive_count) * has_positive
+        negative_loss = (negative_sum / safe_negative_count) * has_negative
         detached_loss = scale * (
             float(self.training_config.threshold_positive_margin_weight)
             * positive_loss
