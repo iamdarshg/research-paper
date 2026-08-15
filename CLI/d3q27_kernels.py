@@ -445,8 +445,10 @@ if triton is not None:
         f_pre_c = f_pre + c * 27 * total
         f_out_c = f_out + c * 27 * total
 
-        # f_i_here = f_pre[c, i, x]
-        f_i_here = tl.load(f_pre_c + i * total + x, mask=valid, other=0.0)
+        # f_i_here = f_pre[c, i, x]. Task 35: upcast bf16 loads to fp32 so the
+        # interpolation arithmetic is fp32 regardless of Triton's mixed-dtype
+        # promotion (bf16 x fp32 does NOT auto-promote); identity for fp32.
+        f_i_here = tl.load(f_pre_c + i * total + x, mask=valid, other=0.0).to(tl.float32)
 
         # f_i_up = f_pre[c, i, x - e_i], zero-padded outside the domain.
         up_x = x3 - dxi
@@ -457,11 +459,11 @@ if triton is not None:
             f_pre_c + i * total + (up_x * n2 + up_y * n + up_z),
             mask=valid & up_in,
             other=0.0,
-        )
+        ).to(tl.float32)
 
         # streamed = f_out[k, x] already written by _stream_kernel_batch (the
         # periodically pulled value f_pre[k, x - e_k]).
-        streamed = tl.load(f_out_c + k * total + x, mask=valid, other=0.0)
+        streamed = tl.load(f_out_c + k * total + x, mask=valid, other=0.0).to(tl.float32)
 
         res_low = (1.0 - 2.0 * qi) * f_i_up + 2.0 * qi * f_i_here
         inv_2q = 1.0 / (2.0 * qi)

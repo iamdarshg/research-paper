@@ -36,6 +36,16 @@ try:
 except Exception:  # pragma: no cover - optional acceleration path
     stream_bfl_d3q27_batch_compressed = None
 
+# Task 35: bf16 population-storage knob for the batched workspace. Default
+# fp32 (the production precision contract). The experiment sets
+# ``D3Q27Solver.batch_population_dtype = torch.bfloat16`` to halve the two
+# resident batch population buffers (``_f_batch`` / ``_f_swap_batch``). The
+# design is "bf16 STORAGE, fp32 COMPUTE": every reduction, the collision
+# matmul, the force accumulators, and the stream/BFL kernels upcast bf16 loads
+# to fp32 before arithmetic, so the ONLY difference between the fp32 and bf16
+# runs is the stored population state, not reduction precision. OFF by default.
+_BATCH_POPULATION_DTYPE = torch.float32
+
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
     """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
@@ -189,6 +199,10 @@ class D3Q27Solver:
         # never alias the single-geometry _q_cache / _boundary_link_cache /
         # drag_link_metric_exponent / self.f. They are allocated lazily by
         # _init_batch_equilibrium at the batch size of the current call.
+        # Task 35: the population-buffer dtype is a knob, default fp32. Setting
+        # this attribute to torch.bfloat16 stores the batch populations in bf16
+        # (halving the two resident buffers); all arithmetic stays fp32.
+        self.batch_population_dtype = _BATCH_POPULATION_DTYPE
         self._f_batch = None
         self._f_pre_batch = None
         self._f_temp_batch = None
@@ -783,8 +797,20 @@ class D3Q27Solver:
         ``_f_temp_batch`` are retained as None so old external cleanup paths that
         reference them stay harmless.
         """
-        if self._f_batch is None or self._f_batch.shape[0] != C:
-            self._f_batch = torch.empty(C, 27, self.res, self.res, self.res, device=self.device)
+        if (
+            self._f_batch is None
+            or self._f_batch.shape[0] != C
+            or self._f_batch.dtype != self.batch_population_dtype
+        ):
+            self._f_batch = torch.empty(
+                C,
+                27,
+                self.res,
+                self.res,
+                self.res,
+                device=self.device,
+                dtype=self.batch_population_dtype,
+            )
             self._f_swap_batch = torch.empty_like(self._f_batch)
         rho = torch.ones(self.res, self.res, self.res, device=self.device)
         ux = torch.zeros_like(rho)
@@ -851,8 +877,8 @@ class D3Q27Solver:
         # (_f_batch = pre-stream source, untouched by streaming) and B
         # (_f_swap_batch = post-stream destination). Reads the same population
         # values the 3-buffer path read from _f_pre_batch/_f_temp_batch.
-        f_in_all = self._f_batch[:, 1:27] * boundary_links_batch
-        f_out_all = self._f_swap_batch[:, self._opposite_links] * boundary_links_batch
+        f_in_all = self._f_batch[:, 1:27].float() * boundary_links_batch
+        f_out_all = self._f_swap_batch[:, self._opposite_links].float() * boundary_links_batch
         sum_all = f_in_all + f_out_all
         step_force_x = (self._force_ex_links[None, ...] * sum_all).sum(dim=(1, 2, 3, 4))
         step_force_z = (self._force_ez_links[None, ...] * sum_all).sum(dim=(1, 2, 3, 4))
@@ -880,7 +906,7 @@ class D3Q27Solver:
             2.0
             * torch.abs(self._force_ex).view(1, 26, 1, 1, 1)
             * metric.unsqueeze(-1)
-            * self._f_batch[:, self._force_dir_index]
+            * self._f_batch[:, self._force_dir_index].float()
         )
         return torch.sum(
             torch.where(upwind[None, ...], projected * boundary_links_batch, torch.zeros_like(projected)),
@@ -897,25 +923,31 @@ class D3Q27Solver:
         f = self._f_swap_batch
         C = f.shape[0]
         if self.inlet_velocity_lu != 0.0:
+            # Task 35: compute the inlet equilibrium in fp32 regardless of the
+            # storage dtype (f may be bf16 under the knob); the write to
+            # ``f`` downcasts to the storage dtype. Only the stored population
+            # state differs between fp32 and bf16 runs.
             inlet_shape = f[:, :, 0, :, :].shape[2:]
-            rho_in = torch.ones((C, *inlet_shape), device=self.device, dtype=f.dtype)
+            rho_in = torch.ones((C, *inlet_shape), device=self.device, dtype=torch.float32)
             ux_in = torch.full_like(rho_in, self.inlet_velocity_lu)
             uy_in = torch.zeros_like(rho_in)
             uz_in = torch.zeros_like(rho_in)
             # Batch-aware equilibrium inlet: [1,27,1,1] velocity/weight views
             # broadcast against the [C,1,H,W] macroscopic plane -> [C,27,H,W].
             cu = (
-                self.ex.to(dtype=f.dtype).view(1, -1, 1, 1) * ux_in.unsqueeze(1)
-                + self.ey.to(dtype=f.dtype).view(1, -1, 1, 1) * uy_in.unsqueeze(1)
-                + self.ez.to(dtype=f.dtype).view(1, -1, 1, 1) * uz_in.unsqueeze(1)
+                self.ex.to(dtype=torch.float32).view(1, -1, 1, 1) * ux_in.unsqueeze(1)
+                + self.ey.to(dtype=torch.float32).view(1, -1, 1, 1) * uy_in.unsqueeze(1)
+                + self.ez.to(dtype=torch.float32).view(1, -1, 1, 1) * uz_in.unsqueeze(1)
             )
             u_sq = ux_in**2 + uy_in**2 + uz_in**2
             feq_in = (
-                self.w.to(dtype=f.dtype).view(1, -1, 1, 1)
+                self.w.to(dtype=torch.float32).view(1, -1, 1, 1)
                 * rho_in.unsqueeze(1)
                 * (1 + 3 * cu + 4.5 * cu**2 - 1.5 * u_sq.unsqueeze(1))
             )
-            f[:, self._inlet_mask, 0, :, :] = feq_in[:, self._inlet_mask]
+            # index_put requires matching dtypes; cast the fp32 equilibrium to
+            # the storage dtype (identity for fp32).
+            f[:, self._inlet_mask, 0, :, :] = feq_in[:, self._inlet_mask].to(dtype=f.dtype)
 
         f[:, self._outlet_mask, -1, :, :] = f[:, self._outlet_mask, -2, :, :]
 
@@ -969,7 +1001,10 @@ class D3Q27Solver:
                 res[q_low] = (1 - 2 * qi[q_low]) * f_neighbor[q_low] + 2 * qi[q_low] * f_i_here[q_low]
             if torch.any(q_high):
                 res[q_high] = (1 / (2 * qi[q_high])) * f_i_here[q_high] + (1 - 1 / (2 * qi[q_high])) * f_opp_streamed[q_high]
-            f_temp[opp_i].reshape(-1)[active_idx] = res
+            # Task 35: cast the fp32 result to the storage dtype (fp32 under
+            # the default, bf16 under the knob) because index_put requires
+            # matching dtypes; compute above stays fp32.
+            f_temp[opp_i].reshape(-1)[active_idx] = res.to(dtype=f_temp.dtype)
 
     def _compute_guo_forcing_batch(self, rho, u, F, omega):
         """Batched Guo forcing source term (ext_force is unused by training)."""
@@ -1009,11 +1044,16 @@ class D3Q27Solver:
 
         f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
-        rho = torch.sum(f_batch, dim=1).clamp_min(1e-8)
+        # Task 35: fp32 compute view. When the population buffers are bf16 this
+        # is a transient fp32 copy so every reduction below (rho/ux/uy/uz) and
+        # the collision matmul run in fp32; the ONLY difference between the fp32
+        # and bf16 runs is the STORED population state. Identity for fp32.
+        f_calc = f_batch.float()
+        rho = torch.sum(f_calc, dim=1).clamp_min(1e-8)
         has_ext_force = ext_force is not None
-        ux_raw = torch.sum(f_batch * ex_b, dim=1)
-        uy_raw = torch.sum(f_batch * ey_b, dim=1)
-        uz_raw = torch.sum(f_batch * ez_b, dim=1)
+        ux_raw = torch.sum(f_calc * ex_b, dim=1)
+        uy_raw = torch.sum(f_calc * ey_b, dim=1)
+        uz_raw = torch.sum(f_calc * ez_b, dim=1)
         if has_ext_force:
             ux = (ux_raw + 0.5 * ext_force[0]) / (rho + 1e-12)
             uy = (uy_raw + 0.5 * ext_force[1]) / (rho + 1e-12)
@@ -1026,9 +1066,10 @@ class D3Q27Solver:
         uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
         uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
 
-        # Flat-matmul collision (accepted LOW-parity reduction order).
+        # Flat-matmul collision (accepted LOW-parity reduction order). Runs on
+        # the fp32 compute view so bf16 storage never touches the matmul.
         N = f_batch[0, 0].numel()
-        f_flat = f_batch.reshape(C, 27, N)
+        f_flat = f_calc.reshape(C, 27, N)
         K = torch.matmul(self.moment_basis, f_flat)
         Keq = self.compute_moment_equilibrium_batch(rho, ux, uy, uz).reshape(C, 27, N)
 
@@ -1054,6 +1095,10 @@ class D3Q27Solver:
         f_new = torch.matmul(self.moment_basis_inv, K_post)
         f_batch.copy_(f_new.reshape_as(f_batch))
         f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+        # The fp32 compute view and collision transients are no longer needed;
+        # free them before streaming so peak VRAM reflects only the resident
+        # buffers (f_calc/f_flat are identity views in the fp32 default).
+        del f_calc, f_flat, K, Keq, K_post, f_new
         # No copy into a separate pre-stream buffer: A (f_batch) remains the
         # pre-stream source after streaming below.
 
@@ -1102,15 +1147,15 @@ class D3Q27Solver:
         self._f_batch, self._f_swap_batch = self._f_swap_batch, self._f_batch
         f_batch = self._f_batch
 
-        rho_new = torch.sum(f_batch, dim=1).clamp_min(1e-8)
+        rho_new = torch.sum(f_batch.float(), dim=1).clamp_min(1e-8)
         if has_ext_force:
-            ux_new = (torch.sum(f_batch * ex_b, dim=1) + 0.5 * ext_force[0]) / (rho_new + 1e-12)
-            uy_new = (torch.sum(f_batch * ey_b, dim=1) + 0.5 * ext_force[1]) / (rho_new + 1e-12)
-            uz_new = (torch.sum(f_batch * ez_b, dim=1) + 0.5 * ext_force[2]) / (rho_new + 1e-12)
+            ux_new = (torch.sum(f_batch.float() * ex_b, dim=1) + 0.5 * ext_force[0]) / (rho_new + 1e-12)
+            uy_new = (torch.sum(f_batch.float() * ey_b, dim=1) + 0.5 * ext_force[1]) / (rho_new + 1e-12)
+            uz_new = (torch.sum(f_batch.float() * ez_b, dim=1) + 0.5 * ext_force[2]) / (rho_new + 1e-12)
         else:
-            ux_new = torch.sum(f_batch * ex_b, dim=1) / (rho_new + 1e-12)
-            uy_new = torch.sum(f_batch * ey_b, dim=1) / (rho_new + 1e-12)
-            uz_new = torch.sum(f_batch * ez_b, dim=1) / (rho_new + 1e-12)
+            ux_new = torch.sum(f_batch.float() * ex_b, dim=1) / (rho_new + 1e-12)
+            uy_new = torch.sum(f_batch.float() * ey_b, dim=1) / (rho_new + 1e-12)
+            uz_new = torch.sum(f_batch.float() * ez_b, dim=1) / (rho_new + 1e-12)
         self._velocity_x_batch = ux_new.nan_to_num(0.0)
         self._velocity_y_batch = uy_new.nan_to_num(0.0)
         self._velocity_z_batch = uz_new.nan_to_num(0.0)
