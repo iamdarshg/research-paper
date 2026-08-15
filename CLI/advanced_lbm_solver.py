@@ -26,6 +26,11 @@ try:
 except Exception:  # pragma: no cover - optional acceleration path
     stream_bfl_d3q27 = None
 
+try:
+    from d3q27_kernels import stream_bfl_d3q27_batch
+except Exception:  # pragma: no cover - optional acceleration path
+    stream_bfl_d3q27_batch = None
+
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
     """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
@@ -173,6 +178,29 @@ class D3Q27Solver:
         # runs on a thread pool in parallel with the GPU LBM solves. Entries stay
         # on CPU; _get_q pops one and moves it to the solve device.
         self._warm_sdf_cache = {}
+
+        # Task 10: private batched-path workspaces. These are NEVER touched by
+        # the sequential path (collide_and_stream/_get_q/_boundary_links) and
+        # never alias the single-geometry _q_cache / _boundary_link_cache /
+        # drag_link_metric_exponent / self.f. They are allocated lazily by
+        # _init_batch_equilibrium at the batch size of the current call.
+        self._f_batch = None
+        self._f_pre_batch = None
+        self._f_temp_batch = None
+        self._velocity_x_batch = None
+        self._velocity_y_batch = None
+        self._velocity_z_batch = None
+        self._pressure_batch = None
+        self._rho_batch = None
+        self._force_x_accum_batch = None
+        self._force_z_accum_batch = None
+        self._projected_drag_accum_batch = None
+        self._force_samples_batch = None
+        self._force_x_last_batch = None
+        self._force_z_last_batch = None
+        self._projected_drag_last_batch = None
+        self._force_sample_start_batch = 0
+        self._force_step_batch = 0
 
         # Precompute Guo directions
         self.ei_guo = torch.stack([self.ex_f, self.ey_f, self.ez_f], dim=1).view(27, 3, 1, 1, 1)
@@ -580,6 +608,387 @@ class D3Q27Solver:
             self.projected_drag_accum += step_projected_drag
             self.force_samples += 1
         self._force_step += 1
+        return ux, uy, uz, rho
+
+    # ------------------------------------------------------------------
+    # Task 10: batched SPSA probe path. All workspaces are private to the
+    # batched methods; the sequential path is authoritative and untouched.
+    # ------------------------------------------------------------------
+    def _get_q_batch(self, geom_hashes, geometry_masks):
+        """Pop warm q tensors for a batch of geometries and stack them.
+
+        Mirrors the sequential ``_get_q`` pop/cold-fallback/refill-hook for each
+        item but returns a ``[C, 27, D, H, W]`` stack owned by the batched path.
+        Never writes into the single-geometry ``_q_cache``.
+        """
+        q_list = []
+        for geom_key, geometry_mask in zip(geom_hashes, geometry_masks):
+            warm_entry = self._warm_sdf_cache.pop(geom_key, None)
+            if warm_entry is not None:
+                q_cpu = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
+                q = q_cpu.to(geometry_mask.device)
+                refill = getattr(self, "_sdf_refill", None)
+                if callable(refill):
+                    refill(self)
+            else:
+                q = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
+            q_list.append(q)
+        return torch.stack(q_list, dim=0).contiguous()
+
+    def compute_moment_equilibrium_batch(self, rho, ux, uy, uz):
+        """Batched equilibrium tensor-product moments for D3Q27.
+
+        Same per-element operand order ``((rho * mx) * my) * mz`` as
+        ``compute_moment_equilibrium``, reshaped to ``[C, 27, D, H, W]``. The
+        broadcast shape differs from the single-geometry ``[27, D, H, W]``
+        (accepted LOW-parity source for the batched path).
+        """
+        cs2 = 1.0 / 3.0
+        mx = torch.stack([torch.ones_like(rho), ux, ux * ux + cs2], dim=1)  # [C,3,D,H,W]
+        my = torch.stack([torch.ones_like(rho), uy, uy * uy + cs2], dim=1)
+        mz = torch.stack([torch.ones_like(rho), uz, uz * uz + cs2], dim=1)
+        # Build all factors as [C,3,3,3,D,H,W] broadcast sources with the
+        # a/b/c index dims in positions 1/2/3, matching the sequential
+        # ((rho * mx[a]) * my[b]) * mz[c] operand order per element.
+        rho_7 = rho.unsqueeze(1).unsqueeze(2).unsqueeze(3)          # [C,1,1,1,D,H,W]
+        mx_7 = mx.unsqueeze(2).unsqueeze(3)                          # [C,3,1,1,D,H,W]
+        my_7 = my.unsqueeze(1).unsqueeze(3)                          # [C,1,3,1,D,H,W]
+        mz_7 = mz.unsqueeze(1).unsqueeze(2)                          # [C,1,1,3,D,H,W]
+        meq = rho_7 * mx_7 * my_7 * mz_7                             # [C,3,3,3,D,H,W]
+        return meq.reshape(meq.shape[0], 27, *rho.shape[1:])
+
+    def reset_force_accounting_batch(self, C, sample_start: int = 0):
+        """Reset [C]-shaped force bookkeeping for a batched solve."""
+        self._force_x_accum_batch = torch.zeros(C, device=self.device)
+        self._force_z_accum_batch = torch.zeros(C, device=self.device)
+        self._projected_drag_accum_batch = torch.zeros(C, device=self.device)
+        self._force_samples_batch = torch.zeros(C, dtype=torch.int64, device=self.device)
+        self._force_x_last_batch = torch.zeros(C, device=self.device)
+        self._force_z_last_batch = torch.zeros(C, device=self.device)
+        self._projected_drag_last_batch = torch.zeros(C, device=self.device)
+        self._force_sample_start_batch = max(0, int(sample_start))
+        self._force_step_batch = 0
+
+    def _init_batch_equilibrium(self, C):
+        """Allocate (if needed) and initialize the private batch buffers to the
+        same equilibrium state ``_initialize_equilibrium`` uses for a single
+        solve, so every item starts byte-identically to the sequential path."""
+        if self._f_batch is None or self._f_batch.shape[0] != C:
+            self._f_batch = torch.empty(C, 27, self.res, self.res, self.res, device=self.device)
+            self._f_pre_batch = torch.empty_like(self._f_batch)
+            self._f_temp_batch = torch.empty_like(self._f_batch)
+        rho = torch.ones(self.res, self.res, self.res, device=self.device)
+        ux = torch.zeros_like(rho)
+        uy = torch.zeros_like(rho)
+        uz = torch.zeros_like(rho)
+        if self.inlet_velocity_lu:
+            ux = torch.full_like(rho, self.inlet_velocity_lu)
+        feq = self.compute_equilibrium(rho, ux, uy, uz)
+        self._f_batch.copy_(feq.unsqueeze(0).expand(C, -1, -1, -1, -1))
+        self._f_pre_batch.copy_(self._f_batch)
+        self._f_temp_batch.copy_(self._f_batch)
+        self._velocity_x_batch = ux.unsqueeze(0).expand(C, -1, -1, -1).clone()
+        self._velocity_y_batch = uy.unsqueeze(0).expand(C, -1, -1, -1).clone()
+        self._velocity_z_batch = uz.unsqueeze(0).expand(C, -1, -1, -1).clone()
+        self._pressure_batch = (rho * (1.0 / 3.0)).unsqueeze(0).expand(C, -1, -1, -1).clone()
+        self._rho_batch = rho.unsqueeze(0).expand(C, -1, -1, -1).clone()
+
+    def _boundary_links_batch(self, mask_stack, geom_hashes=None):
+        """Stacked ``[C, 26, D, H, W]`` fluid-solid links.
+
+        Recomputes the same links ``_boundary_links`` produces per geometry but
+        stacked, bypassing the single-geometry ``_boundary_link_cache``.
+        """
+        masks_bool = mask_stack > 0.5
+        links_list = []
+        for c in range(mask_stack.shape[0]):
+            mask = masks_bool[c]
+            fluid = ~mask
+            D, H, W = mask.shape
+            mask_padded = torch.nn.functional.pad(mask, (1, 1, 1, 1, 1, 1), mode='constant', value=0)
+            links = []
+            for i in self._force_dirs:
+                dx, dy, dz = self._stream_shifts[i]
+                d_s, d_e = 1 + dx, 1 + dx + D
+                h_s, h_e = 1 + dy, 1 + dy + H
+                w_s, w_e = 1 + dz, 1 + dz + W
+                neighbor_is_solid = mask_padded[d_s:d_e, h_s:h_e, w_s:w_e]
+                links.append(fluid & neighbor_is_solid)
+            links_list.append(torch.stack(links, dim=0))
+        return torch.stack(links_list, dim=0)
+
+    def _effective_drag_link_metric_exponent_batch(self, mask_stack):
+        """Per-item ``[C]`` drag-link metric exponent vector.
+
+        Same formula as ``_effective_drag_link_metric_exponent`` but computed per
+        mask and never touching the shared ``self.drag_link_metric_exponent``.
+        """
+        exps = []
+        for c in range(mask_stack.shape[0]):
+            projected_cells = torch.sum(torch.any(mask_stack[c] > 0.5, dim=0).float()).item()
+            projected_side = float(np.sqrt(max(projected_cells, 1.0)))
+            exps.append(float(np.clip(1.68 - 0.295 * (projected_side - 13.0), 0.5, 1.68)))
+        return torch.tensor(exps, device=self.device)
+
+    def _accumulate_momentum_exchange_force_batch(self, mask_stack, boundary_links_batch=None, geom_hashes=None):
+        """Vectorized 26-dir momentum-exchange sum over a batch.
+
+        Same mask-multiply formulas as ``_accumulate_momentum_exchange_force_nosync``
+        with a ``[C]`` reduction over ``(1,2,3,4)``; per-item reduction order is
+        unchanged from the vectorized kernel.
+        """
+        if boundary_links_batch is None:
+            boundary_links_batch = self._boundary_links_batch(mask_stack, geom_hashes)
+        f_in_all = self._f_pre_batch[:, 1:27] * boundary_links_batch
+        f_out_all = self._f_temp_batch[:, self._opposite_links] * boundary_links_batch
+        sum_all = f_in_all + f_out_all
+        step_force_x = (self._force_ex_links[None, ...] * sum_all).sum(dim=(1, 2, 3, 4))
+        step_force_z = (self._force_ez_links[None, ...] * sum_all).sum(dim=(1, 2, 3, 4))
+        return step_force_x, step_force_z
+
+    def _accumulate_projected_pressure_drag_proxy_batch(self, mask_stack, boundary_links_batch=None, geom_hashes=None, exponents_batch=None):
+        """Batched coarse-grid pressure-drag proxy (same formula as
+        ``_accumulate_projected_pressure_drag_proxy``, per-item exponent vector)."""
+        if boundary_links_batch is None:
+            boundary_links_batch = self._boundary_links_batch(mask_stack, geom_hashes)
+        C = mask_stack.shape[0]
+        flow_sign = 1.0 if self.inlet_velocity_lu >= 0.0 else -1.0
+        upwind = (self._force_ex * flow_sign) > 0.0
+        if exponents_batch is None:
+            exponents_batch = self._effective_drag_link_metric_exponent_batch(mask_stack)
+        # [1,26,1,1] link-speed metric against [C,1,1,1] exponents -> [C,26,1,1],
+        # which broadcasts against the [C,26,D,H,W] projected population slice.
+        metric = torch.pow(
+            self._force_speed.clamp_min(1.0).view(1, 26, 1, 1),
+            -exponents_batch.view(C, 1, 1, 1),
+        )
+        # 5-D link factors [C,26,1,1,1] so the link axis stays in dim 1 when
+        # broadcast against the [C,26,D,H,W] pre-stream population slice.
+        projected = (
+            2.0
+            * torch.abs(self._force_ex).view(1, 26, 1, 1, 1)
+            * metric.unsqueeze(-1)
+            * self._f_pre_batch[:, self._force_dir_index]
+        )
+        return torch.sum(
+            torch.where(upwind[None, ...], projected * boundary_links_batch, torch.zeros_like(projected)),
+            dim=(1, 2, 3, 4),
+        )
+
+    def _apply_domain_boundaries_batch(self):
+        """Batched inlet/outlet/mirror domain boundaries (leading batch dim)."""
+        f = self._f_temp_batch
+        C = f.shape[0]
+        if self.inlet_velocity_lu != 0.0:
+            inlet_shape = f[:, :, 0, :, :].shape[2:]
+            rho_in = torch.ones((C, *inlet_shape), device=self.device, dtype=f.dtype)
+            ux_in = torch.full_like(rho_in, self.inlet_velocity_lu)
+            uy_in = torch.zeros_like(rho_in)
+            uz_in = torch.zeros_like(rho_in)
+            # Batch-aware equilibrium inlet: [1,27,1,1] velocity/weight views
+            # broadcast against the [C,1,H,W] macroscopic plane -> [C,27,H,W].
+            cu = (
+                self.ex.to(dtype=f.dtype).view(1, -1, 1, 1) * ux_in.unsqueeze(1)
+                + self.ey.to(dtype=f.dtype).view(1, -1, 1, 1) * uy_in.unsqueeze(1)
+                + self.ez.to(dtype=f.dtype).view(1, -1, 1, 1) * uz_in.unsqueeze(1)
+            )
+            u_sq = ux_in**2 + uy_in**2 + uz_in**2
+            feq_in = (
+                self.w.to(dtype=f.dtype).view(1, -1, 1, 1)
+                * rho_in.unsqueeze(1)
+                * (1 + 3 * cu + 4.5 * cu**2 - 1.5 * u_sq.unsqueeze(1))
+            )
+            f[:, self._inlet_mask, 0, :, :] = feq_in[:, self._inlet_mask]
+
+        f[:, self._outlet_mask, -1, :, :] = f[:, self._outlet_mask, -2, :, :]
+
+        f[:, :, :, 0, :] = f[:, :, :, 1, :]
+        f[:, :, :, -1, :] = f[:, :, :, -2, :]
+        f[:, :, :, :, 0] = f[:, :, :, :, 1]
+        f[:, :, :, :, -1] = f[:, :, :, :, -2]
+
+    def _stream_batch_fallback(self):
+        """Reference streaming fallback (27x roll) writing f_temp_batch."""
+        for c in range(self._f_batch.shape[0]):
+            for i in range(27):
+                self._f_temp_batch[c][i] = torch.roll(
+                    self._f_batch[c][i], shifts=self._stream_shifts[i], dims=(0, 1, 2)
+                )
+
+    def _apply_bfl_boundary_batch_item(self, c, mask, q):
+        """Reference BFL for one batch item (fallback-only path).
+
+        Reads ``f_pre_batch[c]`` and writes ``f_temp_batch[c]``. Boundary links
+        are recomputed per item (no single-geometry cache), so the fallback
+        never populates ``_boundary_link_cache``.
+        """
+        f_pre = self._f_pre_batch[c]
+        f_temp = self._f_temp_batch[c]
+        boundary_links = self._boundary_links_batch(mask.unsqueeze(0))[0]
+        D, H, W = mask.shape
+        f_pre_padded = torch.nn.functional.pad(f_pre, (1, 1, 1, 1, 1, 1), mode='constant', value=0)
+        for i in range(1, 27):
+            opp_i = self._opposite_list[i]
+            link_idx = i - 1
+            active = boundary_links[link_idx]
+            if not torch.any(active):
+                continue
+            qi = q[i][active]
+            dx, dy, dz = self._stream_shifts[i]
+            f_neighbor = f_pre_padded[i, 1 - dx:1 - dx + D, 1 - dy:1 - dy + H, 1 - dz:1 - dz + W][active]
+            q_low = qi < 0.5
+            q_high = ~q_low
+            res = torch.zeros_like(qi)
+            if torch.any(q_low):
+                res[q_low] = (1 - 2 * qi[q_low]) * f_neighbor[q_low] + 2 * qi[q_low] * f_pre[i][active][q_low]
+            if torch.any(q_high):
+                res[q_high] = (1 / (2 * qi[q_high])) * f_pre[i][active][q_high] + (1 - 1 / (2 * qi[q_high])) * f_temp[opp_i][active][q_high]
+            f_temp[opp_i][active] = res
+
+    def _compute_guo_forcing_batch(self, rho, u, F, omega):
+        """Batched Guo forcing source term (ext_force is unused by training)."""
+        cs2 = 1.0 / 3.0
+        uF = torch.sum(u * F.unsqueeze(0), dim=1)
+        factor = (1.0 - 0.5 * omega)
+        ei_u = torch.sum(self.ei_guo.view(1, 27, 3, 1, 1, 1) * u.unsqueeze(1), dim=2)
+        ei_F = torch.sum(self.ei_guo.view(1, 27, 3, 1, 1, 1) * F.view(1, 1, 3, 1, 1, 1), dim=2)
+        term1 = (ei_F - uF.unsqueeze(1)) / cs2
+        term2 = (ei_u * ei_F) / (cs2**2)
+        return factor * self.w.view(27, 1, 1, 1) * (term1 + term2)
+
+    def collide_and_stream_batch(self, omega, mask_stack, ext_force=None, geom_hashes=None, q_stack=None, boundary_links_batch=None, exponents_batch=None):
+        """One collide/stream step for C geometries at once.
+
+        ``mask_stack`` is ``[C, D, H, W]``; ``q_stack`` is ``[C, 27, D, H, W]``.
+        All workspaces are private (``_f_batch``/``_f_pre_batch``/``_f_temp_batch``
+        and the ``_*_batch`` accumulators); the sequential ``self.f`` state and
+        single-geometry caches are never touched.
+        """
+        C = mask_stack.shape[0]
+        device = self.device
+        f_batch = self._f_batch
+        f_pre_batch = self._f_pre_batch
+        f_temp_batch = self._f_temp_batch
+        ex_b = self.ex_f.view(1, 27, 1, 1, 1)
+        ey_b = self.ey_f.view(1, 27, 1, 1, 1)
+        ez_b = self.ez_f.view(1, 27, 1, 1, 1)
+
+        f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+
+        rho = torch.sum(f_batch, dim=1).clamp_min(1e-8)
+        has_ext_force = ext_force is not None
+        ux_raw = torch.sum(f_batch * ex_b, dim=1)
+        uy_raw = torch.sum(f_batch * ey_b, dim=1)
+        uz_raw = torch.sum(f_batch * ez_b, dim=1)
+        if has_ext_force:
+            ux = (ux_raw + 0.5 * ext_force[0]) / (rho + 1e-12)
+            uy = (uy_raw + 0.5 * ext_force[1]) / (rho + 1e-12)
+            uz = (uz_raw + 0.5 * ext_force[2]) / (rho + 1e-12)
+        else:
+            ux = ux_raw / (rho + 1e-12)
+            uy = uy_raw / (rho + 1e-12)
+            uz = uz_raw / (rho + 1e-12)
+        ux = ux.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+        uy = uy.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+        uz = uz.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+
+        # Flat-matmul collision (accepted LOW-parity reduction order).
+        N = f_batch[0, 0].numel()
+        f_flat = f_batch.reshape(C, 27, N)
+        K = torch.matmul(self.moment_basis, f_flat)
+        Keq = self.compute_moment_equilibrium_batch(rho, ux, uy, uz).reshape(C, 27, N)
+
+        s_key = (float(omega), float(self.s_e), float(self.s_h))
+        S = self._s_vec_cache.get(s_key)
+        if S is None:
+            s_vec = torch.tensor([0.0, self.s_e, float(omega), self.s_h], device=device)
+            S = s_vec[self.s_indices].view(27, 1, 1, 1)
+            if len(self._s_vec_cache) > 32:
+                self._s_vec_cache.clear()
+            self._s_vec_cache[s_key] = S
+
+        S_flat = S.view(27, 1)
+        K_post = K + S_flat * (Keq - K)
+
+        if has_ext_force and torch.any(ext_force != 0):
+            u_stacked = torch.stack([ux, uy, uz], dim=1)
+            S_guo = self._compute_guo_forcing_batch(rho, u_stacked, ext_force, omega)
+            K_post += torch.matmul(self.moment_basis, S_guo.reshape(C, 27, N))
+
+        K_post[:, self.conserved_indices, :] = Keq[:, self.conserved_indices, :]
+
+        f_new = torch.matmul(self.moment_basis_inv, K_post)
+        f_batch.copy_(f_new.reshape_as(f_batch))
+        f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+
+        f_pre_batch.copy_(f_batch)
+
+        used_fused_bfl = False
+        if self.use_fused_stream_bfl and stream_bfl_d3q27_batch is not None:
+            if q_stack is None:
+                q_stack = self._get_q_batch(
+                    geom_hashes, [mask_stack[c] for c in range(C)]
+                )
+            solid_u8_batch = (mask_stack > 0.5).to(torch.uint8).contiguous()
+            used_fused_bfl = stream_bfl_d3q27_batch(
+                f_pre_batch,
+                f_temp_batch,
+                solid_u8_batch,
+                q_stack.contiguous(),
+                self.ex,
+                self.ey,
+                self.ez,
+                self.opposite,
+            )
+
+        if not used_fused_bfl:
+            self._stream_batch_fallback()
+            if q_stack is None:
+                q_stack = self._get_q_batch(
+                    geom_hashes, [mask_stack[c] for c in range(C)]
+                )
+            for c in range(C):
+                self._apply_bfl_boundary_batch_item(c, mask_stack[c], q_stack[c])
+
+        self._apply_domain_boundaries_batch()
+
+        step_force_x, step_force_z = self._accumulate_momentum_exchange_force_batch(
+            mask_stack, boundary_links_batch=boundary_links_batch, geom_hashes=geom_hashes
+        )
+        step_projected_drag = self._accumulate_projected_pressure_drag_proxy_batch(
+            mask_stack,
+            boundary_links_batch=boundary_links_batch,
+            geom_hashes=geom_hashes,
+            exponents_batch=exponents_batch,
+        )
+
+        f_batch.copy_(f_temp_batch)
+        f_batch.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+
+        rho_new = torch.sum(f_batch, dim=1).clamp_min(1e-8)
+        if has_ext_force:
+            ux_new = (torch.sum(f_batch * ex_b, dim=1) + 0.5 * ext_force[0]) / (rho_new + 1e-12)
+            uy_new = (torch.sum(f_batch * ey_b, dim=1) + 0.5 * ext_force[1]) / (rho_new + 1e-12)
+            uz_new = (torch.sum(f_batch * ez_b, dim=1) + 0.5 * ext_force[2]) / (rho_new + 1e-12)
+        else:
+            ux_new = torch.sum(f_batch * ex_b, dim=1) / (rho_new + 1e-12)
+            uy_new = torch.sum(f_batch * ey_b, dim=1) / (rho_new + 1e-12)
+            uz_new = torch.sum(f_batch * ez_b, dim=1) / (rho_new + 1e-12)
+        self._velocity_x_batch = ux_new.nan_to_num(0.0)
+        self._velocity_y_batch = uy_new.nan_to_num(0.0)
+        self._velocity_z_batch = uz_new.nan_to_num(0.0)
+        self._pressure_batch = rho_new * (1.0 / 3.0)
+        self._rho_batch = rho_new
+
+        self._force_x_last_batch = step_force_x
+        self._force_z_last_batch = step_force_z
+        self._projected_drag_last_batch = step_projected_drag
+        if self._force_step_batch >= self._force_sample_start_batch:
+            self._force_x_accum_batch += step_force_x
+            self._force_z_accum_batch += step_force_z
+            self._projected_drag_accum_batch += step_projected_drag
+            self._force_samples_batch += 1
+        self._force_step_batch += 1
         return ux, uy, uz, rho
 
 
@@ -1059,6 +1468,228 @@ class D3Q27CascadedSolver:
                 'reference_area_source': 'projected_frontal_voxel_area_yz',
             },
         } | shape_drag_metrics
+
+    # ------------------------------------------------------------------
+    # Task 10: batched SPSA probe path (private workspaces on the inner
+    # solver). The sequential collide_stream / compute_aerodynamic_coefficients
+    # remain authoritative and are not called from these methods.
+    # ------------------------------------------------------------------
+    def collide_stream_batch(self, geometry_masks, steps: int = 100, geom_hashes=None, q_stack=None, ext_force=None):
+        """Run collide/stream for a batch of C geometries at once.
+
+        ``geometry_masks`` is a ``[C, D, H, W]`` binary float tensor. Returns a
+        list of C per-item coefficient dicts (at least ``drag_coefficient`` and
+        ``lift_coefficient``), each reproducing the schema a single sequential
+        solve produces.
+        """
+        C = geometry_masks.shape[0]
+        geometry_masks = geometry_masks.to(self.device, non_blocking=True)
+        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
+        dt = getattr(self.config.lbm_config, 'time_step', 0.001)
+        nu = self._estimate_kinematic_viscosity()
+        self.nu = nu
+        tau_min = float(getattr(self.phys_config, "tau_min_d3q27", 0.52))
+        tau = max(3.0 * nu + 0.5, tau_min)
+        omega = 1.0 / max(tau, 1e-12)
+
+        sample_window = max(10, steps // 4)
+        sample_start = max(0, steps - sample_window)
+        self._solver.reset_force_accounting_batch(C, sample_start=sample_start)
+
+        if geom_hashes is None:
+            geom_hashes = [compute_tensor_content_hash(geometry_masks[c]) for c in range(C)]
+        if q_stack is None:
+            q_stack = self._solver._get_q_batch(geom_hashes, [geometry_masks[c] for c in range(C)])
+
+        # Geometry-only precompute, reused across all steps: stacked boundary
+        # links and the per-item drag-link metric exponent. Never populates the
+        # single-geometry _boundary_link_cache or drag_link_metric_exponent.
+        boundary_links_batch = self._solver._boundary_links_batch(geometry_masks, geom_hashes)
+        exponents_batch = self._solver._effective_drag_link_metric_exponent_batch(geometry_masks)
+
+        self._solver._init_batch_equilibrium(C)
+
+        for step in range(steps):
+            ux, uy, uz, rho = self._solver.collide_and_stream_batch(
+                omega,
+                geometry_masks,
+                ext_force=ext_force,
+                geom_hashes=geom_hashes,
+                q_stack=q_stack,
+                boundary_links_batch=boundary_links_batch,
+                exponents_batch=exponents_batch,
+            )
+            # Mirror the single-solve field aliasing for diagnostics (item 0).
+            self.velocity_x = ux[0]
+            self.velocity_y = uy[0]
+            self.velocity_z = uz[0]
+            self.pressure = rho[0] * (1.0 / 3.0)
+            self.rho = rho[0]
+
+        return self.compute_aerodynamic_coefficients_batch(geometry_masks)
+
+    def compute_aerodynamic_coefficients_batch(self, geometry_masks):
+        """Reproduce ``compute_aerodynamic_coefficients`` per item from the
+        batched force accounting and velocity fields. Returns a list of C dicts.
+        """
+        C = geometry_masks.shape[0]
+        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
+        solver = self._solver
+        results = []
+        for c in range(C):
+            mask = geometry_masks[c]
+            solid = mask > 0.5
+            ref_area = torch.sum(torch.any(solid, dim=0).float()).item() * h**2
+            ref_area = max(ref_area, h**2)
+
+            force_samples = int(solver._force_samples_batch[c].item())
+            if force_samples > 0:
+                projected_drag = solver._projected_drag_accum_batch[c] / force_samples
+                net_drag_force = solver._force_x_accum_batch[c] / force_samples
+                lift_force = solver._force_z_accum_batch[c] / force_samples
+                force_definition = 'raw bounce-back momentum exchange averaged over the last-quarter window'
+            else:
+                projected_drag = solver._projected_drag_last_batch[c]
+                net_drag_force = solver._force_x_last_batch[c]
+                lift_force = solver._force_z_last_batch[c]
+                force_definition = 'raw bounce-back momentum exchange from last streaming step'
+
+            projected_area_lattice = max(torch.sum(torch.any(solid, dim=0).float()).item(), 1.0)
+            raw_projected_drag_coefficient = float(projected_drag.item() / projected_area_lattice)
+            freestream_speed = float(getattr(self.config, 'mach_number', 0.0) * 343.0)
+            drag_reference_speed = float(getattr(self.phys_config, 'drag_reference_speed', 80.0))
+            speed_exponent = float(getattr(self.phys_config, 'drag_speed_normalization_exponent', 1.0))
+            if freestream_speed > 1e-12 and drag_reference_speed > 0.0 and speed_exponent != 0.0:
+                speed_normalization = (drag_reference_speed / freestream_speed) ** speed_exponent
+            else:
+                speed_normalization = 1.0
+            physical_net_drag_force = _scale_momentum_exchange_force(
+                net_drag_force, h, getattr(self.config, 'mach_number', 0.0)
+            )
+            physical_lift_force = _scale_momentum_exchange_force(
+                lift_force, h, getattr(self.config, 'mach_number', 0.0)
+            )
+
+            physical_pressure_fallback_force = raw_projected_drag_coefficient * (
+                0.5 * 1.225 * freestream_speed**2 * ref_area
+            )
+
+            shape_drag_scale, shape_drag_metrics = self._shape_drag_correction(mask, projected_area_lattice)
+            drag_coefficient_surrogate = raw_projected_drag_coefficient * speed_normalization * shape_drag_scale
+            physical_surrogate_force = drag_coefficient_surrogate * (0.5 * 1.225 * freestream_speed**2 * ref_area)
+
+            lbm_raw_force = physical_net_drag_force
+            lbm_calibrated_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
+            physical_drag_force = lbm_raw_force
+
+            coeffs = _compute_force_coefficients(
+                physical_drag_force,
+                physical_lift_force,
+                getattr(self.config, 'mach_number', 0.0),
+                ref_area=max(ref_area, 1e-12),
+                rho_ref=1.225,
+            )
+
+            force_stability = 1.0
+            if force_samples > 20:
+                avg_fx = float(solver._force_x_accum_batch[c].item()) / force_samples
+                last_fx = float(solver._force_x_last_batch[c].item())
+                force_stability = abs(last_fx - avg_fx) / (abs(avg_fx) + 1e-6)
+
+            lbm_converged = bool(
+                not torch.isnan(solver._velocity_x_batch[c]).any()
+                and abs(float(solver._force_x_last_batch[c].item())) < 1e5
+                and force_samples > 50
+                and force_stability < 0.1
+            )
+            compressibility_metadata = build_lbm_compressibility_metadata(
+                mach_number=getattr(self.config, 'mach_number', 0.0),
+                u_lattice=self.inlet_velocity_lu,
+                lbm_converged=lbm_converged,
+                force_stability=force_stability,
+            )
+
+            drag_coefficient = float(coeffs['drag_coefficient'])
+            lift_coefficient = float(coeffs['lift_coefficient'])
+            calibrated_drag_coefficient = float(drag_coefficient_surrogate)
+            training_drag_coefficient = calibrated_drag_coefficient
+            training_drag_label_source = 'lbm_calibrated'
+            if lbm_converged and np.isfinite(drag_coefficient) and drag_coefficient > 0.0:
+                training_drag_coefficient = drag_coefficient
+                training_drag_label_source = 'lbm_raw'
+            training_drag_source = str(compressibility_metadata.get('training_drag_source', 'internal_lbm_raw_low_mach'))
+            if training_drag_source.startswith('none_'):
+                training_drag_coefficient = None
+                training_drag_label_source = training_drag_source
+            lift_to_drag = float(lift_coefficient / max(abs(drag_coefficient), 1e-12))
+
+            v_inf = coeffs.get('freestream_speed', 0.0)
+            nu_turb_mean = 0.0
+            reynolds_turbulent = float(v_inf * h * self.resolution / max(self.nu + nu_turb_mean, 1e-12))
+
+            results.append({
+                'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
+                'force_z': float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force),
+                'label_source': 'lbm_d3q27',
+                'label_tier': 'lbm_raw',
+                'lbm_converged': lbm_converged,
+                'force_stability': force_stability,
+                **compressibility_metadata,
+                'physical_force_source': float(physical_net_drag_force.item() if isinstance(physical_net_drag_force, torch.Tensor) else physical_net_drag_force),
+                'pressure_only_fallback': float(physical_pressure_fallback_force),
+                'surrogate_proxy_force': float(physical_surrogate_force),
+                'raw_force_x': float(projected_drag.item() if isinstance(projected_drag, torch.Tensor) else projected_drag),
+                'raw_force_z': float(lift_force.item() if isinstance(lift_force, torch.Tensor) else lift_force),
+                'drag_coefficient': drag_coefficient,
+                'calibrated_drag_coefficient': calibrated_drag_coefficient,
+                'training_drag_coefficient': training_drag_coefficient,
+                'training_drag_source': training_drag_source,
+                'training_drag_label_source': training_drag_label_source,
+                'lift_coefficient': lift_coefficient,
+                'lift_to_drag': lift_to_drag,
+                'net_momentum_exchange_force_x': float(physical_net_drag_force.item() if isinstance(physical_net_drag_force, torch.Tensor) else physical_net_drag_force),
+                'raw_net_momentum_exchange_force_x': float(net_drag_force.item() if isinstance(net_drag_force, torch.Tensor) else net_drag_force),
+                'projected_area_lattice': projected_area_lattice,
+                'raw_projected_drag_coefficient': raw_projected_drag_coefficient,
+                'drag_speed_normalization': speed_normalization,
+                'drag_reference_speed': drag_reference_speed,
+                'drag_speed_normalization_exponent': speed_exponent,
+                'shape_drag_scale': shape_drag_scale,
+                'force_definition': force_definition,
+                'pressure_sum': float(solver._pressure_batch[c].sum().item()),
+                'max_turbulent_viscosity': 0.0,
+                'mean_smagorinsky_constant': float(getattr(self.phys_config, 'smagorinsky_constant', 0.17)),
+                'max_vorticity': 0.0,
+                'vortex_core_volume': 0.0,
+                'reference_area': ref_area,
+                'reference_area_source': 'projected_frontal_voxel_area_yz',
+                'reference_area_lattice': projected_area_lattice,
+                'reference_length': h * self.resolution,
+                'reference_length_source': 'grid_spacing_times_resolution',
+                'freestream_speed': v_inf,
+                'density': coeffs['density'],
+                'reynolds_number_turbulent': reynolds_turbulent,
+                'empty_geometry': bool(torch.sum(solid.float()).item() <= 0.0),
+                'claim_bearing_cfd': False,
+                'solver_quality_checks': {
+                    'finite_coefficients': bool(np.isfinite(drag_coefficient) and np.isfinite(lift_coefficient)),
+                    'positive_reference_area': bool(ref_area > 0.0),
+                    'nonempty_geometry': bool(torch.sum(solid.float()).item() > 0.0),
+                    'finite_force_outputs': bool(
+                        np.isfinite(float(physical_net_drag_force.item() if isinstance(physical_net_drag_force, torch.Tensor) else physical_net_drag_force))
+                        and np.isfinite(float(physical_lift_force.item() if isinstance(physical_lift_force, torch.Tensor) else physical_lift_force))
+                    ),
+                },
+                'solver_provenance': {
+                    'primary_solver': 'D3Q27',
+                    'label_tier': 'lbm_raw',
+                    'lbm_converged': lbm_converged,
+                    'grid_resolution': int(self.resolution),
+                    'force_samples': int(force_samples),
+                    'reference_area_source': 'projected_frontal_voxel_area_yz',
+                },
+            } | shape_drag_metrics)
+        return results
 
 
 if __name__ == '__main__':
