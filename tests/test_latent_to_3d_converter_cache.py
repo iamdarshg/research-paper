@@ -19,6 +19,14 @@ if CLI_DIR not in sys.path:
 
 from aircraft_diffusion_cfd import LatentTo3DConverter
 
+# Task 6-1: the fused cat+chunk decode is mathematically identical to three
+# separate decodes, but torch's batched matmul may select a different BLAS
+# kernel for a [3B*N, D] input than for [B*N, D], producing last-bit float32
+# round-off from the different reduction order. Measured max abs diff <= 3e-8
+# on CPU/Windows; 1e-6 gives a ~30x margin while still failing on any real
+# divergence.
+FUSED_DECODE_ATOL = 1e-6
+
 
 def _make_converter(bands, grid_resolution=8, chunk_size=64):
     return LatentTo3DConverter(
@@ -166,3 +174,47 @@ def test_forward_cold_vs_warm_and_uncached_bit_identical(batch_size, fourier_ban
     assert cold.shape == (batch_size, *converter.output_shape)
     assert torch.equal(cold, warm)
     assert torch.equal(warm, reference)
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("fourier_bands", [8, 0])
+def test_fused_stacked_decode_matches_separate_decodes(batch_size, fourier_bands):
+    """Task 6-1 regression: the three-way decoder fuse matches separate decodes.
+
+    The production geometry-loss path (OptimizedDiffusionTrainer) fuses the
+    three ``forward_flat_indices`` decodes of ``latent`` / ``x0_pred`` /
+    ``generation_latent`` into ONE stacked call (``torch.cat(..., dim=0)``)
+    followed by ``torch.chunk(..., 3, dim=0)``. Cat + chunk are mathematically
+    identical to three separate decodes, so the fused output must match within
+    float32 last-bit round-off (``FUSED_DECODE_ATOL``), not approximately.
+    """
+    torch.manual_seed(20260815)
+    converter = _make_converter(fourier_bands)
+    converter.eval()
+    latent = torch.randn(batch_size, 4, dtype=torch.float32)
+    x0_pred = torch.randn(batch_size, 4, dtype=torch.float32)
+    generation_latent = torch.randn(batch_size, 4, dtype=torch.float32)
+    flat_indices = torch.tensor([0, 3, 9, 100, 255, 256, 511], dtype=torch.long)
+
+    with torch.no_grad():
+        separate = tuple(
+            converter.forward_flat_indices(code, flat_indices)
+            for code in (latent, x0_pred, generation_latent)
+        )
+        stacked = converter.forward_flat_indices(
+            torch.cat((latent, x0_pred, generation_latent), dim=0),
+            flat_indices,
+        )
+        fused = tuple(torch.chunk(stacked, 3, dim=0))
+
+    for fused_part, separate_part in zip(fused, separate):
+        assert fused_part.shape == separate_part.shape
+        assert torch.allclose(
+            fused_part,
+            separate_part,
+            atol=FUSED_DECODE_ATOL,
+            rtol=FUSED_DECODE_ATOL,
+        ), (
+            f"fused vs separate decode diverged: "
+            f"max_abs_diff={float((fused_part - separate_part).abs().max().item()):.3e}"
+        )

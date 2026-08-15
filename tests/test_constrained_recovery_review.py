@@ -1101,6 +1101,83 @@ def test_config_fixed_threshold_overrides_saved_threshold_when_calibration_disab
     ]
 
 
+def test_config_fixed_load_run_state_preserves_config_threshold(tmp_path, monkeypatch):
+    """C1: a config-fixed trainer resuming a run-state keeps the config threshold.
+
+    ``_prepare_geometry_threshold_for_run`` forces the config 0.5 BEFORE
+    ``trainer.load_run_state`` runs; the old ``load_run_state`` then re-set the
+    run-state's saved (previously-calibrated) threshold, silently overriding the
+    config value. With calibration disabled the config value is authoritative, so
+    ``load_run_state`` must skip the restore entirely and both
+    ``geometry_probability_threshold`` and ``direct_solver_loss.threshold`` must
+    stay in sync at the config value.
+    """
+    # The run-state embeds numpy/random RNG globals, so weights_only=True
+    # rejects it; route it through a trusted path so the fallback fires exactly
+    # like a production build/ run-state.
+    monkeypatch.setattr(recovery, "_TRUSTED_CHECKPOINT_ROOT", tmp_path)
+
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    diffusion = DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4)
+    training = TrainingConfig(
+        num_epochs=1,
+        consistency_interval=1,
+        direct_solver_steps=1,
+        direct_solver_directions=1,
+        direct_solver_interval=1,
+        offload_optimizer_state_between_steps=False,
+        calibrate_geometry_materialization_threshold=False,
+        geometry_materialization_threshold=0.5,
+    )
+    cfd = CFDConfig(base_grid_resolution=4)
+    compatibility = {
+        "manifest_identity": "c1",
+        "grid_size": 4,
+        "latent_dim": 4,
+        "split": "train",
+        "sample_count": 1,
+        "configuration": {"num_epochs": 1, "direct_solver_steps": 1},
+    }
+
+    source = OptimizedDiffusionTrainer(
+        config, diffusion, training, cfd, device=torch.device("cpu")
+    )
+    source._set_geometry_probability_threshold(
+        0.9752,
+        calibrated=True,
+        calibration={"source": "calibrated", "threshold": 0.9752},
+    )
+    run_state_path = tmp_path / "latest_run_state.pt"
+    source.save_run_state(
+        run_state_path,
+        epoch_index=0,
+        completed_in_epoch=1,
+        sample_order=[0],
+        compatibility=compatibility,
+    )
+
+    resumed = OptimizedDiffusionTrainer(
+        config, diffusion, training, cfd, device=torch.device("cpu")
+    )
+    resumed.load_run_state(run_state_path, expected_compatibility=compatibility)
+
+    # The config value (0.5) wins over the saved threshold (0.9752), and the
+    # trainer threshold + direct-solver threshold stay in sync.
+    assert resumed.geometry_probability_threshold == pytest.approx(0.5)
+    assert resumed.direct_solver_loss.threshold == pytest.approx(0.5)
+    assert resumed.geometry_probability_threshold == pytest.approx(
+        resumed.direct_solver_loss.threshold
+    )
+
+
 def test_analytic_occupancy_logit_gradient_behavior():
     """Deterministic one-sided brake, soft anchor, clipping, and ref handling."""
     import math as _math
@@ -1400,7 +1477,12 @@ def test_coordinate_threshold_margin_backpropagates_all_chunks_after_data_backwa
     assert parameter.grad.item() < 0.0
 
 
-def test_interrupted_two_plus_two_resume_is_trajectory_equivalent(tmp_path):
+def test_interrupted_two_plus_two_resume_is_trajectory_equivalent(tmp_path, monkeypatch):
+    # The run-state embeds numpy/random RNG globals (weights_only=True rejects
+    # it); the shared trust-gated loader only falls back to weights_only=False
+    # under the build/ root, so point the trusted root at the temp dir for this
+    # isolation test. The trajectory-equivalence assertions are unchanged.
+    monkeypatch.setattr(recovery, "_TRUSTED_CHECKPOINT_ROOT", tmp_path)
     config = ModelConfig(
         latent_dim=4,
         encoder_channels=[8, 8, 8],

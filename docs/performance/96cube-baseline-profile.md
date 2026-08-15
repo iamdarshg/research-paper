@@ -81,6 +81,11 @@ the FINAL default `_DIRECT_SOLVER_BATCH_CHUNK = 1`. Full report:
 |---|---|---|---|
 | per-update wall | 113.0 s/u | 60.23 s/u | **62.66 s/u** (63/67/61/59 s) |
 
+**Baseline reconciliation:** the plan anchor (and this table's cumulative
+factors) use **112 s/u** as the mandated baseline anchor; the raw measured
+baseline above was **113.04 s/u** (452.17 s / 4 updates). The 1.79× cumulative
+factor in this document uses the 112 plan anchor.
+
 **Fix round (Task 12 R=1):** the old merged default (C=4) regressed the real
 full-update. Bounded re-profiles (`--warmup 1 --iterations 3`, 4 updates each)
 via a module-attribute override harness (`build/perf/baseline/profile_chunk_override.py`,
@@ -106,7 +111,7 @@ outer `_direct_measured_objective_for_single` wraps the inner solver phases
 
 | phase | baseline | Task 12 (default C=1) | note |
 |---|---|---|---|
-| CPU validity (scipy `label`) | 3.9 | 7.83 | 2× baseline (mild residual memory pressure) |
+| CPU validity (scipy `label`) | 3.9 | 7.83 | 2× baseline (EDT-threading core contention; see Task 8/9 optimization-log rows) |
 | `_direct_measured_objective_for_single` | 40.70 | 17.04 | Task-9 EDT threading win held |
 | coordinate decoder (`_checkpointed_coordinate_chunk`) | 14.85 | 15.52 | ~flat |
 | GPU collision+stream (all solves) | 13.2 | 13.83 | ~flat (sequential path) |

@@ -100,8 +100,9 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
 
     # The aircraft occupies only ~1-4% of the box, so the full-volume EDT is
     # mostly wasted work. Crop the SDF + link algebra to the solid bounding box
-    # expanded by a margin of 2 cells. Every crossing cell is solid (sdf > 0)
-    # and therefore lies inside the bbox; its neighbor in the link direction is
+    # expanded by a margin of 2 cells. Every crossing cell is fluid (sdf > 0,
+    # positive sdf = outside/fluid in this codebase's EDT convention) and
+    # therefore lies inside the bbox; its neighbor in the link direction is
     # at most 1 cell outside the bbox. Margin 2 keeps the entire crossing set
     # and its neighbors inside the crop, and because the crop still contains
     # every solid cell, the EDT values inside it are unchanged from the
@@ -141,7 +142,8 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
     sdf_neighbors = torch.stack(neighbor_slices, dim=0)  # [26, cD, cH, cW]
     sdf_view = sdf_crop.unsqueeze(0)
 
-    # Links that cross the boundary: current is solid (>0), neighbor is fluid (<=0).
+    # Links that cross the boundary: current is fluid (>0, positive sdf =
+    # outside/fluid), neighbor is solid (<=0, crossing into solid).
     crossing = (sdf_view > 0) & (sdf_neighbors <= 0)
 
     # Linear interpolation for q: sdf(x) / (sdf(x) - sdf(x+e))

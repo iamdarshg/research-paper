@@ -16,6 +16,7 @@ Current implementation details include:
 import os
 import sys
 import json
+import logging
 import hashlib
 import math
 import pickle
@@ -70,6 +71,72 @@ from multiobjective_gradients import (
 from validate_manifest import validate_manifest_file
 
 warnings.filterwarnings('ignore')
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# ---------------------------------------------------------------------------
+# Trusted checkpoint loading (security: CWE-502 safe-deserialization gate)
+# ---------------------------------------------------------------------------
+# The exception set torch's weights_only=True loader raises when it rejects a
+# checkpoint that embeds non-whitelisted globals (run-state RNG, custom
+# compatibility objects). Depending on how the pickle was produced this is any
+# of these, not just pickle.UnpicklingError.
+_WEIGHTS_ONLY_FALLBACK_EXCEPTIONS = (
+    pickle.UnpicklingError,
+    AttributeError,
+    TypeError,
+    ModuleNotFoundError,
+    ImportError,
+    EOFError,
+)
+
+# Only checkpoints under this root are ever eligible for the weights_only=False
+# fallback. These are trusted local artifacts from our own runs at explicit
+# paths, never untrusted input.
+_TRUSTED_CHECKPOINT_ROOT = REPO_ROOT / "build"
+
+
+def _is_trusted_checkpoint_path(path) -> bool:
+    """True when ``path`` resolves inside the trusted build/ checkpoint root."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    try:
+        trusted_root = _TRUSTED_CHECKPOINT_ROOT.resolve()
+    except OSError:
+        return False
+    return resolved == trusted_root or trusted_root in resolved.parents
+
+
+def _load_checkpoint_metadata(checkpoint: Path):
+    """Load checkpoint metadata preferring the safe weights_only=True loader.
+
+    ``weights_only=True`` rejects any checkpoint that embeds non-whitelisted
+    globals by raising one of ``_WEIGHTS_ONLY_FALLBACK_EXCEPTIONS``. We fall back
+    to the unsafe ``weights_only=False`` loader ONLY for a trusted local
+    artifact that resolves under the build/ root, and we log a warning when we
+    do. Untrusted paths re-raise: we never deserialize untrusted input.
+    """
+    try:
+        return torch.load(checkpoint, map_location="cpu", weights_only=True)
+    except _WEIGHTS_ONLY_FALLBACK_EXCEPTIONS as exc:
+        if not _is_trusted_checkpoint_path(checkpoint):
+            logging.getLogger(__name__).error(
+                "weights_only=True rejected %s (%s); refusing weights_only=False "
+                "fallback for an untrusted checkpoint path",
+                checkpoint,
+                exc,
+            )
+            raise
+        logging.getLogger(__name__).warning(
+            "weights_only=True rejected %s (%s); falling back to "
+            "weights_only=False for trusted local checkpoint under %s",
+            checkpoint,
+            exc,
+            _TRUSTED_CHECKPOINT_ROOT,
+        )
+        return torch.load(checkpoint, map_location="cpu", weights_only=False)
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -5412,12 +5479,20 @@ class OptimizedDiffusionTrainer:
     ) -> Dict[str, Any]:
         """Restore an interrupted run after its original scheduler is configured."""
         resolved_path = resolve_run_state_path(path)
-        state = torch.load(resolved_path, map_location=self.device, weights_only=False)
-        self._set_geometry_probability_threshold(
-            state["geometry_probability_threshold"],
-            calibrated=bool(state.get("geometry_threshold_calibrated", True)),
-            calibration=state.get("geometry_threshold_calibration"),
-        )
+        state = _load_checkpoint_metadata(resolved_path)
+        # C1: the config-fixed threshold is authoritative and must NOT be
+        # overridden by a run-state's saved (previously-calibrated) threshold.
+        # When calibration is enabled the saved threshold IS the exact-resume
+        # state and is restored here as before. The config-fixed path (either
+        # _prepare_geometry_threshold_for_run before this call, or a later
+        # config-fixed restore) has already set geometry_probability_threshold
+        # AND direct_solver_loss.threshold, so they stay in sync.
+        if self.training_config.calibrate_geometry_materialization_threshold:
+            self._set_geometry_probability_threshold(
+                state["geometry_probability_threshold"],
+                calibrated=bool(state.get("geometry_threshold_calibrated", True)),
+                calibration=state.get("geometry_threshold_calibration"),
+            )
         actual_compatibility = state.get("compatibility", {})
         mismatches = validate_run_state_compatibility(
             actual_compatibility,
@@ -5601,8 +5676,11 @@ class OptimizedDiffusionTrainer:
         if soft_occupancies:
             telemetry["occupancy_soft_surrogate"] = float(np.mean(soft_occupancies))
         telemetry["occupancy_reference"] = float(np.mean(references))
+        # M7: `combined` was already divided by max(batch_size, 1) above, so the
+        # telemetry norm must NOT divide again (exact at C=1, under-reports for
+        # batch>1 otherwise). Telemetry only.
         telemetry["occupancy_analytic_gradient_norm"] = float(
-            combined.norm().item() / max(batch_size, 1)
+            combined.norm().item()
         )
         telemetry["occupancy_analytic_gradient_enabled"] = 1.0
         return combined
