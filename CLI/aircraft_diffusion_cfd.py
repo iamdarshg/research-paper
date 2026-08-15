@@ -4207,17 +4207,21 @@ def _direct_measured_objective_for_single(
     # Threshold on the solver device (GPU) to avoid a per-solve CPU round trip
     # and CPU threshold kernel; the binary mask is bit-identical to the
     # CPU-thresholded result, so this is exact-parity. A CPU copy is kept only
-    # for the occupancy telemetry and the CPU connected-components validity eval.
+    # for the CPU connected-components validity eval (occupancy reads the GPU
+    # binary directly — exact-parity because binary is 0/1 fp32 whose integer
+    # sum (< 2^23) is exactly representable, so GPU vs CPU mean cannot differ).
     solver_device = getattr(cfd_simulator, "device", probability_grid.device)
     binary = (probability_grid.detach().float().clamp(0.0, 1.0) > float(threshold)).to(
         dtype=torch.float32
     )
-    geometry_cpu = binary.detach().to("cpu")
     solver_geometry = _canonical_training_geometry_to_solver_xyz(binary).to(
         solver_device
     )
 
     needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    # Build the 3.5 MB CPU copy only when the CPU connected-components validity
+    # eval below will consume it; otherwise keep the solve D2H-free.
+    geometry_cpu = binary.detach().to("cpu") if needs_shape_metrics else None
     validity_report: Dict[str, Any] = {}
     validity_future = None
     if needs_shape_metrics:
@@ -4239,7 +4243,7 @@ def _direct_measured_objective_for_single(
     if validity_future is not None:
         validity_report = validity_future.result()
 
-    occupancy = float(geometry_cpu.mean().item())
+    occupancy = float(binary.float().mean().item())
     raw_drag = cfd_results.get("drag_coefficient")
     if (
         not isinstance(raw_drag, (int, float, np.floating))
