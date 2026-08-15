@@ -47,6 +47,24 @@ from run_monitored_training import (
 import run_monitored_training as monitored_training
 
 
+@pytest.fixture(autouse=True)
+def _force_sequential_direct_solver():
+    """Pin the direct-solver forward loop to the sequential per-sample path.
+
+    This trainer-integration suite predates Task 10 and drives the forward loop
+    with a mocked ``_direct_measured_objective_for_single`` and stub simulators
+    that provide no ``lbm_solver.collide_stream_batch``. The Task 10 module
+    default (``_DIRECT_SOLVER_BATCH_CHUNK = 4``) would route these tests into
+    the batched branch, which bypasses the mock and requires a real solver
+    backend the stubs do not provide. Forcing chunk=1 keeps them on the exact
+    sequential path they were written to exercise.
+    """
+    old = recovery._DIRECT_SOLVER_BATCH_CHUNK
+    recovery._DIRECT_SOLVER_BATCH_CHUNK = 1
+    yield
+    recovery._DIRECT_SOLVER_BATCH_CHUNK = old
+
+
 def _controlled_spsa_objective(active_guards_by_sample):
     calls = []
     slopes = {
