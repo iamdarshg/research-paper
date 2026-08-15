@@ -4014,14 +4014,14 @@ def _aggregate_aircraft_validity_violations(
 # LBM results, so each direct-solver probe submits it to a small thread pool
 # before the GPU solve and collects it afterward. The GPU solve leaves the CPU
 # free to run the scipy connected-component labeling concurrently.
-_VALIDITY_POOL = ThreadPoolExecutor(max_workers=2)
+_VALIDITY_POOL = ThreadPoolExecutor(max_workers=4)
 
 # Task 9: thread the 33 per-solve SDF (EDT) computations across the SPSA
 # direct-solver probes so the CPU EDT runs in parallel with the GPU LBM solves
 # instead of blocking them. scipy's distance_transform_edt releases the GIL and
 # _edt_workspace is thread-local (Task 2), so concurrent EDTs from this pool
 # never share buffers.
-_SDF_POOL = ThreadPoolExecutor(max_workers=8)
+_SDF_POOL = ThreadPoolExecutor(max_workers=4)
 
 # In-flight cap for the pre-warm: keeps only ~this many q tensors resident on
 # CPU at once (~0.8 GB), which is well inside the ~4.5 GiB free RAM on the
