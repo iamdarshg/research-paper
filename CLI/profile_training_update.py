@@ -23,6 +23,7 @@ Usage:
 """
 import argparse
 import json
+import logging
 import pickle
 import statistics
 import sys
@@ -36,6 +37,70 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI_DIR = REPO_ROOT / "CLI"
 if str(CLI_DIR) not in sys.path:
     sys.path.insert(0, str(CLI_DIR))
+
+# ---------------------------------------------------------------------------
+# Trusted checkpoint loading (security: CWE-502 safe-deserialization gate)
+# ---------------------------------------------------------------------------
+# The exception set torch's weights_only=True loader raises when it rejects a
+# checkpoint that embeds non-whitelisted globals (run-state RNG, custom
+# compatibility objects). Depending on how the pickle was produced this is any
+# of these, not just pickle.UnpicklingError.
+_WEIGHTS_ONLY_FALLBACK_EXCEPTIONS = (
+    pickle.UnpicklingError,
+    AttributeError,
+    TypeError,
+    ModuleNotFoundError,
+    ImportError,
+    EOFError,
+)
+
+# Only checkpoints under this root are ever eligible for the weights_only=False
+# fallback. These are trusted local artifacts from our own runs at explicit
+# paths, never untrusted input.
+_TRUSTED_CHECKPOINT_ROOT = REPO_ROOT / "build"
+
+
+def _is_trusted_checkpoint_path(path) -> bool:
+    """True when ``path`` resolves inside the trusted build/ checkpoint root."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    try:
+        trusted_root = _TRUSTED_CHECKPOINT_ROOT.resolve()
+    except OSError:
+        return False
+    return resolved == trusted_root or trusted_root in resolved.parents
+
+
+def _load_checkpoint_metadata(checkpoint: Path):
+    """Load checkpoint metadata preferring the safe weights_only=True loader.
+
+    ``weights_only=True`` rejects any checkpoint that embeds non-whitelisted
+    globals by raising one of ``_WEIGHTS_ONLY_FALLBACK_EXCEPTIONS``. We fall back
+    to the unsafe ``weights_only=False`` loader ONLY for a trusted local
+    artifact that resolves under the build/ root, and we log a warning when we
+    do. Untrusted paths re-raise: we never deserialize untrusted input.
+    """
+    try:
+        return torch.load(checkpoint, map_location="cpu", weights_only=True)
+    except _WEIGHTS_ONLY_FALLBACK_EXCEPTIONS as exc:
+        if not _is_trusted_checkpoint_path(checkpoint):
+            logging.getLogger(__name__).error(
+                "weights_only=True rejected %s (%s); refusing weights_only=False "
+                "fallback for an untrusted checkpoint path",
+                checkpoint,
+                exc,
+            )
+            raise
+        logging.getLogger(__name__).warning(
+            "weights_only=True rejected %s (%s); falling back to "
+            "weights_only=False for trusted local checkpoint under %s",
+            checkpoint,
+            exc,
+            _TRUSTED_CHECKPOINT_ROOT,
+        )
+        return torch.load(checkpoint, map_location="cpu", weights_only=False)
 
 import aircraft_diffusion_cfd as adc  # noqa: E402
 import advanced_lbm_solver as lbs  # noqa: E402
@@ -133,16 +198,11 @@ def _stats(values):
 # Builders (mirror select_recovery_checkpoint / run_monitored_training wiring)
 # ---------------------------------------------------------------------------
 def build_trainer_and_loader(checkpoint: Path, manifest: Path, device, samples: int, solver: str):
-    # Prefer the safe weights_only=True loader (verified against the current
-    # plain checkpoint family). Fall back to weights_only=False ONLY when the
-    # candidate is an interruption-safe run-state checkpoint that embeds torch
-    # rng state / custom compatibility objects (pickle.UnpicklingError). Both
-    # paths load trusted local artifacts from our own runs at explicit paths,
-    # never untrusted input.
-    try:
-        metadata = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    except pickle.UnpicklingError:
-        metadata = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    # Prefer the safe weights_only=True loader; fall back to weights_only=False
+    # ONLY for a trusted local artifact under build/ (see
+    # _load_checkpoint_metadata). This is a trusted local artifact from our own
+    # run at an explicit path, never untrusted input.
+    metadata = _load_checkpoint_metadata(checkpoint)
     model_config = (
         adc.ModelConfig(**metadata["model_config"])
         if "model_config" in metadata
