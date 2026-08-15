@@ -196,6 +196,152 @@ def stream_bfl_d3q27(
     return True
 
 
+if triton is not None:
+    @triton.jit
+    def _stream_bfl_kernel_batch(
+        f_pre,
+        f_out,
+        solid,
+        q_field,
+        ex,
+        ey,
+        ez,
+        opposite,
+        n: tl.constexpr,
+        total: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Batched fused pull-streaming + q-dependent BFL interpolation.
+
+        Identical per-item formulas and write pattern as ``_stream_bfl_kernel``
+        with a leading batch program id ``c``. Every load is offset by
+        ``c * total`` (populations and solid) or ``c * 27 * total`` (q_field),
+        so each (c, k, x) output is written exactly once and the launch is
+        order-independent across the batch dim.
+        """
+        c = tl.program_id(0)
+        k = tl.program_id(1)
+        pid = tl.program_id(2)
+        offsets = pid * block + tl.arange(0, block)
+        valid = offsets < total
+
+        n2 = n * n
+        x = offsets // n2
+        rem = offsets - x * n2
+        y = rem // n
+        z = rem - y * n
+
+        f_pre_c = f_pre + c * 27 * total
+        f_out_c = f_out + c * 27 * total
+        solid_c = solid + c * total
+        q_c = q_field + c * 27 * total
+
+        dxk = tl.load(ex + k)
+        dyk = tl.load(ey + k)
+        dzk = tl.load(ez + k)
+
+        # Plain streaming: periodic pull from x - e_k (torch.roll parity).
+        sx = (x - dxk + n) % n
+        sy = (y - dyk + n) % n
+        sz = (z - dzk + n) % n
+        streamed = tl.load(f_pre_c + k * total + (sx * n2 + sy * n + sz), mask=valid, other=0.0)
+
+        # BFL incoming direction i = opposite(k).
+        i = tl.load(opposite + k)
+        dxi = tl.load(ex + i)
+        dyi = tl.load(ey + i)
+        dzi = tl.load(ez + i)
+
+        # Boundary link: fluid at x, solid at the in-domain neighbor x + e_i.
+        nb_x = x + dxi
+        nb_y = y + dyi
+        nb_z = z + dzi
+        nb_in = (nb_x >= 0) & (nb_x < n) & (nb_y >= 0) & (nb_y < n) & (nb_z >= 0) & (nb_z < n)
+        cell_solid = tl.load(solid_c + offsets, mask=valid, other=1) > 0
+        nb_solid = tl.load(
+            solid_c + (nb_x * n2 + nb_y * n + nb_z),
+            mask=valid & nb_in,
+            other=0,
+        ) > 0
+        active = valid & (~cell_solid) & nb_in & nb_solid & (i != 0)
+
+        qi = tl.load(q_c + i * total + offsets, mask=active, other=1.0)
+        f_i_here = tl.load(f_pre_c + i * total + offsets, mask=active, other=0.0)
+
+        # Upstream fluid neighbor for direction i sits at x - e_i.
+        up_x = x - dxi
+        up_y = y - dyi
+        up_z = z - dzi
+        up_in = (up_x >= 0) & (up_x < n) & (up_y >= 0) & (up_y < n) & (up_z >= 0) & (up_z < n)
+        f_i_up = tl.load(
+            f_pre_c + i * total + (up_x * n2 + up_y * n + up_z),
+            mask=active & up_in,
+            other=0.0,
+        )
+
+        res_low = (1.0 - 2.0 * qi) * f_i_up + 2.0 * qi * f_i_here
+        inv_2q = 1.0 / (2.0 * qi)
+        res_high = inv_2q * f_i_here + (1.0 - inv_2q) * streamed
+        res = tl.where(qi < 0.5, res_low, res_high)
+
+        out = tl.where(active, res, streamed)
+        tl.store(f_out_c + k * total + offsets, out, mask=valid)
+
+
+def stream_bfl_d3q27_batch(
+    f_pre: torch.Tensor,
+    f_out: torch.Tensor,
+    solid_mask_u8: torch.Tensor,
+    q_field: torch.Tensor,
+    ex: torch.Tensor,
+    ey: torch.Tensor,
+    ez: torch.Tensor,
+    opposite: torch.Tensor,
+    block_size: int = 256,
+) -> bool:
+    """Run the batched fused D3Q27 streaming + BFL kernel on CUDA via Triton.
+
+    Operates on ``[C, 27, D, H, W]`` populations and q and ``[C, D, H, W]``
+    uint8 solid masks. Per-item results are bitwise-identical to the
+    sequential ``stream_bfl_d3q27`` (same formulas, same reduction-free
+    streaming). Returns True when the fused path executed, False when the
+    caller must fall back to a batched PyTorch reference implementation.
+    """
+    if triton is None or not f_pre.is_cuda:
+        return False
+    if f_pre.dim() != 5 or f_pre.shape[1] != 27:
+        return False
+    n = int(f_pre.shape[2])
+    if f_pre.shape[2] != f_pre.shape[3] or f_pre.shape[2] != f_pre.shape[4]:
+        return False
+    if q_field.shape != f_pre.shape:
+        return False
+    if not (f_pre.is_contiguous() and f_out.is_contiguous() and q_field.is_contiguous()):
+        return False
+    if solid_mask_u8.dtype != torch.uint8 or not solid_mask_u8.is_contiguous():
+        return False
+    C = int(f_pre.shape[0])
+    if solid_mask_u8.shape != (C, n, n, n):
+        return False
+
+    total = n * n * n
+    grid = (C, 27, triton.cdiv(total, block_size))
+    _stream_bfl_kernel_batch[grid](
+        f_pre,
+        f_out,
+        solid_mask_u8,
+        q_field,
+        ex,
+        ey,
+        ez,
+        opposite,
+        n,
+        total,
+        block=block_size,
+    )
+    return True
+
+
 def stream_bounce_d3q27(
     f: torch.Tensor,
     f_pre: torch.Tensor,
