@@ -4146,8 +4146,13 @@ def _refill_sdf_pool(solver) -> None:
     while len(warm_cache) < _SDF_WARM_TARGET_INFLIGHT and pending:
         geom_key, geometry_cpu = pending.pop(0)
         if geom_key not in warm_cache:
+            # OFFLOAD-3: the pool pre-computes the full-volume SDF (scipy EDT)
+            # only; D3Q27Solver._get_q runs the q-algebra on the solve device,
+            # so only the small [D, H, W] SDF crosses H2D per solve instead of
+            # the full [27, D, H, W] q field (95.5 MB at 96^3). The 5th
+            # positional arg is the return_sdf flag.
             warm_cache[geom_key] = _SDF_POOL.submit(
-                compute_all_link_distances, geometry_cpu, ex_cpu, ey_cpu, ez_cpu
+                compute_all_link_distances, geometry_cpu, ex_cpu, ey_cpu, ez_cpu, True
             )
 
 
@@ -4166,10 +4171,11 @@ def _warm_direct_solver_sdfs(
     _direct_measured_objective_for_single does (same threshold, same canonical
     [Z,Y,X] -> solver [X,Y,Z] transform), hashed on the CUDA solver-frame
     tensor (matching the key simulate_aerodynamics computes), and submitted to
-    _SDF_POOL. The solver's _get_q then pops the CPU result on first use and
-    moves it to the GPU, so the 5 LBM steps of each solve reuse it. Submission
-    is bounded (_refill_sdf_pool keeps ~8 in flight) so CPU residency stays
-    ~0.8 GB instead of 3.1 GB.
+    _SDF_POOL. OFFLOAD-3: the pool pre-computes the full-volume SDF (scipy EDT)
+    only; D3Q27Solver._get_q pops the CPU SDF and runs the 26-link q-algebra on
+    the solve device, so the 5 LBM steps of each solve reuse it and only the
+    small SDF crosses H2D. Submission is bounded (_refill_sdf_pool keeps ~8 in
+    flight) so CPU residency stays ~0.8 GB instead of 3.1 GB.
     """
     solver = _find_q_solver(cfd_simulator)
     if solver is None:

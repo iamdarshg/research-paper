@@ -12,7 +12,7 @@ from lbm_utils import (
     mach_to_lattice_velocity,
 )
 from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity, compute_velocity_gradients
-from sdf_utils import compute_all_link_distances
+from sdf_utils import compute_all_link_distances, compute_link_q
 from lbm_logger import LBMLogger
 from utils import compute_tensor_content_hash
 
@@ -236,15 +236,25 @@ class D3Q27Solver:
         geom_key = geom_hash if geom_hash is not None else compute_tensor_content_hash(geometry_mask)
 
         if geom_key not in self._q_cache:
-            # Task 9: a warm entry is a pre-computed CPU q tensor, or an in-flight
+            # Task 9: a warm entry is a pre-computed CPU tensor, or an in-flight
             # Future that will produce one, submitted by the SPSA probe pre-warm.
             # Pop it, move it to the solve device, and store it in the per-solve
             # _q_cache so the 5 solver steps reuse it. On a miss we fall back to
             # the original compute-and-store path (the EDT then runs serially).
+            # OFFLOAD-3: the pool now pre-computes a [D, H, W] SDF (scipy EDT
+            # stays on CPU); the 26-link q-algebra runs on the solve device, so
+            # only the small SDF crosses H2D instead of the full [27, D, H, W] q
+            # field. A full 4-D q tensor (legacy warm entries / unit-test
+            # sentinels) is still used as-is.
             warm_entry = self._warm_sdf_cache.pop(geom_key, None)
             if warm_entry is not None:
-                q_cpu = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
-                self._q_cache[geom_key] = q_cpu.to(geometry_mask.device)
+                entry = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
+                if entry.ndim == 3:
+                    self._q_cache[geom_key] = compute_link_q(
+                        entry.to(geometry_mask.device), self.ex, self.ey, self.ez
+                    )
+                else:
+                    self._q_cache[geom_key] = entry.to(geometry_mask.device)
                 # Keep the pre-warm pool topped up (bounded in-flight so the CPU
                 # does not accumulate all 33 q tensors at once).
                 refill = getattr(self, "_sdf_refill", None)

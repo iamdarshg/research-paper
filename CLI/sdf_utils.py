@@ -74,73 +74,66 @@ def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
 
     return sdf
 
-def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor) -> torch.Tensor:
-    """
-    Compute normalized wall distance 'q' for all 27 D3Q27 lattice directions (Issue #15).
-    Returns tensor of shape [27, D, H, W].
-    q = distance_to_wall / link_length (0 < q <= 1)
-    """
-    # Support non-cubic tensors
-    if voxel_grid.ndim != 3:
-        raise ValueError(f"Expected 3D voxel grid, got {voxel_grid.ndim}D")
-    D, H, W = voxel_grid.shape
-    num_dirs = ex.shape[0]
+# Fixed D3Q27 stencil: the 26 non-zero link directions are read from the
+# stencil tensors once per direction-count and cached, so the GPU q-algebra
+# does not re-read (and re-sync) ex/ey/ez on every solve. Keyed by the
+# direction count: every production caller uses the D3Q27 lattice; the only
+# non-27-direction caller is the non-cubic unit test with a single link.
+_LINK_DIRECTIONS_CACHE: dict = {}
 
-    # Read the 27 lattice directions once. Direction index 0 is the zero link,
-    # which the original loop skipped; every other index was written into q_all.
-    directions = []
-    for i in range(num_dirs):
-        dx, dy, dz = int(ex[i].item()), int(ey[i].item()), int(ez[i].item())
-        if not (dx == 0 and dy == 0 and dz == 0):
-            directions.append((i, dx, dy, dz))
 
-    q_all = torch.ones((num_dirs, D, H, W), device=voxel_grid.device, dtype=torch.float32)
+def _link_directions(ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor):
+    num_dirs = int(ex.shape[0])
+    cached = _LINK_DIRECTIONS_CACHE.get(num_dirs)
+    if cached is None:
+        ex_l = ex.detach().cpu().tolist()
+        ey_l = ey.detach().cpu().tolist()
+        ez_l = ez.detach().cpu().tolist()
+        cached = [
+            (i, int(ex_l[i]), int(ey_l[i]), int(ez_l[i]))
+            for i in range(num_dirs)
+            if not (int(ex_l[i]) == 0 and int(ey_l[i]) == 0 and int(ez_l[i]) == 0)
+        ]
+        _LINK_DIRECTIONS_CACHE[num_dirs] = cached
+    return cached
+
+
+def compute_link_q(sdf: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor) -> torch.Tensor:
+    """Compute the normalized wall-distance 'q' field from a full-volume SDF.
+
+    OFFLOAD-3: the pure Issue-#15 q-algebra over an already-computed SDF on the
+    target device. The scipy EDT that produced ``sdf`` stays on the CPU thread
+    pool; every op here runs on ``sdf.device``, so the per-solve H2D transfer is
+    the [D, H, W] SDF (3.5 MB at 96^3) instead of the [27, D, H, W] q field
+    (95.5 MB). No bbox crop is applied: all crossing cells lie within one cell
+    of the solid bounding box and their link neighbors within one more cell, so
+    the full-volume EDT is bit-identical to the cropped EDT at every crossing
+    cell, and cells far from the solid keep q = 1.0 through the ``where``.
+    """
+    if sdf.ndim != 3:
+        raise ValueError(f"Expected 3D SDF, got {sdf.ndim}D")
+    D, H, W = sdf.shape
+    num_dirs = int(ex.shape[0])
+
+    directions = _link_directions(ex, ey, ez)
+    q_all = torch.ones((num_dirs, D, H, W), device=sdf.device, dtype=torch.float32)
     if not directions:
         return q_all
 
-    # The aircraft occupies only ~1-4% of the box, so the full-volume EDT is
-    # mostly wasted work. Crop the SDF + link algebra to the solid bounding box
-    # expanded by a margin of 2 cells. Every crossing cell is fluid (sdf > 0,
-    # positive sdf = outside/fluid in this codebase's EDT convention) and
-    # therefore lies inside the bbox; its neighbor in the link direction is
-    # at most 1 cell outside the bbox. Margin 2 keeps the entire crossing set
-    # and its neighbors inside the crop, and because the crop still contains
-    # every solid cell, the EDT values inside it are unchanged from the
-    # full-volume EDT. All cells outside the crop keep the initialized 1.0.
-    solid = voxel_grid > 0.5
-    occupied = torch.nonzero(solid)
-    if occupied.numel() == 0:
-        return q_all
-
-    mins = occupied.min(dim=0).values
-    maxs = occupied.max(dim=0).values
-    lo = torch.clamp(mins - 2, min=0)
-    hi = torch.clamp(maxs + 3, max=torch.tensor([D, H, W], device=voxel_grid.device))
-    lo_z, lo_y, lo_x = (int(v) for v in lo.tolist())
-    hi_z, hi_y, hi_x = (int(v) for v in hi.tolist())
-
-    crop = voxel_grid[lo_z:hi_z, lo_y:hi_y, lo_x:hi_x]
-    sdf_crop = compute_sdf(crop)
-    cD, cH, cW = sdf_crop.shape
-
-    # Avoid boundary wraparound using padding
-    # We pad the SDF so that 'neighbors' outside the domain appear far away (fluid)
-    # Using 10.0 ensures we don't accidentally detect a boundary link to the opposite face
-    sdf_crop_padded = torch.nn.functional.pad(sdf_crop, (1, 1, 1, 1, 1, 1), mode='constant', value=10.0)
+    # Avoid boundary wraparound using padding. We pad the SDF so that
+    # 'neighbors' outside the domain appear far away (fluid). Using 10.0
+    # ensures we don't accidentally detect a boundary link to the opposite face.
+    sdf_padded = torch.nn.functional.pad(sdf, (1, 1, 1, 1, 1, 1), mode='constant', value=10.0)
 
     # Stack the 26 shifted neighbor slices into one tensor, in the exact index
     # order the original loop wrote (ascending direction index, zero link absent).
     neighbor_slices = []
     for _i, dx, dy, dz in directions:
         neighbor_slices.append(
-            sdf_crop_padded[
-                1 + dx:1 + dx + cD,
-                1 + dy:1 + dy + cH,
-                1 + dz:1 + dz + cW,
-            ]
+            sdf_padded[1 + dx:1 + dx + D, 1 + dy:1 + dy + H, 1 + dz:1 + dz + W]
         )
-    sdf_neighbors = torch.stack(neighbor_slices, dim=0)  # [26, cD, cH, cW]
-    sdf_view = sdf_crop.unsqueeze(0)
+    sdf_neighbors = torch.stack(neighbor_slices, dim=0)  # [26, D, H, W]
+    sdf_view = sdf.unsqueeze(0)
 
     # Links that cross the boundary: current is fluid (>0, positive sdf =
     # outside/fluid), neighbor is solid (<=0, crossing into solid).
@@ -153,6 +146,41 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
     q = torch.where(crossing, q, torch.ones_like(q))
 
     for idx, (i, _dx, _dy, _dz) in enumerate(directions):
-        q_all[i, lo_z:hi_z, lo_y:hi_y, lo_x:hi_x] = q[idx]
+        q_all[i] = q[idx]
 
     return q_all
+
+
+def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor, return_sdf: bool = False) -> torch.Tensor:
+    """
+    Compute normalized wall distance 'q' for all 27 D3Q27 lattice directions (Issue #15).
+    Returns tensor of shape [27, D, H, W].
+    q = distance_to_wall / link_length (0 < q <= 1)
+
+    OFFLOAD-3: the SDF (scipy EDT) is computed here; the q-algebra is deferred to
+    :func:`compute_link_q`, which runs on the SDF's device. When ``return_sdf`` is
+    True, only the [D, H, W] SDF is returned (the thread-pool pre-warm path); the
+    caller runs the q-algebra on the solve device.
+    """
+    # Support non-cubic tensors
+    if voxel_grid.ndim != 3:
+        raise ValueError(f"Expected 3D voxel grid, got {voxel_grid.ndim}D")
+
+    # OFFLOAD-3: the pre-warm pool only needs the SDF; the q-algebra is deferred
+    # to the solve device in D3Q27Solver._get_q. This is the only warm path, so
+    # it avoids both the crop bbox scan (33 torch.nonzero host syncs per update)
+    # and the 95.5 MB [27, D, H, W] H2D transfer per solve (3.5 MB SDF instead).
+    if return_sdf:
+        return compute_sdf(voxel_grid)
+
+    # Preserve the original short-circuit for an empty grid (all-1.0 q). This
+    # guard only runs on the rare cold path, so its single host sync is not on
+    # the 33-per-update hot path.
+    num_dirs = int(ex.shape[0])
+    D, H, W = voxel_grid.shape
+    solid = voxel_grid > 0.5
+    if not torch.any(solid):
+        return torch.ones((num_dirs, D, H, W), device=voxel_grid.device, dtype=torch.float32)
+
+    sdf = compute_sdf(voxel_grid)
+    return compute_link_q(sdf, ex, ey, ez)
