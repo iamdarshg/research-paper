@@ -227,6 +227,315 @@ def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
     }
 
 
+def _heuristic_metrics_gpu(
+    grid_gpu: torch.Tensor,
+) -> tuple[Dict[str, float], Optional[torch.Tensor], float]:
+    """GPU composed-pass analogue of ``_heuristic_metrics``.
+
+    Input is a 0/1 fp32 tensor on the solver device (the direct solver's
+    ``binary``). Returns ``(metrics, bbox_crop_cpu, occupied)``:
+
+    * ``metrics`` — the same 27-key dict as ``_heuristic_metrics``, with
+      ``largest_component_fraction`` present as 0.0 and filled later by
+      ``_bbox_component_fraction`` from the returned CPU crop.
+    * ``bbox_crop_cpu`` — the solid-bbox crop on CPU (the same tiny crop the CPU
+      path D2H's for the scipy label), or None for an empty grid.
+    * ``occupied`` — the exact integer occupancy as a Python float.
+
+    Every scalar metric is reduced on GPU, cast to fp64 on GPU, and extracted
+    with a single ``.cpu().tolist()``. For sums of 0/1 values the fp32 sum is
+    integer-exact and order-independent, so ``sum().double()`` reproduces the CPU
+    ``sum().item()`` bit-for-bit. Means are computed in fp32 (the CPU dtype) and
+    then widened to fp64, so they too are bit-identical. The longitudinal-profile
+    CV is the only metric whose reduction order can differ from the CPU path; it
+    is held to a relative-tolerance parity gate.
+    """
+    total = float(grid_gpu.numel())
+    res_z, res_y, res_x = grid_gpu.shape
+    device = grid_gpu.device
+    # CUDA ``tensor / python_scalar`` uses a fast (non-IEEE) division path that
+    # can be off by 1 ULP; torch.div(tensor, tensor) is correctly rounded and is
+    # what the CPU path's scalar arithmetic produces. All divisions below divide
+    # by a same-device tensor so the results are bit-identical to the CPU path.
+    res_z_t = torch.tensor(float(res_z), dtype=torch.float64, device=device)
+    res_y_t = torch.tensor(float(res_y), dtype=torch.float64, device=device)
+    res_x_t = torch.tensor(float(res_x), dtype=torch.float64, device=device)
+    occupied_gpu = grid_gpu.sum().double()
+    occ_indices = torch.nonzero(grid_gpu > 0.5, as_tuple=False)
+
+    if occ_indices.numel() == 0:
+        occupied = float(occupied_gpu.item())
+        metrics: Dict[str, float] = {
+            "occupancy_ratio": 0.0,
+            "largest_component_fraction": 0.0,
+            "symmetry_score": 1.0,
+            "voxel_symmetry_score": 1.0,
+            "thickness_fraction_z": 0.0,
+            "span_fraction_y": 0.0,
+            "length_fraction_x": 0.0,
+            "center_body_fraction": 0.0,
+            "left_wing_fraction": 0.0,
+            "right_wing_fraction": 0.0,
+            "center_body_density": 0.0,
+            "left_wing_density": 0.0,
+            "right_wing_density": 0.0,
+            "center_body_density_ratio": 0.0,
+            "longitudinal_profile_cv": 0.0,
+            "occupied_bbox_fill_ratio": 0.0,
+            "planform_fill_ratio": 0.0,
+            "side_projection_fill_ratio": 0.0,
+            "mean_longitudinal_slice_fill_ratio": 0.0,
+            "max_longitudinal_slice_fill_ratio": 0.0,
+            "center_low_end_fraction": 0.0,
+            "center_high_end_fraction": 0.0,
+            "center_spine_coverage": 0.0,
+            "normalization_boundary_fraction": 0.0,
+            "low_end_fraction": 0.0,
+            "high_end_fraction": 0.0,
+            "tail_fraction": 0.0,
+        }
+        return metrics, None, occupied
+
+    mins = occ_indices.min(dim=0).values
+    maxs = occ_indices.max(dim=0).values + 1
+    bbox_crop_cpu = grid_gpu[
+        mins[0]:maxs[0], mins[1]:maxs[1], mins[2]:maxs[2]
+    ].detach().cpu()
+    bbox_shape = (maxs - mins).double()
+
+    flipped = torch.flip(grid_gpu, dims=[1])
+    voxel_asymmetry = torch.abs(grid_gpu - flipped).sum().double() / torch.clamp(
+        occupied_gpu, min=1.0
+    )
+    voxel_symmetry_score = torch.clamp(1.0 - voxel_asymmetry, min=0.0)
+    span_profile = grid_gpu.sum(dim=(0, 2))
+    span_profile_asymmetry = torch.abs(
+        span_profile - torch.flip(span_profile, dims=[0])
+    ).sum().double() / torch.clamp(occupied_gpu, min=1.0)
+    symmetry_score = torch.clamp(1.0 - span_profile_asymmetry, min=0.0)
+
+    thickness_fraction_z = torch.div(
+        (occ_indices[:, 0].max() - occ_indices[:, 0].min() + 1).double(), res_z_t
+    )
+    span_fraction_y = torch.div(
+        (occ_indices[:, 1].max() - occ_indices[:, 1].min() + 1).double(), res_y_t
+    )
+    length_fraction_x = torch.div(
+        (occ_indices[:, 2].max() - occ_indices[:, 2].min() + 1).double(), res_x_t
+    )
+
+    center_start, center_end = _band_bounds(res_y, 0.42, 0.58)
+    left_start, left_end = _band_bounds(res_y, 0.00, 0.35)
+    right_start, right_end = _band_bounds(res_y, 0.65, 1.00)
+    low_end_start, low_end_end = _band_bounds(res_x, 0.00, 0.28)
+    high_end_start, high_end_end = _band_bounds(res_x, 0.72, 1.00)
+
+    center_band = grid_gpu[:, center_start:center_end, :]
+    left_band = grid_gpu[:, left_start:left_end, :]
+    right_band = grid_gpu[:, right_start:right_end, :]
+    low_end_band = grid_gpu[:, :, low_end_start:low_end_end]
+    high_end_band = grid_gpu[:, :, high_end_start:high_end_end]
+    center_low_end_band = center_band[:, :, low_end_start:low_end_end]
+    center_high_end_band = center_band[:, :, high_end_start:high_end_end]
+
+    center_body_fraction = center_band.sum().double() / torch.clamp(
+        occupied_gpu, min=1.0
+    )
+    left_wing_fraction = left_band.sum().double() / torch.clamp(occupied_gpu, min=1.0)
+    right_wing_fraction = right_band.sum().double() / torch.clamp(occupied_gpu, min=1.0)
+    low_end_fraction = low_end_band.sum().double() / torch.clamp(occupied_gpu, min=1.0)
+    high_end_fraction = high_end_band.sum().double() / torch.clamp(occupied_gpu, min=1.0)
+    tail_fraction = torch.min(low_end_fraction, high_end_fraction)
+    center_band_occupied = center_band.sum().double()
+    center_low_end_fraction = center_low_end_band.sum().double() / torch.clamp(
+        center_band_occupied, min=1.0
+    )
+    center_high_end_fraction = center_high_end_band.sum().double() / torch.clamp(
+        center_band_occupied, min=1.0
+    )
+
+    # Means: reproduce the CPU fp32 ``.mean()`` exactly. CUDA fp32 ``mean()``
+    # uses a block-reduction that is not correctly rounded for 0/1 inputs, so we
+    # divide the (exact-integer) fp32 sum by a same-device fp32 count tensor
+    # instead -- an IEEE division identical to the CPU path's, then widen to fp64.
+    def _fp32_mean(sum_t: torch.Tensor, count: int) -> torch.Tensor:
+        return torch.div(sum_t, torch.tensor(count, dtype=torch.float32, device=device)).double()
+
+    center_body_density = _fp32_mean(center_band.float().sum(), center_band.numel())
+    left_wing_density = _fp32_mean(left_band.float().sum(), left_band.numel())
+    right_wing_density = _fp32_mean(right_band.float().sum(), right_band.numel())
+    wing_density = torch.max(
+        torch.max(left_wing_density, right_wing_density),
+        torch.tensor(1e-6, dtype=torch.float64, device=grid_gpu.device),
+    )
+    center_body_density_ratio = center_body_density / wing_density
+
+    longitudinal_profile = grid_gpu.sum(dim=(0, 1))
+    occupied_profile = longitudinal_profile[longitudinal_profile > 0]
+    longitudinal_profile_cv = torch.zeros(
+        (), dtype=torch.float64, device=grid_gpu.device
+    )
+    if occupied_profile.numel() > 1:
+        profile_mean = _fp32_mean(occupied_profile.float().sum(), occupied_profile.numel())
+        profile_std = occupied_profile.float().std(unbiased=False).double()
+        longitudinal_profile_cv = torch.div(profile_std, torch.clamp(profile_mean, min=1e-6))
+
+    crop_bool = grid_gpu[
+        mins[0]:maxs[0], mins[1]:maxs[1], mins[2]:maxs[2]
+    ] > 0.5
+    bbox_volume = torch.prod(bbox_shape)
+    occupied_bbox_fill_ratio = torch.div(occupied_gpu, torch.clamp(bbox_volume, min=1.0))
+    planform_fill_ratio = _fp32_mean(
+        crop_bool.any(dim=0).float().sum(),
+        crop_bool.shape[1] * crop_bool.shape[2],
+    )
+    side_projection_fill_ratio = _fp32_mean(
+        crop_bool.any(dim=1).float().sum(),
+        crop_bool.shape[0] * crop_bool.shape[2],
+    )
+    slice_any = crop_bool.any(dim=(0, 1))
+    slice_mean = torch.div(
+        crop_bool.float().sum(dim=(0, 1)),
+        torch.tensor(
+            crop_bool.shape[0] * crop_bool.shape[1], dtype=torch.float32, device=device
+        ),
+    )
+    fills = slice_mean[slice_any].double()
+    max_longitudinal_slice_fill_ratio = fills.max()
+
+    occupied_x_profile = grid_gpu.sum(dim=(0, 1)) > 0
+    center_x_profile = center_band.sum(dim=(0, 1)) > 0
+    center_spine_coverage = (
+        torch.logical_and(occupied_x_profile, center_x_profile).double().sum()
+        / torch.clamp(occupied_x_profile.double().sum(), min=1.0)
+    )
+    z_low, z_high = _band_bounds(res_z, 0.30, 0.70)
+    y_low, y_high = _band_bounds(res_y, 0.05, 0.95)
+    x_low, x_high = _band_bounds(res_x, 0.05, 0.95)
+    boundary_occupied = (
+        (occ_indices[:, 0] < z_low)
+        | (occ_indices[:, 0] >= z_high)
+        | (occ_indices[:, 1] < y_low)
+        | (occ_indices[:, 1] >= y_high)
+        | (occ_indices[:, 2] < x_low)
+        | (occ_indices[:, 2] >= x_high)
+    )
+    normalization_boundary_fraction = boundary_occupied.double().sum() / torch.clamp(
+        occupied_gpu, min=1.0
+    )
+
+    scalars = [
+        occupied_gpu,
+        voxel_symmetry_score,
+        symmetry_score,
+        thickness_fraction_z,
+        span_fraction_y,
+        length_fraction_x,
+        center_body_fraction,
+        left_wing_fraction,
+        right_wing_fraction,
+        center_body_density,
+        left_wing_density,
+        right_wing_density,
+        center_body_density_ratio,
+        longitudinal_profile_cv,
+        occupied_bbox_fill_ratio,
+        planform_fill_ratio,
+        side_projection_fill_ratio,
+        max_longitudinal_slice_fill_ratio,
+        center_low_end_fraction,
+        center_high_end_fraction,
+        center_spine_coverage,
+        normalization_boundary_fraction,
+        low_end_fraction,
+        high_end_fraction,
+        tail_fraction,
+    ]
+    # The per-slice fill values ride along in the single tolist so the slice-mean
+    # is computed in Python with the SAME np.mean the CPU path uses (bit-exact).
+    flat = torch.cat([torch.stack(scalars), fills]).cpu().tolist()
+    (
+        occupied,
+        voxel_symmetry_score_f,
+        symmetry_score_f,
+        thickness_fraction_z_f,
+        span_fraction_y_f,
+        length_fraction_x_f,
+        center_body_fraction_f,
+        left_wing_fraction_f,
+        right_wing_fraction_f,
+        center_body_density_f,
+        left_wing_density_f,
+        right_wing_density_f,
+        center_body_density_ratio_f,
+        longitudinal_profile_cv_f,
+        occupied_bbox_fill_ratio_f,
+        planform_fill_ratio_f,
+        side_projection_fill_ratio_f,
+        max_longitudinal_slice_fill_ratio_f,
+        center_low_end_fraction_f,
+        center_high_end_fraction_f,
+        center_spine_coverage_f,
+        normalization_boundary_fraction_f,
+        low_end_fraction_f,
+        high_end_fraction_f,
+        tail_fraction_f,
+    ) = flat[:25]
+    fills_list = flat[25:]
+    mean_longitudinal_slice_fill_ratio = (
+        float(np.mean(fills_list)) if fills_list else 0.0
+    )
+
+    # CUDA ``tensor / python_scalar`` is not correctly rounded, so occupancy_ratio
+    # is computed in Python fp64 -- exactly what the CPU path does.
+    occupancy_ratio = occupied / max(total, 1.0)
+    metrics = {
+        "occupancy_ratio": float(occupancy_ratio),
+        "largest_component_fraction": 0.0,
+        "symmetry_score": float(symmetry_score_f),
+        "voxel_symmetry_score": float(voxel_symmetry_score_f),
+        "thickness_fraction_z": float(thickness_fraction_z_f),
+        "span_fraction_y": float(span_fraction_y_f),
+        "length_fraction_x": float(length_fraction_x_f),
+        "center_body_fraction": float(center_body_fraction_f),
+        "left_wing_fraction": float(left_wing_fraction_f),
+        "right_wing_fraction": float(right_wing_fraction_f),
+        "center_body_density": float(center_body_density_f),
+        "left_wing_density": float(left_wing_density_f),
+        "right_wing_density": float(right_wing_density_f),
+        "center_body_density_ratio": float(center_body_density_ratio_f),
+        "longitudinal_profile_cv": float(longitudinal_profile_cv_f),
+        "occupied_bbox_fill_ratio": float(occupied_bbox_fill_ratio_f),
+        "planform_fill_ratio": float(planform_fill_ratio_f),
+        "side_projection_fill_ratio": float(side_projection_fill_ratio_f),
+        "mean_longitudinal_slice_fill_ratio": float(mean_longitudinal_slice_fill_ratio),
+        "max_longitudinal_slice_fill_ratio": float(max_longitudinal_slice_fill_ratio_f),
+        "center_low_end_fraction": float(center_low_end_fraction_f),
+        "center_high_end_fraction": float(center_high_end_fraction_f),
+        "center_spine_coverage": float(center_spine_coverage_f),
+        "normalization_boundary_fraction": float(normalization_boundary_fraction_f),
+        "low_end_fraction": float(low_end_fraction_f),
+        "high_end_fraction": float(high_end_fraction_f),
+        "tail_fraction": float(tail_fraction_f),
+    }
+    return metrics, bbox_crop_cpu, float(occupied)
+
+
+def _bbox_component_fraction(bbox_crop_cpu: torch.Tensor, occupied: float) -> float:
+    """Largest connected-component fraction via scipy, from the solid-bbox crop.
+
+    Verbatim from ``_heuristic_metrics`` 93-99: the bbox crop is invariant for
+    local-connectivity labeling, and the crop shrinks the label work to the
+    aircraft occupancy instead of the full lattice. Pure CPU and pool-safe.
+    """
+    occupied_mask = bbox_crop_cpu.numpy() > 0.5
+    labeled, component_count = connected_component_labels(occupied_mask)
+    if component_count == 0:
+        return 0.0
+    component_sizes = np.bincount(labeled[occupied_mask])[1:]
+    return float(component_sizes.max() / occupied)
+
+
 def _orientation_score(metrics: Dict[str, float]) -> float:
     wing_fraction = min(metrics["left_wing_fraction"], metrics["right_wing_fraction"])
     wing_density = min(metrics["left_wing_density"], metrics["right_wing_density"])
@@ -365,27 +674,29 @@ def canonicalize_aircraft_voxels(voxels: Any) -> tuple[torch.Tensor, Dict[str, A
     return _canonicalize_aircraft_grid(raw_grid)
 
 
-def evaluate_aircraft_validity(
-    voxels: Any,
-    *,
-    canonicalize: bool = True,
+def _validity_report_from_metrics(
+    metrics: Dict[str, float],
+    occupancy_upper_bound: Optional[float] = None,
+    canonicalization: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # Heuristic shape checks are intentionally separated from claim evidence.
-    # NASA-STD-7009B treats model/simulation credibility as a lifecycle product,
-    # not a single geometric proxy: https://standards.nasa.gov/standard/nasa/nasa-std-7009
-    if canonicalize:
-        grid, canonicalization = canonicalize_aircraft_voxels(voxels)
-        metrics = canonicalization.get("metrics") or _heuristic_metrics(grid)
-    else:
-        grid = _as_tensor(voxels)
-        metrics = _heuristic_metrics(grid)
+    """Assemble the shared validity-report tail from a metrics dict.
+
+    ``occupancy_upper_bound`` defaults to the 96^3 production value 0.02; callers
+    on smaller lattices (e.g. the 32^3 parity suites, which use 0.04) must pass
+    it explicitly. ``canonicalization`` defaults to the canonicalize=False frame
+    record. ``evaluate_aircraft_validity`` passes both explicitly so its
+    behavior is byte-identical; the direct solver passes only ``metrics`` for the
+    production frame.
+    """
+    if occupancy_upper_bound is None:
+        occupancy_upper_bound = 0.02
+    if canonicalization is None:
         canonicalization = {
             "permutation": [0, 1, 2],
             "score": float(_orientation_score(metrics)),
             "metrics": metrics,
             "status": "preserved_input_frame",
         }
-    occupancy_upper_bound = 0.04 if min(grid.shape) < 64 else 0.02
 
     checks = {
         "nonempty_occupancy": 0.002 <= metrics["occupancy_ratio"] <= 0.50,
@@ -433,6 +744,34 @@ def evaluate_aircraft_validity(
         "canonicalization": canonicalization,
         "claim_boundary": "First-pass aircraft-specific heuristic validity, not structural or aerodynamic proof.",
     }
+
+
+def evaluate_aircraft_validity(
+    voxels: Any,
+    *,
+    canonicalize: bool = True,
+) -> Dict[str, Any]:
+    # Heuristic shape checks are intentionally separated from claim evidence.
+    # NASA-STD-7009B treats model/simulation credibility as a lifecycle product,
+    # not a single geometric proxy: https://standards.nasa.gov/standard/nasa/nasa-std-7009
+    if canonicalize:
+        grid, canonicalization = canonicalize_aircraft_voxels(voxels)
+        metrics = canonicalization.get("metrics") or _heuristic_metrics(grid)
+    else:
+        grid = _as_tensor(voxels)
+        metrics = _heuristic_metrics(grid)
+        canonicalization = {
+            "permutation": [0, 1, 2],
+            "score": float(_orientation_score(metrics)),
+            "metrics": metrics,
+            "status": "preserved_input_frame",
+        }
+    occupancy_upper_bound = 0.04 if min(grid.shape) < 64 else 0.02
+    return _validity_report_from_metrics(
+        metrics,
+        occupancy_upper_bound=occupancy_upper_bound,
+        canonicalization=canonicalization,
+    )
 
 
 def evaluate_aircraft_validity_batch(paths: Iterable[Path]) -> Dict[str, Any]:
