@@ -137,15 +137,30 @@ training:
   direct_validity_gradient_max_norm: 1.0
   direct_connectivity_weight: 1.0
   direct_aircraft_validity_weight: 1.0
-  # Calibrate this once against clean grounded reconstructions, persist it in
-  # the checkpoint, and freeze it for direct CFD, promotion, and inference.
+  # Fixed 0.5 materialization threshold. 0.5 is the natural Bayesian boundary,
+  # needs no calibration, keeps the margins (0.5 +/- 0.05) well-defined instead
+  # of clamped, and avoids the tail sensitivity that made the old calibrated
+  # 0.9752 threshold the root fragility. With calibration disabled the config
+  # value is authoritative and overrides any checkpoint/saved threshold.
   geometry_materialization_threshold: 0.5
-  calibrate_geometry_materialization_threshold: true
+  calibrate_geometry_materialization_threshold: false
   geometry_threshold_calibration_samples: 16
   threshold_positive_margin: 0.05
   threshold_negative_margin: 0.05
   threshold_positive_margin_weight: 1.0
   threshold_negative_margin_weight: 1.0
+  # Deterministic occupancy objective on the free-running field. Replaces the
+  # SPSA hard-threshold occupancy component (flip-noise dominated, always at its
+  # clip cap) with an analytic gradient of (a) a one-sided mean-probability
+  # saturation brake -- pushes down only while mean(p) exceeds the threshold --
+  # and (b) a soft threshold-anchored surrogate |mean(sigmoid((p-t)/T)) - ref|
+  # anchoring the materialized fraction at the batch reference occupancy
+  # (~0.5% sparse airframe). A two-sided mean target at 0.5 would materialize a
+  # ~50% filled blob and fight a healthy sparse field; the soft term carries the
+  # occupancy anchor instead.
+  occupancy_mean_probability_weight: 0.5
+  occupancy_soft_temperature: 0.05
+  occupancy_soft_weight: 0.5
   require_direct_solver_every_iteration: true
 
 cfd:

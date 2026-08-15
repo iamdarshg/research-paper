@@ -115,8 +115,18 @@ def _controlled_spsa_objective(active_guards_by_sample):
         }
         for name, slope in slopes.items():
             components[name] += signed_offset * slope
+        # The recovery fix removes occupancy from the SPSA component set and
+        # from total_loss (it is reported as telemetry only; the analytic
+        # gradient is applied at the replay site). The mock mirrors that: the
+        # occupancy_loss key stays in the component dict for probe parity, but
+        # total_loss is the sum of the SPSA-probed components only.
         components["total_loss"] = sum(
-            components[name] for name in slopes
+            components[name]
+            for name in (
+                "aero_loss",
+                "connectivity_loss",
+                "aircraft_validity_loss",
+            )
         )
         calls.append(
             {
@@ -166,10 +176,11 @@ def _controlled_design_spec_objective():
             "aircraft_validity_loss": 0.0,
             "connectivity_guard_shortfall": 0.0,
         }
+        # Recovery fix: occupancy is telemetry only, excluded from total_loss
+        # (the SPSA component set now probes aero/connectivity/validity).
         components["total_loss"] = sum(
             components[name]
             for name in (
-                "occupancy_loss",
                 "aero_loss",
                 "connectivity_loss",
                 "aircraft_validity_loss",
@@ -392,10 +403,8 @@ def test_direct_spsa_preserves_per_sample_design_specs_and_weighted_scalar(
         for sample_index in range(2)
     ) / 2.0
     first_spec_for_both = (
-        specs[0].space_weight * 1.0
-        + specs[0].drag_weight * 10.0
+        specs[0].drag_weight * 10.0
         + specs[0].lift_weight * 100.0
-        + specs[0].space_weight * 2.0
         + specs[0].drag_weight * 11.0
         + specs[0].lift_weight * 101.0
     ) / 2.0
@@ -481,10 +490,8 @@ def test_train_epoch_preserves_per_sample_design_specs_for_all_solver_calls(
         for sample_index in range(2)
     ) / 2.0
     first_spec_for_both = (
-        specs[0].space_weight * 1.0
-        + specs[0].drag_weight * 10.0
+        specs[0].drag_weight * 10.0
         + specs[0].lift_weight * 100.0
-        + specs[0].space_weight * 2.0
         + specs[0].drag_weight * 11.0
         + specs[0].lift_weight * 101.0
     ) / 2.0
@@ -834,6 +841,12 @@ def test_runner_main_restores_saved_threshold_and_resets_cadence(tmp_path, monke
 
         def __init__(self, *args, device=None, **kwargs):
             self.device = device or torch.device("cpu")
+            # This test pins the "resume restores the saved threshold" path, so
+            # calibration must remain enabled here (the config-fixed override is
+            # tested separately below).
+            self.training_config = TrainingConfig(
+                calibrate_geometry_materialization_threshold=True
+            )
             self.geometry_probability_threshold = 0.91
             self.geometry_threshold_calibrated = False
             self.threshold_calls = []
@@ -1003,24 +1016,31 @@ def test_objective_and_epoch_configuration_are_resume_immutable():
     ]
 
 
+class ThresholdProbe:
+    """Lightweight trainer stand-in for _prepare_geometry_threshold_for_run tests."""
+
+    device = torch.device("cpu")
+
+    def __init__(self, *, calibrate=True):
+        self.training_config = TrainingConfig(
+            calibrate_geometry_materialization_threshold=bool(calibrate)
+        )
+        self.geometry_probability_threshold = 0.91
+        self.geometry_threshold_calibrated = False
+        self.calls = []
+
+    def _set_geometry_probability_threshold(self, threshold, *, calibrated, calibration):
+        self.calls.append(("restore", threshold, calibrated, dict(calibration or {})))
+        self.geometry_probability_threshold = float(threshold)
+        self.geometry_threshold_calibrated = bool(calibrated)
+        self.geometry_threshold_calibration = dict(calibration or {})
+
+    def calibrate_geometry_materialization_threshold(self, loader):
+        self.calls.append(("calibrate",))
+        raise AssertionError("exact resume must not recalibrate the threshold")
+
+
 def test_runner_restores_saved_threshold_before_resume_fingerprint(tmp_path):
-    class ThresholdProbe:
-        device = torch.device("cpu")
-
-        def __init__(self):
-            self.geometry_probability_threshold = 0.91
-            self.geometry_threshold_calibrated = False
-            self.calls = []
-
-        def _set_geometry_probability_threshold(self, threshold, *, calibrated, calibration):
-            self.calls.append(("restore", threshold, calibrated))
-            self.geometry_probability_threshold = float(threshold)
-            self.geometry_threshold_calibrated = bool(calibrated)
-
-        def calibrate_geometry_materialization_threshold(self, loader):
-            self.calls.append(("calibrate",))
-            raise AssertionError("exact resume must not recalibrate the threshold")
-
     state_path = tmp_path / "latest_run_state.pt"
     atomic_save_run_state(
         state_path,
@@ -1039,7 +1059,123 @@ def test_runner_restores_saved_threshold_before_resume_fingerprint(tmp_path):
     )
 
     assert trainer.geometry_probability_threshold == pytest.approx(0.37)
-    assert trainer.calls == [("restore", 0.37, True)]
+    assert trainer.calls == [("restore", 0.37, True, {"source": "saved"})]
+
+
+def test_config_fixed_threshold_overrides_saved_threshold_when_calibration_disabled(
+    tmp_path,
+):
+    """With calibration disabled the config value is authoritative at resume time.
+
+    This is the recovery fix: the failed run's calibrated 0.9752 threshold sat in
+    the free-running distribution tail, so even an exact resume must re-force the
+    config's fixed 0.5 threshold over any saved checkpoint/saved threshold.
+    """
+    state_path = tmp_path / "latest_run_state.pt"
+    atomic_save_run_state(
+        state_path,
+        {
+            "geometry_probability_threshold": 0.9752,
+            "geometry_threshold_calibrated": True,
+            "geometry_threshold_calibration": {"source": "saved", "threshold": 0.9752},
+        },
+    )
+    trainer = ThresholdProbe(calibrate=False)
+    trainer.training_config.geometry_materialization_threshold = 0.5
+
+    result = _prepare_geometry_threshold_for_run(
+        trainer,
+        calibration_loader=None,
+        resume_run_state=state_path,
+    )
+
+    assert trainer.geometry_probability_threshold == pytest.approx(0.5)
+    assert trainer.geometry_threshold_calibrated is True
+    assert result["source"] == "config_fixed"
+    assert result["frozen_for_run"] is True
+    assert result["threshold"] == pytest.approx(0.5)
+    # The saved 0.9752 was restored first, then overridden by the config value.
+    assert trainer.calls == [
+        ("restore", 0.9752, True, {"source": "saved", "threshold": 0.9752}),
+        ("restore", 0.5, True, {"source": "config_fixed", "frozen_for_run": True, "threshold": 0.5}),
+    ]
+
+
+def test_analytic_occupancy_logit_gradient_behavior():
+    """Deterministic one-sided brake, soft anchor, clipping, and ref handling."""
+    import math as _math
+
+    trainer = _round4_trainer()
+    trainer.geometry_probability_threshold = 0.5
+    trainer.training_config.occupancy_mean_probability_weight = 0.5
+    trainer.training_config.occupancy_soft_temperature = 0.05
+    trainer.training_config.occupancy_soft_weight = 0.5
+    trainer.training_config.direct_occupancy_gradient_max_norm = 1.0
+    trainer.direct_solver_loss.last_components = {}
+
+    def field(probability):
+        logit = _math.log(probability / (1.0 - probability))
+        return torch.full((1, 8, 8, 8), logit)
+
+    healthy_sparse = field(0.01)  # mean p ~ 0.01 < 0.5
+    saturated = field(0.95)  # mean p ~ 0.95 > 0.5
+
+    # (a) Deterministic: identical inputs produce byte-identical gradients.
+    first = trainer._analytic_occupancy_logit_gradient(
+        healthy_sparse, 0.5, DesignSpec()
+    )
+    second = trainer._analytic_occupancy_logit_gradient(
+        healthy_sparse, 0.5, DesignSpec()
+    )
+    assert torch.equal(first, second)
+
+    # (b) One-sided brake: with only the mean-probability term active, a healthy
+    # sparse field (mean(p) < threshold) gets an exactly-zero gradient.
+    trainer.training_config.occupancy_soft_weight = 0.0
+    brake_only = trainer._analytic_occupancy_logit_gradient(
+        healthy_sparse, 0.5, DesignSpec()
+    )
+    assert torch.equal(brake_only, torch.zeros_like(brake_only))
+
+    # (c) Nonzero when mean(p) > threshold (saturated field engages the brake).
+    brake_only_saturated = trainer._analytic_occupancy_logit_gradient(
+        saturated, 0.5, DesignSpec()
+    )
+    assert float(brake_only_saturated.norm().item()) > 0.0
+
+    # (d) Soft threshold-anchored surrogate: an empty field below the reference
+    # gets a NEGATIVE logit gradient, which gradient descent subtracts, moving
+    # the field UP toward the reference occupancy.
+    trainer.training_config.occupancy_soft_weight = 0.5
+    anchored = trainer._analytic_occupancy_logit_gradient(
+        healthy_sparse, 0.5, DesignSpec()
+    )
+    assert float(anchored.mean().item()) < 0.0
+
+    # (e) Gradient-norm clipping: a saturated field's raw gradient is clipped to
+    # the configured per-sample max norm.
+    trainer.training_config.direct_occupancy_gradient_max_norm = 0.05
+    clipped = trainer._analytic_occupancy_logit_gradient(
+        saturated, 0.5, DesignSpec()
+    )
+    assert float(clipped.norm().item()) <= 0.05 * (1.0 + 1.0e-6)
+
+    # (f) Scalar vs 1-element tensor reference_occupancy behave identically.
+    trainer.training_config.direct_occupancy_gradient_max_norm = 1.0
+    scalar_ref = trainer._analytic_occupancy_logit_gradient(
+        healthy_sparse, 0.5, DesignSpec()
+    )
+    tensor_ref = trainer._analytic_occupancy_logit_gradient(
+        healthy_sparse, torch.tensor([0.5]), DesignSpec()
+    )
+    assert torch.allclose(scalar_ref, tensor_ref)
+
+    telemetry = trainer.direct_solver_loss.last_components
+    assert telemetry.get("occupancy_analytic_gradient_enabled") == 1.0
+    assert "occupancy_reference" in telemetry
+    assert "occupancy_analytic_gradient_norm" in telemetry
+    assert "occupancy_mean_probability" in telemetry
+    assert "occupancy_soft_surrogate" in telemetry
 
 
 def test_resume_fingerprint_contains_live_training_behavior():

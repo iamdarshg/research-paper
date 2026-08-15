@@ -108,22 +108,44 @@ def _prepare_geometry_threshold_for_run(
 ) -> Dict[str, Any]:
     """Restore an exact-run threshold before compatibility is constructed."""
     if resume_run_state is None:
-        return trainer.calibrate_geometry_materialization_threshold(calibration_loader)
+        calibration = trainer.calibrate_geometry_materialization_threshold(
+            calibration_loader
+        )
+    else:
+        resolved_path = resolve_run_state_path(resume_run_state)
+        state = torch.load(
+            resolved_path,
+            map_location=trainer.device,
+            weights_only=False,
+        )
+        if "geometry_probability_threshold" not in state:
+            raise ValueError("Exact resume state is missing its saved geometry threshold")
+        trainer._set_geometry_probability_threshold(
+            state["geometry_probability_threshold"],
+            calibrated=bool(state.get("geometry_threshold_calibrated", True)),
+            calibration=state.get("geometry_threshold_calibration"),
+        )
+        calibration = dict(state.get("geometry_threshold_calibration", {}))
 
-    resolved_path = resolve_run_state_path(resume_run_state)
-    state = torch.load(
-        resolved_path,
-        map_location=trainer.device,
-        weights_only=False,
-    )
-    if "geometry_probability_threshold" not in state:
-        raise ValueError("Exact resume state is missing its saved geometry threshold")
-    trainer._set_geometry_probability_threshold(
-        state["geometry_probability_threshold"],
-        calibrated=bool(state.get("geometry_threshold_calibrated", True)),
-        calibration=state.get("geometry_threshold_calibration"),
-    )
-    return dict(state.get("geometry_threshold_calibration", {}))
+    if not trainer.training_config.calibrate_geometry_materialization_threshold:
+        # Fixed-threshold mode: the config value is authoritative and overrides
+        # any checkpoint/saved threshold (e.g. the failed run's calibrated
+        # 0.9752, which sits in the distribution tail and is the root fragility).
+        fixed_threshold = float(
+            trainer.training_config.geometry_materialization_threshold
+        )
+        trainer._set_geometry_probability_threshold(
+            fixed_threshold,
+            calibrated=True,
+            calibration={
+                **calibration,
+                "source": "config_fixed",
+                "frozen_for_run": True,
+                "threshold": fixed_threshold,
+            },
+        )
+        calibration = dict(trainer.geometry_threshold_calibration)
+    return calibration
 
 
 def _dataclass_fingerprint(value: Any) -> Any:

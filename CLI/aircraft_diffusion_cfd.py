@@ -461,6 +461,23 @@ class TrainingConfig:
     direct_aircraft_validity_weight: float = float(config_value("training", "direct_aircraft_validity_weight", 1.0))
     direct_solver_target_occupancy: Optional[float] = None
     direct_solver_use_batch_reference_occupancy: bool = True
+    # Differentiable occupancy objective on the free-running field. The SPSA
+    # hard-threshold occupancy component was flip-noise dominated (step-function
+    # derivative through the frozen threshold, always at its clip cap) and is the
+    # measured root cause of the occupancy bang-bang oscillation. It is replaced
+    # by an analytic gradient of two smooth terms: a one-sided mean-probability
+    # saturation brake (pushes down only while mean(p) > threshold) plus a soft
+    # threshold-anchored surrogate anchoring the materialized fraction at the
+    # batch reference occupancy (~0.5% sparse airframe).
+    occupancy_mean_probability_weight: float = float(
+        config_value("training", "occupancy_mean_probability_weight", 0.5)
+    )
+    occupancy_soft_temperature: float = float(
+        config_value("training", "occupancy_soft_temperature", 0.05)
+    )
+    occupancy_soft_weight: float = float(
+        config_value("training", "occupancy_soft_weight", 0.5)
+    )
     geometry_materialization_threshold: float = float(
         config_value("training", "geometry_materialization_threshold", 0.5)
     )
@@ -629,6 +646,18 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
     if not bool(training_config.direct_solver_use_batch_reference_occupancy) and not has_fixed_target:
         errors.append(
             "direct_solver_target_occupancy must be in (0, 0.50] when batch reference occupancy is disabled"
+        )
+    if float(training_config.occupancy_mean_probability_weight) < 0.0:
+        errors.append("occupancy_mean_probability_weight must be nonnegative")
+    if float(training_config.occupancy_soft_weight) < 0.0:
+        errors.append("occupancy_soft_weight must be nonnegative")
+    if (
+        float(training_config.occupancy_soft_weight) > 0.0
+        and float(training_config.occupancy_soft_temperature) <= 0.0
+    ):
+        errors.append(
+            "occupancy_soft_temperature must be greater than 0 "
+            "when occupancy_soft_weight > 0"
         )
     if errors:
         raise ValueError(
@@ -3173,7 +3202,6 @@ class AdvancedCFDSimulator:
         self.init_flow_field()
         # Step 1: Run the base solver
         geometry_mask = (geometry > 0.5).float()
-        print(f"Running {self.config.solver_type} GPU LBM solver at base resolution...")
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
         results = dict(self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask))
 
@@ -4074,15 +4102,18 @@ def _direct_measured_objective_for_single(
     # Materialize with one checkpoint-persisted threshold. The target occupancy
     # is a loss reference only; using it to choose voxels masks probability
     # collapse and leaks ground truth into generated geometry.
-    geometry_cpu = _binarize_probability_grid_for_solver(
-        probability_grid.detach().to("cpu"),
-        threshold=threshold,
-        target_occupancy=None,
-    )
+    # Threshold on the solver device (GPU) to avoid a per-solve CPU round trip
+    # and CPU threshold kernel; the binary mask is bit-identical to the
+    # CPU-thresholded result, so this is exact-parity. A CPU copy is kept only
+    # for the occupancy telemetry and the CPU connected-components validity eval.
     solver_device = getattr(cfd_simulator, "device", probability_grid.device)
-    solver_geometry = _canonical_training_geometry_to_solver_xyz(
-        geometry_cpu
-    ).to(solver_device)
+    binary = (probability_grid.detach().float().clamp(0.0, 1.0) > float(threshold)).to(
+        dtype=torch.float32
+    )
+    geometry_cpu = binary.detach().to("cpu")
+    solver_geometry = _canonical_training_geometry_to_solver_xyz(binary).to(
+        solver_device
+    )
 
     needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
     validity_report: Dict[str, Any] = {}
@@ -4137,6 +4168,12 @@ def _direct_measured_objective_for_single(
     occupancy_reference = occupancy if target_occupancy is None else float(target_occupancy)
     occupancy_loss = abs(occupancy - occupancy_reference)
     weighted_occupancy_loss = float(design_spec.space_weight) * occupancy_loss
+    # NOTE: weighted_occupancy_loss is excluded from total_loss and from the
+    # SPSA component set on purpose. Its hard-threshold gradient is flip-noise
+    # dominated (step-function derivative through the frozen threshold, always
+    # at its clip cap) and is the measured root cause of the occupancy
+    # oscillation. It is reported here only as telemetry; the actual occupancy
+    # signal is the deterministic analytic gradient added at the replay site.
     aero_loss = (
         float(design_spec.drag_weight) * float(drag_coefficient)
         + float(design_spec.lift_weight) * lift_term
@@ -4169,8 +4206,7 @@ def _direct_measured_objective_for_single(
 
     drag_loss = float(design_spec.drag_weight) * float(drag_coefficient)
     total_loss = (
-        weighted_occupancy_loss
-        + aero_loss
+        aero_loss
         + float(connectivity_weight) * connectivity_loss
         + float(aircraft_validity_weight) * validity_loss
     )
@@ -4273,6 +4309,12 @@ def _assemble_direct_solver_components(
     occupancy_reference = occupancy if target_occupancy is None else float(target_occupancy)
     occupancy_loss = abs(occupancy - occupancy_reference)
     weighted_occupancy_loss = float(design_spec.space_weight) * occupancy_loss
+    # NOTE: weighted_occupancy_loss is excluded from total_loss and from the
+    # SPSA component set on purpose. Its hard-threshold gradient is flip-noise
+    # dominated (step-function derivative through the frozen threshold, always
+    # at its clip cap) and is the measured root cause of the occupancy
+    # oscillation. It is reported here only as telemetry; the actual occupancy
+    # signal is the deterministic analytic gradient added at the replay site.
     aero_loss = (
         float(design_spec.drag_weight) * float(drag_coefficient)
         + float(design_spec.lift_weight) * lift_term
@@ -4305,8 +4347,7 @@ def _assemble_direct_solver_components(
 
     drag_loss = float(design_spec.drag_weight) * float(drag_coefficient)
     total_loss = (
-        weighted_occupancy_loss
-        + aero_loss
+        aero_loss
         + float(connectivity_weight) * connectivity_loss
         + float(aircraft_validity_weight) * validity_loss
     )
@@ -4552,7 +4593,6 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         generator.manual_seed(int(seed) % (2**63 - 1))
         direction_count = max(1, int(directions))
         component_names = (
-            "occupancy_loss",
             "aero_loss",
             "connectivity_loss",
             "aircraft_validity_loss",
@@ -5445,6 +5485,127 @@ class OptimizedDiffusionTrainer:
             "threshold": threshold_value,
         }
         self.direct_solver_loss.threshold = threshold_value
+
+    def _analytic_occupancy_logit_gradient(
+        self,
+        logits: torch.Tensor,
+        reference_occupancy: Optional[Union[float, torch.Tensor]],
+        design_spec: Union[DesignSpec, Sequence[DesignSpec]],
+    ) -> torch.Tensor:
+        """Deterministic differentiable occupancy gradient on the free-running logits.
+
+        Replaces the SPSA finite-difference occupancy component -- flip-noise
+        dominated (step-function derivative through the hard threshold, always at
+        its clip cap, directionally random) -- with the analytic gradient of two
+        smooth, deterministic terms:
+
+          loss_occ = mean_w * max(0, mean(p) - threshold)          # saturation brake
+                   + soft_w * |soft_occ - ref|                     # occupancy anchor
+          soft_occ  = mean(sigmoid((p - threshold) / T))
+
+        ref is the batch reference occupancy (~0.5% sparse airframe). The
+        mean-probability term is the user's "loss tied to average probability"
+        but used as a ONE-SIDED saturation brake: it pushes the field down only
+        while mean(p) sits above the threshold (the saturated 0.95 regime), and
+        never pushes a healthy sparse field back up. A two-sided target at the
+        reference is wrong: a healthy field with 0.5% positives at p=1 and the
+        rest at p~0.24 has mean ~0.24, and a two-sided loss would inflate it.
+        The soft term anchors the materialized fraction at the threshold (it
+        equals mean(p) only in the degenerate all-voxels-at-0.5 case, which is
+        exactly the 50% blob the run was oscillating in). Both are self-limiting:
+        each is ~0 at the healthy fixed point, and the soft term is
+        bimodality-aware so it cannot be satisfied by probability collapse.
+        """
+        batch_size = int(logits.shape[0])
+        mean_weight = float(self.training_config.occupancy_mean_probability_weight)
+        soft_weight = float(self.training_config.occupancy_soft_weight)
+        temperature = float(self.training_config.occupancy_soft_temperature)
+        if batch_size <= 0 or (mean_weight <= 0.0 and soft_weight <= 0.0):
+            return torch.zeros_like(logits)
+        threshold = self.geometry_probability_threshold
+        probs = torch.sigmoid(logits.detach().float())
+        prob_one_minus_prob = probs * (1.0 - probs)
+        ref_tensor = None
+        if torch.is_tensor(reference_occupancy):
+            ref_tensor = reference_occupancy.detach().reshape(-1).float().cpu()
+        if isinstance(design_spec, DesignSpec):
+            spec_list = [design_spec]
+        else:
+            spec_list = list(design_spec)
+        if len(spec_list) not in {1, batch_size}:
+            raise ValueError(
+                "design_spec sequence must contain one value or one value per "
+                f"batch item, got {len(spec_list)} values for batch size {batch_size}"
+            )
+        norm_limit = float(self.training_config.direct_occupancy_gradient_max_norm)
+        per_sample_grads = []
+        mean_probabilities: List[float] = []
+        soft_occupancies: List[float] = []
+        references: List[float] = []
+        for batch_idx in range(batch_size):
+            sample_probs = probs[batch_idx]
+            if ref_tensor is not None:
+                sample_reference = float(
+                    ref_tensor[0].item()
+                    if ref_tensor.numel() == 1
+                    else ref_tensor[batch_idx].item()
+                )
+            elif reference_occupancy is not None:
+                sample_reference = float(reference_occupancy)
+            else:
+                sample_reference = float(sample_probs.mean().item())
+            spec = spec_list[0 if len(spec_list) == 1 else batch_idx]
+            space_weight = float(getattr(spec, "space_weight", 1.0))
+            sample_grad = torch.zeros_like(sample_probs)
+            if mean_weight > 0.0:
+                mean_probability = float(sample_probs.mean().item())
+                # One-sided saturation brake: only while the field mean sits
+                # above the threshold does it push down. It never pushes a
+                # healthy sparse field back up toward the threshold.
+                if mean_probability > threshold:
+                    sample_grad = sample_grad + (
+                        mean_weight * prob_one_minus_prob[batch_idx]
+                    )
+                mean_probabilities.append(mean_probability)
+            if soft_weight > 0.0 and temperature > 0.0:
+                soft = torch.sigmoid((sample_probs - threshold) / temperature)
+                soft_occupancy = float(soft.mean().item())
+                soft_error = soft_occupancy - sample_reference
+                per_voxel = (
+                    (1.0 / temperature)
+                    * soft
+                    * (1.0 - soft)
+                    * prob_one_minus_prob[batch_idx]
+                )
+                sample_grad = sample_grad + (
+                    float(np.sign(soft_error)) * soft_weight
+                ) * per_voxel
+                soft_occupancies.append(soft_occupancy)
+            sample_grad = sample_grad * space_weight
+            sample_norm = sample_grad.norm()
+            if (
+                norm_limit > 0.0
+                and torch.isfinite(sample_norm)
+                and float(sample_norm.item()) > norm_limit
+            ):
+                sample_grad = sample_grad * (
+                    norm_limit / sample_norm.clamp_min(1.0e-12)
+                )
+            per_sample_grads.append(sample_grad)
+            references.append(sample_reference)
+        combined = torch.stack(per_sample_grads, dim=0)
+        combined = combined / max(batch_size, 1)
+        telemetry = self.direct_solver_loss.last_components
+        if mean_probabilities:
+            telemetry["occupancy_mean_probability"] = float(np.mean(mean_probabilities))
+        if soft_occupancies:
+            telemetry["occupancy_soft_surrogate"] = float(np.mean(soft_occupancies))
+        telemetry["occupancy_reference"] = float(np.mean(references))
+        telemetry["occupancy_analytic_gradient_norm"] = float(
+            combined.norm().item() / max(batch_size, 1)
+        )
+        telemetry["occupancy_analytic_gradient_enabled"] = 1.0
+        return combined
 
     def calibrate_geometry_materialization_threshold(
         self,
@@ -6348,8 +6509,18 @@ class OptimizedDiffusionTrainer:
                         )
                 if any(parameter.grad is not None for parameter in optimizer_parameters):
                     raise RuntimeError("direct replay started with stale optimizer gradients")
+                # The occupancy component is no longer probed by SPSA. Instead
+                # add its deterministic analytic gradient (mean-probability
+                # desaturation + soft threshold-anchored surrogate) so the
+                # occupancy signal is smooth and coherent instead of flip-noise.
+                analytic_occupancy_gradient = self._analytic_occupancy_logit_gradient(
+                    direct_optimizer_logits.detach(),
+                    reference_occupancy,
+                    design_spec,
+                )
                 direct_optimizer_logits.backward(
-                    gradient=direct_weight * direct_logit_gradient
+                    gradient=direct_weight
+                    * (direct_logit_gradient + analytic_occupancy_gradient)
                 )
                 direct_gradients = capture_gradients(optimizer_parameters)
                 clear_gradients(optimizer_parameters)
