@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence, Iterable
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 import asyncio
 
 import numpy as np
@@ -3898,6 +3898,14 @@ _SDF_POOL = ThreadPoolExecutor(max_workers=8)
 # target box; holding all 33 (~3.1 GB) would OOM alongside the training process.
 _SDF_WARM_TARGET_INFLIGHT = 8
 
+# Task 10: batch size for the 32 SPSA direct-solver probes. Only the probe
+# solves are batched; the base solve stays sequential and byte-identical. The
+# batched path is exercised at forward() call time (so tests can monkeypatch
+# this to 1 to force the verbatim sequential fallback or to 4 for the batched
+# chunked path). C < 2 disables batching entirely and the per-direction loop
+# runs the original sequential code verbatim.
+_DIRECT_SOLVER_BATCH_CHUNK = 4
+
 
 def _find_q_solver(cfd_simulator: "AdvancedCFDSimulator"):
     """Return the inner D3Q27 solver that owns _get_q/_warm_sdf_cache."""
@@ -4192,6 +4200,240 @@ def _direct_measured_objective_for_single(
     return components if return_components else components["total_loss"]
 
 
+def _assemble_direct_solver_components(
+    geometry_cpu: torch.Tensor,
+    design_spec: DesignSpec,
+    cfd_results: Dict[str, Any],
+    validity_report: Dict[str, Any],
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    target_occupancy: Optional[float],
+) -> Dict[str, float]:
+    """Turn one probe's geometry + CFD results + validity into the component dict.
+
+    This is a faithful copy of the loss-accounting tail of
+    ``_direct_measured_objective_for_single`` (occupancy, drag/lift extraction,
+    connectivity/validity losses, and the ``components`` dict). It exists as a
+    separate helper so the batched probe path shares the exact same arithmetic
+    without refactoring the sequential single-probe path (which stays
+    byte-identical).
+    """
+    occupancy = float(geometry_cpu.mean().item())
+    raw_drag = cfd_results.get("drag_coefficient")
+    if (
+        not isinstance(raw_drag, (int, float, np.floating))
+        or not np.isfinite(float(raw_drag))
+    ):
+        raise FloatingPointError(
+            "Direct solver requires a finite raw momentum-exchange "
+            f"drag_coefficient, got {raw_drag!r}; calibrated or surrogate "
+            "fallbacks are forbidden"
+        )
+    signed_drag_coefficient = float(raw_drag)
+    drag_coefficient = abs(signed_drag_coefficient)
+    raw_lift = cfd_results.get("lift_coefficient", 0.0)
+    if (
+        not isinstance(raw_lift, (int, float, np.floating))
+        or not np.isfinite(float(raw_lift))
+    ):
+        raise FloatingPointError(
+            "Direct solver requires a finite raw momentum-exchange "
+            "lift_coefficient"
+        )
+    lift_coefficient = abs(float(raw_lift))
+    lift_term = lift_coefficient
+
+    occupancy_reference = occupancy if target_occupancy is None else float(target_occupancy)
+    occupancy_loss = abs(occupancy - occupancy_reference)
+    weighted_occupancy_loss = float(design_spec.space_weight) * occupancy_loss
+    aero_loss = (
+        float(design_spec.drag_weight) * float(drag_coefficient)
+        + float(design_spec.lift_weight) * lift_term
+    )
+
+    connectivity_loss = 0.0
+    if connectivity_weight > 0.0:
+        connected_fraction = float(
+            validity_report.get("metrics", {}).get("largest_component_fraction", 0.0)
+        )
+        connectivity_loss = 1.0 - connected_fraction
+
+    validity_loss = 0.0
+    validity_mean_violation = 0.0
+    validity_worst_violation = 0.0
+    if aircraft_validity_weight > 0.0:
+        violation_scores = validity_report.get("violation_scores", {})
+        if isinstance(violation_scores, Mapping) and violation_scores:
+            (
+                validity_mean_violation,
+                validity_worst_violation,
+                validity_loss,
+            ) = _aggregate_aircraft_validity_violations(
+                violation_scores
+            )
+        else:
+            validity_mean_violation = 1.0
+            validity_worst_violation = 1.0
+            validity_loss = 2.0
+
+    drag_loss = float(design_spec.drag_weight) * float(drag_coefficient)
+    total_loss = (
+        weighted_occupancy_loss
+        + aero_loss
+        + float(connectivity_weight) * connectivity_loss
+        + float(aircraft_validity_weight) * validity_loss
+    )
+    components = {
+        "total_loss": float(total_loss),
+        "aero_loss": float(aero_loss),
+        "drag_coefficient": float(drag_coefficient),
+        "signed_drag_coefficient": float(signed_drag_coefficient),
+        "drag_loss": float(drag_loss),
+        "lift_coefficient": float(lift_coefficient),
+        "lift_loss": float(design_spec.lift_weight) * float(lift_term),
+        "occupancy": float(occupancy),
+        "occupancy_loss": float(weighted_occupancy_loss),
+        "connectivity_loss": float(connectivity_weight) * float(connectivity_loss),
+        "largest_component_fraction": float(
+            validity_report.get("metrics", {}).get(
+                "largest_component_fraction", 0.0
+            )
+        ),
+        "connectivity_guard_shortfall": max(
+            0.0,
+            0.70
+            - float(
+                validity_report.get("metrics", {}).get(
+                    "largest_component_fraction", 0.0
+                )
+            ),
+        ),
+        "aircraft_validity_loss": float(aircraft_validity_weight) * float(validity_loss),
+        "aircraft_validity_mean_violation": (
+            float(aircraft_validity_weight) * float(validity_mean_violation)
+        ),
+        "aircraft_validity_worst_violation": (
+            float(aircraft_validity_weight) * float(validity_worst_violation)
+        ),
+        "solver_used_raw_drag": 1.0,
+        "solver_drag_sign_reversed": float(signed_drag_coefficient < 0.0),
+        "solver_lbm_converged": float(bool(cfd_results.get("lbm_converged", False))),
+        "solver_force_stability": float(
+            cfd_results.get("force_stability")
+            if isinstance(cfd_results.get("force_stability"), (int, float, np.floating))
+            and np.isfinite(float(cfd_results.get("force_stability")))
+            else 1.0
+        ),
+    }
+    nonfinite_components = [
+        name for name, value in components.items() if not np.isfinite(float(value))
+    ]
+    if nonfinite_components:
+        raise FloatingPointError(
+            "Direct measured objective produced nonfinite components: "
+            + ", ".join(nonfinite_components)
+        )
+    return components
+
+
+def _direct_measured_objectives_batch(
+    probe_probability_grids: Sequence[torch.Tensor],
+    design_spec: DesignSpec,
+    cfd_simulator: "AdvancedCFDSimulator",
+    cfd_steps: int,
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    threshold: float,
+    target_occupancy: Optional[float],
+) -> List[Dict[str, float]]:
+    """Evaluate several SPSA probe grids in one batched D3Q27 solve.
+
+    ``probe_probability_grids`` is an ordered list of C probability grids in the
+    canonical [Z, Y, X] training frame (the ``+eps*delta`` / ``-eps*delta``
+    probes for one chunk, in interleaved plus/minus order). Each item is
+    binarized, submitted for validity on the pool, and stacked into a
+    ``[C, D, H, W]`` mask; the batch is solved in one ``collide_stream_batch``
+    call and per-probe components are assembled with
+    ``_assemble_direct_solver_components``. The returned list is indexed exactly
+    like ``probe_probability_grids``.
+    """
+    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    solver_device = getattr(cfd_simulator, "device", probe_probability_grids[0].device)
+
+    geometries_cpu: List[torch.Tensor] = []
+    solver_geometries: List[torch.Tensor] = []
+    validity_futures: List[Optional[Future]] = []
+    for probe in probe_probability_grids:
+        geometry_cpu = _binarize_probability_grid_for_solver(
+            probe.detach().to("cpu"),
+            threshold=threshold,
+            target_occupancy=None,
+        )
+        geometries_cpu.append(geometry_cpu)
+        solver_geometries.append(
+            _canonical_training_geometry_to_solver_xyz(geometry_cpu).to(solver_device)
+        )
+        if needs_shape_metrics:
+            validity_futures.append(
+                _VALIDITY_POOL.submit(
+                    evaluate_aircraft_validity, geometry_cpu, canonicalize=False
+                )
+            )
+        else:
+            validity_futures.append(None)
+
+    mask_stack = torch.stack([(g > 0.5).float() for g in solver_geometries], dim=0)
+    cfd_results_batch = cfd_simulator.lbm_solver.collide_stream_batch(
+        mask_stack, steps=max(1, int(cfd_steps))
+    )
+    validity_reports = [
+        future.result() if future is not None else {}
+        for future in validity_futures
+    ]
+
+    components_list = []
+    for i in range(len(probe_probability_grids)):
+        components_list.append(
+            _assemble_direct_solver_components(
+                geometries_cpu[i],
+                design_spec,
+                cfd_results_batch[i],
+                validity_reports[i],
+                connectivity_weight,
+                aircraft_validity_weight,
+                target_occupancy,
+            )
+        )
+    return components_list
+
+
+def _clear_direct_solver_batch_workspace(cfd_simulator: "AdvancedCFDSimulator") -> None:
+    """Drop the private batched-workspace buffers after a chunked SPSA solve.
+
+    The batched path allocates ``[C, 27, D, H, W]`` populations and q tensors on
+    the inner D3Q27 solver. This releases them so a later chunk (or the next
+    training batch) reallocates for its own C, and so peak VRAM reflects only
+    the current chunk rather than accumulating chunk after chunk.
+    """
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    nested_solver = getattr(root_solver, "_solver", None) if root_solver is not None else None
+    solver = nested_solver if nested_solver is not None else root_solver
+    if solver is None:
+        return
+    for name in (
+        "_f_batch",
+        "_f_pre_batch",
+        "_f_temp_batch",
+        "_velocity_x_batch",
+        "_velocity_y_batch",
+        "_velocity_z_batch",
+        "_pressure_batch",
+        "_rho_batch",
+    ):
+        if hasattr(solver, name):
+            setattr(solver, name, None)
+
+
 def _clear_direct_solver_geometry_caches(cfd_simulator: "AdvancedCFDSimulator") -> None:
     """Drop per-geometry LBM caches after SPSA probes to avoid 96^3 cache growth."""
     solvers = []
@@ -4379,50 +4621,111 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 name: torch.zeros_like(sample_field) for name in component_names
             }
             legacy_total_grad = torch.zeros_like(sample_field)
-            for delta in deltas:
-                plus_field = sample_field + eps * delta
-                minus_field = sample_field - eps * delta
-                plus_components = _direct_measured_objective_for_single(
-                    torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
-                    sample_design_spec,
-                    cfd_simulator,
-                    cfd_steps,
-                    connectivity_weight,
-                    aircraft_validity_weight,
-                    threshold,
-                    sample_target,
-                    return_components=True,
-                )
-                minus_components = _direct_measured_objective_for_single(
-                    torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
-                    sample_design_spec,
-                    cfd_simulator,
-                    cfd_steps,
-                    connectivity_weight,
-                    aircraft_validity_weight,
-                    threshold,
-                    sample_target,
-                    return_components=True,
-                )
-                legacy_total_grad.add_(
-                    (
-                        (plus_components["total_loss"] - minus_components["total_loss"])
-                        / (2.0 * eps)
+            # Task 10: batch the 32 SPSA probes into chunks of
+            # _DIRECT_SOLVER_BATCH_CHUNK simultaneous solves. The base solve is
+            # always sequential; only this probe loop may batch. When the
+            # chunk is < 2 the loop below is the original sequential code
+            # verbatim (the batch path is never exercised).
+            _spsa_batch_chunk = int(_DIRECT_SOLVER_BATCH_CHUNK)
+            if _spsa_batch_chunk >= 2:
+                deltas_per_chunk = max(1, _spsa_batch_chunk // 2)
+                for chunk_start in range(0, direction_count, deltas_per_chunk):
+                    chunk_deltas = deltas[chunk_start:chunk_start + deltas_per_chunk]
+                    probe_grids = []
+                    for delta in chunk_deltas:
+                        plus_field = sample_field + eps * delta
+                        minus_field = sample_field - eps * delta
+                        probe_grids.append(
+                            torch.sigmoid(plus_field)
+                            if input_is_logits
+                            else plus_field.clamp(0.0, 1.0)
+                        )
+                        probe_grids.append(
+                            torch.sigmoid(minus_field)
+                            if input_is_logits
+                            else minus_field.clamp(0.0, 1.0)
+                        )
+                    chunk_components = _direct_measured_objectives_batch(
+                        probe_grids,
+                        sample_design_spec,
+                        cfd_simulator,
+                        cfd_steps,
+                        connectivity_weight,
+                        aircraft_validity_weight,
+                        threshold,
+                        sample_target,
                     )
-                    * delta
-                )
-                for component_name in component_names:
-                    raw_component_grads[component_name].add_(
-                        (
+                    for local_index, delta in enumerate(chunk_deltas):
+                        plus_components = chunk_components[2 * local_index]
+                        minus_components = chunk_components[2 * local_index + 1]
+                        legacy_total_grad.add_(
                             (
-                                plus_components[component_name]
-                                - minus_components[component_name]
+                                (
+                                    plus_components["total_loss"]
+                                    - minus_components["total_loss"]
+                                )
+                                / (2.0 * eps)
                             )
+                            * delta
+                        )
+                        for component_name in component_names:
+                            raw_component_grads[component_name].add_(
+                                (
+                                    (
+                                        plus_components[component_name]
+                                        - minus_components[component_name]
+                                    )
+                                    / (2.0 * eps)
+                                )
+                                * delta
+                            )
+                    _clear_direct_solver_geometry_caches(cfd_simulator)
+                    _clear_direct_solver_batch_workspace(cfd_simulator)
+            else:
+                for delta in deltas:
+                    plus_field = sample_field + eps * delta
+                    minus_field = sample_field - eps * delta
+                    plus_components = _direct_measured_objective_for_single(
+                        torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
+                        sample_design_spec,
+                        cfd_simulator,
+                        cfd_steps,
+                        connectivity_weight,
+                        aircraft_validity_weight,
+                        threshold,
+                        sample_target,
+                        return_components=True,
+                    )
+                    minus_components = _direct_measured_objective_for_single(
+                        torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
+                        sample_design_spec,
+                        cfd_simulator,
+                        cfd_steps,
+                        connectivity_weight,
+                        aircraft_validity_weight,
+                        threshold,
+                        sample_target,
+                        return_components=True,
+                    )
+                    legacy_total_grad.add_(
+                        (
+                            (plus_components["total_loss"] - minus_components["total_loss"])
                             / (2.0 * eps)
                         )
                         * delta
                     )
-                _clear_direct_solver_geometry_caches(cfd_simulator)
+                    for component_name in component_names:
+                        raw_component_grads[component_name].add_(
+                            (
+                                (
+                                    plus_components[component_name]
+                                    - minus_components[component_name]
+                                )
+                                / (2.0 * eps)
+                            )
+                            * delta
+                        )
+                    _clear_direct_solver_geometry_caches(cfd_simulator)
             legacy_total_grad.div_(direction_count)
             for component_grad in raw_component_grads.values():
                 component_grad.div_(direction_count)
