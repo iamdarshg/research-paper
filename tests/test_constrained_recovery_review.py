@@ -41,6 +41,7 @@ from run_monitored_training import (
     _resume_epoch_position,
     _run_state_checkpoint_due,
     _reconcile_updates_log,
+    _updates_log_reconciliation_metadata,
     restore_promotion_baseline,
 )
 import run_monitored_training as monitored_training
@@ -240,7 +241,10 @@ def test_eight_plus_twenty_four_log_reconciliation_has_no_duplicate_steps(tmp_pa
             path,
             {"global_step": step, "kind": "optimizer_update"},
         )
-    _reconcile_updates_log(path, checkpoint)
+    _reconcile_updates_log(
+        path,
+        _updates_log_reconciliation_metadata(path, checkpoint),
+    )
     for step in range(9, 33):
         _append_jsonl(path, {"global_step": step, "kind": "optimizer_update"})
 
@@ -923,7 +927,10 @@ def test_log_ahead_is_reconciled_to_checkpoint_boundary(tmp_path):
     first = _append_jsonl(path, {"global_step": 1, "kind": "optimizer_update"})
     second = _append_jsonl(path, {"global_step": 2, "kind": "optimizer_update"})
 
-    result = _reconcile_updates_log(path, first)
+    result = _reconcile_updates_log(
+        path,
+        _updates_log_reconciliation_metadata(path, first),
+    )
 
     assert result["truncated_records"] == 1
     assert [json.loads(line)["global_step"] for line in path.read_text().splitlines()] == [1]
@@ -1329,6 +1336,7 @@ def test_interrupted_two_plus_two_resume_is_trajectory_equivalent(tmp_path):
     }
     set_seed(2026)
     interrupted = make_trainer()
+    interrupted.run_state_updates_log_path = str(updates_path)
 
     def interrupted_update(record):
         interrupted.run_state_log_metadata = _append_jsonl(updates_path, record)

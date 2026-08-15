@@ -4759,6 +4759,7 @@ class OptimizedDiffusionTrainer:
         self.stop_after_updates: Optional[int] = None
         self.run_state_metadata: Dict[str, Any] = {}
         self.run_state_log_metadata: Dict[str, Any] = {}
+        self.run_state_updates_log_path: Optional[str] = None
         self.last_gradient_lifecycle: Dict[str, Any] = {}
         self._sync_consistency_teacher()
 
@@ -4788,6 +4789,17 @@ class OptimizedDiffusionTrainer:
     ) -> Dict[str, Any]:
         """Build the complete state needed to continue at the next sample."""
         self._sync_consistency_teacher()
+        log_reconciliation = dict(self.run_state_log_metadata)
+        updates_log_path = getattr(self, "run_state_updates_log_path", None)
+        recorded_offset = log_reconciliation.get("offset")
+        if (
+            updates_log_path is not None
+            and recorded_offset is not None
+            and Path(updates_log_path).exists()
+        ):
+            with open(updates_log_path, "rb") as handle:
+                prefix = handle.read(int(recorded_offset))
+            log_reconciliation["sha256"] = hashlib.sha256(prefix).hexdigest()
         return {
             "run_state_version": 1,
             "epoch_index": int(epoch_index),
@@ -4819,7 +4831,7 @@ class OptimizedDiffusionTrainer:
             ),
             "compatibility": dict(compatibility),
             "run_state_metadata": dict(self.run_state_metadata),
-            "log_reconciliation": dict(self.run_state_log_metadata),
+            "log_reconciliation": log_reconciliation,
         }
 
     def save_run_state(
@@ -6080,13 +6092,26 @@ class OptimizedDiffusionTrainer:
             # EMA update
             self._update_ema()
 
-            # Logging
-            total_optimization_loss += optimization_loss_val.item()
-            total_mse += mse_loss_val.item()
-            total_clean_geometry += clean_geometry_loss_val.item()
-            total_geometry += geometry_loss_val.item()
-            total_generation_geometry += generation_geometry_loss_val.item()
-            total_consistency += consistency_loss.item()
+            # Logging — read each loss .item() exactly once (GPU->CPU) and
+            # reuse the floats in the totals, the progress postfix, and the
+            # metrics callback. The loss tensors are untouched and still feed
+            # the optimization objective.
+            optimization_loss_float = optimization_loss_val.item()
+            mse_loss_float = mse_loss_val.item()
+            clean_geometry_loss_float = clean_geometry_loss_val.item()
+            geometry_loss_float = geometry_loss_val.item()
+            generation_geometry_loss_float = generation_geometry_loss_val.item()
+            consistency_float = consistency_loss.item()
+            latent_reconstruction_float = latent_reconstruction_loss_val.item()
+            denoising_confidence_float = denoising_geometry_confidence.item()
+            direct_solver_float = direct_solver_loss_val.item()
+
+            total_optimization_loss += optimization_loss_float
+            total_mse += mse_loss_float
+            total_clean_geometry += clean_geometry_loss_float
+            total_geometry += geometry_loss_float
+            total_generation_geometry += generation_geometry_loss_float
+            total_consistency += consistency_float
             data_gradient_metrics = branch_telemetry["data"]
             consistency_gradient_metrics = branch_telemetry["consistency"]
             direct_gradient_metrics = branch_telemetry["direct"]
@@ -6113,11 +6138,11 @@ class OptimizedDiffusionTrainer:
                 total_consistency_student_rms += float(
                     self.last_consistency_metrics.get("student_rms", 0.0)
                 )
-            total_latent_reconstruction += latent_reconstruction_loss_val.item()
-            total_denoising_geometry_confidence += denoising_geometry_confidence.item()
-            total_direct_solver += direct_solver_loss_val.item()
+            total_latent_reconstruction += latent_reconstruction_float
+            total_denoising_geometry_confidence += denoising_confidence_float
+            total_direct_solver += direct_solver_float
             if direct_solver_evaluated:
-                total_direct_solver_eval += direct_solver_loss_val.item()
+                total_direct_solver_eval += direct_solver_float
                 components = self.direct_solver_loss.last_components
                 total_direct_occupancy += float(
                     components.get("occupancy_loss", 0.0)
@@ -6164,20 +6189,21 @@ class OptimizedDiffusionTrainer:
                 )
                 direct_solver_eval_count += 1
 
-            pbar.set_postfix({
-                'opt_loss': optimization_loss_val.item(),
-                'mse': mse_loss_val.item(),
-                'clean_geom': clean_geometry_loss_val.item(),
-                'geom': geometry_loss_val.item(),
-                'gen_geom': generation_geometry_loss_val.item(),
-                'consistency': consistency_loss.item(),
-                'latent_recon': latent_reconstruction_loss_val.item(),
-                'direct_solver': direct_solver_loss_val.item(),
-                'denoise_conf': denoising_geometry_confidence.item(),
-                'grad_data': data_gradient_metrics.applied_norm,
-                'grad_cons': consistency_gradient_metrics.applied_norm,
-                'grad_direct': direct_gradient_metrics.applied_norm,
-            })
+            if batch_idx % 5 == 0:
+                pbar.set_postfix({
+                    'opt_loss': optimization_loss_float,
+                    'mse': mse_loss_float,
+                    'clean_geom': clean_geometry_loss_float,
+                    'geom': geometry_loss_float,
+                    'gen_geom': generation_geometry_loss_float,
+                    'consistency': consistency_float,
+                    'latent_recon': latent_reconstruction_float,
+                    'direct_solver': direct_solver_float,
+                    'denoise_conf': denoising_confidence_float,
+                    'grad_data': data_gradient_metrics.applied_norm,
+                    'grad_cons': consistency_gradient_metrics.applied_norm,
+                    'grad_direct': direct_gradient_metrics.applied_norm,
+                })
 
             self.global_step += 1
             if self.update_metrics_callback is not None:
@@ -6202,18 +6228,18 @@ class OptimizedDiffusionTrainer:
                         ),
                         "remaining_in_epoch": int(len(train_loader) - batch_idx - 1),
                         "losses": {
-                            "optimization": float(optimization_loss_val.item()),
-                            "mse": float(mse_loss_val.item()),
-                            "clean_geometry": float(clean_geometry_loss_val.item()),
-                            "geometry": float(geometry_loss_val.item()),
+                            "optimization": float(optimization_loss_float),
+                            "mse": float(mse_loss_float),
+                            "clean_geometry": float(clean_geometry_loss_float),
+                            "geometry": float(geometry_loss_float),
                             "generation_geometry": float(
-                                generation_geometry_loss_val.item()
+                                generation_geometry_loss_float
                             ),
-                            "consistency": float(consistency_loss.item()),
+                            "consistency": float(consistency_float),
                             "latent_reconstruction": float(
-                                latent_reconstruction_loss_val.item()
+                                latent_reconstruction_float
                             ),
-                            "direct_solver": float(direct_solver_loss_val.item()),
+                            "direct_solver": float(direct_solver_float),
                             "threshold_positive_margin_loss": float(
                                 self.last_threshold_margin_components.get(
                                     "threshold_positive_margin_loss", 0.0
@@ -6292,10 +6318,6 @@ class OptimizedDiffusionTrainer:
             ):
                 interrupted_early = True
                 break
-
-            # Clear memory
-            if batch_idx % 10 == 0:
-                torch.cuda.empty_cache()
 
         denominator = max(processed_updates, 1)
         avg_optimization_loss = total_optimization_loss / denominator

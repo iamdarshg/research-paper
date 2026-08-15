@@ -40,27 +40,64 @@ from training_stability import (
 from sdf_utils import prepare_edt_workspace
 
 
+_JSONL_RECORD_COUNTS: Dict[str, int] = {}
+
+
+def _count_jsonl_records(path: Path) -> int:
+    try:
+        with path.open("rb") as handle:
+            return sum(1 for _ in handle)
+    except FileNotFoundError:
+        return 0
+
+
 def _append_jsonl(path: Path, record: Dict[str, Any]) -> Dict[str, Any]:
+    """Append one JSONL record (append + flush only, no fsync or full-file scan).
+
+    Returns the durable append offset and global_step used to build the
+    run-state reconciliation metadata. The full-file sha256 prefix digest is NOT
+    computed per append; the run-state save path computes it once over the
+    recorded offset (see OptimizedDiffusionTrainer.build_run_state). The record
+    count is kept as an in-memory running counter (initialized once per path to
+    cover resume) instead of re-counting the whole file on every append.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    key = str(path)
+    if key not in _JSONL_RECORD_COUNTS:
+        _JSONL_RECORD_COUNTS[key] = _count_jsonl_records(path)
     line = json.dumps(record, sort_keys=True, allow_nan=False)
     encoded = (line + "\n").encode("utf-8")
     with path.open("ab") as handle:
         handle.seek(0, os.SEEK_END)
-        start = handle.tell()
         handle.write(encoded)
         handle.flush()
-        os.fsync(handle.fileno())
         end = handle.tell()
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    with path.open("rb") as record_handle:
-        record_count = sum(1 for _ in record_handle)
+    _JSONL_RECORD_COUNTS[key] += 1
     return {
         "offset": int(end),
-        "sha256": digest,
         "global_step": int(record.get("global_step", 0)),
-        "record_count": int(record_count),
-        "start_offset": int(start),
+        "record_count": int(_JSONL_RECORD_COUNTS[key]),
     }
+
+
+def _updates_log_reconciliation_metadata(
+    path: Path,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Stamp the durable-prefix sha256 onto updates-log metadata.
+
+    Mirrors the digest computation the run-state save path performs over the
+    recorded offset (OptimizedDiffusionTrainer.build_run_state) so callers that
+    hold only the per-append metadata can produce a reconcile-ready checkpoint.
+    """
+    stamped = dict(metadata)
+    offset = int(metadata.get("offset", -1))
+    if offset < 0:
+        return stamped
+    with path.open("rb") as handle:
+        prefix = handle.read(offset)
+    stamped["sha256"] = hashlib.sha256(prefix).hexdigest()
+    return stamped
 
 
 def _prepare_geometry_threshold_for_run(
@@ -940,6 +977,7 @@ def main() -> int:
         )
     args.updates_output = str(updates_output)
     trainer.run_state_checkpoint_path = str(run_state_target)
+    trainer.run_state_updates_log_path = str(updates_output)
     trainer.update_metrics_callback = lambda record: _append_jsonl(
         updates_output,
         record,
