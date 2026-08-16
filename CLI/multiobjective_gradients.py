@@ -96,9 +96,12 @@ def gradient_l2_norm(
     (and no full-size square allocation) is ever materialized.  The per-tensor
     norms are combined with a max-scaled accumulation so a single representable
     extreme value (e.g. 1e308) keeps a finite result instead of overflowing the
-    intermediate sum of squares.
+    intermediate sum of squares.  All per-tensor reductions stay on the device;
+    a single host read fetches the combined result, so the per-update telemetry
+    path performs one GPU→CPU sync instead of one per tensor.
     """
-    per_tensor_norms: list[float] = []
+    per_tensor_norms: list[torch.Tensor] = []
+    finite_checks: list[torch.Tensor] = []
     for parameter_index, gradient in enumerate(gradients):
         if gradient is None:
             continue
@@ -108,27 +111,30 @@ def gradient_l2_norm(
             parameter_index=parameter_index,
         )
         gradient_f64 = gradient.detach().to(dtype=torch.float64)
-        if not bool(torch.isfinite(gradient_f64).all().item()):
-            raise NonFiniteGradientError(
-                f"gradient branch {branch_name!r} contains nonfinite values"
-            )
+        finite_checks.append(torch.isfinite(gradient_f64).all())
         # Per-tensor norm of the fp64 tensor; a tensor with finite values whose
         # norm still overflows (e.g. two 1e308 entries) reports inf here and is
         # rejected by the scale check below, matching the concatenated behavior.
         per_tensor_norms.append(
-            float(torch.linalg.vector_norm(gradient_f64, ord=2).item())
+            torch.linalg.vector_norm(gradient_f64, ord=2)
         )
     if not per_tensor_norms:
         return 0.0
-    scale = max(per_tensor_norms)
-    if not math.isfinite(scale):
+    if not bool(torch.stack(finite_checks).all().item()):
         raise NonFiniteGradientError(
-            f"gradient branch {branch_name!r} has a nonfinite L2 norm"
+            f"gradient branch {branch_name!r} contains nonfinite values"
         )
-    if scale == 0.0:
-        return 0.0
-    total_norm = scale * math.sqrt(
-        sum((norm / scale) ** 2 for norm in per_tensor_norms)
+    norms = torch.stack(per_tensor_norms)
+    scale = norms.max()
+    # Max-scaled accumulation on the GPU stack. A zero scale means every
+    # per-tensor norm is zero, so the branch norm is exactly zero; select the
+    # zero result on the device so a single host read resolves both cases (an
+    # inf/nan scale propagates through the accumulation and is caught below).
+    scaled_total = scale * torch.sqrt(torch.sum((norms / scale) ** 2))
+    total_norm = float(
+        torch.where(
+            scale == 0.0, torch.zeros_like(scaled_total), scaled_total
+        ).item()
     )
     if not math.isfinite(total_norm):
         raise NonFiniteGradientError(
@@ -176,10 +182,11 @@ def _gradient_dot_product(
         raise ValueError("gradient branches must have the same buffer count")
 
     # Streaming per-tensor accumulation: the per-pair fp64 products are summed
-    # in a Python float so no full-model FP64 concatenated vectors are built.
+    # on the device so no full-model FP64 concatenated vectors are built.
     # Summation order differs from the concatenated form; callers compare within
     # the repo's atol/rtol, not bit-exactness.
-    dot = 0.0
+    pair_dots: list[torch.Tensor] = []
+    finite_checks: list[torch.Tensor] = []
     for parameter_index, (first_gradient, second_gradient) in enumerate(
         zip(first, second)
     ):
@@ -197,19 +204,23 @@ def _gradient_dot_product(
         )
         first_f64 = first_gradient.detach().to(dtype=torch.float64)
         second_f64 = second_gradient.detach().to(dtype=torch.float64)
-        if not bool(
+        finite_checks.append(
             torch.logical_and(
                 torch.isfinite(first_f64),
                 torch.isfinite(second_f64),
-            ).all().item()
-        ):
-            raise NonFiniteGradientError(
-                f"gradient dot product for {first_name!r} and {second_name!r} "
-                "contains nonfinite values"
-            )
-        dot += float(
-            torch.dot(first_f64.reshape(-1), second_f64.reshape(-1)).item()
+            ).all()
         )
+        pair_dots.append(
+            torch.dot(first_f64.reshape(-1), second_f64.reshape(-1))
+        )
+    if not pair_dots:
+        return 0.0
+    if not bool(torch.stack(finite_checks).all().item()):
+        raise NonFiniteGradientError(
+            f"gradient dot product for {first_name!r} and {second_name!r} "
+            "contains nonfinite values"
+        )
+    dot = float(torch.stack(pair_dots).sum().item())
     if not math.isfinite(dot):
         raise NonFiniteGradientError(
             f"gradient dot product for {first_name!r} and {second_name!r} "
