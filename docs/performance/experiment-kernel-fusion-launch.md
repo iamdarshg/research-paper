@@ -76,8 +76,16 @@ graphs.
 * Graph-pool footprint for a [32768, 896] capture is estimated ~350 MiB
   persistent — **"do not land on 8GB"** per workflow. Mitigation: capture at a
   smaller `rows` (e.g. 8192) and loop 4 replays per chunk; the pool shrinks ~4x
-  at the cost of more replays (still 2 launches each vs 24 eager). The
-  microbenchmark measures the real pool delta.
+  at the cost of more replays (still 2 launches each vs 24 eager).
+* **Microbenchmark result (CLI/kernel_fusion_graph.py, GPU, after the
+  device-drift fix in d1a3481): the graph gives NO speedup on this GPU** —
+  0.99x (graph 2379.8 ms vs eager 2359.3 ms per 27-chunk update at
+  [32768, 231]->[896] width-5 MLP), parity bit-exact (0.000e+00). The harness
+  cannot directly read the pool delta (the graph's private pool is created at
+  CAPTURE time, before the harness's baseline; the pool-delta print reads ~0).
+  The earlier 336 MiB figure was the MLP's eager peak intermediate set — which
+  is exactly what a real capture-time pool would pin, so ~350 MiB stands as the
+  cost. **Lever 3 stays OFF: no measured speedup AND ~350 MiB pool on 8 GB.**
 
 ## Full phase attribution of the 24.86 s GPU idle (workflow wf_da6a83b6-ae6)
 
