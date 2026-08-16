@@ -79,6 +79,56 @@ graphs.
   at the cost of more replays (still 2 launches each vs 24 eager). The
   microbenchmark measures the real pool delta.
 
+## Full phase attribution of the 24.86 s GPU idle (workflow wf_da6a83b6-ae6)
+
+Per-phase windows of the 63.17 s traced update (phase_attribution.py, 0/114,264
+kernels unclassified):
+
+| phase | window (into wall) | GPU busy | GPU idle | util | kernels |
+|---|---|---|---|---|---|
+| decoder_forward | 0-15.55 s (0-24.6 %) | 12.46 s | 2.73 s | ~80 % | 36,870 |
+| diffusion_consistency | interleaved w/ decoder | 0.05 s | 0.31 s | - | 9,481 |
+| solver (SPSA direct-solve) | 15.55-32.71 s (24.6-51.8 %) | 5.36 s | **11.84 s** | 31 % | 30,184 |
+| backward | 32.71-60.5 s (51.8-95.8 %) | 20.14 s | **7.68 s** | 72 % | 26,091 |
+| optimizer_save (copy burst) | 60.5-63.2 s (95.8-100 %) | 0.30 s | 2.30 s | - | 11,638 |
+
+Top-25 gaps: 20 solver (4.4 s of 50-200 ms per-solve drains), 4 backward (6.0 s
+incl. the single 5852 ms end drain), 1 decoder startup.
+
+### The three recoverable levers (ranked)
+
+1. **Solver scalar-read drain (11.84 s idle, ~9 s recoverable).** The sequential
+   33-probe SPSA loop gates every solve on ~6 host scalar reads (validity
+   `.tolist()` aircraft_validity.py:456, occupancy `.item()` :4307, 15-scalar
+   coeff `.tolist()` :1640, nonempty bool :3417, drag-exponent `.item()`
+   advanced_lbm_solver.py:343, full-96^3 D2H `compute_tensor_content_hash`
+   utils.py:42) -> ~600 serialized barriers/update. None of the probe values
+   feed control flow inside the loop (only post-loop accumulation + records),
+   so all reads can defer to ONE batched pinned D2H + one sync after the 33rd
+   solve. `_assemble_direct_solver_components` (aircraft_diffusion_cfd.py:4433)
+   already exists as a byte-faithful assembly tail -> reuse verbatim. Zero
+   memory risk (pinned [33,~20] floats); CPU-parity-gateable; keeps solves
+   sequential (batching C>=2 is OFF on 8 GB - measured 117/183 s/u vs 62.66).
+   Also folds in the 2888 ms SPSA-batch-prep entry drain by pre-rolling the
+   per-probe binarize/canonical/hash into the Task-9 pre-warm.
+
+2. **End-of-update optimizer boundary (5.85 s GPU-silent + 2.30 s copy burst).**
+   Between the last loss scalar read (:54.7 s) and the save burst (:60.5 s)
+   the trainer serializes the host against the GPU: 3x full-model fp64 gradient
+   reconstruction + `.item()` guard-dot reads (aircraft_diffusion_cfd.py:
+   6932-6947, one per active guard), `clip_grad_norm_` x3 (:6905-6907),
+   `capture_gradients` x2 (:6908/:6919), `project_improvement_gradients_
+   against_guards`, and `_update_ema` (:5872). `offload_optimizer_state_
+   between_steps` is FALSE in config.yaml (confirmed), so the copy burst is NOT
+   the offload - it is the guard/gradient-capture/EMA churn. Fix direction:
+   compute the guard dots GPU-side (fp64 cat + dot + a single deferred .item()),
+   or accept them but overlap with the next forward. NOT the SPSA loop (corrects
+   the pre-workflow belief).
+
+3. **Decoder launch overhead (2.73 s idle, healthy ~80 % util).** This branch's
+   CUDA graph (Target 1) applies here - recovers the CPU launch/Python overhead,
+   not this idle (launch-gap scale). Conditional on 8 GB memory headroom.
+
 ## How to run the GPU microbenchmark (deferred)
 
 When no training job is on the GPU:
