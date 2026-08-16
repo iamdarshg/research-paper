@@ -679,8 +679,8 @@ def stream_bfl_d3q27_batch_compressed(
     active_flat = sparse["active_flat"]
     pair_start = sparse["pair_start"]
     pair_count = sparse["pair_count"]
-    if q_flat.numel() > 0 and int(pair_count.max().item()) > 0:
-        max_count = int(pair_count.max().item())
+    max_count = int(pair_count.max().item())
+    if q_flat.numel() > 0 and max_count > 0:
         n_pairs = int(pair_count.numel())
         grid_correct = (n_pairs, triton.cdiv(max_count, block_size))
         _bfl_correct_kernel_batch[grid_correct](
