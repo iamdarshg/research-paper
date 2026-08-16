@@ -2151,8 +2151,16 @@ class D3Q27CascadedSolver:
             lift_to_drag = float(lift_coefficient / max(abs(drag_coefficient), 1e-12))
 
             v_inf = coeffs.get('freestream_speed', 0.0)
-            nu_turb_mean = 0.0
-            reynolds_turbulent = float(v_inf * h * self.resolution / max(self.nu + nu_turb_mean, 1e-12))
+
+            # reynolds_number_turbulent is explicit-unavailable (None) on the
+            # batch path: it needs nu_turb_mean, the mean Smagorinsky
+            # turbulent-viscosity field, which is computed only in the SEQUENTIAL
+            # compute_aerodynamic_coefficients (:1765). A hardcoded
+            # nu_turb_mean = 0.0 here would silently report a LAMINAR-ONLY
+            # Reynolds number under a "turbulent" key (a mislabel). The consumer
+            # audit found nothing reads reynolds_number_turbulent from batch
+            # dicts, so the unavailable marking is propagated instead, consistent
+            # with the three turbulence/vorticity fields below.
 
             results.append({
                 'force_x': float(physical_drag_force.item() if isinstance(physical_drag_force, torch.Tensor) else physical_drag_force),
@@ -2184,10 +2192,20 @@ class D3Q27CascadedSolver:
                 'shape_drag_scale': shape_drag_scale,
                 'force_definition': force_definition,
                 'pressure_sum': float(solver._pressure_batch[c].sum().item()),
-                'max_turbulent_viscosity': 0.0,
+                # Explicit-unavailable on the batch path: the batched force
+                # accounting holds force sums and the velocity fields but NOT the
+                # per-geometry vorticity / Smagorinsky turbulent-viscosity
+                # fields. Those are computed only in the SEQUENTIAL
+                # compute_aerodynamic_coefficients (:1838 max_turbulent_viscosity
+                # from nu_turb_max_f, :1840 max_vorticity from vorticity_max_f,
+                # :1841 vortex_core_volume from vortex_cells_f). Computing them
+                # here would require per-geometry curl + viscosity reductions over
+                # the full field with no existing parity gate. None serializes to
+                # JSON null = unambiguous "not computed here".
+                'max_turbulent_viscosity': None,
                 'mean_smagorinsky_constant': float(getattr(self.phys_config, 'smagorinsky_constant', 0.17)),
-                'max_vorticity': 0.0,
-                'vortex_core_volume': 0.0,
+                'max_vorticity': None,
+                'vortex_core_volume': None,
                 'reference_area': ref_area,
                 'reference_area_source': 'projected_frontal_voxel_area_yz',
                 'reference_area_lattice': projected_area_lattice,
@@ -2195,7 +2213,7 @@ class D3Q27CascadedSolver:
                 'reference_length_source': 'grid_spacing_times_resolution',
                 'freestream_speed': v_inf,
                 'density': coeffs['density'],
-                'reynolds_number_turbulent': reynolds_turbulent,
+                'reynolds_number_turbulent': None,
                 'empty_geometry': bool(torch.sum(solid.float()).item() <= 0.0),
                 'claim_bearing_cfd': False,
                 'solver_quality_checks': {
