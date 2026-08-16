@@ -243,6 +243,22 @@ class D3Q27Solver:
         # Precompute Guo directions
         self.ei_guo = torch.stack([self.ex_f, self.ey_f, self.ez_f], dim=1).view(27, 3, 1, 1, 1)
 
+    def _materialize_q_from_warm_entry(self, entry, geometry_mask):
+        """Materialize an on-device q tensor from a warm-pool entry.
+
+        Shared by the sequential ``_get_q`` and the Task 10 batched helpers
+        (``_get_q_batch`` / ``_get_q_single_batch``). OFFLOAD-3: the pool now
+        pre-computes a [D, H, W] SDF (scipy EDT stays on CPU); the 26-link
+        q-algebra runs on the solve device, so only the small SDF crosses H2D
+        instead of the full [27, D, H, W] q field. A full 4-D q tensor (legacy
+        warm entries / unit-test sentinels) is still used as-is.
+        """
+        if entry.ndim == 3:
+            return compute_link_q(
+                entry.to(geometry_mask.device), self.ex, self.ey, self.ez
+            )
+        return entry.to(geometry_mask.device)
+
     def _get_q(self, geometry_mask, geom_hash=None):
         """Get or compute sub-voxel distances for the given geometry (Fix A/Issue #15)."""
         # Fix A: Use a true content hash for the geometry key (Review Feedback)
@@ -252,23 +268,14 @@ class D3Q27Solver:
         if geom_key not in self._q_cache:
             # Task 9: a warm entry is a pre-computed CPU tensor, or an in-flight
             # Future that will produce one, submitted by the SPSA probe pre-warm.
-            # Pop it, move it to the solve device, and store it in the per-solve
+            # Pop it, materialize it on the solve device (see
+            # _materialize_q_from_warm_entry), and store it in the per-solve
             # _q_cache so the 5 solver steps reuse it. On a miss we fall back to
             # the original compute-and-store path (the EDT then runs serially).
-            # OFFLOAD-3: the pool now pre-computes a [D, H, W] SDF (scipy EDT
-            # stays on CPU); the 26-link q-algebra runs on the solve device, so
-            # only the small SDF crosses H2D instead of the full [27, D, H, W] q
-            # field. A full 4-D q tensor (legacy warm entries / unit-test
-            # sentinels) is still used as-is.
             warm_entry = self._warm_sdf_cache.pop(geom_key, None)
             if warm_entry is not None:
                 entry = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
-                if entry.ndim == 3:
-                    self._q_cache[geom_key] = compute_link_q(
-                        entry.to(geometry_mask.device), self.ex, self.ey, self.ez
-                    )
-                else:
-                    self._q_cache[geom_key] = entry.to(geometry_mask.device)
+                self._q_cache[geom_key] = self._materialize_q_from_warm_entry(entry, geometry_mask)
                 # Keep the pre-warm pool topped up (bounded in-flight so the CPU
                 # does not accumulate all 33 q tensors at once).
                 refill = getattr(self, "_sdf_refill", None)
@@ -730,16 +737,7 @@ class D3Q27Solver:
             warm_entry = self._warm_sdf_cache.pop(geom_key, None)
             if warm_entry is not None:
                 entry = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
-                # OFFLOAD-3 warm entries are [D, H, W] SDFs; run the 26-link
-                # q-algebra on the solve device (mirrors sequential _get_q). A
-                # full 4-D q tensor (legacy warm entries / test sentinels) is
-                # used as-is.
-                if entry.ndim == 3:
-                    q = compute_link_q(
-                        entry.to(geometry_mask.device), self.ex, self.ey, self.ez
-                    )
-                else:
-                    q = entry.to(geometry_mask.device)
+                q = self._materialize_q_from_warm_entry(entry, geometry_mask)
                 refill = getattr(self, "_sdf_refill", None)
                 if callable(refill):
                     refill(self)
@@ -760,16 +758,7 @@ class D3Q27Solver:
         warm_entry = self._warm_sdf_cache.pop(geom_hash, None)
         if warm_entry is not None:
             entry = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
-            # OFFLOAD-3 warm entries are [D, H, W] SDFs; run the 26-link
-            # q-algebra on the solve device (mirrors sequential _get_q). A
-            # full 4-D q tensor (legacy warm entries / test sentinels) is
-            # used as-is.
-            if entry.ndim == 3:
-                q = compute_link_q(
-                    entry.to(geometry_mask.device), self.ex, self.ey, self.ez
-                )
-            else:
-                q = entry.to(geometry_mask.device)
+            q = self._materialize_q_from_warm_entry(entry, geometry_mask)
             refill = getattr(self, "_sdf_refill", None)
             if callable(refill):
                 refill(self)

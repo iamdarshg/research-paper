@@ -55,6 +55,13 @@ from lbm_utils import (
     mach_to_physical_speed,
 )
 from tests.test_direct_solver_fused_parity import COMPONENT_ATOL, COMPONENT_RTOL
+from advanced_lbm_solver import D3Q27Solver
+from sdf_utils import compute_all_link_distances, compute_link_q
+from utils import compute_tensor_content_hash
+
+# Repo field-parity envelope (verbatim constant from test_task10_batched_spsa_parity /
+# test_d3q27_kernel_parity).
+FIELD_ATOL_5STEP = 4e-6
 
 
 @pytest.fixture(autouse=True)
@@ -1901,3 +1908,54 @@ def test_scale_momentum_exchange_force_references_speed_of_sound_constant():
 
     assert "REFERENCE_SPEED_OF_SOUND_MPS" in inspect.getsource(advanced_scale)
     assert "REFERENCE_SPEED_OF_SOUND_MPS" in inspect.getsource(cascaded_scale)
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (PR-41 GPT-5.6 review): shared warm-SDF materialization seam.
+# All three q helpers (_get_q / _get_q_batch / _get_q_single_batch) route warm
+# entries through _materialize_q_from_warm_entry. A bare [D,H,W] SDF warm-pool
+# entry must round-trip through every helper to the same [27,D,H,W] q that the
+# sequential _get_q produces (OFFLOAD-3 ndim==3 -> compute_link_q branch).
+# ---------------------------------------------------------------------------
+def test_warm_sdf_q_materialization_batched_matches_sequential():
+    """A warm [D,H,W] SDF round-trips through all q helpers identically.
+
+    Each solver owns a private warm cache seeded with the SAME production-style
+    SDF (scipy EDT via ``compute_all_link_distances(..., return_sdf=True)``), so
+    the batched result cannot be a warm-pop the sequential path already drained.
+    The materialized q is also checked against an independent ``compute_link_q``
+    reference (the seam's "correct [27,D,H,W] q on-device" contract), not just
+    self-consistency across helpers.
+    """
+    device = torch.device("cpu")
+    n = 8
+    mask = torch.zeros(n, n, n)
+    mask[2:6, 2:6, 2:6] = 1.0  # interior solid block -> nontrivial SDF
+
+    seq = D3Q27Solver(n, device)
+    single_batch = D3Q27Solver(n, device)
+    full_batch = D3Q27Solver(n, device)
+
+    # OFFLOAD-3 warm entry shape: a bare full-volume [n,n,n] SDF (CPU), exactly
+    # what the SPSA pre-warm thread pool submits.
+    warm_sdf = compute_all_link_distances(mask, seq.ex, seq.ey, seq.ez, True)
+    assert warm_sdf.ndim == 3 and warm_sdf.shape == (n, n, n)
+
+    geom_key = compute_tensor_content_hash(mask)
+    for solver in (seq, single_batch, full_batch):
+        solver._warm_sdf_cache[geom_key] = warm_sdf
+
+    q_seq = seq._get_q(mask, geom_hash=geom_key)
+    q_single = single_batch._get_q_single_batch(mask, geom_key)
+    q_full = full_batch._get_q_batch([geom_key], [mask])[0]
+
+    expected = compute_link_q(warm_sdf.to(device), seq.ex, seq.ey, seq.ez)
+    assert expected.shape == (27, n, n, n)
+    for q in (q_seq, q_single, q_full):
+        assert q.shape == (27, n, n, n)
+        assert torch.allclose(q, expected, atol=FIELD_ATOL_5STEP)
+    assert torch.allclose(q_seq, q_single, atol=FIELD_ATOL_5STEP)
+    assert torch.allclose(q_seq, q_full, atol=FIELD_ATOL_5STEP)
+    # Same shared helper + identical inputs => byte-identical round-trip.
+    assert torch.equal(q_seq, q_single)
+    assert torch.equal(q_seq, q_full)
