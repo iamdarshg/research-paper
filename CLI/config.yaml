@@ -201,6 +201,17 @@ conditioning:
     - public CLI surfaces only a subset of the full schema and still needs condition-response benchmarks before claims can be strengthened
     - scalar constraints include thrust-to-weight, turn-rate, explicit thrust and engine geometry, and numeric min/max bounds
 
+experiment:
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
+  # coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
+  # (CLI/kernel_fusion_graph.py) to cut ~13 launches/chunk to 3. OFF by default:
+  # the graph is memory-conditional on 8 GB (~350 MiB static pool) and is only
+  # engaged when grad is disabled (torch.utils.checkpoint forward) at a fixed
+  # [chunk_size, latent_dim+coordinate_dim] input. Capture failure, shape/device
+  # drift, or any autograd-enabled call silently falls back to the compiled or
+  # eager path. See docs/performance/experiment-kernel-fusion-launch.md.
+  graph_decode_mlp: false
+
 design:
   target_speed: 50.0
   wingspan_limit_m: 1.8

@@ -3105,6 +3105,29 @@ class LatentTo3DConverter(nn.Module):
         return self._encoded_coordinate_grid
 
     def _decode_coordinate_features(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        if _GRAPH_DECODE_MLP:
+            # EXPERIMENTAL CUDA-graph path (branch experiment/kernel-fusion-launch):
+            # capture/replay the MLP forward to cut ~13 launches/chunk to 3. The
+            # graph binds to the configured chunk row count and the actual feature
+            # width, so partial/stacked chunks (e.g. the 3x-stacked sparse geometry
+            # decode) fall back to eager via shape drift. DecodeMLPGraph.__call__
+            # also falls back internally on capture failure and on ANY
+            # autograd-enabled call -- the torch.utils.checkpoint BACKWARD recompute
+            # must not replay (a detached result would zero gradients to latent);
+            # only the no_grad forward is safe to replay.
+            graph = getattr(self, "_graph_decode_mlp", None)
+            if graph is None:
+                from kernel_fusion_graph import DecodeMLPGraph
+
+                graph = DecodeMLPGraph(
+                    self._decode_coordinate_features_eager,
+                    self._effective_coordinate_chunk_size(decoder_input.device),
+                    decoder_input.shape[1],
+                    decoder_input.device,
+                    decoder_input.dtype,
+                )
+                self._graph_decode_mlp = graph
+            return graph(decoder_input)
         if self._compiled_decode_features is not None:
             try:
                 return self._compiled_decode_features(decoder_input)
@@ -4096,6 +4119,16 @@ _SDF_WARM_TARGET_INFLIGHT = 8
 # batched path stays available and parity-gated for boxes with >= 16 GiB VRAM
 # (isolated probe win: C=4 1.12x real / 1.09-1.10x isolated).
 _DIRECT_SOLVER_BATCH_CHUNK = 1
+
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
+# coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
+# (CLI/kernel_fusion_graph.py) to cut ~13 launches/chunk to 3. OFF by default:
+# the graph is memory-conditional on 8 GB (~350 MiB static pool) and is only
+# engaged when grad is disabled (torch.utils.checkpoint forward) at a fixed
+# [chunk_size, latent_dim+coordinate_dim] input. Capture failure, shape/device
+# drift, or any autograd-enabled call silently falls back to the compiled or
+# eager path. See docs/performance/experiment-kernel-fusion-launch.md.
+_GRAPH_DECODE_MLP = bool(config_value("experiment", "graph_decode_mlp", False))
 
 
 def _direct_solver_supports_batch(cfd_simulator) -> bool:

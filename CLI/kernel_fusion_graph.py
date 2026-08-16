@@ -161,7 +161,12 @@ class DecodeMLPGraph:
             return self._fn(x)
         self._static_in.copy_(x)
         self._graph.replay()
-        return self._static_out
+        # MUST return a fresh copy, not the static buffer: the next replay
+        # overwrites self._static_out, and the decoder chunk loop holds
+        # .view()s of each chunk's output until the final torch.cat. Returning
+        # a clone adds one memcpy kernel per replay (3 launches/chunk vs ~12
+        # eager) but guarantees chunk N's output survives chunk N+1's replay.
+        return self._static_out.clone()
 
     # -- introspection ----------------------------------------------------
     @property
