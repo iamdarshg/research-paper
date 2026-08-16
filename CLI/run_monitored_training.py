@@ -1427,7 +1427,13 @@ def main() -> int:
                 metrics["promotion_report"] = dict(promotion)
                 metrics["promotion_non_regression_report"] = dict(non_regression)
                 metrics["promotion_directional_gate"] = dict(directional_gate)
-                candidate_improved = promotion_passed
+                # Only gate the best-checkpoint save on the lexicographic
+                # promotion rank improving over the best seen so far; every
+                # passing promotion otherwise overwrites the best checkpoint
+                # regardless of rank. Metric recording below is unchanged.
+                candidate_improved = (
+                    promotion_passed and promotion_rank > best_promotion_rank
+                )
                 if candidate_improved:
                     best_promotion_rank = promotion_rank
                     best_geometry_metric = metrics["geometry_selection_metric"]
