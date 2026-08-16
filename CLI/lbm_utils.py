@@ -41,7 +41,7 @@ def classify_lbm_regime(mach_number: float, external_validation: str | None = No
     mach = float(mach_number)
     mach_magnitude = abs(mach)
     base = {
-        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=REFERENCE_SPEED_OF_SOUND_MPS m/s",
+        "sound_speed_model": f"D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a={REFERENCE_SPEED_OF_SOUND_MPS} m/s",
         "compressibility_model": "weakly_compressible_isothermal_lbm",
         "thermal_model": "none_isothermal",
     }

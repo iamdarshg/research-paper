@@ -38,7 +38,7 @@ from CLI.openfoam_case_utils import (
 )
 
 
-SPEED_OF_SOUND = 343.0
+from lbm_utils import REFERENCE_SPEED_OF_SOUND_MPS as SPEED_OF_SOUND
 RHO_INF = 1.225
 
 

@@ -9,6 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'CLI'))
 
 from advanced_lbm_solver import D3Q27CascadedSolver, D3Q27Lattice
 from config import CFDConfig, LBMPhysicsConfig
+from lbm_utils import REFERENCE_SPEED_OF_SOUND_MPS
 
 class TestLBMSolvers(unittest.TestCase):
     def setUp(self):
@@ -63,7 +64,7 @@ class TestLBMSolvers(unittest.TestCase):
     def test_d3q27_benchmark_like_run_is_finite(self):
         benchmark_config = CFDConfig(
             base_grid_resolution=32,
-            mach_number=80 / 343.0,
+            mach_number=80 / REFERENCE_SPEED_OF_SOUND_MPS,
             reynolds_number=80 * 40.0 / 1.47e-5,
         )
         benchmark_config.lbm_config = LBMPhysicsConfig()

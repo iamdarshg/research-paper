@@ -1864,6 +1864,11 @@ def test_mach_helpers_map_documented_mach_to_lattice_and_physical_speed():
     )
 
 
+def test_reference_speed_of_sound_pinned_to_isa_sea_level_343():
+    """The ISA sea-level reference speed of sound must stay pinned at 343.0 m/s."""
+    assert REFERENCE_SPEED_OF_SOUND_MPS == 343.0
+
+
 def test_estimate_lattice_freestream_velocity_honors_mach_unclamped(caplog):
     """Mach 0.3 must yield u_lattice ~0.1732, NOT the clamped 0.12, and the warning path fires."""
     from advanced_lbm_solver import D3Q27CascadedSolver as AdvancedD3Q27CascadedSolver
