@@ -176,6 +176,9 @@ cfd:
   # External PDE validation is a separate evidence run. The non-claim-bearing
   # local placeholder is never executed inside the optimizer.
   enable_external_validation: false
+  # Mach (dimensionless) is the solver operating point. Absolute speed (m/s)
+  # is derived via the ISA sea-level reference speed of sound (343 m/s) for
+  # physical-unit force conversion only, and varies with temperature/pressure.
   mach_number: 0.3
   reynolds_number: 1000000.0
   simulation_steps: 500

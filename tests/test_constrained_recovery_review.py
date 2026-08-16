@@ -1,8 +1,12 @@
+import inspect
 import json
+import logging
+import math
 import os
 import random
 import sys
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -45,6 +49,11 @@ from run_monitored_training import (
     restore_promotion_baseline,
 )
 import run_monitored_training as monitored_training
+from lbm_utils import (
+    REFERENCE_SPEED_OF_SOUND_MPS,
+    mach_to_lattice_velocity,
+    mach_to_physical_speed,
+)
 from tests.test_direct_solver_fused_parity import COMPONENT_ATOL, COMPONENT_RTOL
 
 
@@ -1823,3 +1832,67 @@ def test_interrupted_two_plus_two_resume_is_trajectory_equivalent(tmp_path, monk
     assert torch.equal(torch.get_rng_state(), uninterrupted_rng)
     assert random.getstate() == uninterrupted_python_rng
     assert saved_state["completed_in_epoch"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (PR-41 GPT-5.6 review): honor the documented Mach 0.3 operating point.
+# The configured Mach (dimensionless) is the operating-point truth; absolute
+# speed is a derived quantity. These tests pin the config->reality seam.
+# ---------------------------------------------------------------------------
+
+
+def test_both_cfdconfig_classes_read_mach_number_from_config_yaml():
+    """Both CFDConfig classes must read cfd.mach_number (0.3) from the repo config.yaml."""
+    from aircraft_diffusion_cfd import CFDConfig as RecoveryCFDConfig
+    from config import CFDConfig as ConfigCFDConfig
+
+    assert ConfigCFDConfig().mach_number == 0.3
+    assert RecoveryCFDConfig().mach_number == 0.3
+    # An explicit constructor override must still win over the YAML default.
+    assert ConfigCFDConfig(mach_number=0.05).mach_number == 0.05
+    assert RecoveryCFDConfig(mach_number=0.05).mach_number == 0.05
+
+
+def test_mach_helpers_map_documented_mach_to_lattice_and_physical_speed():
+    """mach_to_lattice_velocity(0.3) == 0.3/sqrt(3); physical speed uses the named constant."""
+    expected_lattice = 0.3 / math.sqrt(3.0)
+    assert mach_to_lattice_velocity(0.3) == pytest.approx(
+        expected_lattice, rel=COMPONENT_RTOL, abs=COMPONENT_ATOL
+    )
+    assert mach_to_physical_speed(0.3) == pytest.approx(
+        0.3 * REFERENCE_SPEED_OF_SOUND_MPS, rel=COMPONENT_RTOL, abs=COMPONENT_ATOL
+    )
+
+
+def test_estimate_lattice_freestream_velocity_honors_mach_unclamped(caplog):
+    """Mach 0.3 must yield u_lattice ~0.1732, NOT the clamped 0.12, and the warning path fires."""
+    from advanced_lbm_solver import D3Q27CascadedSolver as AdvancedD3Q27CascadedSolver
+
+    stub = SimpleNamespace(
+        config=SimpleNamespace(mach_number=0.3),
+        phys_config=SimpleNamespace(max_mach=0.3, target_lattice_velocity=0.12),
+    )
+    with caplog.at_level(logging.WARNING, logger="advanced_lbm_solver"):
+        u_lattice = AdvancedD3Q27CascadedSolver._estimate_lattice_freestream_velocity(stub)
+
+    expected = 0.3 / math.sqrt(3.0)
+    assert u_lattice == pytest.approx(expected, rel=COMPONENT_RTOL, abs=COMPONENT_ATOL)
+    assert u_lattice != pytest.approx(0.12)  # NOT silently clamped to target_lattice_velocity
+    assert any("Mach 0.3" in record.message for record in caplog.records)
+
+    # Sign-symmetry must be preserved for negative mach.
+    stub_neg = SimpleNamespace(
+        config=SimpleNamespace(mach_number=-0.3),
+        phys_config=SimpleNamespace(max_mach=0.3, target_lattice_velocity=0.12),
+    )
+    u_neg = AdvancedD3Q27CascadedSolver._estimate_lattice_freestream_velocity(stub_neg)
+    assert u_neg == pytest.approx(-expected, rel=COMPONENT_RTOL, abs=COMPONENT_ATOL)
+
+
+def test_scale_momentum_exchange_force_references_speed_of_sound_constant():
+    """Physical-unit force conversion must use the named REFERENCE_SPEED_OF_SOUND_MPS constant."""
+    from advanced_lbm_solver import _scale_momentum_exchange_force as advanced_scale
+    from cascaded_lbm import _scale_momentum_exchange_force as cascaded_scale
+
+    assert "REFERENCE_SPEED_OF_SOUND_MPS" in inspect.getsource(advanced_scale)
+    assert "REFERENCE_SPEED_OF_SOUND_MPS" in inspect.getsource(cascaded_scale)

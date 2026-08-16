@@ -1,4 +1,6 @@
 
+import logging
+
 import torch
 import numpy as np
 from concurrent.futures import Future
@@ -7,9 +9,11 @@ from typing import TYPE_CHECKING
 
 from lbm_utils import (
     D3Q27Lattice,
+    REFERENCE_SPEED_OF_SOUND_MPS,
     _compute_force_coefficients,
     build_lbm_compressibility_metadata,
     mach_to_lattice_velocity,
+    mach_to_physical_speed,
 )
 from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity, compute_velocity_gradients
 from sdf_utils import compute_all_link_distances, compute_link_q
@@ -62,12 +66,12 @@ def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: floa
     1. multiplying by the lattice freestream speed to recover the missing O(U)
        factor needed for force ~ U^2 at fixed Reynolds number.
 
-    Using dt = dx / (343.0 * sqrt(3)) gives the remaining force scale
-    rho_phys * dx^2 * (343.0 * sqrt(3))^2.
+    Using dt = dx / (REFERENCE_SPEED_OF_SOUND_MPS * sqrt(3)) gives the
+    remaining force scale rho_phys * dx^2 * (REFERENCE_SPEED_OF_SOUND_MPS * sqrt(3))^2.
     """
     dx = float(grid_spacing)
-    # velocity_ratio = sound_speed_phys / sound_speed_lattice = 343.0 * sqrt(3)
-    velocity_ratio = 343.0 * np.sqrt(3.0)
+    # velocity_ratio = sound_speed_phys / sound_speed_lattice = REFERENCE_SPEED_OF_SOUND_MPS * sqrt(3)
+    velocity_ratio = REFERENCE_SPEED_OF_SOUND_MPS * np.sqrt(3.0)
     force_scale = float(density) * (dx**2) * (velocity_ratio**2)
     lattice_freestream_speed = abs(float(mach_number)) / np.sqrt(3.0)
     return lattice_freestream_speed * force * force_scale
@@ -1414,6 +1418,12 @@ class D3Q27CascadedSolver:
 
         For D3Q27, the sound speed c_s = 1/sqrt(3).
         To maintain consistent Mach number, u_lattice = Ma * c_s = Ma / sqrt(3).
+
+        The configured Mach number is the operating-point truth: the returned
+        lattice velocity is always mach / sqrt(3), never silently clamped. The
+        stability envelope below is retained as a DIAGNOSTIC only -- if the
+        implied lattice velocity exceeds it, a single warning is emitted per
+        solver init and the unclamped value is returned unchanged.
         """
         mach = getattr(self.config, 'mach_number', 0.0)
         u_lattice = mach_to_lattice_velocity(mach)
@@ -1422,7 +1432,17 @@ class D3Q27CascadedSolver:
         target_lattice_velocity = float(getattr(self.phys_config, "target_lattice_velocity", 0.12))
         max_lattice_velocity = max(1e-4, min(0.85 * (max_mach / np.sqrt(3.0)), target_lattice_velocity))
 
-        return float(np.clip(u_lattice, -max_lattice_velocity, max_lattice_velocity))
+        if abs(u_lattice) > max_lattice_velocity:
+            logging.getLogger(__name__).warning(
+                "Configured Mach %g implies lattice velocity %.6g, which exceeds the "
+                "stability envelope %.6g; honoring the configured operating point "
+                "unclamped (re-stabilization at this Mach is required).",
+                mach,
+                u_lattice,
+                max_lattice_velocity,
+            )
+
+        return float(u_lattice)
 
     def _initialize_equilibrium(self):
         """Initialize solver populations to equilibrium with a small freestream."""
@@ -1687,7 +1707,7 @@ class D3Q27CascadedSolver:
         ref_area = max(ref_area, h**2)
         projected_area_lattice = max(projected_area_raw, 1.0)
         raw_projected_drag_coefficient = float(projected_drag_f / projected_area_lattice)
-        freestream_speed = float(mach_number * 343.0)
+        freestream_speed = mach_to_physical_speed(mach_number)
         drag_reference_speed = float(getattr(self.phys_config, 'drag_reference_speed', 80.0))
         speed_exponent = float(getattr(self.phys_config, 'drag_speed_normalization_exponent', 1.0))
         if freestream_speed > 1e-12 and drag_reference_speed > 0.0 and speed_exponent != 0.0:
@@ -1720,7 +1740,7 @@ class D3Q27CascadedSolver:
         # calls force_x.item()/force_z.item() internally, which would re-insert
         # two syncs; inlining keeps the exact fp64 arithmetic on the extracted
         # floats).
-        v_inf = mach_number * 343.0
+        v_inf = mach_to_physical_speed(mach_number)
         q_inf = 0.5 * 1.225 * v_inf**2
         denom = q_inf * max(ref_area, 1e-12) + 1e-12
         drag_coefficient = float(physical_drag_force_f / denom)
@@ -2074,7 +2094,7 @@ class D3Q27CascadedSolver:
 
             projected_area_lattice = max(torch.sum(torch.any(solid, dim=0).float()).item(), 1.0)
             raw_projected_drag_coefficient = float(projected_drag.item() / projected_area_lattice)
-            freestream_speed = float(getattr(self.config, 'mach_number', 0.0) * 343.0)
+            freestream_speed = mach_to_physical_speed(float(getattr(self.config, 'mach_number', 0.0)))
             drag_reference_speed = float(getattr(self.phys_config, 'drag_reference_speed', 80.0))
             speed_exponent = float(getattr(self.phys_config, 'drag_speed_normalization_exponent', 1.0))
             if freestream_speed > 1e-12 and drag_reference_speed > 0.0 and speed_exponent != 0.0:
