@@ -13,11 +13,22 @@ Modes:
                    drives trainer.direct_solver_loss on a fixed-shape field
   --solver-only    isolated CFD solves on the base geometry (warm q-cache floor)
 
-Each instrumented phase ends with torch.cuda.synchronize() so its wall time
-includes the GPU work an async launch would otherwise defer to the next .item().
+Per-update wall time (--full-update) is measured at the trainer's natural
+per-update boundary (update_metrics_callback), warmup updates are unmeasured,
+and the stats (mean/median/p90/p95) are computed over the M>=5 measured updates
+only -- warmup is never in the denominator. A single synchronize at each update
+boundary folds the just-launched GPU work into the wall delta; the per-call
+synchronize inside the instrumented phase wrappers is optional
+(--sync-per-call) and never feeds the wall numbers.
+
+--fresh-init constructs the trainer WITHOUT loading a checkpoint and with a
+procedural synthetic loader, so --full-update runs on any worktree with no
+checkpoint present (the per-update cost is dominated by the SPSA solves +
+decoder + solver, which are to first order weights-independent).
 
 Usage:
-  python CLI/profile_training_update.py --warmup 1 --iterations 3 --full-update
+  python CLI/profile_training_update.py --warmup 1 --iterations 5 --full-update
+  python CLI/profile_training_update.py --warmup 1 --iterations 5 --full-update --fresh-init
   python CLI/profile_training_update.py --direct-only --iterations 1
   python CLI/profile_training_update.py --solver-only --iterations 5
 """
@@ -118,7 +129,7 @@ from run_monitored_training import (  # noqa: E402
 TIMERS: dict[str, list[float]] = {}  # name -> [total_s, call_count]
 
 
-def _instrument(cls_or_module, name):
+def _instrument(cls_or_module, name, sync_per_call: bool = True):
     owner = getattr(cls_or_module, name, None)
     if owner is None:
         return
@@ -127,7 +138,7 @@ def _instrument(cls_or_module, name):
         def wrapper(*args, **kwargs):
             t0 = time.perf_counter()
             result = fn(*args, **kwargs)
-            if torch.cuda.is_available():
+            if sync_per_call and torch.cuda.is_available():
                 torch.cuda.synchronize()
             entry = TIMERS.setdefault(name, [0.0, 0.0])
             entry[0] += time.perf_counter() - t0
@@ -140,25 +151,33 @@ def _instrument(cls_or_module, name):
     setattr(cls_or_module, name, make_wrapper(owner))
 
 
-def install_instrumentation():
-    _instrument(adc.AdvancedCFDSimulator, "simulate_aerodynamics")
-    _instrument(adc.AdvancedCFDSimulator, "init_flow_field")
-    _instrument(adc.AdvancedCFDSimulator, "compute_aerodynamic_coefficients")
-    _instrument(lbs.D3Q27Solver, "collide_and_stream")
-    _instrument(lbs.D3Q27Solver, "_get_q")
-    _instrument(adc, "evaluate_aircraft_validity")
-    _instrument(adc, "_direct_measured_objective_for_single")
+def install_instrumentation(sync_per_call: bool = True):
+    """Instrument the hot phases.
+
+    ``sync_per_call`` makes the per-call ``torch.cuda.synchronize()`` optional:
+    when False the phase table is approximate (deferred GPU work is excluded)
+    but per-update wall numbers -- which come from the update-boundary callback
+    in ``run_full_update``, never from per-call syncs -- stay exact. Defaults to
+    True for the legacy direct/solver phase-attribution callers.
+    """
+    _instrument(adc.AdvancedCFDSimulator, "simulate_aerodynamics", sync_per_call)
+    _instrument(adc.AdvancedCFDSimulator, "init_flow_field", sync_per_call)
+    _instrument(adc.AdvancedCFDSimulator, "compute_aerodynamic_coefficients", sync_per_call)
+    _instrument(lbs.D3Q27Solver, "collide_and_stream", sync_per_call)
+    _instrument(lbs.D3Q27Solver, "_get_q", sync_per_call)
+    _instrument(adc, "evaluate_aircraft_validity", sync_per_call)
+    _instrument(adc, "_direct_measured_objective_for_single", sync_per_call)
     # ---- model-phase instrumentation (the un-instrumented ~72s/update) ----
-    _instrument(adc.OptimizedDiffusionTrainer, "_compute_consistency_loss")
-    _instrument(adc.ConsistencyModel, "fast_inference")
-    _instrument(adc.LatentTo3DConverter, "forward")
-    _instrument(adc.LatentTo3DConverter, "forward_flat_indices")
-    _instrument(adc.LatentTo3DConverter, "_checkpointed_coordinate_chunk")
-    _instrument(adc.LatentTo3DConverter, "_encode_coordinates")
+    _instrument(adc.OptimizedDiffusionTrainer, "_compute_consistency_loss", sync_per_call)
+    _instrument(adc.ConsistencyModel, "fast_inference", sync_per_call)
+    _instrument(adc.LatentTo3DConverter, "forward", sync_per_call)
+    _instrument(adc.LatentTo3DConverter, "forward_flat_indices", sync_per_call)
+    _instrument(adc.LatentTo3DConverter, "_checkpointed_coordinate_chunk", sync_per_call)
+    _instrument(adc.LatentTo3DConverter, "_encode_coordinates", sync_per_call)
     # diffusion_model, student_model, and teacher_model are all
     # LatentDiffusionUNet instances, so one class-level instrument covers the
     # total UNet forward cost (diffusion + consistency student + teacher).
-    _instrument(adc.LatentDiffusionUNet, "forward")
+    _instrument(adc.LatentDiffusionUNet, "forward", sync_per_call)
 
 
 def _report_phases():
@@ -194,29 +213,79 @@ def _stats(values):
     }
 
 
+def _format_su_line(stats: dict, warmup: int, n: int) -> str:
+    """Single machine-parseable stdout line with the per-update cost.
+
+    Format (per the on-demand speed-tool requirement):
+      s/u mean=12.34 median=12.30 p90=12.60 over=5 updates (warmup=1)
+    ``n`` is the number of MEASURED updates (warmup excluded).
+    """
+    mean = stats.get("mean")
+    median = stats.get("median")
+    p90 = stats.get("p90")
+    if mean is None or median is None or p90 is None:
+        mean = median = p90 = float("nan")
+    return (
+        f"s/u mean={mean:.2f} median={median:.2f} p90={p90:.2f} "
+        f"over={n} updates (warmup={warmup})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Builders (mirror select_recovery_checkpoint / run_monitored_training wiring)
 # ---------------------------------------------------------------------------
-def build_trainer_and_loader(checkpoint: Path, manifest: Path, device, samples: int, solver: str):
-    # Prefer the safe weights_only=True loader; fall back to weights_only=False
-    # ONLY for a trusted local artifact under build/ (see
-    # _load_checkpoint_metadata). This is a trusted local artifact from our own
-    # run at an explicit path, never untrusted input.
-    metadata = _load_checkpoint_metadata(checkpoint)
-    model_config = (
-        adc.ModelConfig(**metadata["model_config"])
-        if "model_config" in metadata
-        else adc.ModelConfig(**metadata["compatibility"]["configuration"]["model_config"])
-    )
+def build_trainer_and_loader(
+    checkpoint: Path,
+    manifest: Path,
+    device,
+    samples: int,
+    solver: str,
+    *,
+    fresh_init: bool = False,
+):
+    if fresh_init:
+        # Fresh-init mode: construct the trainer with DEFAULT (unloaded) weights
+        # and a procedurally-generated synthetic loader so --full-update runs on
+        # any worktree with no checkpoint present. The per-update cost is
+        # dominated by the SPSA solves + decoder + solver, which are to
+        # first-order weights-independent -- a fresh-init run is the right
+        # on-demand A/B tool for code changes. The checkpoint is deliberately
+        # never read here.
+        model_config = adc.ModelConfig()
+    else:
+        # Prefer the safe weights_only=True loader; fall back to
+        # weights_only=False ONLY for a trusted local artifact under build/ (see
+        # _load_checkpoint_metadata). This is a trusted local artifact from our
+        # own run at an explicit path, never untrusted input.
+        metadata = _load_checkpoint_metadata(checkpoint)
+        model_config = (
+            adc.ModelConfig(**metadata["model_config"])
+            if "model_config" in metadata
+            else adc.ModelConfig(**metadata["compatibility"]["configuration"]["model_config"])
+        )
     resolved_grid_size = int(model_config.grid_resolution)
     prepare_edt_workspace((resolved_grid_size,) * 3)
 
-    dataset = adc.AircraftDesignDataset(
-        num_samples=0,
-        grid_size=resolved_grid_size,
-        latent_dim=int(model_config.latent_dim),
-        manifest_path=str(manifest),
-    )
+    if fresh_init:
+        dataset = adc.AircraftDesignDataset(
+            num_samples=samples,
+            grid_size=resolved_grid_size,
+            latent_dim=int(model_config.latent_dim),
+            seed=0,
+        )
+        # Synthetic loader: every record is "train" so the loader yields exactly
+        # `samples` batches. The procedural split_assignments would otherwise
+        # strip ~30% of records and starve warmup+iterations, silently
+        # under-measuring the per-update stats.
+        dataset.metadata = dict(dataset.metadata)
+        dataset.metadata["split_assignments"] = ["train"] * len(dataset)
+    else:
+        dataset = adc.AircraftDesignDataset(
+            num_samples=0,
+            grid_size=resolved_grid_size,
+            latent_dim=int(model_config.latent_dim),
+            manifest_path=str(manifest),
+        )
     epoch_dataset = _build_epoch_dataset(
         dataset, max_samples_per_epoch=samples, subset_seed=0, split="train"
     )
@@ -256,8 +325,15 @@ def build_trainer_and_loader(checkpoint: Path, manifest: Path, device, samples: 
         cfd_config,
         device=device,
     )
-    trainer.load_checkpoint(str(checkpoint))
-    _prepare_geometry_threshold_for_run(trainer, loader, resume_run_state=None)
+    if fresh_init:
+        # No checkpoint load: global_step stays 0 and weights are the model
+        # defaults. The geometry threshold comes from the config fixed value
+        # (calibrate_geometry_materialization_threshold is False in config.yaml,
+        # so _prepare_geometry_threshold_for_run is a config-fixed no-op).
+        _prepare_geometry_threshold_for_run(trainer, loader, resume_run_state=None)
+    else:
+        trainer.load_checkpoint(str(checkpoint))
+        _prepare_geometry_threshold_for_run(trainer, loader, resume_run_state=None)
     return trainer, loader
 
 
@@ -269,12 +345,41 @@ def run_full_update(trainer, loader, warmup: int, iterations: int, profile_cuda:
     trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         trainer.optimizer, T_max=max(1, warmup + iterations)
     )
-    trainer.update_metrics_callback = None
     trainer.run_state_checkpoint_callback = None
     trainer.run_state_checkpoint_path = None
     trainer.stop_after_updates = int(trainer.global_step) + warmup + iterations
 
-    update_times = []
+    # Per-update wall via the trainer's NATURAL per-update boundary
+    # (update_metrics_callback, invoked at the end of every optimizer update).
+    # Warmup updates are unmeasured; only `iterations` measured updates feed the
+    # stats, so the denominator is iterations only. A single synchronize at each
+    # boundary folds the just-launched GPU work of the update into the wall
+    # delta -- per-call instrument syncs never feed these numbers.
+    update_times: list[float] = []
+    boundary: dict = {"seen": 0, "t_prev": None}
+
+    def _on_update(metrics: dict) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        boundary["seen"] += 1
+        seen = boundary["seen"]
+        if boundary["t_prev"] is not None and warmup < seen <= warmup + iterations:
+            update_times.append(now - boundary["t_prev"])
+        boundary["t_prev"] = now
+
+    trainer.update_metrics_callback = _on_update
+
+    def _train() -> None:
+        # Initialise t_prev before the first update so warmup=0 measures update
+        # 1 (otherwise the first boundary would only set t_prev).
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        boundary["t_prev"] = time.perf_counter()
+        trainer.train_epoch(loader, grid_size=96, start_batch=0)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     if profile_cuda:
         with torch.profiler.profile(
             activities=[
@@ -283,28 +388,23 @@ def run_full_update(trainer, loader, warmup: int, iterations: int, profile_cuda:
             ],
             record_shapes=True,
         ) as prof:
-            t0 = time.perf_counter()
-            trainer.train_epoch(loader, grid_size=96, start_batch=0)
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
+            _train()
         trace_path = REPO_ROOT / "build" / "perf" / "baseline" / "update_trace.json"
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         prof.export_chrome_trace(str(trace_path))
         print("chrome trace:", trace_path)
     else:
-        t0 = time.perf_counter()
-        trainer.train_epoch(loader, grid_size=96, start_batch=0)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-    total = t1 - t0
-    # train_epoch does not report per-update times; report the aggregate and
-    # the per-phase table which is summed over every update.
-    update_times.append(total / max(1, warmup + iterations))
+        _train()
+
+    stats = _stats(update_times)
+    print(_format_su_line(stats, warmup, len(update_times)))
     return {
         "mode": "full_update",
         "updates": warmup + iterations,
-        "total_wall_s": total,
-        "update_stats": _stats([total / max(1, warmup + iterations)]),
+        "warmup": warmup,
+        "measured_updates": len(update_times),
+        "total_wall_s": sum(update_times),
+        "update_stats": stats,
         "phases": {k: {"total_s": v[0], "calls": int(v[1])} for k, v in TIMERS.items()},
     }
 
@@ -355,13 +455,25 @@ def run_solver_only(trainer, iterations: int) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=str(REPO_ROOT / "build" / "recovery_ladder_20260814" / "step1305.pt"))
-    ap.add_argument("--manifest", default=str(REPO_ROOT / "build" / "grounded_combined_1k_20260716" / "manifest.jsonl"))
-    ap.add_argument("--warmup", type=int, default=1, help="updates for warmup (absorbs Triton JIT)")
-    ap.add_argument("--iterations", type=int, default=3, help="measured updates / solver calls")
+    ap.add_argument("--checkpoint",
+                    default=str(REPO_ROOT / "build" / "recovery_ladder_20260814" / "step1305.pt"),
+                    help="checkpoint to load (ignored with --fresh-init)")
+    ap.add_argument("--manifest",
+                    default=str(REPO_ROOT / "build" / "grounded_combined_1k_20260716" / "manifest.jsonl"),
+                    help="grounded manifest (ignored with --fresh-init; a procedural synthetic loader is used)")
+    ap.add_argument("--fresh-init", action="store_true",
+                    help="construct the trainer WITHOUT loading weights and with a procedural synthetic "
+                         "loader, so --full-update runs on any worktree with no checkpoint present "
+                         "(per-update cost is weights-independent to first order)")
+    ap.add_argument("--warmup", type=int, default=1, help="updates for warmup (absorbs Triton JIT); unmeasured")
+    ap.add_argument("--iterations", type=int, default=5,
+                    help="measured updates / solver calls (--full-update requires M>=5 per spec-1)")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--no-instrument", action="store_true",
                     help="skip per-call-sync instrumentation; measure the production update path")
+    ap.add_argument("--sync-per-call", action="store_true",
+                    help="synchronize inside each instrumented call (accurate phase table; optional -- "
+                         "per-update wall numbers come from the update boundary, never from per-call syncs)")
     ap.add_argument("--profile-cuda", action="store_true", help="emit a chrome-trace of the full update")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--full-update", action="store_true", help="complete optimizer updates (default)")
@@ -374,26 +486,36 @@ def main() -> int:
     print("device:", device)
     print("torch:", torch.__version__, "cuda:", torch.version.cuda if torch.cuda.is_available() else "n/a")
 
+    sync_per_call = args.sync_per_call and not args.no_instrument
+
     if args.solver_only:
         trainer, _ = build_trainer_and_loader(
             Path(args.checkpoint), Path(args.manifest), device,
             samples=1, solver=str(config_value("cfd", "solver", "D3Q27")),
+            fresh_init=args.fresh_init,
         )
         result = run_solver_only(trainer, args.iterations)
     elif args.direct_only:
-        install_instrumentation()
+        install_instrumentation(sync_per_call=sync_per_call)
         trainer, _ = build_trainer_and_loader(
             Path(args.checkpoint), Path(args.manifest), device,
             samples=1, solver=str(config_value("cfd", "solver", "D3Q27")),
+            fresh_init=args.fresh_init,
         )
         result = run_direct_only(trainer, args.iterations)
     else:
+        if args.iterations < 5:
+            ap.error(
+                f"--full-update requires --iterations >= 5 (spec-1: per-update stats "
+                f"over M>=5 measured iterations); got {args.iterations}"
+            )
         if not args.no_instrument:
-            install_instrumentation()
+            install_instrumentation(sync_per_call=sync_per_call)
         trainer, loader = build_trainer_and_loader(
             Path(args.checkpoint), Path(args.manifest), device,
             samples=args.warmup + args.iterations,
             solver=str(config_value("cfd", "solver", "D3Q27")),
+            fresh_init=args.fresh_init,
         )
         result = run_full_update(trainer, loader, args.warmup, args.iterations, args.profile_cuda)
 
