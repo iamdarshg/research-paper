@@ -7361,10 +7361,31 @@ class OptimizedDiffusionTrainer:
             ):
                 parameter.grad = gradient
             step_gradients = capture_gradients(optimizer_parameters)
-            for guard_name, guard_gradients in self.last_gradient_lifecycle[
-                "active_guard_gradients"
-            ].items():
-                aligned_pairs = [
+            # Final guard-dot sign check: the update must not be uphill on any
+            # active guard. Each dot is fp64 over the flattened concatenations
+            # (same tensors, same order). With _BATCH_GUARD_DOT_READS all dots
+            # are computed GPU-side and read back in ONE deferred .tolist();
+            # the values are bit-identical to the per-guard .item() path -- only
+            # the number of GPU->CPU syncs changes.
+
+            def _guard_dot(aligned_pairs):
+                return torch.dot(
+                    torch.cat(
+                        [
+                            update_gradient.detach().double().reshape(-1)
+                            for update_gradient, _ in aligned_pairs
+                        ]
+                    ),
+                    torch.cat(
+                        [
+                            guard_gradient.detach().double().reshape(-1)
+                            for guard_gradient, _ in aligned_pairs
+                        ]
+                    ),
+                )
+
+            guard_aligned_pairs = {
+                guard_name: [
                     (update_gradient, guard_gradient)
                     for update_gradient, guard_gradient in zip(
                         step_gradients,
@@ -7372,30 +7393,41 @@ class OptimizedDiffusionTrainer:
                     )
                     if update_gradient is not None and guard_gradient is not None
                 ]
-                if aligned_pairs:
-                    guard_dot = float(
-                        torch.dot(
-                            torch.cat(
-                                [
-                                    update_gradient.detach().double().reshape(-1)
-                                    for update_gradient, _ in aligned_pairs
-                                ]
-                            ),
-                            torch.cat(
-                                [
-                                    guard_gradient.detach().double().reshape(-1)
-                                    for guard_gradient, _ in aligned_pairs
-                                ]
-                            ),
-                        ).item()
+                for guard_name, guard_gradients in self.last_gradient_lifecycle[
+                    "active_guard_gradients"
+                ].items()
+            }
+            if _BATCH_GUARD_DOT_READS:
+                guard_dot_tensors = {
+                    guard_name: _guard_dot(pairs)
+                    for guard_name, pairs in guard_aligned_pairs.items()
+                    if pairs
+                }
+                guard_dot_values = (
+                    dict(
+                        zip(
+                            guard_dot_tensors.keys(),
+                            torch.stack(list(guard_dot_tensors.values())).tolist(),
+                        )
                     )
-                else:
-                    guard_dot = 0.0
-                if guard_dot < -1.0e-8:
-                    raise RuntimeError(
-                        f"final optimizer gradient is uphill on active {guard_name} guard: "
-                        f"dot={guard_dot:.6g}"
-                    )
+                    if guard_dot_tensors
+                    else {}
+                )
+                for guard_name, _pairs in guard_aligned_pairs.items():
+                    guard_dot = guard_dot_values.get(guard_name, 0.0)
+                    if guard_dot < -1.0e-8:
+                        raise RuntimeError(
+                            f"final optimizer gradient is uphill on active {guard_name} guard: "
+                            f"dot={guard_dot:.6g}"
+                        )
+            else:
+                for guard_name, pairs in guard_aligned_pairs.items():
+                    guard_dot = float(_guard_dot(pairs).item()) if pairs else 0.0
+                    if guard_dot < -1.0e-8:
+                        raise RuntimeError(
+                            f"final optimizer gradient is uphill on active {guard_name} guard: "
+                            f"dot={guard_dot:.6g}"
+                        )
             self.last_gradient_lifecycle["step_gradients"] = step_gradients
 
             # Optimizer step

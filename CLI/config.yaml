@@ -215,6 +215,7 @@ experiment:
   # torch.stack(...).tolist() + one sync (occupancy and the coefficient
   # arithmetic are bit-identical to the per-solve read path). OFF by default.
   deferred_solver_reads: false
+
 design:
   target_speed: 50.0
   wingspan_limit_m: 1.8
