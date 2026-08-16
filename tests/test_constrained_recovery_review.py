@@ -1307,14 +1307,21 @@ def test_analytic_occupancy_logit_gradient_behavior():
 
 
 def test_analytic_occupancy_logit_gradient_matches_autograd():
-    """Hand-derived 1/N gradient equals ordinary autograd of the scalar loss.
+    """Hand-derived SUM gradient equals ordinary autograd of the scalar loss.
 
-    Both the one-sided saturation brake (d/dlogit mean(p)) and the soft
-    occupancy anchor (d/dlogit mean(sigmoid((p-threshold)/T))) are derivatives
-    of a mean over the voxel field, so each carries a 1/N factor (N =
-    sample_probs.numel()).  This test reconstructs the exact scalar loss with
-    plain autograd and compares ``logits.grad * space_weight`` against the
-    analytic function's output BEFORE the per-sample L2 clip (norm_limit = 0).
+    The occupancy loss is declared SUM-semantics: both the one-sided saturation
+    brake (d/dlogit sum(p)) and the soft occupancy anchor (d/dlogit
+    sum(sigmoid((p-threshold)/T))) are derivatives of a SUM over the voxel
+    field, so each carries NO 1/N mean factor. This test reconstructs the exact
+    scalar loss with plain autograd and compares ``logits.grad * space_weight``
+    against the analytic function's output BEFORE the per-sample L2 clip
+    (norm_limit = 0).
+
+    The relu indicator must stay threshold-equivalent: ``sum(p) > threshold*N``
+    is the same brake condition as ``mean(p) > threshold``. A mid field with
+    p = 0.5 has sum(p) = 256 but N = 512, so a naive ``relu(sum(p) -
+    threshold)`` would spuriously ENGAGE the brake while the function's
+    mean-based brake is INACTIVE.
     """
     import math as _math
 
@@ -1339,12 +1346,13 @@ def test_analytic_occupancy_logit_gradient_matches_autograd():
     def autograd_gradient(logits, *, brake_active, soft_active, reference=0.5):
         logits = logits.clone().requires_grad_(True)
         p = torch.sigmoid(logits)
+        N = p.numel()
         loss = torch.zeros((), dtype=logits.dtype)
         if brake_active:
-            loss = loss + mean_weight * torch.relu(p.mean() - threshold)
+            loss = loss + mean_weight * torch.relu(p.sum() - threshold * N)
         if soft_active:
-            soft_occ = torch.sigmoid((p - threshold) / temperature).mean()
-            loss = loss + soft_weight * torch.abs(soft_occ - reference)
+            soft_occ = torch.sigmoid((p - threshold) / temperature).sum()
+            loss = loss + soft_weight * torch.abs(soft_occ - reference * N)
         loss.backward()
         return logits.grad * float(spec.space_weight)
 
@@ -1363,7 +1371,7 @@ def test_analytic_occupancy_logit_gradient_matches_autograd():
     # (b) Soft-anchor-only: mean(p) == threshold leaves the brake inactive; the
     # soft term alone drives the field toward the reference occupancy. A
     # reference != 0.5 keeps the soft error (and therefore the soft gradient)
-    # nonzero so the assertion actually exercises the soft 1/N.
+    # nonzero so the assertion actually exercises the soft sum derivative.
     mid = field(0.5)
     actual = trainer._analytic_occupancy_logit_gradient(mid, 0.9, spec)
     expected = autograd_gradient(

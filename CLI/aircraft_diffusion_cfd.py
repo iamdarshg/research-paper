@@ -6104,9 +6104,9 @@ class OptimizedDiffusionTrainer:
         its clip cap, directionally random) -- with the analytic gradient of two
         smooth, deterministic terms:
 
-          loss_occ = mean_w * max(0, mean(p) - threshold)          # saturation brake
-                   + soft_w * |soft_occ - ref|                     # occupancy anchor
-          soft_occ  = mean(sigmoid((p - threshold) / T))
+          loss_occ = mean_w * max(0, sum(p) - threshold*N)         # saturation brake
+                   + soft_w * |sum(soft) - ref*N|                  # occupancy anchor
+          soft_occ  = sum(sigmoid((p - threshold) / T))
 
         ref is the batch reference occupancy (~0.5% sparse airframe). The
         mean-probability term is the user's "loss tied to average probability"
@@ -6161,10 +6161,9 @@ class OptimizedDiffusionTrainer:
                 sample_reference = float(sample_probs.mean().item())
             spec = spec_list[0 if len(spec_list) == 1 else batch_idx]
             space_weight = float(getattr(spec, "space_weight", 1.0))
-            # Both gradient terms below are derivatives of mean(...) over the
-            # voxel field (mean(p) and mean(soft)), so each carries the 1/N
-            # mean-derived derivative factor.
-            N = sample_probs.numel()
+            # Both gradient terms below are derivatives of sum(...) over the
+            # voxel field (sum(p) and sum(soft)), so each is the plain
+            # per-voxel derivative with no 1/N mean factor.
             sample_grad = torch.zeros_like(sample_probs)
             if mean_weight > 0.0:
                 mean_probability = float(sample_probs.mean().item())
@@ -6173,7 +6172,7 @@ class OptimizedDiffusionTrainer:
                 # healthy sparse field back up toward the threshold.
                 if mean_probability > threshold:
                     sample_grad = sample_grad + (
-                        (mean_weight / N) * prob_one_minus_prob[batch_idx]
+                        mean_weight * prob_one_minus_prob[batch_idx]
                     )
                 mean_probabilities.append(mean_probability)
             if soft_weight > 0.0 and temperature > 0.0:
@@ -6186,26 +6185,16 @@ class OptimizedDiffusionTrainer:
                     * (1.0 - soft)
                     * prob_one_minus_prob[batch_idx]
                 )
-                # 1/N for the mean(soft) derivative (see N above).
-                per_voxel = per_voxel / N
                 sample_grad = sample_grad + (
                     float(np.sign(soft_error)) * soft_weight
                 ) * per_voxel
                 soft_occupancies.append(soft_occupancy)
             sample_grad = sample_grad * space_weight
-            # The gradient above is the true mean(...) derivative: both the
-            # saturation brake (d/dlogit mean(p)) and the soft occupancy anchor
-            # (d/dlogit mean(sigmoid(...))) carry the 1/N mean factor (see N
-            # above). Scale back up by N so the per-sample L2 clip below
-            # compares norm_limit against the same magnitude it did before the
-            # 1/N fix, keeping direct_occupancy_gradient_max_norm at its
-            # historical strength meaning:
-            #   applied = clip(g_correct * sw * N, limit)
-            #          == clip(g_historical * sw, limit)      to fp tolerance.
-            # When the clip is disabled (norm_limit == 0) no units need
-            # restoring, and the true 1/N gradient is returned unchanged.
-            if norm_limit > 0.0:
-                sample_grad = sample_grad * N
+            # Sum-semantics: both the saturation brake (d/dlogit sum(p)) and the
+            # soft occupancy anchor (d/dlogit sum(sigmoid(...))) are plain
+            # per-voxel derivatives with no 1/N mean factor, so the per-sample
+            # L2 clip below compares norm_limit against the same unit-norm force
+            # the recovery-fix run trained at (pre-fix b5301a7).
             sample_norm = sample_grad.norm()
             if (
                 norm_limit > 0.0
