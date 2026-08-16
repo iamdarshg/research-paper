@@ -211,6 +211,13 @@ experiment:
   # drift, or any autograd-enabled call silently falls back to the compiled or
   # eager path. See docs/performance/experiment-kernel-fusion-launch.md.
   graph_decode_mlp: false
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): collapse the
+  # per-active-guard .item() guard-dot reads at the end of each update into ONE
+  # deferred read (all dots computed GPU-side as fp64 tensors, one stacked
+  # .tolist() after the loop). Results are bit-identical to the per-guard path
+  # (same fp64 torch.dot over the same flattened concatenations, same order);
+  # only the GPU->CPU sync count changes. OFF by default.
+  batch_guard_dot_reads: false
 
 design:
   target_speed: 50.0

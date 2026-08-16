@@ -4,7 +4,8 @@ Status: **experimental, off by default**. Built under the standing GPU constrain
 (approved training job PID 24436 running; no GPU work may launch while it runs).
 The harness and its CPU-only fallback path are verified; the GPU microbenchmark
 is written but **must not be run until the training job ends or the user opens a
-GPU window**.
+GPU window**. Training was stopped safely 2026-08-16 (validated checkpoint at
+step 2338); the GPU is now free for the microbenchmark and parity validation.
 
 ## What the branch tries
 
@@ -128,6 +129,52 @@ incl. the single 5852 ms end drain), 1 decoder startup.
 3. **Decoder launch overhead (2.73 s idle, healthy ~80 % util).** This branch's
    CUDA graph (Target 1) applies here - recovers the CPU launch/Python overhead,
    not this idle (launch-gap scale). Conditional on 8 GB memory headroom.
+
+## MSI Center utilization analysis (profile.CSV, 2026-08-16) — what's still underutilised
+
+Workflow wf_12a39185-15e (6 lenses) over `build/perf/profile_training_window.csv`
+(27,872 samples, 2.008 s cadence, 15.55 h of the continuation run). The user
+asked to "find exactly what's still underutilised"; the five lenses resolve the
+question that the profiler snapshot (39.4 % GPU idle per update) could not.
+
+**Headline: the GPU is power-capped, not idle.** `lim_power_yn = Yes` on 73.6 %
+of samples (~11.4 h). At load > 90 % the GPU clamps to an ~85 W TGP (mean 82.7 W,
+never touches the ~95 W laptop TGP) and the clock sags from a 2535-2550 MHz boost
+peak to mean 2068-2071 MHz. Temperatures never fire a limiter (gpu_temp max
+69.7 °C vs 87 °C limit; hotspot max 87.9 vs 100; ~12-18 °C headroom) and thermal
+limiter = No on ALL samples. So the envelope is **not** heat: the power budget is
+the lever. Raising the TGP (MSI Center / driver) directly buys compute on the
+compute-bound decoder (~12.5 s busy/update, ~80 % util) and backward (~20.1 s,
+72 %) phases.
+
+- **GPU idle is real but mostly short-burst, sync-bound — not CPU-bound.** 14.3 %
+  of samples sit < 30 % load (~2.2 h/day), structured as 2265 low-load runs with
+  median length 2.0 s (1328 single-sample blips); only 298 runs exceed 5 s
+  (longest 124.5 s; 31 runs in the 16-20 s band ~ the per-update host drain).
+  The profiler's per-update 39.4 % idle is authoritative; the 2 s sampler smears
+  the short solver/backward drains up into mid-util samples.
+- **CPU is heavily underused (mean 22.4 %, ~3.6/16 threads; max ~6.25 threads).**
+  During GPU-idle samples CPU mean is 27.3 % — the CPU is ALSO idle, so the GPU
+  idle is a serialization/sync/latency drain (the 33 sequential SPSA solves +
+  end-of-update host drain), **not** a CPU-compute-bound one. Adding CPU threads
+  will not help; de-serializing the reads is the lever.
+- **VRAM is thin-but-stable: min 566 MiB, p5 573 MiB free (pinned at ~7,615/8,188
+  allocated), zero samples < 256 MiB.** RAM paging is active (pagefile 32-38 %)
+  but no OOM on either. Implication: a 350 MiB persistent CUDA-graph pool (lever
+  3) would consume 61 % of the standing buffer, leaving a worst-case 216-223 MiB
+  margin — **below the 256 MiB comfort line for ~95 % of samples. Lever 3 stays
+  OFF (decoder graph)**; the memory cost is not justified by the ~1-1.5 s of CPU
+  launch overhead it recovers.
+
+**Net priority update (supersedes the pure code-fix ordering):**
+1. **Raise the GPU power budget (envelope, user action)** — largest and most
+   certain lever for the compute-bound phases; thermal headroom makes it safe.
+2. **Lever 1 (deferred batched solver reads, ~9 s)** and **lever 2 (GPU-side
+   guard-dot reads, ~1-3 s of the 5.85 s end drain)** — the code-side
+   de-serialization the CPU lens confirms is the real idle driver.
+3. **Lever 3 (decoder CUDA graph) — NOT WORTH IT on 8 GB** (memory margin below
+   comfort line; recovers only ~1-1.5 s of launch overhead on a phase that is
+   already power-capped-compute-bound).
 
 ## How to run the GPU microbenchmark (deferred)
 
