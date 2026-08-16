@@ -201,6 +201,20 @@ conditioning:
     - public CLI surfaces only a subset of the full schema and still needs condition-response benchmarks before claims can be strengthened
     - scalar constraints include thrust-to-weight, turn-rate, explicit thrust and engine geometry, and numeric min/max bounds
 
+experiment:
+  # EXPERIMENTAL (merged from experiment/kernel-fusion-launch): collapse the
+  # per-active-guard .item() guard-dot reads at the end of each update into ONE
+  # deferred read (all dots computed GPU-side as fp64 tensors, one stacked
+  # .tolist() after the loop). Results are bit-identical to the per-guard path
+  # (same fp64 torch.dot over the same flattened concatenations, same order);
+  # only the GPU->CPU sync count changes. OFF by default.
+  batch_guard_dot_reads: false
+  # EXPERIMENTAL (merged from experiment/kernel-fusion-launch): enqueue all 33
+  # sequential SPSA solves with NO host scalar reads, then read every probe's
+  # occupancy / coefficient / nonempty scalars back in ONE batched
+  # torch.stack(...).tolist() + one sync (occupancy and the coefficient
+  # arithmetic are bit-identical to the per-solve read path). OFF by default.
+  deferred_solver_reads: false
 design:
   target_speed: 50.0
   wingspan_limit_m: 1.8

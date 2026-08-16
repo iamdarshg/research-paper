@@ -148,3 +148,59 @@ python CLI/kernel_fusion_graph.py --chunks 27 --iters 20 [--eager]
 Reports: eager vs graph ms/update, per-op vs per-replay CPU enqueue latency
 (the "10 us vs 1140 us" claim), parity max abs diff vs COMPONENT_ATOL, and the
 graph-pool reserved-memory delta.
+
+## Lever 1 (built): deferred batched solver scalar reads
+
+Implementation status (2026-08-16): **built, parity-verified, OFF by default**.
+
+File `CLI/config.yaml` -> `experiment.deferred_solver_reads: false`. When OFF,
+the SPSA direct-solver sequential probe loop is byte-identical to the
+pre-existing code (a reviewer can diff the legacy branch; the new `else`
+sub-block differs only by indentation). When ON (and the SPSA chunk is the
+deliberate 8 GB setting `_DIRECT_SOLVER_BATCH_CHUNK = 1`), the 32 probe solves
+are enqueued back-to-back with NO host scalar reads, then every probe's
+coefficient / occupancy / nonempty scalars are read back in ONE batched
+`torch.stack(...).tolist()` (+ one sync) and per-probe components are assembled
+afterward.
+
+What was deferred (bit-identical to the per-solve read path):
+- the 15-scalar coefficient stack (`compute_aerodynamic_coefficients_deferred`,
+  `CLI/advanced_lbm_solver.py`) — fp64 GPU `[15]` tensor, materialized later by
+  `_aerodynamic_coefficients_from_raw` (the same fp64 arithmetic as the eager
+  path, run from one row of the batched read);
+- the occupancy `binary.float().mean()` (fp32 GPU scalar);
+- the nonempty `torch.sum(geometry_mask)` and the `reference_area` fallback
+  `(geometry_mask.sum(dim=0) > 0).float().sum()` GPU tensors.
+
+Kept per solve (documented residuals, do not touch for parity):
+- the drag-exponent `.item()` (`advanced_lbm_solver.py:340-345`,
+  `_effective_drag_link_metric_exponent`) — it feeds `torch.pow` kernel
+  arithmetic mid-solve; deferring it would change the collision kernel;
+- `_heuristic_metrics_gpu`'s one small `.cpu().tolist()` (validity metrics run on
+  the already-GPU binary BEFORE the solve, so it does not extend the solve drain);
+- `compute_tensor_content_hash` (full-96^3 D2H hash feeding the per-solve
+  boundary cache; cleared between probes);
+- `_shape_drag_correction`'s internal 4-scalar `.tolist()`
+  (`advanced_lbm_solver.py:1504`) — a second GPU read inside the coefficient
+  materialize (the brief's "only GPU read" claim is inaccurate; preserved
+  exactly, so parity holds — it only means the materialize step has one extra
+  small per-probe read).
+
+Parity (GPU, 24^3, `build/perf/deferred_solver_reads_parity.py`, git-ignored):
+- full `simulate_aerodynamics` vs deferred `materialize` dict: `==` on every key;
+- deferred capture + materialize vs eager `compute_aerodynamic_coefficients`:
+  `==` on every key;
+- sequential `_direct_measured_objective_for_single` vs
+  `_deferred_single_probe` + `_materialize_deferred_probes`: `==` on every
+  component key (drag/lift/occupancy/total_loss/solver_lbm_converged/...);
+- full `DirectSolverSPSAFunction.apply` with the flag OFF vs ON (16 directions,
+  33 solves): identical loss, byte-identical gradients, and byte-identical
+  per-probe component dicts and deltas.
+
+Deviations from the brief (documented): `_assemble_direct_solver_components`
+gains an `occupancy_override: Optional[float] = None` trailing parameter so the
+deferred path feeds the GPU-computed occupancy (GPU fp32 mean of a 0/1 tensor
+and CPU fp32 mean can differ by 1 ULP; the sequential single-probe path uses the
+GPU value). Default preserves all existing callers byte-identical. The batched
+read also carries the `reference_area` fallback scalar (18 columns total) so
+every deferred scalar is read in the single `.tolist()`.
