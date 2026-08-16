@@ -16,7 +16,12 @@ from lbm_utils import (
     mach_to_physical_speed,
 )
 from lbm_diagnostics import compute_strain_rate_tensor, compute_vorticity, compute_velocity_gradients
-from sdf_utils import compute_all_link_distances, compute_link_q
+from sdf_utils import (
+    _link_directions,
+    compute_all_link_distances,
+    compute_link_q,
+    compute_sdf,
+)
 from lbm_logger import LBMLogger
 from utils import compute_tensor_content_hash
 
@@ -766,6 +771,58 @@ class D3Q27Solver:
             q = compute_all_link_distances(geometry_mask, self.ex, self.ey, self.ez)
         return q
 
+    def _pop_warm_q_source(self, geometry_mask, geom_hash):
+        """Pop a warm-pool entry (or cold-compute) for the sparse-q builder.
+
+        OFFLOAD-3 shrink (Task 7): the sparse builder consumes q only at the
+        boundary-link active voxels, so a 3-D warm SDF entry (the production
+        OFFLOAD-3 shape) — or a cold ``compute_sdf`` — returns the ``[D, H, W]``
+        SDF directly and the q-algebra runs gather-only in
+        ``_build_bfl_sparse_tables``; the full ``[27, D, H, W]`` q transient is
+        never materialized on this path. Returns ``(source, is_sdf)``: when
+        ``is_sdf`` is True ``source`` is the on-device SDF; when False it is an
+        on-device full ``[27, D, H, W]`` q tensor (legacy 4-D warm entries /
+        unit-test sentinels, gathered as-is). The ``_sdf_refill`` top-up hook
+        fires after a warm pop, matching ``_get_q_single_batch``.
+        """
+        warm_entry = self._warm_sdf_cache.pop(geom_hash, None)
+        if warm_entry is not None:
+            entry = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
+            refill = getattr(self, "_sdf_refill", None)
+            if callable(refill):
+                refill(self)
+            if entry.ndim == 3:
+                return entry.to(geometry_mask.device), True
+            return entry.to(geometry_mask.device), False
+        return compute_sdf(geometry_mask), True
+
+    def _gather_only_link_q(self, sdf, idx, dx, dy, dz):
+        """Compute q at the active voxels ``idx`` for lattice link ``(dx, dy, dz)``
+        without materializing the full ``[27, D, H, W]`` q field.
+
+        Per-element identity of ``compute_link_q``'s crossing-cell formula,
+        evaluated only at the boundary-link active voxels. The neighbor SDF value
+        is read through the same 10.0-padded volume ``compute_link_q`` pads with,
+        so every value is bit-identical to the full-field path at those voxels
+        (the mask-derived ``_boundary_links_batch`` set equals ``compute_link_q``'s
+        ``crossing`` set, so the ``where(..., 1.0)`` is a no-op here).
+        """
+        D, H, W = sdf.shape
+        sdf_flat = sdf.reshape(-1)
+        PH, PW = H + 2, W + 2
+        sdf_padded_flat = torch.nn.functional.pad(
+            sdf, (1, 1, 1, 1, 1, 1), mode='constant', value=10.0
+        ).reshape(-1)
+        x = idx // (H * W)
+        rem = idx % (H * W)
+        y = rem // W
+        z = rem % W
+        neighbor_padded = (x + 1 + dx) * (PH * PW) + (y + 1 + dy) * PW + (z + 1 + dz)
+        sdf_vals = sdf_flat[idx]
+        neighbor_vals = sdf_padded_flat[neighbor_padded]
+        denom = sdf_vals - neighbor_vals
+        return torch.clamp(sdf_vals / (denom + 1e-12), 0.01, 1.0)
+
     def _build_bfl_sparse_tables(self, mask_stack, geom_hashes, q_stack=None, boundary_links_batch=None):
         """Build compact active-voxel (boundary-link) q tables for the batch.
 
@@ -784,8 +841,12 @@ class D3Q27Solver:
         bit-identical to today's ``q_field[i]`` at active voxels. Tables are
         geometry-static and cached keyed by ``(geom_hashes, C, res)`` so the
         per-step solve loop never rebuilds them. ``q_stack`` (a caller-owned full
-        stack) is honored when supplied; otherwise q is computed per geometry and
-        the full tensor is freed immediately (only boundary q crosses to GPU).
+        stack) is honored when supplied. Otherwise (the production
+        ``q_stack=None`` SPSA shape) the boundary links are known BEFORE q exists,
+        so q is computed ONLY at the active voxels from the SDF — the gather-only
+        ``_gather_only_link_q`` — and the full ``[27, D, H, W]`` q transient is
+        never materialized (OFFLOAD-3 shrink, Task 7). A legacy 4-D warm entry is
+        a full q tensor and is gathered as-is. Only boundary q crosses to GPU.
         """
         C = mask_stack.shape[0]
         res = int(mask_stack.shape[1])
@@ -801,12 +862,22 @@ class D3Q27Solver:
         offs_list = []
         q_list = []
         cum = 0
+        directions = _link_directions(self.ex, self.ey, self.ez) if q_stack is None else None
         for c in range(C):
+            # Resolve the per-geometry q source. A caller-owned full stack is
+            # gathered as-is. Otherwise, when the geometry has any active voxels,
+            # pop a warm SDF (or cold-compute one) and gather-only q; a legacy
+            # 4-D warm entry is a full q tensor, reshaped and gathered as-is.
+            q_c_flat = None
+            sdf_c = None
             if q_stack is not None:
                 q_c_flat = q_stack[c].reshape(27, N)
-            else:
-                q_c = self._get_q_single_batch(mask_stack[c], geom_hashes[c])
-                q_c_flat = q_c.reshape(27, N)
+            elif torch.any(boundary_links_batch[c]):
+                src, is_sdf = self._pop_warm_q_source(mask_stack[c], geom_hashes[c])
+                if is_sdf:
+                    sdf_c = src
+                else:
+                    q_c_flat = src.reshape(27, N)
             for i in range(1, 27):
                 link_idx = i - 1
                 idx = boundary_links_batch[c, link_idx].reshape(-1).nonzero(as_tuple=False).reshape(-1)
@@ -814,11 +885,17 @@ class D3Q27Solver:
                 starts.append(cum)
                 counts.append(n_i)
                 if n_i:
+                    if q_c_flat is not None:
+                        q_vals = q_c_flat[i][idx]
+                    else:
+                        _i, dx, dy, dz = directions[link_idx]
+                        q_vals = self._gather_only_link_q(sdf_c, idx, dx, dy, dz)
                     offs_list.append(idx.to(torch.int32))
-                    q_list.append(q_c_flat[i][idx])
+                    q_list.append(q_vals)
                     cum += n_i
-            if q_stack is None:
-                del q_c
+            # Only boundary q survives: drop the per-geometry full-q source now.
+            if q_stack is None and q_c_flat is not None:
+                del q_c_flat
         if offs_list:
             active_flat = torch.cat(offs_list, dim=0).contiguous()
             q_flat = torch.cat(q_list, dim=0).contiguous()

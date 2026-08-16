@@ -154,6 +154,73 @@ def test_sparse_tables_consistent_with_full_q():
             ), f"c={c} i={i}: compact q mismatch at active voxels"
 
 
+def _assert_sparse_equal(sparse_a, sparse_b):
+    for k in ("active_flat", "q_flat", "pair_start", "pair_count"):
+        assert torch.equal(sparse_a[k], sparse_b[k]), f"sparse key {k} differs"
+
+
+def test_sparse_q_internal_gather_only_matches_full_q():
+    """OFFLOAD-3 shrink (Task 7): the internal ``q_stack=None`` path must build
+    the compact active-voxel q tables from the gather-only SDF q-algebra that is
+    BIT-IDENTICAL to gathering from the full ``[27, D, H, W]`` q field.
+
+    The reference is the explicit-``q_stack`` path (full q from
+    ``compute_all_link_distances``), which is what the pre-shrink ``q_stack=None``
+    path produced. The three internal variants — cold ``compute_sdf``, a warm 3-D
+    SDF entry, and a legacy 4-D full-q entry — must all reproduce the reference
+    tables exactly.
+    """
+    n = 16
+    device = torch.device("cpu")
+    solver = D3Q27Solver(n, device)
+    mask_stack = _sphere_mask(n).unsqueeze(0)
+    boundary_links_batch = solver._boundary_links_batch(mask_stack)
+
+    q_stack = torch.stack(
+        [compute_all_link_distances(mask_stack[0], solver.ex, solver.ey, solver.ez)],
+        dim=0,
+    ).contiguous()
+    ref = solver._build_bfl_sparse_tables(mask_stack, ["href"], q_stack, boundary_links_batch)
+
+    # Cold internal path: no warm entry -> compute_sdf -> gather-only q.
+    cold = solver._build_bfl_sparse_tables(mask_stack, ["hcold"], None, boundary_links_batch)
+    _assert_sparse_equal(cold, ref)
+
+    # Warm 3-D SDF entry (production OFFLOAD-3 shape) -> gather-only q.
+    warm_sdf = compute_all_link_distances(mask_stack[0], solver.ex, solver.ey, solver.ez, True)
+    solver._warm_sdf_cache["hwarm3d"] = warm_sdf
+    warm = solver._build_bfl_sparse_tables(mask_stack, ["hwarm3d"], None, boundary_links_batch)
+    _assert_sparse_equal(warm, ref)
+    assert "hwarm3d" not in solver._warm_sdf_cache, "warm 3-D entry was not popped"
+
+    # Legacy 4-D full-q warm entry -> gathered as-is.
+    solver._warm_sdf_cache["hwarm4d"] = q_stack[0]
+    legacy = solver._build_bfl_sparse_tables(mask_stack, ["hwarm4d"], None, boundary_links_batch)
+    _assert_sparse_equal(legacy, ref)
+    assert "hwarm4d" not in solver._warm_sdf_cache, "warm 4-D entry was not popped"
+
+
+def test_sparse_q_internal_gather_only_empty_geometry():
+    """The internal path must produce empty (all-zero) tables for a geometry with
+    no boundary links (all-fluid domain) without computing an EDT, matching the
+    explicit-``q_stack`` reference."""
+    n = 16
+    device = torch.device("cpu")
+    solver = D3Q27Solver(n, device)
+    mask_stack = torch.zeros(1, n, n, n)
+    boundary_links_batch = solver._boundary_links_batch(mask_stack)
+    assert not torch.any(boundary_links_batch)
+
+    q_stack = torch.stack(
+        [compute_all_link_distances(mask_stack[0], solver.ex, solver.ey, solver.ez)],
+        dim=0,
+    ).contiguous()
+    ref = solver._build_bfl_sparse_tables(mask_stack, ["href"], q_stack, boundary_links_batch)
+    internal = solver._build_bfl_sparse_tables(mask_stack, ["hcold"], None, boundary_links_batch)
+    _assert_sparse_equal(internal, ref)
+    assert int(ref["pair_count"].sum().item()) == 0
+
+
 @requires_fused
 @pytest.mark.parametrize("fixture_name", sorted(FIXTURES))
 def test_batched_two_buffer_internal_q_vs_sequential(fixture_name):
