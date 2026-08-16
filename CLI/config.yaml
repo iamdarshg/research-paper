@@ -218,6 +218,12 @@ experiment:
   # (same fp64 torch.dot over the same flattened concatenations, same order);
   # only the GPU->CPU sync count changes. OFF by default.
   batch_guard_dot_reads: false
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): enqueue all 33
+  # sequential SPSA solves with NO host scalar reads, then read every probe's
+  # occupancy / coefficient / nonempty scalars back in ONE batched
+  # torch.stack(...).tolist() + one sync (occupancy and the coefficient
+  # arithmetic are bit-identical to the per-solve read path). OFF by default.
+  deferred_solver_reads: false
 
 design:
   target_speed: 50.0

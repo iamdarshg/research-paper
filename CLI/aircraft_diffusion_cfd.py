@@ -3454,6 +3454,59 @@ class AdvancedCFDSimulator:
 
         return results
 
+    def simulate_aerodynamics_deferred(
+        self, geometry: torch.Tensor, steps: int = 100
+    ) -> "_DeferredCFDResults":
+        """Deferred-read mirror of ``simulate_aerodynamics`` (Lever 1).
+
+        Mirrors ``simulate_aerodynamics`` but calls
+        ``lbm_solver.compute_aerodynamic_coefficients_deferred`` instead of
+        ``compute_aerodynamic_coefficients``: the 15 coefficient scalars are
+        left un-read on the GPU (an fp64 ``[15]`` stack), and the nonempty
+        ``torch.sum(geometry_mask)`` and the ``reference_area`` fallback
+        ``(geometry_mask.sum(dim=0) > 0).float().sum()`` are captured as GPU
+        tensors instead of ``.item()``-ed. Returns a ``_DeferredCFDResults``
+        that materializes the full result dict (same keys as
+        ``simulate_aerodynamics``) later from one row of the batched
+        solver-scalar read, so the SPSA probe loop can enqueue all solves with
+        NO host scalar reads in between.
+
+        If the AMR sub-solver or external FluidX3D validation is enabled, the
+        deferred path is not supported and this falls back to the eager
+        ``simulate_aerodynamics`` (returning a plain dict). The SPSA deferred
+        probe helper rejects that case explicitly.
+        """
+        if self.amr_solver or getattr(
+            self.config, "enable_external_validation", False
+        ):
+            return self.simulate_aerodynamics(geometry, steps=steps)
+
+        self.init_flow_field()
+        geometry_mask = (geometry > 0.5).float()
+        self.lbm_solver.collide_stream(geometry_mask, steps=steps)
+        aero = self.lbm_solver.compute_aerodynamic_coefficients_deferred(geometry_mask)
+        # Deferred reads (captured as GPU tensors; consumed by the ONE batched
+        # .tolist() in _materialize_deferred_probes):
+        nonempty_sum = torch.sum(geometry_mask)
+        ref_area_fallback_sum = (geometry_mask.sum(dim=0) > 0).float().sum()
+
+        grid_resolution = getattr(self, "resolution", None)
+        if not isinstance(grid_resolution, (int, np.integer)):
+            config_resolution = getattr(self.config, "base_grid_resolution", None)
+            grid_resolution = (
+                config_resolution
+                if isinstance(config_resolution, (int, np.integer))
+                else int(geometry_mask.shape[-1])
+            )
+        return _DeferredCFDResults(
+            aero=aero,
+            nonempty_sum=nonempty_sum,
+            ref_area_fallback_sum=ref_area_fallback_sum,
+            steps=int(steps),
+            grid_resolution=int(grid_resolution),
+            solver_gate_support=self._build_solver_gate_support(),
+        )
+
     def _run_fluidx3d_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
         """Run FluidX3D for validation (simplified integration)"""
         try:
@@ -4141,6 +4194,19 @@ _BATCH_GUARD_DOT_READS = bool(
     config_value("experiment", "batch_guard_dot_reads", False)
 )
 
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): in the sequential SPSA
+# direct-solver phase, enqueue all 32 probe solves back-to-back with NO host
+# scalar reads, then read every probe's coefficient / occupancy / nonempty
+# scalars back in ONE batched torch.stack(...).tolist() (+ one sync) and
+# assemble per-probe components afterward. Results are bit-identical to the
+# per-solve read path (same fp64 arithmetic, same reduction order; only the
+# GPU->CPU sync count changes). OFF by default; see
+# docs/performance/experiment-kernel-fusion-launch.md. When OFF, the SPSA
+# forward's sequential probe loop is byte-identical to the pre-existing code.
+_DEFERRED_SOLVER_READS = bool(
+    config_value("experiment", "deferred_solver_reads", False)
+)
+
 
 def _direct_solver_supports_batch(cfd_simulator) -> bool:
     """True if the simulator's LBM solver exposes the batched ``collide_stream_batch``.
@@ -4288,6 +4354,99 @@ def _clear_direct_solver_sdf_warm_cache(cfd_simulator: "AdvancedCFDSimulator") -
         for attr in ("_pending_sdf_specs", "_sdf_dirs_cpu", "_sdf_refill"):
             if hasattr(solver, attr):
                 delattr(solver, attr)
+
+
+class _DeferredCFDResults:
+    """Simulator-level record for one deferred ``simulate_aerodynamics`` call.
+
+    Holds the inner ``_DeferredAeroCoefficients`` (the un-read fp64 ``[15]``
+    GPU stack plus the frozen per-solve runtime scalars) and the deferred
+    nonempty / reference-area-fallback GPU tensors, plus the post-processing
+    state captured at solve time (steps, grid_resolution, solver_gate_support)
+    that ``simulate_aerodynamics`` would apply eagerly. ``materialize`` runs
+    the identical fp64 coefficient arithmetic (via the inner record) and the
+    identical post-processing (drag/lift extraction, reference-area fallback,
+    solver_quality_checks / solver_provenance overwrite, solver_gate_support,
+    external_validation) from one row of the batched read, so the returned dict
+    has the same keys/values as the eager ``simulate_aerodynamics`` path
+    bit-for-bit (Lever 1 deferred solver reads).
+    """
+
+    __slots__ = (
+        "aero",
+        "nonempty_sum",
+        "ref_area_fallback_sum",
+        "steps",
+        "grid_resolution",
+        "solver_gate_support",
+    )
+
+    def __init__(
+        self,
+        aero,
+        nonempty_sum: torch.Tensor,
+        ref_area_fallback_sum: torch.Tensor,
+        steps: int,
+        grid_resolution: int,
+        solver_gate_support: Dict[str, Any],
+    ):
+        self.aero = aero
+        self.nonempty_sum = nonempty_sum
+        self.ref_area_fallback_sum = ref_area_fallback_sum
+        self.steps = steps
+        self.grid_resolution = grid_resolution
+        self.solver_gate_support = solver_gate_support
+
+    def materialize(
+        self,
+        coeff_row: Sequence[float],
+        nonempty_val: float,
+        ref_area_fallback_val: float,
+    ) -> Dict[str, float]:
+        """Assemble the full result dict for this probe.
+
+        ``coeff_row`` is the 15-scalar row of the batched read (the
+        ``.tolist()`` of this probe's raw stack); ``nonempty_val`` and
+        ``ref_area_fallback_val`` are the batched-read nonempty sum and
+        reference-area fallback scalar. Reproduces ``simulate_aerodynamics``
+        post-processing exactly.
+        """
+        results = dict(self.aero.materialize(coeff_row))
+
+        drag = float(results.get("drag_coefficient", 0.0))
+        lift = float(results.get("lift_coefficient", 0.0))
+        reference_area = float(results.get("reference_area", 0.0))
+        if reference_area <= 0.0:
+            reference_area = float(ref_area_fallback_val)
+            results["reference_area"] = reference_area
+            results.setdefault("reference_area_source", "projected_frontal_voxel_area_yz")
+
+        results["drag_coefficient"] = drag
+        results["lift_coefficient"] = lift
+        results["lift_to_drag"] = float(lift / max(abs(drag), 1e-12))
+        results.setdefault("label_source", "lbm_d3q27")
+        results.setdefault("label_tier", "lbm_raw")
+        results.setdefault("claim_bearing_cfd", False)
+        results["solver_quality_checks"] = {
+            **results.get("solver_quality_checks", {}),
+            "finite_coefficients": bool(np.isfinite(drag) and np.isfinite(lift)),
+            "positive_reference_area": bool(reference_area > 0.0),
+            "nonempty_geometry": bool(nonempty_val > 0.0),
+        }
+        results["solver_provenance"] = {
+            **results.get("solver_provenance", {}),
+            "primary_solver": str(
+                results.get("solver_provenance", {}).get(
+                    "primary_solver", "D3Q27"
+                )
+            ),
+            "label_tier": str(results.get("label_tier", "lbm_raw")),
+            "grid_resolution": int(self.grid_resolution),
+            "steps": int(self.steps),
+        }
+        results["solver_gate_support"] = self.solver_gate_support
+        results["external_validation"] = {"status": "not_run"}
+        return results
 
 
 def _direct_measured_objective_for_single(
@@ -4482,6 +4641,7 @@ def _assemble_direct_solver_components(
     connectivity_weight: float,
     aircraft_validity_weight: float,
     target_occupancy: Optional[float],
+    occupancy_override: Optional[float] = None,
 ) -> Dict[str, float]:
     """Turn one probe's geometry + CFD results + validity into the component dict.
 
@@ -4490,9 +4650,18 @@ def _assemble_direct_solver_components(
     connectivity/validity losses, and the ``components`` dict). It exists as a
     separate helper so the batched probe path shares the exact same arithmetic
     without refactoring the sequential single-probe path (which stays
-    byte-identical).
+    byte-identical). ``occupancy_override`` lets the deferred-read path feed the
+    GPU-computed occupancy (``binary.float().mean()``) instead of the CPU mean;
+    when set, the CPU ``geometry_cpu.mean()`` is not evaluated (GPU fp32 mean
+    and CPU fp32 mean of a 0/1 tensor can differ by 1 ULP, so the sequential
+    single-probe path's occupancy is the GPU value — the deferred path must use
+    the same).
     """
-    occupancy = float(geometry_cpu.mean().item())
+    occupancy = (
+        float(occupancy_override)
+        if occupancy_override is not None
+        else float(geometry_cpu.mean().item())
+    )
     raw_drag = cfd_results.get("drag_coefficient")
     if (
         not isinstance(raw_drag, (int, float, np.floating))
@@ -4681,6 +4850,174 @@ def _direct_measured_objectives_batch(
                 connectivity_weight,
                 aircraft_validity_weight,
                 target_occupancy,
+            )
+        )
+    return components_list
+
+
+class _DeferredProbe:
+    """Capture-side record for one deferred SPSA direct-solver probe.
+
+    Holds everything needed to assemble the probe's component dict later:
+    the GPU binary, the validity pool future (NOT yet awaited — the await is
+    deferred to ``_materialize_deferred_probes`` so the CPU scipy jobs overlap
+    the 33 GPU solves), the GPU metrics dict, the deferred CFD result
+    (``_DeferredCFDResults``), and the deferred occupancy scalar. All reads
+    from this record happen in the ONE batched read in
+    ``_materialize_deferred_probes`` (Lever 1 deferred solver reads).
+    """
+
+    __slots__ = (
+        "binary",
+        "validity_future",
+        "metrics",
+        "cfd_result",
+        "occupancy_gpu",
+    )
+
+    def __init__(
+        self,
+        binary: torch.Tensor,
+        validity_future: Optional[Future],
+        metrics: Optional[Dict[str, Any]],
+        cfd_result: "_DeferredCFDResults",
+        occupancy_gpu: torch.Tensor,
+    ):
+        self.binary = binary
+        self.validity_future = validity_future
+        self.metrics = metrics
+        self.cfd_result = cfd_result
+        self.occupancy_gpu = occupancy_gpu
+
+
+def _deferred_single_probe(
+    probability_grid: torch.Tensor,
+    design_spec: DesignSpec,
+    cfd_simulator: "AdvancedCFDSimulator",
+    cfd_steps: int,
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    threshold: float,
+    target_occupancy: Optional[float],
+) -> "_DeferredProbe":
+    """Capture-side twin of ``_direct_measured_objective_for_single``.
+
+    Runs the identical thresholding / validity submission / deferred CFD solve
+    as the sequential single-probe path but performs NO host scalar reads: the
+    coefficient scalars stay on the GPU in the ``_DeferredCFDResults``, the
+    occupancy is captured as an fp32 GPU tensor, and the validity future is not
+    awaited. ``_materialize_deferred_probes`` reads every probe's scalars in one
+    batched ``.tolist()`` afterwards. ``design_spec`` and ``target_occupancy``
+    are accepted for signature parity with the sequential helper (the spec is
+    frozen into the record for assembly via the weights passed separately).
+    """
+    solver_device = getattr(cfd_simulator, "device", probability_grid.device)
+    binary = (
+        probability_grid.detach().float().clamp(0.0, 1.0) > float(threshold)
+    ).to(dtype=torch.float32)
+    solver_geometry = _canonical_training_geometry_to_solver_xyz(binary).to(
+        solver_device
+    )
+
+    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    validity_future = None
+    metrics = None
+    if needs_shape_metrics:
+        metrics, bbox_crop_cpu, occupied = _heuristic_metrics_gpu(binary)
+        if bbox_crop_cpu is not None:
+            validity_future = _VALIDITY_POOL.submit(
+                _bbox_component_fraction, bbox_crop_cpu, occupied
+            )
+
+    cfd_result = cfd_simulator.simulate_aerodynamics_deferred(
+        solver_geometry,
+        steps=max(1, int(cfd_steps)),
+    )
+    if not isinstance(cfd_result, _DeferredCFDResults):
+        # Only reachable if the flag is on but the simulator has the AMR
+        # sub-solver or external validation enabled (training config has both
+        # off, so this is a misconfiguration guard, not a training path).
+        raise RuntimeError(
+            "deferred_solver_reads is enabled but simulate_aerodynamics_deferred "
+            "fell back to the eager path (AMR sub-solver or external FluidX3D "
+            "validation active); the sequential SPSA probe loop must be used"
+        )
+    occupancy_gpu = binary.float().mean()
+    return _DeferredProbe(
+        binary=binary,
+        validity_future=validity_future,
+        metrics=metrics,
+        cfd_result=cfd_result,
+        occupancy_gpu=occupancy_gpu,
+    )
+
+
+def _materialize_deferred_probes(
+    probes: Sequence["_DeferredProbe"],
+    design_spec: DesignSpec,
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    target_occupancy: Optional[float],
+) -> List[Dict[str, float]]:
+    """Assemble every deferred probe's component dict from ONE batched read.
+
+    Stacks every probe's deferred scalars (the 15-scalar coefficient stack, the
+    occupancy, the nonempty sum, and the reference-area fallback — all fp64 GPU
+    tensors) into one ``[P, K]`` tensor and reads them with a single
+    ``.tolist()`` (+ one sync), batches the binary D2H copy into one contiguous
+    transfer, then builds each probe's component dict with
+    ``_assemble_direct_solver_components`` (reused verbatim, occupancy fed from
+    the GPU read). The validity future awaits now overlap the 33 GPU solves that
+    already ran in the capture phase. The returned list is indexed exactly like
+    ``probes`` (interleaved plus/minus per SPSA direction).
+    """
+    raw_rows = torch.stack(
+        [
+            torch.cat(
+                [
+                    probe.cfd_result.aero.raw_stack,
+                    probe.occupancy_gpu.double().reshape(1),
+                    probe.cfd_result.nonempty_sum.double().reshape(1),
+                    probe.cfd_result.ref_area_fallback_sum.double().reshape(1),
+                ]
+            )
+            for probe in probes
+        ],
+        dim=0,
+    ).tolist()
+    batch_binaries = torch.stack([probe.binary for probe in probes]).cpu()
+
+    components_list: List[Dict[str, float]] = []
+    for i, probe in enumerate(probes):
+        row = raw_rows[i]
+        coeff_row = row[:15]
+        occupancy_val = row[15]
+        nonempty_val = row[16]
+        ref_area_fallback_val = row[17]
+
+        if probe.validity_future is not None:
+            probe.metrics["largest_component_fraction"] = probe.validity_future.result()
+        if probe.metrics is not None:
+            validity_report = _validity_report_from_metrics(
+                probe.metrics,
+                occupancy_upper_bound=(0.04 if min(probe.binary.shape) < 64 else 0.02),
+            )
+        else:
+            validity_report = {}
+
+        cfd_results = probe.cfd_result.materialize(
+            coeff_row, nonempty_val, ref_area_fallback_val
+        )
+        components_list.append(
+            _assemble_direct_solver_components(
+                batch_binaries[i],
+                design_spec,
+                cfd_results,
+                validity_report,
+                connectivity_weight,
+                aircraft_validity_weight,
+                target_occupancy,
+                occupancy_override=float(occupancy_val),
             )
         )
     return components_list
@@ -4975,52 +5312,127 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     _clear_direct_solver_geometry_caches(cfd_simulator)
                     _clear_direct_solver_batch_workspace(cfd_simulator)
             else:
-                for delta in deltas:
-                    plus_field = sample_field + eps * delta
-                    minus_field = sample_field - eps * delta
-                    plus_components = _direct_measured_objective_for_single(
-                        torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
-                        sample_design_spec,
-                        cfd_simulator,
-                        cfd_steps,
-                        connectivity_weight,
-                        aircraft_validity_weight,
-                        threshold,
-                        sample_target,
-                        return_components=True,
-                    )
-                    minus_components = _direct_measured_objective_for_single(
-                        torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
-                        sample_design_spec,
-                        cfd_simulator,
-                        cfd_steps,
-                        connectivity_weight,
-                        aircraft_validity_weight,
-                        threshold,
-                        sample_target,
-                        return_components=True,
-                    )
-                    probe_component_records.append(plus_components)
-                    probe_component_records.append(minus_components)
-                    legacy_total_grad.add_(
-                        (
-                            (plus_components["total_loss"] - minus_components["total_loss"])
-                            / (2.0 * eps)
+                if _DEFERRED_SOLVER_READS:
+                    # Lever 1: enqueue all 32 probe solves with NO host scalar
+                    # reads, then read every probe's scalars in ONE batched
+                    # .tolist() (+ one sync) and assemble components after.
+                    # Bit-identical to the sequential loop below.
+                    deferred_probes = []
+                    for delta in deltas:
+                        plus_field = sample_field + eps * delta
+                        minus_field = sample_field - eps * delta
+                        deferred_probes.append(
+                            _deferred_single_probe(
+                                torch.sigmoid(plus_field)
+                                if input_is_logits
+                                else plus_field.clamp(0.0, 1.0),
+                                sample_design_spec,
+                                cfd_simulator,
+                                cfd_steps,
+                                connectivity_weight,
+                                aircraft_validity_weight,
+                                threshold,
+                                sample_target,
+                            )
                         )
-                        * delta
+                        deferred_probes.append(
+                            _deferred_single_probe(
+                                torch.sigmoid(minus_field)
+                                if input_is_logits
+                                else minus_field.clamp(0.0, 1.0),
+                                sample_design_spec,
+                                cfd_simulator,
+                                cfd_steps,
+                                connectivity_weight,
+                                aircraft_validity_weight,
+                                threshold,
+                                sample_target,
+                            )
+                        )
+                        _clear_direct_solver_geometry_caches(cfd_simulator)
+                    deferred_components = _materialize_deferred_probes(
+                        deferred_probes,
+                        sample_design_spec,
+                        connectivity_weight,
+                        aircraft_validity_weight,
+                        sample_target,
                     )
-                    for component_name in component_names:
-                        raw_component_grads[component_name].add_(
+                    for index, delta in enumerate(deltas):
+                        plus_components = deferred_components[2 * index]
+                        minus_components = deferred_components[2 * index + 1]
+                        probe_component_records.append(plus_components)
+                        probe_component_records.append(minus_components)
+                        legacy_total_grad.add_(
                             (
                                 (
-                                    plus_components[component_name]
-                                    - minus_components[component_name]
+                                    plus_components["total_loss"]
+                                    - minus_components["total_loss"]
                                 )
                                 / (2.0 * eps)
                             )
                             * delta
                         )
-                    _clear_direct_solver_geometry_caches(cfd_simulator)
+                        for component_name in component_names:
+                            raw_component_grads[component_name].add_(
+                                (
+                                    (
+                                        plus_components[component_name]
+                                        - minus_components[component_name]
+                                    )
+                                    / (2.0 * eps)
+                                )
+                                * delta
+                            )
+                else:
+                    for delta in deltas:
+                        plus_field = sample_field + eps * delta
+                        minus_field = sample_field - eps * delta
+                        plus_components = _direct_measured_objective_for_single(
+                            torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
+                            sample_design_spec,
+                            cfd_simulator,
+                            cfd_steps,
+                            connectivity_weight,
+                            aircraft_validity_weight,
+                            threshold,
+                            sample_target,
+                            return_components=True,
+                        )
+                        minus_components = _direct_measured_objective_for_single(
+                            torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
+                            sample_design_spec,
+                            cfd_simulator,
+                            cfd_steps,
+                            connectivity_weight,
+                            aircraft_validity_weight,
+                            threshold,
+                            sample_target,
+                            return_components=True,
+                        )
+                        probe_component_records.append(plus_components)
+                        probe_component_records.append(minus_components)
+                        legacy_total_grad.add_(
+                            (
+                                (
+                                    plus_components["total_loss"]
+                                    - minus_components["total_loss"]
+                                )
+                                / (2.0 * eps)
+                            )
+                            * delta
+                        )
+                        for component_name in component_names:
+                            raw_component_grads[component_name].add_(
+                                (
+                                    (
+                                        plus_components[component_name]
+                                        - minus_components[component_name]
+                                    )
+                                    / (2.0 * eps)
+                                )
+                                * delta
+                            )
+                        _clear_direct_solver_geometry_caches(cfd_simulator)
             legacy_total_grad.div_(direction_count)
             for component_grad in raw_component_grads.values():
                 component_grad.div_(direction_count)
