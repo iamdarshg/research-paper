@@ -725,8 +725,17 @@ class D3Q27Solver:
         for geom_key, geometry_mask in zip(geom_hashes, geometry_masks):
             warm_entry = self._warm_sdf_cache.pop(geom_key, None)
             if warm_entry is not None:
-                q_cpu = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
-                q = q_cpu.to(geometry_mask.device)
+                entry = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
+                # OFFLOAD-3 warm entries are [D, H, W] SDFs; run the 26-link
+                # q-algebra on the solve device (mirrors sequential _get_q). A
+                # full 4-D q tensor (legacy warm entries / test sentinels) is
+                # used as-is.
+                if entry.ndim == 3:
+                    q = compute_link_q(
+                        entry.to(geometry_mask.device), self.ex, self.ey, self.ez
+                    )
+                else:
+                    q = entry.to(geometry_mask.device)
                 refill = getattr(self, "_sdf_refill", None)
                 if callable(refill):
                     refill(self)
@@ -746,8 +755,17 @@ class D3Q27Solver:
         """
         warm_entry = self._warm_sdf_cache.pop(geom_hash, None)
         if warm_entry is not None:
-            q_cpu = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
-            q = q_cpu.to(geometry_mask.device)
+            entry = warm_entry.result() if isinstance(warm_entry, Future) else warm_entry
+            # OFFLOAD-3 warm entries are [D, H, W] SDFs; run the 26-link
+            # q-algebra on the solve device (mirrors sequential _get_q). A
+            # full 4-D q tensor (legacy warm entries / test sentinels) is
+            # used as-is.
+            if entry.ndim == 3:
+                q = compute_link_q(
+                    entry.to(geometry_mask.device), self.ex, self.ey, self.ez
+                )
+            else:
+                q = entry.to(geometry_mask.device)
             refill = getattr(self, "_sdf_refill", None)
             if callable(refill):
                 refill(self)
