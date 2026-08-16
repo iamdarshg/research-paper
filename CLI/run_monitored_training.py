@@ -107,7 +107,10 @@ class _AsyncRecordWriter:
         self._notify = threading.Condition(self._lock)
         self._next_seq = 0
         self._last_jsonl_seq: Optional[int] = None
-        self._completed_seq = 0
+        # The first JSONL record gets sequence 0; start the completed watermark
+        # at -1 so flush_barrier(0) actually blocks until record 0 is durable
+        # instead of returning before it (0 < 0 is false with a 0 watermark).
+        self._completed_seq = -1
         self._last_meta: Dict[str, Any] = {}
         self._closed = False
         # First worker failure is stashed here and re-raised to the producer at
