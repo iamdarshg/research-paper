@@ -2,7 +2,7 @@
 import torch
 import numpy as np
 from concurrent.futures import Future
-from typing import Dict
+from typing import Dict, Optional, Sequence
 from typing import TYPE_CHECKING
 
 from lbm_utils import (
@@ -1255,6 +1255,60 @@ class D3Q27Solver:
         return ux, uy, uz, rho
 
 
+class _DeferredAeroCoefficients:
+    """Capture-side record for a deferred aerodynamic-coefficient read.
+
+    Holds the un-read fp64 ``[15]`` GPU stack (the same 15 scalars that
+    ``compute_aerodynamic_coefficients`` extracts via ``.tolist()``), the
+    per-probe geometry mask, and the frozen per-solve runtime scalars the
+    coefficient arithmetic depends on (``force_samples``, ``nu``,
+    ``drag_link_metric_exponent``). Later solves' ``init_flow_field`` /
+    ``collide_stream`` overwrite those scalars on the solver, so they are frozen
+    here at capture time. ``materialize(raw_row)`` runs the identical fp64
+    arithmetic from one row of the batched read (Lever 1 deferred solver reads).
+    """
+
+    __slots__ = (
+        "raw_stack",
+        "geometry_mask",
+        "force_samples",
+        "nu",
+        "drag_link_metric_exponent",
+        "_solver",
+    )
+
+    def __init__(
+        self,
+        raw_stack: torch.Tensor,
+        geometry_mask: torch.Tensor,
+        force_samples: int,
+        nu: float,
+        drag_link_metric_exponent: Optional[float],
+        solver: "D3Q27CascadedSolver",
+    ):
+        self.raw_stack = raw_stack
+        self.geometry_mask = geometry_mask
+        self.force_samples = force_samples
+        self.nu = nu
+        self.drag_link_metric_exponent = drag_link_metric_exponent
+        self._solver = solver
+
+    def materialize(self, raw_row: Sequence[float]) -> Dict[str, float]:
+        """Assemble the full coefficient dict from one row of the batched read.
+
+        ``raw_row`` must be the 15 Python floats for this probe, in the same
+        order as ``raw_stack`` (i.e. the ``.tolist()`` row of the batched
+        fp64 tensor).
+        """
+        return self._solver._aerodynamic_coefficients_from_raw(
+            self.geometry_mask,
+            raw_row,
+            self.force_samples,
+            self.nu,
+            self.drag_link_metric_exponent,
+        )
+
+
 class D3Q27CascadedSolver:
     """Adapter to provide a D3Q27 cascaded solver API compatible with the CFD
     simulator. Wraps the simpler `D3Q27Solver` defined above and exposes the
@@ -1569,42 +1623,27 @@ class D3Q27CascadedSolver:
             'shape_drag_projected_side': projected_side,
         }
 
-    def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
-        """Compute approximate aerodynamic coefficients from the last simulated
-        macroscopic fields. This mirrors the interface used by the training
-        CFD simulator.
+    def _aerodynamic_coefficients_from_raw(
+        self,
+        geometry_mask: torch.Tensor,
+        raw: Sequence[float],
+        force_samples: int,
+        nu: float,
+        drag_link_metric_exponent: Optional[float],
+    ) -> Dict[str, float]:
+        """Run the exact fp64 arithmetic of ``compute_aerodynamic_coefficients``
+        that follows the 15-scalar extraction.
+
+        ``raw`` must be the ``.tolist()`` of the stack built below (the 15
+        scalars, in the same order). The public ``compute_aerodynamic_coefficients``
+        calls this with its extracted floats; the deferred path
+        (``compute_aerodynamic_coefficients_deferred``) calls it later with the
+        floats from the batched read. Must reproduce the full returned dict,
+        INCLUDING lbm_converged, force_stability, the tiered label selection, and
+        solver_quality_checks, bit-for-bit. ``force_samples``, ``nu`` and
+        ``drag_link_metric_exponent`` are the frozen per-solve values captured at
+        solve time (the later solves overwrite them on the solver).
         """
-        # conservative reference area and freestream speed
-        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
-        solid = geometry_mask > 0.5
-
-        # OFFLOAD-2: collapse the ~25 per-solve GPU->CPU .item() reads into a
-        # single stacked .tolist() (one sync). Every reduction is computed on
-        # GPU and widened fp32->fp64 on GPU; fp64 widening is lossless, so each
-        # unpacked Python float is bit-identical to float(x.item()). All
-        # downstream coefficient arithmetic stays in Python fp64, unchanged.
-        mach_number = float(getattr(self.config, 'mach_number', 0.0))
-        force_samples = self._solver.force_samples
-
-        # Issue #23: Handle zero-sample case for early convergence (Review Feedback)
-        if force_samples > 0:
-            projected_drag = self._solver.projected_drag_accum / force_samples
-            net_drag_force = self._solver.force_x_accum / force_samples
-            lift_force = self._solver.force_z_accum / force_samples
-            force_definition = 'raw bounce-back momentum exchange averaged over the last-quarter window'
-        else:
-            projected_drag = self._solver.projected_drag_last
-            net_drag_force = self._solver.force_x_last
-            lift_force = self._solver.force_z_last
-            force_definition = 'raw bounce-back momentum exchange from last streaming step'
-
-        # 1. Pure momentum exchange (Raw PDE Ground Truth)
-        physical_net_drag_force = _scale_momentum_exchange_force(net_drag_force, h, mach_number)
-        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, mach_number)
-
-        vorticity_mag = self._refresh_flow_diagnostics()
-
-        q_threshold = float(getattr(self.phys_config, 'q_threshold', 0.0))
         (
             projected_area_raw,
             solid_volume_raw,
@@ -1621,23 +1660,10 @@ class D3Q27CascadedSolver:
             vortex_cells_f,
             vorticity_max_f,
             nan_any_f,
-        ) = torch.stack([
-            torch.any(solid, dim=0).float().sum().double(),
-            solid.float().sum().double(),
-            projected_drag.double(),
-            net_drag_force.double(),
-            lift_force.double(),
-            physical_net_drag_force.double(),
-            physical_lift_force.double(),
-            self._solver.force_x_accum.double(),
-            self._solver.force_x_last.double(),
-            self.nu_turb.mean().double(),
-            self.pressure.sum().double(),
-            self.nu_turb.max().double(),
-            (self.q_criterion > q_threshold).float().sum().double(),
-            vorticity_mag.max().double(),
-            torch.isnan(self.velocity_x).any().double(),
-        ]).tolist()
+        ) = raw
+
+        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
+        mach_number = float(getattr(self.config, 'mach_number', 0.0))
 
         ref_area = projected_area_raw * h**2
         ref_area = max(ref_area, h**2)
@@ -1663,8 +1689,10 @@ class D3Q27CascadedSolver:
         # 1. lbm_raw: Pure PDE momentum exchange from internal solver
         # 2. lbm_calibrated: Heuristically corrected result for stable training
 
-        lbm_raw_force = physical_net_drag_force
-        lbm_calibrated_force = torch.tensor(physical_surrogate_force, device=self.device, dtype=self.f.dtype)
+        # NOTE: the original lbm_raw_force / lbm_calibrated_force assignments
+        # (formerly lines 1666-1667) are dead code -- neither feeds the returned
+        # dict -- and reference GPU tensors that are not part of the deferred raw
+        # vector, so they are intentionally not reproduced here.
 
         # Issue #16: Use pure PDE momentum exchange by default
         physical_drag_force_f = physical_net_drag_force_f
@@ -1708,7 +1736,7 @@ class D3Q27CascadedSolver:
 
         vortex_cells = vortex_cells_f
         nu_turb_mean = nu_turb_mean_f
-        reynolds_turbulent = float(v_inf * h * self.resolution / max(self.nu + nu_turb_mean, 1e-12))
+        reynolds_turbulent = float(v_inf * h * self.resolution / max(nu + nu_turb_mean, 1e-12))
         calibrated_drag_coefficient = float(drag_coefficient_surrogate)
         training_drag_coefficient = calibrated_drag_coefficient
         training_drag_label_source = 'lbm_calibrated'
@@ -1734,9 +1762,15 @@ class D3Q27CascadedSolver:
         # the last per-call sync); identical cache check + formula, with the
         # projected side read from the already-extracted area.
         drag_link_metric_exponent = (
-            float(self._solver.drag_link_metric_exponent)
-            if self._solver.drag_link_metric_exponent is not None
+            float(drag_link_metric_exponent)
+            if drag_link_metric_exponent is not None
             else float(np.clip(1.68 - 0.295 * (float(np.sqrt(projected_area_lattice)) - 13.0), 0.5, 1.68))
+        )
+
+        force_definition = (
+            'raw bounce-back momentum exchange averaged over the last-quarter window'
+            if force_samples > 0
+            else 'raw bounce-back momentum exchange from last streaming step'
         )
 
         return {
@@ -1798,6 +1832,135 @@ class D3Q27CascadedSolver:
                 'reference_area_source': 'projected_frontal_voxel_area_yz',
             },
         } | shape_drag_metrics
+
+    def compute_aerodynamic_coefficients(self, geometry_mask: torch.Tensor) -> Dict[str, float]:
+        """Compute approximate aerodynamic coefficients from the last simulated
+        macroscopic fields. This mirrors the interface used by the training
+        CFD simulator.
+        """
+        # conservative reference area and freestream speed
+        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
+        solid = geometry_mask > 0.5
+
+        # OFFLOAD-2: collapse the ~25 per-solve GPU->CPU .item() reads into a
+        # single stacked .tolist() (one sync). Every reduction is computed on
+        # GPU and widened fp32->fp64 on GPU; fp64 widening is lossless, so each
+        # unpacked Python float is bit-identical to float(x.item()). All
+        # downstream coefficient arithmetic stays in Python fp64, unchanged.
+        mach_number = float(getattr(self.config, 'mach_number', 0.0))
+        force_samples = self._solver.force_samples
+
+        # Issue #23: Handle zero-sample case for early convergence (Review Feedback)
+        if force_samples > 0:
+            projected_drag = self._solver.projected_drag_accum / force_samples
+            net_drag_force = self._solver.force_x_accum / force_samples
+            lift_force = self._solver.force_z_accum / force_samples
+        else:
+            projected_drag = self._solver.projected_drag_last
+            net_drag_force = self._solver.force_x_last
+            lift_force = self._solver.force_z_last
+
+        # 1. Pure momentum exchange (Raw PDE Ground Truth)
+        physical_net_drag_force = _scale_momentum_exchange_force(net_drag_force, h, mach_number)
+        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, mach_number)
+
+        vorticity_mag = self._refresh_flow_diagnostics()
+
+        q_threshold = float(getattr(self.phys_config, 'q_threshold', 0.0))
+        raw_scalars = torch.stack([
+            torch.any(solid, dim=0).float().sum().double(),
+            solid.float().sum().double(),
+            projected_drag.double(),
+            net_drag_force.double(),
+            lift_force.double(),
+            physical_net_drag_force.double(),
+            physical_lift_force.double(),
+            self._solver.force_x_accum.double(),
+            self._solver.force_x_last.double(),
+            self.nu_turb.mean().double(),
+            self.pressure.sum().double(),
+            self.nu_turb.max().double(),
+            (self.q_criterion > q_threshold).float().sum().double(),
+            vorticity_mag.max().double(),
+            torch.isnan(self.velocity_x).any().double(),
+        ]).tolist()
+        return self._aerodynamic_coefficients_from_raw(
+            geometry_mask,
+            raw_scalars,
+            force_samples,
+            self.nu,
+            self._solver.drag_link_metric_exponent,
+        )
+
+    def compute_aerodynamic_coefficients_deferred(
+        self, geometry_mask: torch.Tensor
+    ) -> "_DeferredAeroCoefficients":
+        """Compute the same 15-scalar stack as ``compute_aerodynamic_coefficients``
+        but return it UN-READ (fp64 GPU ``[15]`` tensor) plus the frozen
+        per-solve runtime scalars (``force_samples``, ``nu``,
+        ``drag_link_metric_exponent``). The SPSA probe loop can then enqueue all
+        solves back-to-back with NO host scalar reads and read every probe's
+        scalars in ONE batched ``torch.stack(...).tolist()`` afterwards
+        (Lever 1 deferred solver reads). ``materialize()`` applies the identical
+        fp64 arithmetic per probe from the batched row.
+
+        The frozen scalars are captured here (immediately after this solve's
+        ``collide_stream``); later solves' ``init_flow_field``/``collide_stream``
+        overwrite them on the solver, so the deferred materialize must not read
+        them back from ``self``.
+        """
+        # conservative reference area and freestream speed
+        h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
+        solid = geometry_mask > 0.5
+
+        # Same branch selection + 15-scalar stack as
+        # compute_aerodynamic_coefficients; identical fp32->fp64 widenings on
+        # GPU, but no .tolist() here.
+        mach_number = float(getattr(self.config, 'mach_number', 0.0))
+        force_samples = self._solver.force_samples
+
+        # Issue #23: Handle zero-sample case for early convergence (Review Feedback)
+        if force_samples > 0:
+            projected_drag = self._solver.projected_drag_accum / force_samples
+            net_drag_force = self._solver.force_x_accum / force_samples
+            lift_force = self._solver.force_z_accum / force_samples
+        else:
+            projected_drag = self._solver.projected_drag_last
+            net_drag_force = self._solver.force_x_last
+            lift_force = self._solver.force_z_last
+
+        # 1. Pure momentum exchange (Raw PDE Ground Truth)
+        physical_net_drag_force = _scale_momentum_exchange_force(net_drag_force, h, mach_number)
+        physical_lift_force = _scale_momentum_exchange_force(lift_force, h, mach_number)
+
+        vorticity_mag = self._refresh_flow_diagnostics()
+
+        q_threshold = float(getattr(self.phys_config, 'q_threshold', 0.0))
+        raw_stack = torch.stack([
+            torch.any(solid, dim=0).float().sum().double(),
+            solid.float().sum().double(),
+            projected_drag.double(),
+            net_drag_force.double(),
+            lift_force.double(),
+            physical_net_drag_force.double(),
+            physical_lift_force.double(),
+            self._solver.force_x_accum.double(),
+            self._solver.force_x_last.double(),
+            self.nu_turb.mean().double(),
+            self.pressure.sum().double(),
+            self.nu_turb.max().double(),
+            (self.q_criterion > q_threshold).float().sum().double(),
+            vorticity_mag.max().double(),
+            torch.isnan(self.velocity_x).any().double(),
+        ])
+        return _DeferredAeroCoefficients(
+            raw_stack=raw_stack,
+            geometry_mask=geometry_mask,
+            force_samples=force_samples,
+            nu=self.nu,
+            drag_link_metric_exponent=self._solver.drag_link_metric_exponent,
+            solver=self,
+        )
 
     # ------------------------------------------------------------------
     # Task 10: batched SPSA probe path (private workspaces on the inner
