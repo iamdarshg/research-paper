@@ -38,7 +38,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# This file sits at the repository root, so `.parent` IS the repo root;
+# `parents[1]` would resolve one level too high (to the worktrees dir).
+REPO_ROOT = Path(__file__).resolve().parent
+assert (REPO_ROOT / "CLI").is_dir(), (
+    f"REPO_ROOT resolves to {REPO_ROOT}; expected the repository root with CLI/"
+)
+assert (REPO_ROOT / "build").is_dir(), (
+    f"REPO_ROOT resolves to {REPO_ROOT}; expected the repository root with build/"
+)
 CLI_DIR = REPO_ROOT / "CLI"
 if str(CLI_DIR) not in sys.path:
     sys.path.insert(0, str(CLI_DIR))
