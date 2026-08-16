@@ -1289,6 +1289,76 @@ def test_analytic_occupancy_logit_gradient_behavior():
     assert "occupancy_soft_surrogate" in telemetry
 
 
+def test_analytic_occupancy_logit_gradient_matches_autograd():
+    """Hand-derived 1/N gradient equals ordinary autograd of the scalar loss.
+
+    Both the one-sided saturation brake (d/dlogit mean(p)) and the soft
+    occupancy anchor (d/dlogit mean(sigmoid((p-threshold)/T))) are derivatives
+    of a mean over the voxel field, so each carries a 1/N factor (N =
+    sample_probs.numel()).  This test reconstructs the exact scalar loss with
+    plain autograd and compares ``logits.grad * space_weight`` against the
+    analytic function's output BEFORE the per-sample L2 clip (norm_limit = 0).
+    """
+    import math as _math
+
+    COMPONENT_RTOL = 1e-3
+    COMPONENT_ATOL = 5e-5
+
+    trainer = _round4_trainer()
+    trainer.geometry_probability_threshold = 0.5
+    trainer.training_config.occupancy_mean_probability_weight = 0.5
+    trainer.training_config.occupancy_soft_temperature = 0.05
+    trainer.training_config.occupancy_soft_weight = 0.5
+    # Disable the per-sample L2 clip: the assertion must hold BEFORE clipping.
+    trainer.training_config.direct_occupancy_gradient_max_norm = 0.0
+    trainer.direct_solver_loss.last_components = {}
+    spec = DesignSpec()  # space_weight = 0.33
+    threshold = 0.5
+    temperature = 0.05
+    mean_weight = 0.5
+    soft_weight = 0.5
+
+    def field(probability):
+        logit = _math.log(probability / (1.0 - probability))
+        return torch.full((1, 8, 8, 8), logit)
+
+    def autograd_gradient(logits, *, brake_active, soft_active, reference=0.5):
+        logits = logits.clone().requires_grad_(True)
+        p = torch.sigmoid(logits)
+        loss = torch.zeros((), dtype=logits.dtype)
+        if brake_active:
+            loss = loss + mean_weight * torch.relu(p.mean() - threshold)
+        if soft_active:
+            soft_occ = torch.sigmoid((p - threshold) / temperature).mean()
+            loss = loss + soft_weight * torch.abs(soft_occ - reference)
+        loss.backward()
+        return logits.grad * float(spec.space_weight)
+
+    # (a) Saturated brake-only: mean(p) = 0.95 > threshold engages the brake.
+    saturated = field(0.95)
+    actual = trainer._analytic_occupancy_logit_gradient(saturated, 0.5, spec)
+    expected = autograd_gradient(saturated, brake_active=True, soft_active=False)
+    assert torch.allclose(
+        actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
+    ), (float(actual.norm()), float(expected.norm()))
+
+    # (b) Soft-anchor-only: mean(p) == threshold leaves the brake inactive; the
+    # soft term alone drives the field toward the reference occupancy.
+    mid = field(0.5)
+    actual = trainer._analytic_occupancy_logit_gradient(mid, 0.5, spec)
+    expected = autograd_gradient(mid, brake_active=False, soft_active=True)
+    assert torch.allclose(
+        actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
+    ), (float(actual.norm()), float(expected.norm()))
+
+    # (c) Combined: saturated field with both terms active.
+    actual = trainer._analytic_occupancy_logit_gradient(saturated, 0.5, spec)
+    expected = autograd_gradient(saturated, brake_active=True, soft_active=True)
+    assert torch.allclose(
+        actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
+    ), (float(actual.norm()), float(expected.norm()))
+
+
 def test_resume_fingerprint_contains_live_training_behavior():
     training = TrainingConfig(
         consistency_interval=3,

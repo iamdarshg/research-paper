@@ -5736,6 +5736,10 @@ class OptimizedDiffusionTrainer:
                 sample_reference = float(sample_probs.mean().item())
             spec = spec_list[0 if len(spec_list) == 1 else batch_idx]
             space_weight = float(getattr(spec, "space_weight", 1.0))
+            # Both gradient terms below are derivatives of mean(...) over the
+            # voxel field (mean(p) and mean(soft)), so each carries the 1/N
+            # mean-derived derivative factor.
+            N = sample_probs.numel()
             sample_grad = torch.zeros_like(sample_probs)
             if mean_weight > 0.0:
                 mean_probability = float(sample_probs.mean().item())
@@ -5744,7 +5748,7 @@ class OptimizedDiffusionTrainer:
                 # healthy sparse field back up toward the threshold.
                 if mean_probability > threshold:
                     sample_grad = sample_grad + (
-                        mean_weight * prob_one_minus_prob[batch_idx]
+                        (mean_weight / N) * prob_one_minus_prob[batch_idx]
                     )
                 mean_probabilities.append(mean_probability)
             if soft_weight > 0.0 and temperature > 0.0:
@@ -5757,6 +5761,8 @@ class OptimizedDiffusionTrainer:
                     * (1.0 - soft)
                     * prob_one_minus_prob[batch_idx]
                 )
+                # 1/N for the mean(soft) derivative (see N above).
+                per_voxel = per_voxel / N
                 sample_grad = sample_grad + (
                     float(np.sign(soft_error)) * soft_weight
                 ) * per_voxel
