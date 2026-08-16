@@ -75,26 +75,50 @@ def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
     return sdf
 
 # Fixed D3Q27 stencil: the 26 non-zero link directions are read from the
-# stencil tensors once per direction-count and cached, so the GPU q-algebra
-# does not re-read (and re-sync) ex/ey/ez on every solve. Keyed by the
-# direction count: every production caller uses the D3Q27 lattice; the only
-# non-27-direction caller is the non-cubic unit test with a single link.
-_LINK_DIRECTIONS_CACHE: dict = {}
+# stencil tensors once per stencil and cached, so the GPU q-algebra does not
+# re-read (and re-sync) ex/ey/ez on every solve. The cached value is a LIST of
+# ``(i, dx, dy, dz)`` integer lattice-link offset tuples; the ``[num_dirs, D, H,
+# W]`` stacks are built PER-CALL from the current sdf shape, never from the
+# cache (see compute_link_q). The lattice offsets themselves are
+# resolution-INDEPENDENT, so the cache is safe across resolutions. The PRIMARY
+# key is a stencil fingerprint (the nonzero ``(i, dx, dy, dz)`` tuples), not the
+# bare direction count, so a FUTURE stencil with the same number of non-zero
+# links but different offsets/ordering cannot silently collide with D3Q27 (the
+# review's finding). Computing the fingerprint reads the small offset tensors,
+# so a second, identity-keyed fast path serves repeat calls that pass the SAME
+# tensor objects (the steady-state case: solver ex/ey/ez are long-lived) without
+# re-reading them; the stored strong reference keeps each id from being reused,
+# so a different stencil's tensors can never be mistaken for a cached one. Every
+# production caller uses the D3Q27 lattice; the only non-27-direction caller is
+# the non-cubic unit test with a single link.
+_LINK_DIRECTIONS_CACHE: dict = {}       # fingerprint -> directions list
+_LINK_ID_FAST_CACHE: dict = {}          # (id(ex), id(ey), id(ez)) -> (directions, (ex, ey, ez))
 
 
 def _link_directions(ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor):
+    id_key = (id(ex), id(ey), id(ez))
+    fast = _LINK_ID_FAST_CACHE.get(id_key)
+    if fast is not None:
+        return fast[0]
     num_dirs = int(ex.shape[0])
-    cached = _LINK_DIRECTIONS_CACHE.get(num_dirs)
+    ex_l = ex.detach().cpu().tolist()
+    ey_l = ey.detach().cpu().tolist()
+    ez_l = ez.detach().cpu().tolist()
+    directions = [
+        (i, int(ex_l[i]), int(ey_l[i]), int(ez_l[i]))
+        for i in range(num_dirs)
+        if not (int(ex_l[i]) == 0 and int(ey_l[i]) == 0 and int(ez_l[i]) == 0)
+    ]
+    # Stencil fingerprint: the nonzero offset triples (with their direction
+    # indices, in ascending order). Identical for the same stencil at any
+    # resolution; distinct for any stencil whose nonzero link set or index
+    # assignment differs, which is exactly the collision the review flagged.
+    fingerprint = tuple(directions)
+    cached = _LINK_DIRECTIONS_CACHE.get(fingerprint)
     if cached is None:
-        ex_l = ex.detach().cpu().tolist()
-        ey_l = ey.detach().cpu().tolist()
-        ez_l = ez.detach().cpu().tolist()
-        cached = [
-            (i, int(ex_l[i]), int(ey_l[i]), int(ez_l[i]))
-            for i in range(num_dirs)
-            if not (int(ex_l[i]) == 0 and int(ey_l[i]) == 0 and int(ez_l[i]) == 0)
-        ]
-        _LINK_DIRECTIONS_CACHE[num_dirs] = cached
+        cached = directions
+        _LINK_DIRECTIONS_CACHE[fingerprint] = cached
+    _LINK_ID_FAST_CACHE[id_key] = (cached, (ex, ey, ez))
     return cached
 
 
