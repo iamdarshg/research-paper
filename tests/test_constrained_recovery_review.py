@@ -45,6 +45,7 @@ from run_monitored_training import (
     restore_promotion_baseline,
 )
 import run_monitored_training as monitored_training
+from tests.test_direct_solver_fused_parity import COMPONENT_ATOL, COMPONENT_RTOL
 
 
 @pytest.fixture(autouse=True)
@@ -1301,9 +1302,6 @@ def test_analytic_occupancy_logit_gradient_matches_autograd():
     """
     import math as _math
 
-    COMPONENT_RTOL = 1e-3
-    COMPONENT_ATOL = 5e-5
-
     trainer = _round4_trainer()
     trainer.geometry_probability_threshold = 0.5
     trainer.training_config.occupancy_mean_probability_weight = 0.5
@@ -1335,18 +1333,26 @@ def test_analytic_occupancy_logit_gradient_matches_autograd():
         return logits.grad * float(spec.space_weight)
 
     # (a) Saturated brake-only: mean(p) = 0.95 > threshold engages the brake.
+    # The soft term must be OFF in both the function and the reconstruction, or
+    # its tiny-but-nonzero contribution would pollute a brake-only assertion.
     saturated = field(0.95)
+    trainer.training_config.occupancy_soft_weight = 0.0
     actual = trainer._analytic_occupancy_logit_gradient(saturated, 0.5, spec)
+    trainer.training_config.occupancy_soft_weight = 0.5
     expected = autograd_gradient(saturated, brake_active=True, soft_active=False)
     assert torch.allclose(
         actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
     ), (float(actual.norm()), float(expected.norm()))
 
     # (b) Soft-anchor-only: mean(p) == threshold leaves the brake inactive; the
-    # soft term alone drives the field toward the reference occupancy.
+    # soft term alone drives the field toward the reference occupancy. A
+    # reference != 0.5 keeps the soft error (and therefore the soft gradient)
+    # nonzero so the assertion actually exercises the soft 1/N.
     mid = field(0.5)
-    actual = trainer._analytic_occupancy_logit_gradient(mid, 0.5, spec)
-    expected = autograd_gradient(mid, brake_active=False, soft_active=True)
+    actual = trainer._analytic_occupancy_logit_gradient(mid, 0.9, spec)
+    expected = autograd_gradient(
+        mid, brake_active=False, soft_active=True, reference=0.9
+    )
     assert torch.allclose(
         actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
     ), (float(actual.norm()), float(expected.norm()))
@@ -1354,6 +1360,91 @@ def test_analytic_occupancy_logit_gradient_matches_autograd():
     # (c) Combined: saturated field with both terms active.
     actual = trainer._analytic_occupancy_logit_gradient(saturated, 0.5, spec)
     expected = autograd_gradient(saturated, brake_active=True, soft_active=True)
+    assert torch.allclose(
+        actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
+    ), (float(actual.norm()), float(expected.norm()))
+
+
+def test_analytic_occupancy_logit_gradient_applied_matches_pre_fix():
+    """Applied (clipped) gradient equals the pre-1/N b5301a7 applied gradient.
+
+    Round-1 human decision "fix math, keep strength": the 1/N mean-derivative
+    stays, but the applied occupancy anchor must keep its historical magnitude.
+    Scaling the per-sample gradient back up by N after the space-weight makes
+    the per-sample L2 clip compare norm_limit against the same units as before,
+    so to fp tolerance:
+
+        applied = clip(g_correct * sw * N, limit) == clip(g_buggy * sw, limit)
+
+    This test reconstructs the pre-fix b5301a7 applied gradient directly (the
+    same scalar loss WITHOUT the 1/N factors, then the same unit-norm clip at
+    the production strength norm_limit = 1.0) and asserts equality.
+    """
+    import math as _math
+
+    trainer = _round4_trainer()
+    trainer.geometry_probability_threshold = 0.5
+    trainer.training_config.occupancy_mean_probability_weight = 0.5
+    trainer.training_config.occupancy_soft_temperature = 0.05
+    trainer.training_config.occupancy_soft_weight = 0.5
+    # Restore the per-sample clip at production strength
+    # (config.yaml: direct_occupancy_gradient_max_norm = 1.0).
+    trainer.training_config.direct_occupancy_gradient_max_norm = 1.0
+    trainer.direct_solver_loss.last_components = {}
+    # space_weight = 1.0 (vs the 0.33 default) so the raw gradient's norm
+    # exceeds the clip and the test actually pins the unit-norm applied force.
+    spec = DesignSpec(space_weight=1.0)
+    threshold = 0.5
+    temperature = 0.05
+    mean_weight = 0.5
+    soft_weight = 0.5
+    norm_limit = 1.0
+
+    def field(probability, grid=16):
+        logit = _math.log(probability / (1.0 - probability))
+        return torch.full((1, grid, grid, grid), logit)
+
+    def pre_fix_applied(logits, *, brake_active, soft_active, reference=0.5):
+        """The b5301a7 applied gradient: the scalar-loss gradient WITHOUT the
+        1/N mean factors, times space_weight, then the same unit-norm clip."""
+        p = torch.sigmoid(logits)
+        raw = torch.zeros_like(p)
+        if brake_active:
+            raw = raw + mean_weight * p * (1.0 - p)
+        if soft_active:
+            soft = torch.sigmoid((p - threshold) / temperature)
+            per_voxel = (
+                (1.0 / temperature) * soft * (1.0 - soft) * p * (1.0 - p)
+            )
+            soft_error = float(soft.mean().item()) - reference
+            sign = int(soft_error > 0.0) - int(soft_error < 0.0)
+            raw = raw + sign * soft_weight * per_voxel
+        raw = raw * float(spec.space_weight)
+        norm = raw.norm()
+        if (
+            norm_limit > 0.0
+            and torch.isfinite(norm)
+            and float(norm.item()) > norm_limit
+        ):
+            raw = raw * (norm_limit / norm.clamp_min(1.0e-12))
+        return raw
+
+    # Saturated field: the brake is active and the raw gradient's norm exceeds
+    # the clip, so this pins the unit-norm strength of the applied anchor.
+    saturated = field(0.95)
+    actual = trainer._analytic_occupancy_logit_gradient(saturated, 0.5, spec)
+    expected = pre_fix_applied(saturated, brake_active=True, soft_active=True)
+    assert torch.allclose(
+        actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
+    ), (float(actual.norm()), float(expected.norm()))
+
+    # Mid field with reference 0.9: brake inactive, soft term alone drives the
+    # field; the applied gradient must match the pre-fix soft-only clip.
+    mid = field(0.5)
+    actual = trainer._analytic_occupancy_logit_gradient(mid, 0.9, spec)
+    expected = pre_fix_applied(
+        mid, brake_active=False, soft_active=True, reference=0.9
+    )
     assert torch.allclose(
         actual, expected, rtol=COMPONENT_RTOL, atol=COMPONENT_ATOL
     ), (float(actual.norm()), float(expected.norm()))

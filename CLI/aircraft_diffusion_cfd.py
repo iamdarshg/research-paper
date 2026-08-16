@@ -5771,6 +5771,19 @@ class OptimizedDiffusionTrainer:
                 ) * per_voxel
                 soft_occupancies.append(soft_occupancy)
             sample_grad = sample_grad * space_weight
+            # The gradient above is the true mean(...) derivative: both the
+            # saturation brake (d/dlogit mean(p)) and the soft occupancy anchor
+            # (d/dlogit mean(sigmoid(...))) carry the 1/N mean factor (see N
+            # above). Scale back up by N so the per-sample L2 clip below
+            # compares norm_limit against the same magnitude it did before the
+            # 1/N fix, keeping direct_occupancy_gradient_max_norm at its
+            # historical strength meaning:
+            #   applied = clip(g_correct * sw * N, limit)
+            #          == clip(g_historical * sw, limit)      to fp tolerance.
+            # When the clip is disabled (norm_limit == 0) no units need
+            # restoring, and the true 1/N gradient is returned unchanged.
+            if norm_limit > 0.0:
+                sample_grad = sample_grad * N
             sample_norm = sample_grad.norm()
             if (
                 norm_limit > 0.0
