@@ -360,6 +360,8 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=1, help="updates for warmup (absorbs Triton JIT)")
     ap.add_argument("--iterations", type=int, default=3, help="measured updates / solver calls")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--no-instrument", action="store_true",
+                    help="skip per-call-sync instrumentation; measure the production update path")
     ap.add_argument("--profile-cuda", action="store_true", help="emit a chrome-trace of the full update")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--full-update", action="store_true", help="complete optimizer updates (default)")
@@ -386,7 +388,8 @@ def main() -> int:
         )
         result = run_direct_only(trainer, args.iterations)
     else:
-        install_instrumentation()
+        if not args.no_instrument:
+            install_instrumentation()
         trainer, loader = build_trainer_and_loader(
             Path(args.checkpoint), Path(args.manifest), device,
             samples=args.warmup + args.iterations,
