@@ -1215,8 +1215,15 @@ def main() -> int:
     trainer.update_metrics_callback = record_update
     current_epoch_index = int(resume_state_info.get("epoch_index", 0))
 
-    def maybe_save_run_state(completed_in_epoch: int, total_in_epoch: int) -> Optional[str]:
-        if not _run_state_checkpoint_due(
+    def maybe_save_run_state(
+        completed_in_epoch: int,
+        total_in_epoch: int,
+        force: bool = False,
+    ) -> Optional[str]:
+        # A forced save (bounded stop_after_updates interruption) bypasses the
+        # cadence gate; it is idempotent with the cadence save (same state,
+        # atomic ``.previous`` fallback).
+        if not force and not _run_state_checkpoint_due(
             completed_in_epoch,
             int(resume_state_info["completed_in_epoch"]),
             args.checkpoint_every_updates,

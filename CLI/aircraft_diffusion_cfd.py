@@ -5476,8 +5476,11 @@ class OptimizedDiffusionTrainer:
         self.update_metrics_callback: Optional[
             Callable[[Dict[str, Any]], None]
         ] = None
+        # The optional ``force`` argument requests an unconditional run-state
+        # save (used at a bounded ``stop_after_updates`` interruption so a stop
+        # that misses the checkpoint cadence still leaves a resumable state).
         self.run_state_checkpoint_callback: Optional[
-            Callable[[int, int], Optional[str]]
+            Callable[[int, int, bool], Optional[str]]
         ] = None
         self.stop_after_updates: Optional[int] = None
         self.run_state_metadata: Dict[str, Any] = {}
@@ -7214,11 +7217,22 @@ class OptimizedDiffusionTrainer:
                 )
 
             if self.run_state_checkpoint_callback is not None:
-                self.run_state_checkpoint_callback(batch_idx + 1, len(train_loader))
+                self.run_state_checkpoint_callback(
+                    batch_idx + 1, len(train_loader), force=False
+                )
             if (
                 self.stop_after_updates is not None
                 and self.global_step >= int(self.stop_after_updates)
             ):
+                # Bounded interruption: force a final atomic run-state save even
+                # when this boundary is not on the checkpoint cadence, so a
+                # resumed segment sees the correct completed-in-epoch. The save
+                # is idempotent with the cadence path (same state, atomic
+                # ``.previous`` fallback).
+                if self.run_state_checkpoint_callback is not None:
+                    self.run_state_checkpoint_callback(
+                        batch_idx + 1, len(train_loader), force=True
+                    )
                 interrupted_early = True
                 break
 
