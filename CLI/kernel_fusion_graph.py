@@ -149,7 +149,11 @@ class DecodeMLPGraph:
         if (
             x.shape[0] != self._rows
             or x.shape[-1] != self._in_features
-            or x.device != self._device
+            # Compare against the buffer the graph was actually captured on:
+            # torch.device("cuda") != torch.device("cuda:0") in torch (index
+            # None vs 0), so comparing x.device to the constructor's unindexed
+            # self._device would fall back to eager on EVERY call.
+            or x.device != self._static_in.device
             or x.dtype != self._dtype
         ):
             # Shape/device drift: degrade to eager (log once).
@@ -277,16 +281,18 @@ def main() -> int:
 
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        for _ in range(args.chunks * args.iters):
-            g(x)
+        with torch.no_grad():
+            for _ in range(args.chunks * args.iters):
+                g(x)
         torch.cuda.synchronize()
         graph_s = time.perf_counter() - t1
 
         # Per-REPLAY CPU enqueue latency (input copy_ + graph.replay()).
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        for _ in range(args.chunks * args.iters):
-            g(x)
+        with torch.no_grad():
+            for _ in range(args.chunks * args.iters):
+                g(x)
         graph_enqueue_s = (time.perf_counter() - t1)
         print(f"graph per-replay enq : {graph_enqueue_s / (args.chunks * args.iters) * 1e6:7.1f} us/replay "
               f"(vs ~1140 us/launch in the trace)")
