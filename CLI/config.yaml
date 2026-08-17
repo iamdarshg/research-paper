@@ -23,6 +23,10 @@ model:
   coordinate_gradient_checkpointing: true
   enable_gradient_checkpointing: true
   use_torch_compile: false
+  # A1 (experiment/kernel-fusion-launch): compile the backward graph with
+  # torch._dynamo.compiled_autograd (fuses checkpointed decoder recomputes +
+  # elementwise backward ops). Opt-in, default off; parity-gated.
+  compiled_autograd: false
   # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP only so
   # inductor fuses the post-GEMM add+SiLU epilogues into the GEMM kernels.
   # Opt-in, default off. Whole-model compile stays off (it previously overflowed).

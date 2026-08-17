@@ -375,6 +375,12 @@ class ModelConfig:
     # Memory optimization
     enable_gradient_checkpointing: bool = bool(config_value("model", "enable_gradient_checkpointing", True))
     use_torch_compile: bool = bool(config_value("model", "use_torch_compile", False))
+    # A1 (experiment/kernel-fusion-launch): compile the backward graph with
+    # torch._dynamo.compiled_autograd so inductor fuses the checkpointed
+    # coordinate-decoder recompute-forwards and elementwise backward ops into
+    # fewer kernels. Targets the backward's ~26k small launches. Opt-in,
+    # default off; numerics must stay within GRAD_ATOL/LOSS_ATOL.
+    compiled_autograd: bool = bool(config_value("model", "compiled_autograd", False))
     coordinate_decoder_width: int = 256
     coordinate_decoder_depth: int = 2
     coordinate_fourier_bands: int = int(config_value("model", "coordinate_fourier_bands", 6))
@@ -5932,6 +5938,15 @@ class OptimizedDiffusionTrainer:
         if bool(config_value("experiment", "tf32_gemm_math", False)):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = False  # no convs in the model; keep IEEE
+
+        # A1 (experiment/kernel-fusion-launch): compile the backward graph.
+        # Set at trainer construction so every backward in the update loop
+        # (decoder chunk recompute + elementwise grad ops) is captured and
+        # fused by Inductor. Opt-in via model.compiled_autograd (reads through
+        # the dataclass field so programmatic construction works too); must
+        # stay within the GRAD_ATOL/LOSS_ATOL parity envelopes.
+        if bool(getattr(self.model_config, "compiled_autograd", False)):
+            torch._dynamo.config.compiled_autograd = True
 
         self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device, self.dtype)
 
