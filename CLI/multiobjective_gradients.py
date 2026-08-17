@@ -84,6 +84,30 @@ def _validate_gradient_layout(
         )
 
 
+def _cat_grouped_to_dtype(
+    pieces: Sequence[torch.Tensor],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Concatenate 1-D ``pieces`` into one 1-D tensor of ``dtype``.
+
+    Groups pieces by their native dtype so one concatenation + one conversion
+    replaces the old per-tensor ``.to(dtype)`` (one conversion kernel per
+    parameter, ~10k launches on the full model).  fp32->fp64 and fp16->fp64
+    are exact, and within a dtype group the element order is identical to the
+    per-parameter order, so when every piece shares one dtype (the production
+    fp32 path) the result is byte-for-byte the tensor the per-parameter path
+    built.  Mixed dtypes still convert exactly per group; only the relative
+    group order may differ from parameter order, which no production path has.
+    """
+    if not pieces:
+        return torch.empty(0, dtype=dtype)
+    groups: dict[torch.dtype, list[torch.Tensor]] = {}
+    for piece in pieces:
+        groups.setdefault(piece.dtype, []).append(piece)
+    flats = [torch.cat(group).to(dtype=dtype) for group in groups.values()]
+    return flats[0] if len(flats) == 1 else torch.cat(flats)
+
+
 def _flatten_present_gradients(
     gradients: Sequence[Optional[torch.Tensor]],
     *,
@@ -106,10 +130,8 @@ def _flatten_present_gradients(
             branch_name=branch_name,
             parameter_index=parameter_index,
         )
-        pieces.append(gradient.detach().to(dtype=dtype).reshape(-1))
-    if not pieces:
-        return torch.empty(0, dtype=dtype)
-    return torch.cat(pieces)
+        pieces.append(gradient.detach().reshape(-1))
+    return _cat_grouped_to_dtype(pieces, dtype)
 
 
 def gradient_l2_norm(
@@ -191,17 +213,13 @@ def _gradient_dot_product(
             branch_name=second_name,
             parameter_index=parameter_index,
         )
-        first_pieces.append(
-            first_gradient.detach().to(dtype=torch.float64).reshape(-1)
-        )
-        second_pieces.append(
-            second_gradient.detach().to(dtype=torch.float64).reshape(-1)
-        )
+        first_pieces.append(first_gradient.detach().reshape(-1))
+        second_pieces.append(second_gradient.detach().reshape(-1))
     if not first_pieces:
         return 0.0
 
-    first_flat = torch.cat(first_pieces)
-    second_flat = torch.cat(second_pieces)
+    first_flat = _cat_grouped_to_dtype(first_pieces, torch.float64)
+    second_flat = _cat_grouped_to_dtype(second_pieces, torch.float64)
     if not bool(
         torch.logical_and(
             torch.isfinite(first_flat),
