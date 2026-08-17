@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -16,11 +17,46 @@ from run_monitored_training import (
     _run_state_checkpoint_due,
     _geometry_non_regression,
     _geometry_promotion_metrics,
+    _load_monitored_history,
     _restore_best_promotion_rank,
     _sync_best_checkpoint_state,
 )
 from training_stability import compute_core_loss, summarize_stability
 from training_stability import evaluate_directional_promotion_gate
+
+
+def test_load_monitored_history_round_trips_and_is_defensive(tmp_path):
+    """R6 (PR 41 review, item 6): the history payload is the source of truth
+    for the stability/early-stop window on resume. Missing / malformed /
+    history-less payloads degrade to an empty list."""
+    history_path = tmp_path / "monitored_history.json"
+    assert _load_monitored_history(history_path) == []
+
+    history_path.write_text(
+        json.dumps(
+            {
+                "config": {"num_epochs": 200},
+                "history": [
+                    {"epoch": 1, "core_loss": 1.2},
+                    {"epoch": 2, "core_loss": 1.1},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _load_monitored_history(history_path) == [
+        {"epoch": 1, "core_loss": 1.2},
+        {"epoch": 2, "core_loss": 1.1},
+    ]
+
+    history_path.write_text("{not valid json", encoding="utf-8")
+    assert _load_monitored_history(history_path) == []
+
+    history_path.write_text(json.dumps({"config": {}}), encoding="utf-8")
+    assert _load_monitored_history(history_path) == []
+
+    history_path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    assert _load_monitored_history(history_path) == []
 
 
 class TestTrainingStability(unittest.TestCase):

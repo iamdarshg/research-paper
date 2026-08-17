@@ -928,6 +928,31 @@ def _build_history_payload(
     }
 
 
+def _load_monitored_history(path: Path) -> List[Dict[str, Any]]:
+    """R6 (PR 41 review, item 6): read the persisted monitored-history payload
+    and return its epoch records.
+
+    The monitored loop rewrites the history file every epoch with the full
+    payload, so the file is always the latest complete history. Seeding the
+    in-memory list from it on resume keeps the stability/early-stop window and
+    the history JSONL continuity intact instead of restarting cold (which would
+    both delay convergence detection and drop pre-resume rows).
+    """
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    records = payload.get("history")
+    if not isinstance(records, list):
+        return []
+    return [dict(record) for record in records if isinstance(record, dict)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a GPU-monitored training sweep with stability checks.")
     parser.add_argument("--manifest", required=True, help="Grounded manifest used for training.")
@@ -1361,6 +1386,13 @@ def main() -> int:
             best_checkpoint_path = resumed_metadata.get(
                 "best_checkpoint_path", best_checkpoint_path
             )
+            # R6 (PR 41 review, item 6): seed the stability/early-stop history
+            # from the persisted history payload so the convergence window and
+            # the history JSONL survive an exact resume instead of restarting
+            # cold (which would delay early-stop and drop pre-resume rows).
+            restored_history = _load_monitored_history(history_output)
+            if restored_history:
+                history = restored_history
 
         if not args.resume_run_state and (
             args.resume_from or args.warm_start_from or not promotion_baseline
