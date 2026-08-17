@@ -264,10 +264,14 @@ def validate_run_state_compatibility(
     ]
     actual_configuration = actual.get("configuration", {})
     expected_configuration = expected.get("configuration", {})
+    # Intersection semantics (R4, PR 41 review): a fingerprint key added in a
+    # NEWER code version (e.g. experiment_flags) must not block resuming an
+    # older run-state that predates it. Keys present on BOTH sides are compared
+    # strictly; a key present on only one side cannot be verified and is skipped.
     mismatches.extend(
         f"configuration.{field_name}"
         for field_name in sorted(
-            set(actual_configuration) | set(expected_configuration)
+            set(actual_configuration) & set(expected_configuration)
         )
         if actual_configuration.get(field_name) != expected_configuration.get(field_name)
     )

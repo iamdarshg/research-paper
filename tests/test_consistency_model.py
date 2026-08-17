@@ -74,6 +74,78 @@ def test_run_state_round_trip_restores_rng_and_is_atomic(tmp_path):
     assert not path.with_suffix(path.suffix + ".tmp").exists()
 
 
+def test_run_state_compatibility_configuration_uses_intersection_semantics():
+    """R4 (PR 41 review, item 4): the ``configuration`` sub-dict is compared
+    over the INTERSECTION of keys, so a fingerprint key added in a newer code
+    version (here ``experiment_flags``) does not block resuming an older
+    run-state that predates it. Keys present on both sides are still compared
+    strictly: a tf32 flip must block the resume.
+    """
+    base = {
+        "manifest_identity": "manifest-a",
+        "grid_size": 96,
+        "latent_dim": 192,
+        "split": "train",
+        "sample_count": 32,
+    }
+    # Old run-state: no experiment_flags key. New code adds it. Resume is fine.
+    old_state = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.00002},
+            "cfd_config": {"solver": "D3Q27"},
+        },
+    }
+    new_expected = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.00002},
+            "cfd_config": {"solver": "D3Q27"},
+            "experiment_flags": {
+                "graph_decode_mlp": False,
+                "batch_guard_dot_reads": True,
+                "deferred_solver_reads": True,
+                "tf32_gemm_math": True,
+            },
+        },
+    }
+    assert validate_run_state_compatibility(old_state, new_expected) == []
+
+    # Both sides carry experiment_flags -> strict comparison. tf32 flipped.
+    same_code = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.00002},
+            "experiment_flags": {
+                "graph_decode_mlp": False,
+                "batch_guard_dot_reads": True,
+                "deferred_solver_reads": True,
+                "tf32_gemm_math": False,
+            },
+        },
+    }
+    assert validate_run_state_compatibility(same_code, new_expected) == [
+        "configuration.experiment_flags"
+    ]
+
+    # A shared configuration key with a different value is still caught.
+    drifted = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.001},
+            "experiment_flags": {
+                "graph_decode_mlp": False,
+                "batch_guard_dot_reads": True,
+                "deferred_solver_reads": True,
+                "tf32_gemm_math": True,
+            },
+        },
+    }
+    assert validate_run_state_compatibility(drifted, new_expected) == [
+        "configuration.training_config",
+    ]
+
+
 def test_run_state_compatibility_reports_all_immutable_mismatches():
     expected = {
         "manifest_identity": "manifest-a",

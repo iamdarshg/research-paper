@@ -319,6 +319,30 @@ def _dataclass_fingerprint(value: Any) -> Any:
     return value
 
 
+_EXPERIMENT_FLAG_NAMES = (
+    "graph_decode_mlp",
+    "batch_guard_dot_reads",
+    "deferred_solver_reads",
+    "tf32_gemm_math",
+)
+
+
+def _experiment_flags_fingerprint() -> Dict[str, bool]:
+    """Resolve every live experiment flag from the loaded YAML.
+
+    R4 (PR 41 review, item 4): these flags were not recorded in the exact-resume
+    fingerprint, so a resume could silently flip numerics (``tf32_gemm_math``)
+    or execution behavior (``graph_decode_mlp`` / ``batch_guard_dot_reads`` /
+    ``deferred_solver_reads``) without any incompatibility being raised. Reads go
+    through the same ``config_value`` accessors the trainer uses, so this is the
+    effective configuration, not the YAML defaults.
+    """
+    return {
+        name: bool(config_value("experiment", name, False))
+        for name in _EXPERIMENT_FLAG_NAMES
+    }
+
+
 def _build_objective_configuration_fingerprint(
     *,
     args: Any,
@@ -348,6 +372,11 @@ def _build_objective_configuration_fingerprint(
         "model_config": _dataclass_fingerprint(model_config),
         "diffusion_config": _dataclass_fingerprint(diffusion_config),
         "cfd_config": _dataclass_fingerprint(cfd_config),
+        # R4 (PR 41 review, item 4): numerics (tf32_gemm_math) and execution
+        # (graph_decode_mlp / batch_guard_dot_reads / deferred_solver_reads)
+        # flags. A resume with these flipped silently changes arithmetic or
+        # kernel behavior; the fingerprint now records them.
+        "experiment_flags": _experiment_flags_fingerprint(),
     }
 
 
