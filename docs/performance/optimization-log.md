@@ -314,4 +314,42 @@ small real win, ~0.2-0.4 s, lost in noise). Reaching 40 would require a precisio
 trade (TF32/FP16 — changes numerics, needs explicit approval + full parity
 re-verification, conflicts with the fp32 claim-bearing run) or more VRAM /
 a quieter machine. **On this 8 GiB / 16 GB box under the binding constraints,
-~44 s/u steady-state is the practical floor.**
+~44 s/u steady-state is the practical floor** *without a precision change*.
+
+### 16. TF32 GEMM precision — quantified (2026-08-17, user approved "quantify first")
+
+Global `torch.backends.cuda.matmul.allow_tf32=True` (fp32 storage, TF32
+tensor-core GEMM math; cudnn stays IEEE). **Physics is immune**: the D3Q27
+LBM/SPSA solver path contains zero matmul/einsum/Linear (grep-verified) — it is
+elementwise kernels only, so the solver's arithmetic is byte-for-byte unchanged.
+Only the neural-network GEMMs (coordinate decoder + diffusion encoder/attention)
+move to TF32.
+
+**Drift (real step1305 converter, real full-grid checkpointed decode):**
+`build/perf/baseline/tf32_probe.py`
+* decoder output: max_rel **1.96e-4** (49× over the FIELD_ATOL_5STEP=4e-6
+  refactor-parity gate; ~1e-4 absolute occupancy shift at the boundary — the
+  gate is a bit-parity refactor check, not a precision-choice gate)
+* grad@latent: max_rel **8.7e-5** → **0.2× of GRAD_ATOL=5e-4** (WITHIN envelope)
+* grad@W0: max_rel **1.8e-4** → **0.4× of GRAD_ATOL=5e-4** (WITHIN envelope)
+* the optimizer inputs (gradients) stay inside the parity envelope by 2-5×;
+  only the strict output-field bit-parity gate is exceeded, by a factor that
+  is negligible at the geometry level (logit-82→sigmoid≈1 unaffected; ~1e-4
+  flip probability only within the calibrated-threshold boundary band).
+
+**Wall-clock (full-update profile, warmup 1 + 3 iters, same committed code):**
+`build/perf/baseline/tf32_profile.py` -> `profile_tf32_0817.json`
+* mean **36.2 s/u** (total 144.8 s / 4) vs fp32 post-levers 49.3 s/u → **-27%**
+* actual per-update wall from tqdm timestamps: 47 (warmup) / 34 / 31 / 32 →
+  **steady-state ~31-34 s/u** vs fp32 ~44 s/u → **-25 to -30%**, below the 40 s gate
+* loss trajectory stable across all 4 updates (opt_loss=10.2, no divergence)
+* same VRAM (fp32 storage), no OOM at full 8 GB; decode fwd+bwd microbench
+  1.511× faster (8776.9 → 5808.4 ms, width-896 depth-5 decoder)
+
+**Open decision (user):** adopting TF32 for the training continuation is a
+deliberate, documented precision mode — it requires explicit approval (the
+"no silent precision switches" constraint is about *silent* switching). The
+claim-bearing run would be "fp32-storage, TF32-GEMM" from step 1306 onward,
+which the paper must describe. Gradients are within the parity envelope; the
+output-field drift breaks the strict 4e-6 refactor gate but is benign at the
+geometry level.
