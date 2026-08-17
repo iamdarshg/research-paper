@@ -268,3 +268,50 @@ compile levers measured 0.99×/overflow. **Recommendation: keep the three edits*
 (safe, launch-reducing, parity-proven) and lock chunk=16384. Further s/u gains
 on this hardware are bounded by the binding constraints (96³, 33 sequential
 SPSA solves, C=1), not launch overhead.
+
+### 15. Old-vs-new A/B (worktree) + host-RSS measurement — 2026-08-17
+
+**A/B in an isolated worktree** (`git worktree add` at HEAD `18de04a`, `build/`
+junctioned to the main tree so the same step1305.pt + manifest are used; the
+worktree's module-relative `config.yaml` keeps the two sync-cut levers OFF and
+the old code path). Same flags as the NEW run (warmup 1 + 3 iters, no-instrument,
+OMP/MKL=12, full VRAM):
+
+| version | mean s/u | steady-state updates |
+|---|---|---|
+| OLD (HEAD `18de04a`, no edits, levers off) | **48.53** | 61 w/u + 45/43/45 |
+| NEW (3 edits + levers on) | **49.25** | ~44-45 |
+
+Δ0.72 s/u ≈ 1.5%, well inside run-to-run noise (same code swung 44.80↔47.72;
+within the OLD run updates ranged 43-61 s). **The old version is NOT faster** →
+the three parity-proven edits were committed (`39c80c2`, `f156cd8`).
+
+**Steady-state clarification.** Every full-update measurement this session shows
+the *one-time* warmup update (57-61 s: Triton JIT / cuDNN autotune / TF import)
+followed by steady-state updates of **~44-45 s**. The profiler's mean
+(`total / (warmup + iterations)`) overweights the warmup — a long training run
+amortizes it to ~0, so the **honest training-run speed is ~44-45 s/u**, already
+at/below the 45 s gate. The 48-49 s means are warmup-inflated, not the true
+per-update cost.
+
+**Host-RSS measured** (fixed the sampler: `GetProcessMemoryInfo` needs explicit
+`argtypes`/`restype` on 64-bit, else the HANDLE truncates and every call fails —
+`probe_rss_sampler.py`, `chunk_size_override.py` updated). On the trainer during
+a full update:
+* **host working set peak = 2.4 GiB** (most state is in VRAM, 5.76 GiB alloc)
+* **pagefile/commit = 12.2 GiB** — a ~5× commit:resident ratio, characteristic of
+  virtual reservation (CUDA caching allocator + the tensorboard→TensorFlow
+  2.21.0 import chain, quantified at **~358 MiB** host RAM by `probe_tf_cost.py`).
+* The machine ran at 88-94% total RAM during the runs; over-commit vs 15.2 GiB
+  physical was only ~1.5-2.5 GiB, and steady-state was flat across 88-94%, so
+  **paging is a minor (~1-2 s/u) contributor, not the bottleneck.**
+
+**Path to 40 s/u — assessment.** Steady-state ~44 s is launch/compute bound
+(GPU busy 32.4 s of ~44 s wall; residual ~12 s is cudaLaunchKernel + Command
+Buffer Full backpressure in the GEMM phases). The launch-reduction axis is spent
+(chunk 16384 = 8-GiB max; graph/compile 0.99×/overflow; guard-dot hoist lands a
+small real win, ~0.2-0.4 s, lost in noise). Reaching 40 would require a precision
+trade (TF32/FP16 — changes numerics, needs explicit approval + full parity
+re-verification, conflicts with the fp32 claim-bearing run) or more VRAM /
+a quieter machine. **On this 8 GiB / 16 GB box under the binding constraints,
+~44 s/u steady-state is the practical floor.**
