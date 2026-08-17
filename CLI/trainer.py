@@ -1,4 +1,7 @@
 
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,6 +20,30 @@ from models import LatentDiffusionUNet, LatentTo3DConverter, ConsistencyModel, N
 from data_utils import ConnectivityLoss, AerodynamicLoss, GroundTruthExporter
 from cfd_simulator import AdvancedCFDSimulator
 from aircraft_diffusion_cfd import LatentTo3DConverter as ScalableLatentTo3DConverter
+
+
+def atomic_write_checkpoint(path, checkpoint):
+    """Atomically write a checkpoint: temp file + fsync + rename (R10).
+
+    A crash can never leave a torn checkpoint at ``path``: the bytes are fully
+    written and fsynced to a sibling temporary file before the atomic replace.
+    Mirrors ``atomic_save_run_state`` in aircraft_diffusion_cfd.py so every
+    durable artifact follows the same write-temp / fsync / replace discipline.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    try:
+        with temporary.open("wb") as handle:
+            torch.save(checkpoint, handle)
+            handle.flush()
+            # fsync requires a handle with write access; a read-only handle
+            # fails on Windows (OSError 9).
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _make_grad_scaler(device_type: str):
@@ -262,7 +289,7 @@ class OptimizedDiffusionTrainer:
             'diffusion_config': asdict(self.diffusion_config),
             'training_config': asdict(self.training_config),
         }
-        torch.save(checkpoint, path)
+        atomic_write_checkpoint(path, checkpoint)
 
     def load_checkpoint(self, path, allow_legacy: bool = False):
         checkpoint = torch.load(path, map_location=self.device)

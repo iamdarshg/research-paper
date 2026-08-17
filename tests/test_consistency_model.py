@@ -74,6 +74,42 @@ def test_run_state_round_trip_restores_rng_and_is_atomic(tmp_path):
     assert not path.with_suffix(path.suffix + ".tmp").exists()
 
 
+def test_atomic_write_checkpoint_serializes_and_cleans_tmp(tmp_path):
+    """R10 (PR 41 review, item 10): trainer.atomic_write_checkpoint must
+    follow the same write-temp / fsync / atomic-replace discipline as
+    atomic_save_run_state. A successful write leaves a loadable target (with
+    its parent directory created) and no .tmp sibling."""
+    from trainer import atomic_write_checkpoint
+
+    path = tmp_path / "sub" / "model.pt"
+    checkpoint = {"step": 7, "tensor": torch.tensor([1.0, -2.0])}
+    atomic_write_checkpoint(path, checkpoint)
+
+    assert path.exists()
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    assert loaded["step"] == 7
+    torch.testing.assert_close(loaded["tensor"], checkpoint["tensor"])
+
+
+def test_atomic_write_checkpoint_failure_preserves_existing_target(tmp_path):
+    """R10: a serialization failure must clean up the temp file and leave any
+    pre-existing checkpoint at the target untouched — a crash mid-save can
+    never manifest as a torn checkpoint at the public path."""
+    from trainer import atomic_write_checkpoint
+
+    path = tmp_path / "model.pt"
+    atomic_write_checkpoint(path, {"step": 1})
+    before = path.read_bytes()
+
+    # torch.save cannot pickle a local lambda -> serialization must fail.
+    with pytest.raises(Exception):
+        atomic_write_checkpoint(path, {"unserializable": lambda: None})
+
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    assert path.read_bytes() == before
+
+
 def test_run_state_compatibility_configuration_uses_intersection_semantics():
     """R4 (PR 41 review, item 4): the ``configuration`` sub-dict is compared
     over the INTERSECTION of keys, so a fingerprint key added in a newer code

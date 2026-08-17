@@ -8570,7 +8570,15 @@ class OptimizedDiffusionTrainer:
             checkpoint_path.suffix + ".tmp"
         )
         try:
-            torch.save(checkpoint, str(temporary_path))
+            with temporary_path.open("wb") as handle:
+                torch.save(checkpoint, handle)
+                handle.flush()
+                # R10 (PR 41 review, item 10): fsync the temp before the atomic
+                # replace so a crash right after replace cannot leave a torn
+                # checkpoint on disk (the temp would otherwise sit only in the
+                # OS page cache). fsync needs a handle with write access — a
+                # read-only handle fails on Windows (OSError 9).
+                os.fsync(handle.fileno())
             os.replace(temporary_path, checkpoint_path)
         except Exception:
             temporary_path.unlink(missing_ok=True)
