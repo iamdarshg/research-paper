@@ -6958,7 +6958,6 @@ class OptimizedDiffusionTrainer:
             mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
             direct_solver_field = None
             direct_initial_noise = None
-            direct_free_running_latent = None
             run_optimizer_grid_loss = (
                 float(self.training_config.direct_solver_loss_weight) > 0.0
                 and batch_idx
@@ -6967,15 +6966,6 @@ class OptimizedDiffusionTrainer:
             )
             if run_optimizer_grid_loss:
                 direct_initial_noise = torch.randn_like(latent)
-                with torch.no_grad():
-                    direct_free_running_latent = (
-                        self.consistency_model.fast_inference(
-                            latent.shape,
-                            num_steps=self.diffusion_config.student_steps,
-                            condition=condition,
-                            initial_noise=direct_initial_noise,
-                        ).nan_to_num(0.0)
-                    )
 
             if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
                 flat_target = geometry_target.reshape(geometry_target.shape[0], -1)
@@ -7056,19 +7046,43 @@ class OptimizedDiffusionTrainer:
                     population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
                 if run_optimizer_grid_loss:
-                    with torch.no_grad():
-                        direct_solver_field = self.converter(
-                            direct_free_running_latent
-                        ).nan_to_num(0.0)
+                    # Build the replay inference path once, in grad mode, BEFORE
+                    # the SPSA solves. Its decode graph (checkpointed; ~small
+                    # metadata + the 0.95 MB consistency graph) serves BOTH the
+                    # detached SPSA base and the optimizer backward, so the old
+                    # redundant no_grad decode is gone entirely. Values are
+                    # bit-identical to the previous separate no_grad decode
+                    # (same noise, model, steps, no optimizer step between).
+                    direct_generation_latent = self.consistency_model.fast_inference(
+                        latent.shape,
+                        num_steps=self.diffusion_config.student_steps,
+                        condition=condition,
+                        initial_noise=direct_initial_noise.detach(),
+                    ).nan_to_num(0.0)
+                    direct_solver_field = self.converter(
+                        direct_generation_latent
+                    ).nan_to_num(0.0)
             else:
                 clean_geom_logits = self.converter(latent).nan_to_num(0.0)
                 generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
                 geom_logits = self.converter(x0_pred).nan_to_num(0.0)
                 if run_optimizer_grid_loss:
-                    with torch.no_grad():
-                        direct_solver_field = self.converter(
-                            direct_free_running_latent
-                        ).nan_to_num(0.0)
+                    # Build the replay inference path once, in grad mode, BEFORE
+                    # the SPSA solves. Its decode graph (checkpointed; ~small
+                    # metadata + the 0.95 MB consistency graph) serves BOTH the
+                    # detached SPSA base and the optimizer backward, so the old
+                    # redundant no_grad decode is gone entirely. Values are
+                    # bit-identical to the previous separate no_grad decode
+                    # (same noise, model, steps, no optimizer step between).
+                    direct_generation_latent = self.consistency_model.fast_inference(
+                        latent.shape,
+                        num_steps=self.diffusion_config.student_steps,
+                        condition=condition,
+                        initial_noise=direct_initial_noise.detach(),
+                    ).nan_to_num(0.0)
+                    direct_solver_field = self.converter(
+                        direct_generation_latent
+                    ).nan_to_num(0.0)
                 clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     clean_geom_logits.float(),
                     geometry_target.float(),
@@ -7217,15 +7231,11 @@ class OptimizedDiffusionTrainer:
                     raise RuntimeError(
                         "Direct solver inference replay is missing initial noise"
                     )
-                direct_generation_latent = self.consistency_model.fast_inference(
-                    latent.shape,
-                    num_steps=self.diffusion_config.student_steps,
-                    condition=condition,
-                    initial_noise=direct_initial_noise.detach(),
-                ).nan_to_num(0.0)
-                direct_optimizer_logits = self.converter(
-                    direct_generation_latent
-                ).nan_to_num(0.0)
+                # Reuse the grad-mode decode built before the SPSA solves. The
+                # SPSA base (`direct_logit_snapshot`) is this tensor's detached
+                # copy, so the same decode serves both the black-box solver and
+                # the optimizer backward. No redundant second decode.
+                direct_optimizer_logits = direct_solver_field
                 direct_weight = float(
                     self.training_config.direct_solver_loss_weight
                 )
