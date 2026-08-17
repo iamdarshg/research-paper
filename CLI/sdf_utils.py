@@ -133,6 +133,13 @@ def compute_link_q(sdf: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: to
     of the solid bounding box and their link neighbors within one more cell, so
     the full-volume EDT is bit-identical to the cropped EDT at every crossing
     cell, and cells far from the solid keep q = 1.0 through the ``where``.
+
+    R12: the 26-link algebra is evaluated one direction at a time, writing
+    directly into the pre-filled 1.0 ``q_all``. The stacked [num_dirs, D, H, W]
+    temporaries the batched form materialized (``sdf_neighbors``, ``crossing``,
+    ``denom``, ``q``, and the ``where`` result — ~5 x 88 MB fp32 at 96^3) are
+    replaced by per-direction [D, H, W] temporaries (~3.5 MB each). Every
+    element's arithmetic is unchanged, so the result is bit-identical.
     """
     if sdf.ndim != 3:
         raise ValueError(f"Expected 3D SDF, got {sdf.ndim}D")
@@ -149,28 +156,21 @@ def compute_link_q(sdf: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: to
     # ensures we don't accidentally detect a boundary link to the opposite face.
     sdf_padded = torch.nn.functional.pad(sdf, (1, 1, 1, 1, 1, 1), mode='constant', value=10.0)
 
-    # Stack the 26 shifted neighbor slices into one tensor, in the exact index
-    # order the original loop wrote (ascending direction index, zero link absent).
-    neighbor_slices = []
-    for _i, dx, dy, dz in directions:
-        neighbor_slices.append(
-            sdf_padded[1 + dx:1 + dx + D, 1 + dy:1 + dy + H, 1 + dz:1 + dz + W]
-        )
-    sdf_neighbors = torch.stack(neighbor_slices, dim=0)  # [26, D, H, W]
-    sdf_view = sdf.unsqueeze(0)
+    # One direction at a time (R12): the per-element formula below is identical
+    # to the batched form, so only the working-set size changes. Non-crossing
+    # cells keep the pre-filled 1.0, matching the original ``where(..., ones)``.
+    for _idx, (i, dx, dy, dz) in enumerate(directions):
+        neighbor_slice = sdf_padded[1 + dx:1 + dx + D, 1 + dy:1 + dy + H, 1 + dz:1 + dz + W]
 
-    # Links that cross the boundary: current is fluid (>0, positive sdf =
-    # outside/fluid), neighbor is solid (<=0, crossing into solid).
-    crossing = (sdf_view > 0) & (sdf_neighbors <= 0)
+        # Links that cross the boundary: current is fluid (>0, positive sdf =
+        # outside/fluid), neighbor is solid (<=0, crossing into solid).
+        crossing = (sdf > 0) & (neighbor_slice <= 0)
 
-    # Linear interpolation for q: sdf(x) / (sdf(x) - sdf(x+e))
-    # This assumes the wall is at sdf=0. Non-crossing cells stay at 1.0.
-    denom = sdf_view - sdf_neighbors
-    q = torch.clamp(sdf_view / (denom + 1e-12), 0.01, 1.0)
-    q = torch.where(crossing, q, torch.ones_like(q))
-
-    for idx, (i, _dx, _dy, _dz) in enumerate(directions):
-        q_all[i] = q[idx]
+        # Linear interpolation for q: sdf(x) / (sdf(x) - sdf(x+e))
+        # This assumes the wall is at sdf=0. Non-crossing cells stay at 1.0.
+        denom = sdf - neighbor_slice
+        q_dir = torch.clamp(sdf / (denom + 1e-12), 0.01, 1.0)
+        q_all[i] = torch.where(crossing, q_dir, q_all[i])
 
     return q_all
 

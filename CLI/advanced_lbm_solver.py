@@ -931,11 +931,15 @@ class D3Q27Solver:
             q_flat = torch.zeros(0, dtype=torch.float32, device=self.device)
         pair_start = torch.tensor(starts, dtype=torch.int32, device=self.device)
         pair_count = torch.tensor(counts, dtype=torch.int32, device=self.device)
+        # R12: max_count is geometry-static (pair_count is fixed by the cached
+        # (geom_hashes, C, res) key), so compute it once here instead of the
+        # per-solve host sync `pair_count.max().item()` the kernel used to do.
         sparse = {
             "active_flat": active_flat,
             "q_flat": q_flat,
             "pair_start": pair_start,
             "pair_count": pair_count,
+            "max_count": int(pair_count.max().item()),
         }
         if len(self._bfl_sparse_cache) > 64:
             self._bfl_sparse_cache.clear()

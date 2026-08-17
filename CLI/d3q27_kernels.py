@@ -679,7 +679,12 @@ def stream_bfl_d3q27_batch_compressed(
     active_flat = sparse["active_flat"]
     pair_start = sparse["pair_start"]
     pair_count = sparse["pair_count"]
-    max_count = int(pair_count.max().item())
+    # R12: max_count is geometry-static and cached in the sparse dict by
+    # _build_bfl_sparse_tables; read it here instead of a per-solve host sync.
+    # The .get() fallback keeps legacy hand-built dicts working.
+    max_count = sparse.get("max_count")
+    if max_count is None:
+        max_count = int(pair_count.max().item())
     if q_flat.numel() > 0 and max_count > 0:
         n_pairs = int(pair_count.numel())
         grid_correct = (n_pairs, triton.cdiv(max_count, block_size))
