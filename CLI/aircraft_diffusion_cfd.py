@@ -3427,6 +3427,49 @@ class PipelineParallelism:
 # ENHANCED CFD SIMULATION WITH FLUIDX3D INTEGRATION
 # ============================================================================
 
+# R8 (PR 41 review, item 8): mission-adaptive CFD semantics — DECISION.
+#
+# The aerodynamic *solve* is deliberately mission-independent. Every sample's
+# LBM solve runs at the same global flow conditions (mach_number from
+# config.yaml; reynolds_number=1e6 requested -> realized effective Re ~2,494
+# at 96^3 after the tau_min_d3q27 stability floor; see R2), so the aero loss
+# is a stable, cross-sample-comparable objective and every reported
+# coefficient is reproducible. Mission-adaptivity is delivered where it can be
+# measured, not in the flow regime:
+#   * design_spec.target_speed is normalized into the condition vector, so the
+#     generator learns a geometry <-> mission mapping;
+#   * per-mission flight paths (climb/cruise/maneuver/descent) are synthesized
+#     at evaluation time from the design_spec.
+# Per-sample flow conditions are intentionally NOT propagated into the solver:
+# doing so would silently change the objective per sample, break exact-resume
+# continuity, and invalidate the documented effective-Re operating point.
+SOLVER_MISSION_INDEPENDENT_FIELDS = (
+    "mach_number",
+    "reynolds_number",
+    "tau_min_d3q27",
+    "drag_reference_speed",
+)
+
+
+def _mission_independent_solver_conditions(config) -> tuple:
+    """Return the (frozen) flow-condition tuple the solver runs at.
+
+    R8 contract: every element is a global, mission-independent scalar derived
+    from ``config`` alone. A future change that derives any element from a
+    per-sample ``design_spec`` violates the decided semantics and must be
+    reviewed as a training-objective change, not a refactor.
+    """
+    lbm_config = getattr(config, "lbm_config", None)
+    tau_min = getattr(lbm_config, "tau_min_d3q27", None)
+    drag_reference_speed = getattr(lbm_config, "drag_reference_speed", None)
+    return (
+        float(getattr(config, "mach_number", 0.0)),
+        float(getattr(config, "reynolds_number", 0.0)),
+        None if tau_min is None else float(tau_min),
+        None if drag_reference_speed is None else float(drag_reference_speed),
+    )
+
+
 class AdvancedCFDSimulator:
     """Advanced CFD simulator with FluidX3D integration and adaptive mesh refinement"""
 
@@ -3438,6 +3481,17 @@ class AdvancedCFDSimulator:
         if config.solver_type != "D3Q27":
             raise ValueError("Only the D3Q27 LBM solver is supported")
         self.lbm_solver = D3Q27CascadedSolver(self.config, device, LBMPhysicsConfig)
+
+        # R8: enforce the mission-independent CFD semantics at every simulator
+        # construction site. The solve regime is a fixed, global tuple derived
+        # from config alone; it must never be derived from a per-sample
+        # design_spec (see SOLVER_MISSION_INDEPENDENT_FIELDS).
+        self.flow_conditions = _mission_independent_solver_conditions(config)
+        if not all(value is None or value > 0.0 for value in self.flow_conditions):
+            raise ValueError(
+                "solver flow conditions must be positive, mission-independent "
+                "scalars (got %r)" % (self.flow_conditions,)
+            )
 
         # Initialize a higher-resolution solver for AMR if enabled
         if self.config.use_amr:

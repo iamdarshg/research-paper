@@ -11,7 +11,10 @@ CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
 if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
-from aircraft_diffusion_cfd import AdvancedCFDSimulator
+from aircraft_diffusion_cfd import (
+    AdvancedCFDSimulator,
+    _mission_independent_solver_conditions,
+)
 
 
 class _FakeLBMSolver:
@@ -113,6 +116,42 @@ class TestCFDSolverContract(unittest.TestCase):
         self.assertEqual(proxy["label_tier"], "heuristic_proxy")
         self.assertFalse(proxy["claim_bearing"])
         self.assertIn("not claim-bearing", proxy["claim_boundary"])
+
+    def test_mission_independent_solver_conditions_are_global_scalars(self):
+        """R8 (PR 41 review, item 8): the flow-condition tuple that defines a
+        solve is derived from global CFDConfig scalars alone — mach_number,
+        reynolds_number, tau_min_d3q27, drag_reference_speed. It is never a
+        function of a per-sample design_spec, so AdvancedCFDSimulator can
+        enforce a fixed, cross-comparable solve regime at construction."""
+        cfg = SimpleNamespace(
+            mach_number=0.3,
+            reynolds_number=1e6,
+            lbm_config=SimpleNamespace(
+                tau_min_d3q27=0.52,
+                drag_reference_speed=80.0,
+            ),
+        )
+        self.assertEqual(
+            _mission_independent_solver_conditions(cfg),
+            (0.3, 1e6, 0.52, 80.0),
+        )
+
+        # A config differing only in mission-flavored (non-flow) fields yields
+        # the identical solve regime — the semantics are global by contract.
+        cfg.lbm_config.use_shape_drag_correction = True
+        cfg.other_mission_field = 123.0
+        self.assertEqual(
+            _mission_independent_solver_conditions(cfg),
+            (0.3, 1e6, 0.52, 80.0),
+        )
+
+        # A missing LBM physics config degrades optional fields to None rather
+        # than fabricating a per-sample value.
+        bare = SimpleNamespace(mach_number=0.3, reynolds_number=1e6, lbm_config=None)
+        self.assertEqual(
+            _mission_independent_solver_conditions(bare),
+            (0.3, 1e6, None, None),
+        )
 
 
 if __name__ == "__main__":

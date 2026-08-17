@@ -126,6 +126,36 @@ class TestLBMSolvers(unittest.TestCase):
         self.assertTrue(torch.isfinite(torch.tensor(coeffs['drag_coefficient'])).item())
         self.assertTrue(torch.isfinite(torch.tensor(coeffs['lift_coefficient'])).item())
 
+    def test_flow_regime_is_mission_independent_fixed_global(self):
+        """R8 (PR 41 review, item 8): the aerodynamic solve runs at fixed,
+        global flow conditions derived from CFDConfig alone. The realized
+        regime (tau_actual / nu_effective) must be identical across samples —
+        a stand-in for the per-sample design_spec — so the aero loss stays a
+        cross-sample-comparable objective. Mission-adaptivity is delivered
+        through the conditioning vector and mission flight-path synthesis,
+        not through the solve."""
+        geometry_a = torch.zeros((8, 8, 8), device=self.device)
+        geometry_a[3:5, 3:5, 3:5] = 1.0
+        geometry_b = torch.zeros((8, 8, 8), device=self.device)
+        geometry_b[2:6, 2:6, 1:7] = 1.0
+
+        solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
+        solver.collide_stream(geometry_a, steps=1)
+        regime = (solver.tau_actual, solver.nu_effective)
+
+        solver.collide_stream(geometry_b, steps=1)
+        self.assertEqual(
+            (solver.tau_actual, solver.nu_effective),
+            regime,
+            "the realized flow regime must not change between samples: the "
+            "solve is mission-independent by design",
+        )
+
+        # The regime is pinned to the config's flow fields, not to any
+        # per-sample mission value.
+        self.assertEqual(float(solver.config.mach_number), self.config.mach_number)
+        self.assertEqual(float(solver.config.reynolds_number), self.config.reynolds_number)
+
     def test_mrt_conservation(self):
         """Verify that MRT collision operator conserves mass and momentum."""
         # Use zero freestream to ensure mass is conserved in a closed/balanced domain
