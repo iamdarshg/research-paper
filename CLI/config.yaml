@@ -189,7 +189,12 @@ cfd:
   # effective_reynolds / tau_actual / reynolds_clamped and must be what the
   # paper's Reynolds claim cites.
   reynolds_number: 1000000.0
-  simulation_steps: 500
+  # Advisory only: no training / validation path reads CFDConfig.simulation_steps
+  # (the direct solver is governed by training.direct_solver_steps, and the
+  # corpus builders use their own SIMULATION_STEPS constants). R9 (PR 41 review,
+  # item 9) aligns it with the legacy 1000 recorded in pre-existing exact-resume
+  # fingerprints so a config-sourced value cannot silently diverge.
+  simulation_steps: 1000
   output_interval: 50
   device_id: 0
 

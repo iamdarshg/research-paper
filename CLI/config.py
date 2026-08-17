@@ -190,8 +190,8 @@ class CFDConfig:
     solver_type: str = "D3Q27"
     base_grid_resolution: int = 32  # Consistent grid resolution - no resizing needed
     mach_number: float = float(config_value("cfd", "mach_number", 0.025))
-    reynolds_number: float = 1e6
-    simulation_steps: int = 1000
+    reynolds_number: float = float(config_value("cfd", "reynolds_number", 1e6))
+    simulation_steps: int = int(config_value("cfd", "simulation_steps", 1000))
     output_interval: int = 50
     device_id: int = 0
     # Adaptive mesh refinement
