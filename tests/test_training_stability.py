@@ -16,6 +16,8 @@ from run_monitored_training import (
     _run_state_checkpoint_due,
     _geometry_non_regression,
     _geometry_promotion_metrics,
+    _restore_best_promotion_rank,
+    _sync_best_checkpoint_state,
 )
 from training_stability import compute_core_loss, summarize_stability
 from training_stability import evaluate_directional_promotion_gate
@@ -127,6 +129,49 @@ class TestTrainingStability(unittest.TestCase):
         )
         self.assertAlmostEqual(metrics["geometry_selection_metric"], 0.3)
         self.assertEqual(metrics["promotion_gate_passed"], 0.0)
+
+    def test_restore_best_promotion_rank_round_trips_and_falls_back(self):
+        """R5 (PR 41 review, item 5): a persisted list rank restores to the
+        tuple gate used by the lexicographic comparison, and run-states that
+        predate the field (or hold garbage) fall back without raising."""
+        persisted = [0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9]
+        self.assertEqual(
+            _restore_best_promotion_rank({"best_promotion_rank": persisted}),
+            (0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9),
+        )
+        self.assertEqual(_restore_best_promotion_rank({}), (-1.0,) * 8)
+        self.assertEqual(
+            _restore_best_promotion_rank({"best_promotion_rank": "bad"}),
+            (-1.0,) * 8,
+        )
+        self.assertEqual(
+            _restore_best_promotion_rank({"best_promotion_rank": None}),
+            (-1.0,) * 8,
+        )
+
+    def test_sync_best_checkpoint_state_mirrors_into_run_state_metadata(self):
+        """R5: the best-checkpoint selection is mirrored into the trainer's
+        run_state_metadata, which build_run_state persists verbatim."""
+        class _FakeTrainer:
+            def __init__(self):
+                self.run_state_metadata = {}
+
+        trainer = _FakeTrainer()
+        _sync_best_checkpoint_state(
+            trainer,
+            best_promotion_rank=(0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9),
+            best_geometry_metric=0.31,
+            best_checkpoint_path=r"C:\out\best_geometry_model.pt",
+        )
+        self.assertEqual(
+            trainer.run_state_metadata["best_promotion_rank"],
+            [0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9],
+        )
+        self.assertEqual(trainer.run_state_metadata["best_geometry_metric"], 0.31)
+        self.assertEqual(
+            trainer.run_state_metadata["best_checkpoint_path"],
+            r"C:\out\best_geometry_model.pt",
+        )
 
     def test_geometry_non_regression_rejects_boundary_and_diversity_collapse(self):
         baseline = {

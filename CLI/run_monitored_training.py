@@ -13,7 +13,7 @@ import queue
 import random
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -686,6 +686,45 @@ def _geometry_promotion_metrics(
     return metrics, rank
 
 
+def _restore_best_promotion_rank(
+    metadata: Mapping[str, Any],
+) -> tuple[float, ...]:
+    """R5 (PR 41 review, item 5): restore the persisted best promotion rank.
+
+    Falls back to the fail-safe ``(-1.0,) * 8`` when the run-state predates
+    this field or holds a non-numeric value, so the lexicographic rank gate
+    never errors on a resume.
+    """
+    value = metadata.get("best_promotion_rank")
+    if value is None:
+        return (-1.0,) * 8
+    try:
+        return tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return (-1.0,) * 8
+
+
+def _sync_best_checkpoint_state(
+    trainer: OptimizedDiffusionTrainer,
+    *,
+    best_promotion_rank: tuple[float, ...],
+    best_geometry_metric: float,
+    best_checkpoint_path: str | None,
+) -> None:
+    """R5 (PR 41 review, item 5): mirror the best-checkpoint selection into the
+    trainer's run_state_metadata so the next run-state save persists it for an
+    exact resume (the metadata dict round-trips verbatim through build_run_state
+    / load_run_state).
+    """
+    trainer.run_state_metadata.update(
+        {
+            "best_promotion_rank": list(best_promotion_rank),
+            "best_geometry_metric": float(best_geometry_metric),
+            "best_checkpoint_path": best_checkpoint_path,
+        }
+    )
+
+
 def _geometry_non_regression(
     candidate: Dict[str, Any],
     baseline: Dict[str, Any],
@@ -1311,6 +1350,17 @@ def main() -> int:
                 resumed_metadata.get("promotion_baseline_metrics", {})
             ) or None
             trainer.run_state_metadata = resumed_metadata
+            # R5 (PR 41 review, item 5): restore the best-checkpoint selection
+            # state so a resume keeps the lexicographic rank gate and reported
+            # best path/metric instead of resetting to (-1,)*8 / inf / None and
+            # clobbering best_geometry_model.pt with a worse promotion.
+            best_promotion_rank = _restore_best_promotion_rank(resumed_metadata)
+            best_geometry_metric = resumed_metadata.get(
+                "best_geometry_metric", float("inf")
+            )
+            best_checkpoint_path = resumed_metadata.get(
+                "best_checkpoint_path", best_checkpoint_path
+            )
 
         if not args.resume_run_state and (
             args.resume_from or args.warm_start_from or not promotion_baseline
@@ -1361,6 +1411,14 @@ def main() -> int:
                 str(Path(args.resume_from or args.warm_start_from).resolve())
                 if (args.resume_from or args.warm_start_from)
                 else None
+            )
+            # R5: seed the persisted best-checkpoint selection state so the
+            # first run-state save captures it for an exact resume.
+            _sync_best_checkpoint_state(
+                trainer,
+                best_promotion_rank=best_promotion_rank,
+                best_geometry_metric=best_geometry_metric,
+                best_checkpoint_path=best_checkpoint_path,
             )
             initial_promotion_path = history_output.with_name(
                 "initial_geometry_promotion.json"
@@ -1472,6 +1530,14 @@ def main() -> int:
                     trainer.save_checkpoint(candidate_best_checkpoint_path)
                     best_checkpoint_path = candidate_best_checkpoint_path
                     metrics["selected_as_best_geometry_checkpoint"] = 1.0
+                    # R5: mirror into run_state_metadata so the next run-state
+                    # save persists the selection gate across an exact resume.
+                    _sync_best_checkpoint_state(
+                        trainer,
+                        best_promotion_rank=best_promotion_rank,
+                        best_geometry_metric=best_geometry_metric,
+                        best_checkpoint_path=best_checkpoint_path,
+                    )
             else:
                 metrics["geometry_selection_metric"] = float("nan")
             history.append(metrics)
