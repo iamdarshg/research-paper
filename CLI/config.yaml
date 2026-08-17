@@ -176,9 +176,6 @@ cfd:
   # External PDE validation is a separate evidence run. The non-claim-bearing
   # local placeholder is never executed inside the optimizer.
   enable_external_validation: false
-  # Mach (dimensionless) is the solver operating point. Absolute speed (m/s)
-  # is derived via the ISA sea-level reference speed of sound (343 m/s) for
-  # physical-unit force conversion only, and varies with temperature/pressure.
   mach_number: 0.3
   reynolds_number: 1000000.0
   simulation_steps: 500
@@ -205,19 +202,31 @@ conditioning:
     - scalar constraints include thrust-to-weight, turn-rate, explicit thrust and engine geometry, and numeric min/max bounds
 
 experiment:
-  # EXPERIMENTAL (merged from experiment/kernel-fusion-launch): collapse the
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
+  # coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
+  # (CLI/kernel_fusion_graph.py) to cut ~13 launches/chunk to 3. OFF by default:
+  # the graph is memory-conditional on 8 GB (~350 MiB static pool) and is only
+  # engaged when grad is disabled (torch.utils.checkpoint forward) at a fixed
+  # [chunk_size, latent_dim+coordinate_dim] input. Capture failure, shape/device
+  # drift, or any autograd-enabled call silently falls back to the compiled or
+  # eager path. See docs/performance/experiment-kernel-fusion-launch.md.
+  graph_decode_mlp: false
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): collapse the
   # per-active-guard .item() guard-dot reads at the end of each update into ONE
   # deferred read (all dots computed GPU-side as fp64 tensors, one stacked
   # .tolist() after the loop). Results are bit-identical to the per-guard path
   # (same fp64 torch.dot over the same flattened concatenations, same order);
-  # only the GPU->CPU sync count changes. OFF by default.
-  batch_guard_dot_reads: false
-  # EXPERIMENTAL (merged from experiment/kernel-fusion-launch): enqueue all 33
+  # only the GPU->CPU sync count changes. ON 2026-08-16 after parity re-verify
+  # on HEAD (guard_dot_parity_check*.py: bit-identical per guard).
+  batch_guard_dot_reads: true
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): enqueue all 33
   # sequential SPSA solves with NO host scalar reads, then read every probe's
   # occupancy / coefficient / nonempty scalars back in ONE batched
   # torch.stack(...).tolist() + one sync (occupancy and the coefficient
-  # arithmetic are bit-identical to the per-solve read path). OFF by default.
-  deferred_solver_reads: false
+  # arithmetic are bit-identical to the per-solve read path). ON 2026-08-16
+  # after parity re-verify on HEAD (deferred_solver_reads_parity.py: ALL PASS,
+  # full SPSA forward OFF-vs-ON byte-identical loss/grads/components).
+  deferred_solver_reads: true
   # NUMERICS (branch experiment/kernel-fusion-launch): run the neural-network
   # GEMMs (coordinate decoder + diffusion encoder/attention) on TF32 tensor-core
   # math. The D3Q27 LBM/SPSA solver path is elementwise-only (no matmul/einsum),
@@ -229,3 +238,41 @@ experiment:
   # unchanged; only GEMM math moves to TF32. ON 2026-08-17 by explicit user
   # decision; the claim-bearing run's paper must document this precision mode.
   tf32_gemm_math: true
+
+design:
+  target_speed: 50.0
+  wingspan_limit_m: 1.8
+  thrust_to_weight_min: 0.45
+  turn_rate_min_deg_s: 18.0
+  required_static_thrust_n: 180.0
+  engine_diameter_mm: 140
+  engine_length_mm: 260
+  engine_count_min: 1
+  engine_count_max: 2
+  payload_mass_min_g: 500
+  payload_mass_max_g: 2000
+  takeoff_distance_min_m: 120
+  takeoff_distance_max_m: 250
+  wall_thickness_min_mm: 1
+  wall_thickness_max_mm: 2
+  part_count_min: 1
+  part_count_max: 8
+  manufacturing_method: fdm_pla_0p4mm
+  space_weight: 0.33
+  drag_weight: 0.33
+  lift_weight: 0.34
+  bounding_box: [64, 64, 64]
+
+# Load this config in Python:
+#
+# import yaml
+#
+# with open('config.yaml', 'r') as f:
+#     config = yaml.safe_load(f)
+#
+# model_cfg = ModelConfig(**config['model'])
+# diff_cfg = DiffusionConfig(**config['diffusion'])
+# train_cfg = TrainingConfig(**config['training'])
+# cfd_cfg = CFDConfig(**config['cfd'])
+# conditioning_cfg = config['conditioning']  # Includes schema_path for the documented tensor seam
+# design_cfg = DesignSpec(**config['design'])

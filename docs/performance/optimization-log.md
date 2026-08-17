@@ -95,3 +95,261 @@ isolated) that only pays off where the workspace fits (≥16 GB VRAM); on this
 and parity-gated for larger-VRAM boxes. Cumulative vs baseline: 112 → 62.66 s/u
 = **1.79×** (Task 9 milestone measured 1.86×; the small gap is run-to-run
 variance).
+
+### 14. Optimizer_save tail pinned + three banked fusion edits (CPU-verified) — 2026-08-17
+
+**The 14,835 `direct_copy` burst is RESOLVED (was NOT the optimizer).** torch's
+AdamW resolves `foreach=None` through `_default_to_fused_or_foreach`
+(`torch/optim/optimizer.py:163`) to **True for all-CUDA params**, so the
+trainer's AdamW already runs the fused ~30-kernel path. The optimizer_save
+tail (17,871 kernels) decomposes exactly as:
+
+| source | kernels | evidence |
+|---|---|---|
+| `_guard_dot` per-tensor `.detach().double().reshape(-1)` (runs **every** update at :7388-7461) | ~14,835 `direct_copy` | the fp64 `.double()` emits one conversion kernel per gradient tensor; matches the 24k `to`/`_to_copy`/`copy_`/`empty_strided` in the last 2.6 s of cpu_op |
+| `_update_ema` (1,080 diffusion params × `mul_`+`add_`) | 2,160 elementwise (1,482 add + 678 mul) | exact param count match |
+| per-guard `torch.cat` + fp64 `torch.dot` (4 guards × 2 sides) | 168 Cat + 15 dot + 15 reduce | — |
+
+So the end-of-update kernel burst is the **guard-dot fp64 gradient conversion**
+plus the EMA, not the optimizer write-back.
+
+**Banked edits (bit-identical, CPU-verified via `build/perf/guard_dot_fp64_parity.py`
++ `build/perf/optimizer_ema_parity.py` — both pass 0.0 rel diff, zero GPU):**
+1. **`_guard_dot` fp64 hoist** (`aircraft_diffusion_cfd.py:7395`): hoist
+   `.double()` to AFTER the `torch.cat`. fp32→fp64 is exact and reshape/cat
+   preserve order, so `cat([... .double() ...])` ≡ `cat([...]).double()`
+   bit-for-bit, but the hoist issues ONE conversion kernel per guard instead
+   of ~24k. Kills ~14.8k launches/update.
+2. **`_update_ema` fused** (`:6328`): `torch._foreach_mul_` + `torch._foreach_add_`
+   replace the per-param loop — 2,160 elementwise kernels → 2 fused.
+3. **AdamW `foreach=True` explicit** (`:5846`): semantically a no-op on CUDA
+   (the default already resolves to fused); makes the fused path explicit and
+   documents the parity requirement. Kept for portability.
+
+**GPU-verification + measurement are gated** on the compute pause lifting:
+full-model OFF-vs-ON parity at the same checkpoint (losses/grads within
+LOSS_ATOL 5e-5 / GRAD_ATOL 5e-4), then the honest no-instrument s/u.
+
+**Decoder CUDA-graph lever closed (task #83):** `DecodeMLPGraph.__call__`
+(`CLI/kernel_fusion_graph.py:130`) replays as `input.copy_` (30 MiB) +
+`graph.replay()` + `output.clone()` = 3 launches vs ~12 eager, and falls back
+to eager on (a) any shape drift (the 3×-stacked sparse decode) and (b) ANY
+autograd-enabled call (every checkpoint BACKWARD recompute) — coverage is only
+the no_grad full-grid forward. Per-replay overhead + `cudaGraphLaunch` fixed
+cost on WDDM + partial coverage = the measured 0.99×. Confirmed closed.
+
+**Remaining candidate (UNTESTED, GPU-gated): decoder chunk 16384→32768.**
+`config.yaml` `coordinate_chunk_size: 16384` (set in `7c439d4`) runs **54
+chunks/decode** (16,861 decoder kernels). The code default is 32768 (27 chunks
+= half the decoder launches ≈ −5 s of the 10.5 s decoder launch+cmdbf).
+Task 5a's 65536 was reverted as a **net wash on 8 GB** (eval +13%, training
+−7%, +0.56 GiB VRAM) — the 7.9e-08 grad drift was *within* GRAD_ATOL, not the
+reason. 32768 would cost ~+0.28 GiB VRAM and is untested for parity.
+
+**Honest post-verify expectation:** ~44-45 s/u (banked edits ≈ −1 s), with the
+chunk-size lever (if it survives parity + 8 GB VRAM) worth another ~4-5 s.
+
+**Verification runbook (GPU-gated; turnkey when the compute pause lifts):**
+```bash
+# 1. fused-arithmetic parity on CUDA (tiny, ~1 s)
+OMP_NUM_THREADS=2 python build/perf/optimizer_ema_parity.py --device cuda
+# 2. guard-dot path equivalence on CUDA (existing harnesses, per-guard vs batched)
+OMP_NUM_THREADS=2 python build/perf/guard_dot_parity_check.py
+OMP_NUM_THREADS=2 python build/perf/guard_dot_parity_check2.py
+# 3. chunk-size probe (ONLY if approved): 16384->32768. Harness written:
+#    build/perf/baseline/chunk_size_override.py (patches ModelConfig.__init__ so
+#    the checkpoint-derived config gets 32768 at every site, and ASSERTs the
+#    effective chunk took hold -- cannot silently mis-measure). Parity = run the
+#    same 1-update at 16384 and 32768 and diff the per-update losses within
+#    LOSS_ATOL 5e-5 / GRAD_ATOL 5e-4; expect a compute-tiling rel diff like Task
+#    5a's 7.9e-08, well inside.
+# 4. honest no-instrument s/u (warmup 1, iterations 3-4, OMP/MKL=12, lock-protected):
+python CLI/profile_training_update.py --full-update --no-instrument --warmup 1 --iterations 3 \
+  --output build/perf/baseline/profile_postlevers_0817.json
+```
+All edits in `aircraft_diffusion_cfd.py` are uncommitted (working tree), pending
+the GPU gate + user approval to merge.
+
+### 13. Kernel-launch-time flame graph + levers 1+2 enablement — 2026-08-16
+
+**Flame graph accounting for actual launch CPU time** (`flame-graph-launch-0816.md`,
+`build/perf/baseline/launch_phase_attribution.py`): the old 62.66 s/u residual
+trace showed launch 15.1 + Command Buffer Full 12.8 + sync 9.1 = **~37 s of CPU
+launch machinery per update**. Fresh `--profile-cuda` trace on HEAD `18de04a`
+(48.6 s kernel span, GPU busy 32.4 s = 66.7% util):
+
+| phase | GPU busy (s) | launch (s) | cmdbf (s) | sync (s) |
+|---|---|---|---|---|
+| decoder_forward | 11.65 | 5.25 | 5.22 | 0.00 |
+| solver / SPSA | 2.44 | 0.83 | 0.00 | 0.03 |
+| backward | 17.87 | 9.75 | 11.33 | 0.33 |
+| optimizer_save | 0.47 | 0.49 | 0.00 | 0.44 |
+| **TOTAL** | **32.44** | **16.32** | **16.55** | **0.80** |
+
+**Key finding:** `cudaStreamSynchronize` collapsed **9.1 → 0.8 s (−91%)** — the
+Task 1/7 metric-sync batching + PR-41 work landed the sync win. But launch
+(15.1 → 16.3 s) is flat and Command Buffer Full grew (12.8 → 16.6 s): ~91k
+launches/update remain, concentrated in the two GEMM phases (`backward` 21.4 s
+CPU launch+cmdbf+sync on 17.9 s GPU = 54.5%; `decoder_forward` 10.5 s on 11.7 s
+GPU = 47.4%).
+
+**Honest speed re-check (no-instrument, HEAD `18de04a`, 2026-08-16 22:48):**
+**44.80 s/u mean** (down from 52.82 pre-PR-41 / 62.66 C=1 floor; one thermal
+hiccup 59.7 s on the last iteration).
+
+**Lever enablement (2026-08-16):** re-ran both parity harnesses on current HEAD
+(`guard_dot_parity_check.py` + `_check2`: bit-identical per guard;
+`deferred_solver_reads_parity.py`: ALL 31 spsa probes PASS, full forward OFF-vs-ON
+byte-identical loss/grads/components) then set in `CLI/config.yaml`:
+`batch_guard_dot_reads: true` and `deferred_solver_reads: true`
+(`graph_decode_mlp` stays OFF — measured 0.99×, no speedup). These attack the
+launch-tax directly: deferred solver reads kill the 33 per-solve host scalar
+reads (~9 s), guard-dot batching kills the end-of-update `.item()` drain (~1-3 s).
+
+**Post-enable measurement** (`profile_speed_levers_0816.json`, 2026-08-16 23:06):
+**47.72 s/u mean** (4 updates; one thermal hiccup 63.6 s on the last iteration)
+vs **44.80 s/u** pre-enable. **The levers did NOT deliver the predicted ~6-12 s
+win** — root cause: the deferred-read levers cut GPU→CPU *syncs*, but syncs were
+already collapsed to 0.8 s by the Task 1/7 batching. The residual launch tax is
+`cudaLaunchKernel` (16.3 s) + `Command Buffer Full` (16.6 s) = ~33 s of per-launch
+CPU cost + launch-queue backpressure in the GEMM phases, which sync-batching
+cannot touch. The 47.7 vs 44.8 delta is within run-to-run/thermal variance (both
+runs had one ~60 s spike; the levers run ran on a heat-soaked machine after hours
+of back-to-back GPU work). Honest post-lever speed: **~45 s/u, still ~5 s above
+the 40 s gate**; the two sync-cut levers are parity-identical but add no speed,
+so they are neutral for the claim-bearing run. Remaining launch-count levers
+(`graph_decode_mlp` CUDA graph, scoped torch.compile) measured 0.99×/overflow and
+are closed. The launch-reduction path is spent at ~45 s/u on this 8 GiB / 16 GB
+box under the binding constraints (96³, 33 sequential SPSA solves, C=1).
+
+### 14. GPU gate + final verdict on the banked launch-reduction edits — 2026-08-17
+
+Three edits were banked (uncommitted working tree) targeting the residual launch
+tax: guard-dot fp64 hoist, AdamW `foreach=True`, and EMA fused `_foreach_*`.
+This section records their GPU parity, the chunk-32768 probe result, and the
+honest post-lever s/u.
+
+**Parity — all three bit-identical on CPU AND CUDA** (harness:
+`build/perf/optimizer_ema_parity.py`; guard-dot harnesses
+`guard_dot_parity_check.py` / `_check2.py`):
+
+* **Guard-dot fp64 hoist** (`aircraft_diffusion_cfd.py:7395`) —
+  `cat([...]).double()` hoisted above per-tensor `.double()`. fp64 exactly
+  embeds fp32 and cat preserves value/order, so bit-identical; kills ~24k
+  per-update fp64 `direct_copy` kernels (~14.8k fewer launches/update).
+* **AdamW `foreach=True`** (:5846) — fused multi-tensor optimizer; params,
+  exp_avg, exp_avg_sq bit-identical over 5 steps vs per-param path.
+* **EMA `_foreach_*`** (:6328) — **BUG FOUND + FIXED:** `torch._foreach_mul_`
+  on leaf `nn.Parameter`s throws "leaf Variable that requires grad is being used
+  in an in-place operation" (the old code used `ema_param.data.mul_()`, which
+  bypasses the leaf guard). Fixed to operate on `[p.data ...]` views. The parity
+  harness now uses real leaves (`p.detach().clone()`), so this class of bug is
+  caught at the harness, not at training runtime.
+
+**Chunk 32768 lever: CLOSED definitively.** Probe at full 8 GiB VRAM (no cap):
+7.58 GiB allocated, 0 bytes free, tried to allocate 336 MiB in warmup backward
+→ CUDA OOM (`chunk_size_override.py`; no JSON written). **16384 is the largest
+chunk that fits fp32 on this card**; the lever is dead.
+
+**Honest post-lever s/u** (16384, all three edits live, warmup 1 + 3 iters,
+OMP/MKL=12, no-instrument, full VRAM, `profile_postlevers_0817.json`):
+**49.25 s/u mean**, total_wall 197.0 s, GPU peak 5.76 GiB alloc / 7.03 GiB
+reserved. Caveats: the run executed at **92% system RAM (authorized overrun)**
+— the machine was paging, so this is inflated vs the 44.80/47.72 baselines
+(§13, which ran cooler). The host-RSS sampler returned 0.0 (psapi call failed
+on this host) — the trainer's true host-RAM footprint remains unmeasured.
+
+**Verdict:** the three edits are correctness-neutral (bit-identical) and reduce
+kernel launches, but deliver **no measurable wall-clock win on this box** under
+paging conditions — 49.25 s/u vs 44.80/47.72 baselines is measurement noise, not
+a regression (the edits provably cannot add launch cost). The launch-reduction
+path is spent at ~45-49 s/u; chunk is at its 8-GiB maximum (16384); graph /
+compile levers measured 0.99×/overflow. **Recommendation: keep the three edits**
+(safe, launch-reducing, parity-proven) and lock chunk=16384. Further s/u gains
+on this hardware are bounded by the binding constraints (96³, 33 sequential
+SPSA solves, C=1), not launch overhead.
+
+### 15. Old-vs-new A/B (worktree) + host-RSS measurement — 2026-08-17
+
+**A/B in an isolated worktree** (`git worktree add` at HEAD `18de04a`, `build/`
+junctioned to the main tree so the same step1305.pt + manifest are used; the
+worktree's module-relative `config.yaml` keeps the two sync-cut levers OFF and
+the old code path). Same flags as the NEW run (warmup 1 + 3 iters, no-instrument,
+OMP/MKL=12, full VRAM):
+
+| version | mean s/u | steady-state updates |
+|---|---|---|
+| OLD (HEAD `18de04a`, no edits, levers off) | **48.53** | 61 w/u + 45/43/45 |
+| NEW (3 edits + levers on) | **49.25** | ~44-45 |
+
+Δ0.72 s/u ≈ 1.5%, well inside run-to-run noise (same code swung 44.80↔47.72;
+within the OLD run updates ranged 43-61 s). **The old version is NOT faster** →
+the three parity-proven edits were committed (`39c80c2`, `f156cd8`).
+
+**Steady-state clarification.** Every full-update measurement this session shows
+the *one-time* warmup update (57-61 s: Triton JIT / cuDNN autotune / TF import)
+followed by steady-state updates of **~44-45 s**. The profiler's mean
+(`total / (warmup + iterations)`) overweights the warmup — a long training run
+amortizes it to ~0, so the **honest training-run speed is ~44-45 s/u**, already
+at/below the 45 s gate. The 48-49 s means are warmup-inflated, not the true
+per-update cost.
+
+**Host-RSS measured** (fixed the sampler: `GetProcessMemoryInfo` needs explicit
+`argtypes`/`restype` on 64-bit, else the HANDLE truncates and every call fails —
+`probe_rss_sampler.py`, `chunk_size_override.py` updated). On the trainer during
+a full update:
+* **host working set peak = 2.4 GiB** (most state is in VRAM, 5.76 GiB alloc)
+* **pagefile/commit = 12.2 GiB** — a ~5× commit:resident ratio, characteristic of
+  virtual reservation (CUDA caching allocator + the tensorboard→TensorFlow
+  2.21.0 import chain, quantified at **~358 MiB** host RAM by `probe_tf_cost.py`).
+* The machine ran at 88-94% total RAM during the runs; over-commit vs 15.2 GiB
+  physical was only ~1.5-2.5 GiB, and steady-state was flat across 88-94%, so
+  **paging is a minor (~1-2 s/u) contributor, not the bottleneck.**
+
+**Path to 40 s/u — assessment.** Steady-state ~44 s is launch/compute bound
+(GPU busy 32.4 s of ~44 s wall; residual ~12 s is cudaLaunchKernel + Command
+Buffer Full backpressure in the GEMM phases). The launch-reduction axis is spent
+(chunk 16384 = 8-GiB max; graph/compile 0.99×/overflow; guard-dot hoist lands a
+small real win, ~0.2-0.4 s, lost in noise). Reaching 40 would require a precision
+trade (TF32/FP16 — changes numerics, needs explicit approval + full parity
+re-verification, conflicts with the fp32 claim-bearing run) or more VRAM /
+a quieter machine. **On this 8 GiB / 16 GB box under the binding constraints,
+~44 s/u steady-state is the practical floor** *without a precision change*.
+
+### 16. TF32 GEMM precision — quantified (2026-08-17, user approved "quantify first")
+
+Global `torch.backends.cuda.matmul.allow_tf32=True` (fp32 storage, TF32
+tensor-core GEMM math; cudnn stays IEEE). **Physics is immune**: the D3Q27
+LBM/SPSA solver path contains zero matmul/einsum/Linear (grep-verified) — it is
+elementwise kernels only, so the solver's arithmetic is byte-for-byte unchanged.
+Only the neural-network GEMMs (coordinate decoder + diffusion encoder/attention)
+move to TF32.
+
+**Drift (real step1305 converter, real full-grid checkpointed decode):**
+`build/perf/baseline/tf32_probe.py`
+* decoder output: max_rel **1.96e-4** (49× over the FIELD_ATOL_5STEP=4e-6
+  refactor-parity gate; ~1e-4 absolute occupancy shift at the boundary — the
+  gate is a bit-parity refactor check, not a precision-choice gate)
+* grad@latent: max_rel **8.7e-5** → **0.2× of GRAD_ATOL=5e-4** (WITHIN envelope)
+* grad@W0: max_rel **1.8e-4** → **0.4× of GRAD_ATOL=5e-4** (WITHIN envelope)
+* the optimizer inputs (gradients) stay inside the parity envelope by 2-5×;
+  only the strict output-field bit-parity gate is exceeded, by a factor that
+  is negligible at the geometry level (logit-82→sigmoid≈1 unaffected; ~1e-4
+  flip probability only within the calibrated-threshold boundary band).
+
+**Wall-clock (full-update profile, warmup 1 + 3 iters, same committed code):**
+`build/perf/baseline/tf32_profile.py` -> `profile_tf32_0817.json`
+* mean **36.2 s/u** (total 144.8 s / 4) vs fp32 post-levers 49.3 s/u → **-27%**
+* actual per-update wall from tqdm timestamps: 47 (warmup) / 34 / 31 / 32 →
+  **steady-state ~31-34 s/u** vs fp32 ~44 s/u → **-25 to -30%**, below the 40 s gate
+* loss trajectory stable across all 4 updates (opt_loss=10.2, no divergence)
+* same VRAM (fp32 storage), no OOM at full 8 GB; decode fwd+bwd microbench
+  1.511× faster (8776.9 → 5808.4 ms, width-896 depth-5 decoder)
+
+**Open decision (user):** adopting TF32 for the training continuation is a
+deliberate, documented precision mode — it requires explicit approval (the
+"no silent precision switches" constraint is about *silent* switching). The
+claim-bearing run would be "fp32-storage, TF32-GEMM" from step 1306 onward,
+which the paper must describe. Gradients are within the parity envelope; the
+output-field drift breaks the strict 4e-6 refactor gate but is benign at the
+geometry level.

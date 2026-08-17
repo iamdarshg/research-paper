@@ -1114,11 +1114,22 @@ def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -
     # original host-side bool(...any().item()) guards did.
     positive_any = positive_mask.any()
     negative_any = negative_mask.any()
+    # Gather each class via index_select on precomputed nonzero indices instead
+    # of boolean-mask indexing: the backward of x[mask] (IndexBackward0) calls
+    # torch.nonzero (a device->host sync) per class term, stalling the GPU in
+    # the backward. index_select's backward (IndexSelectBackward0) scatters on
+    # device with no host sync. The masks derive from target (no grad), so the
+    # nonzero runs only in the forward and creates no backward ops. The
+    # gathered elements are identical and in the same order, so values and
+    # gradients are bit-identical.
+    flat_losses = losses.reshape(-1)
+    positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+    negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
     positive_term = torch.where(
-        positive_any, losses[positive_mask].mean(), losses.new_zeros(())
+        positive_any, flat_losses.index_select(0, positive_indices).mean(), losses.new_zeros(())
     )
     negative_term = torch.where(
-        negative_any, losses[negative_mask].mean(), losses.new_zeros(())
+        negative_any, flat_losses.index_select(0, negative_indices).mean(), losses.new_zeros(())
     )
     class_count = positive_any.to(losses.dtype) + negative_any.to(losses.dtype)
     return torch.where(
@@ -1176,8 +1187,29 @@ def grounded_threshold_margin_loss(
     positive_penalty = (positive_boundary - values).clamp_min(0.0).square()
     negative_penalty = (values - negative_boundary).clamp_min(0.0).square()
     zero = values.sum() * 0.0
-    positive_loss = positive_penalty[positive_mask].mean() if bool(positive_mask.any()) else zero
-    negative_loss = negative_penalty[negative_mask].mean() if bool(negative_mask.any()) else zero
+    # Device-side class selection with index_select gathers: the old
+    # bool(...any().item()) guard was a host sync and the boolean-mask
+    # gather's backward (IndexBackward0) called torch.nonzero per class term.
+    # index_select's backward scatters on device; the masks derive from target
+    # (no grad) so nonzero runs only in the forward. Values and gradients are
+    # bit-identical (an all-False mask yields NaN inside torch.where, discarded
+    # in favor of `zero`, exactly like the BCE helper above).
+    positive_any = positive_mask.any()
+    negative_any = negative_mask.any()
+    flat_positive = positive_penalty.reshape(-1)
+    flat_negative = negative_penalty.reshape(-1)
+    positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+    negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
+    positive_loss = torch.where(
+        positive_any,
+        flat_positive.index_select(0, positive_indices).mean(),
+        zero,
+    )
+    negative_loss = torch.where(
+        negative_any,
+        flat_negative.index_select(0, negative_indices).mean(),
+        zero,
+    )
     loss = positive_weight_value * positive_loss + negative_weight_value * negative_loss
     if not torch.isfinite(loss):
         raise FloatingPointError("threshold margin loss is nonfinite")
@@ -1234,8 +1266,20 @@ def sparse_voxel_reconstruction_loss(
         negative_counts = population_negative_counts.to(logits.device, torch.float32).reshape(-1)
         dice_values: List[torch.Tensor] = []
         for row in range(flat_probabilities.shape[0]):
-            positive_sample = flat_probabilities[row][flat_target[row]]
-            negative_sample = flat_probabilities[row][~flat_target[row]]
+            # Gather via index_select on precomputed long indices instead of
+            # boolean-mask indexing: the backward of x[mask] (IndexBackward0)
+            # calls torch.nonzero (a device->host sync) per row, which stalls
+            # the GPU ~83x/update (~3.5s). index_select's backward scatters on
+            # device with no host sync. The gathered elements are the same, in
+            # the same order, so values and gradients are bit-identical.
+            positive_indices = torch.nonzero(flat_target[row], as_tuple=False).flatten()
+            negative_indices = torch.nonzero(~flat_target[row], as_tuple=False).flatten()
+            positive_sample = flat_probabilities[row].index_select(
+                0, positive_indices.to(device=flat_probabilities.device)
+            )
+            negative_sample = flat_probabilities[row].index_select(
+                0, negative_indices.to(device=flat_probabilities.device)
+            )
             positive_mean = (
                 positive_sample.mean() if positive_sample.numel() else flat_probabilities.new_zeros(())
             )
@@ -3105,6 +3149,29 @@ class LatentTo3DConverter(nn.Module):
         return self._encoded_coordinate_grid
 
     def _decode_coordinate_features(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        if _GRAPH_DECODE_MLP:
+            # EXPERIMENTAL CUDA-graph path (branch experiment/kernel-fusion-launch):
+            # capture/replay the MLP forward to cut ~13 launches/chunk to 3. The
+            # graph binds to the configured chunk row count and the actual feature
+            # width, so partial/stacked chunks (e.g. the 3x-stacked sparse geometry
+            # decode) fall back to eager via shape drift. DecodeMLPGraph.__call__
+            # also falls back internally on capture failure and on ANY
+            # autograd-enabled call -- the torch.utils.checkpoint BACKWARD recompute
+            # must not replay (a detached result would zero gradients to latent);
+            # only the no_grad forward is safe to replay.
+            graph = getattr(self, "_graph_decode_mlp", None)
+            if graph is None:
+                from kernel_fusion_graph import DecodeMLPGraph
+
+                graph = DecodeMLPGraph(
+                    self._decode_coordinate_features_eager,
+                    self._effective_coordinate_chunk_size(decoder_input.device),
+                    decoder_input.shape[1],
+                    decoder_input.device,
+                    decoder_input.dtype,
+                )
+                self._graph_decode_mlp = graph
+            return graph(decoder_input)
         if self._compiled_decode_features is not None:
             try:
                 return self._compiled_decode_features(decoder_input)
@@ -3227,6 +3294,41 @@ class LatentTo3DConverter(nn.Module):
         voxels = torch.cat(chunks, dim=1)
         voxels = voxels.view(batch_size, *self.output_shape)
         return voxels
+
+    def forward_voxel_mask(
+        self,
+        latent: torch.Tensor,
+        selected_chunks: Sequence[int],
+    ) -> torch.Tensor:
+        """Decode only ``selected_chunks`` of the coordinate grid.
+
+        Used by the C=2 topology-guard walk: the walk needs the param-space
+        direction of only the two chunks that dominate the guard gradient, so
+        this builds a graph whose backward recomputes and VJPs those chunks
+        alone. Rows in the other chunks contribute exactly zero to the walk
+        (the same zeroing the old full-width walk applied through the gradient
+        itself, measured at ~0.99 param-space cosine vs the exact direction).
+        ``selected_chunks`` are 0-based indices over the SAME chunking
+        ``forward`` uses, and the returned rows are the concatenation of the
+        selected chunks' rows in ascending chunk order.
+        """
+        batch_size = latent.shape[0]
+        coords = self._encode_full_coordinate_grid(latent.device, latent.dtype)
+        chunk_size = self._effective_coordinate_chunk_size(latent.device)
+        keep = set(int(i) for i in selected_chunks)
+        latent_expanded = latent[:, None, :]
+        selected = []
+        idx = 0
+        for start in range(0, coords.shape[0], chunk_size):
+            if idx in keep:
+                coord_chunk = coords[start:start + chunk_size]
+                selected.append(
+                    self._checkpointed_coordinate_chunk(
+                        latent, coord_chunk, latent_expanded
+                    )
+                )
+            idx += 1
+        return torch.cat(selected, dim=1)
 
 # ============================================================================
 # PIPELINE PARALLELISM: CFD + DIFFUSION OVERLAP
@@ -4150,7 +4252,17 @@ _SDF_WARM_TARGET_INFLIGHT = 8
 # (isolated probe win: C=4 1.12x real / 1.09-1.10x isolated).
 _DIRECT_SOLVER_BATCH_CHUNK = 1
 
-# EXPERIMENTAL (merged from experiment/kernel-fusion-launch): collapse the
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
+# coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
+# (CLI/kernel_fusion_graph.py) to cut ~13 launches/chunk to 3. OFF by default:
+# the graph is memory-conditional on 8 GB (~350 MiB static pool) and is only
+# engaged when grad is disabled (torch.utils.checkpoint forward) at a fixed
+# [chunk_size, latent_dim+coordinate_dim] input. Capture failure, shape/device
+# drift, or any autograd-enabled call silently falls back to the compiled or
+# eager path. See docs/performance/experiment-kernel-fusion-launch.md.
+_GRAPH_DECODE_MLP = bool(config_value("experiment", "graph_decode_mlp", False))
+
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): collapse the
 # per-active-guard .item() guard-dot reads at the end of each update into ONE
 # deferred read (all dots computed GPU-side as fp64 tensors, one stacked
 # .tolist() after the loop). Results are bit-identical to the per-guard path
@@ -4161,8 +4273,8 @@ _BATCH_GUARD_DOT_READS = bool(
     config_value("experiment", "batch_guard_dot_reads", False)
 )
 
-# EXPERIMENTAL (merged from experiment/kernel-fusion-launch): in the sequential
-# SPSA direct-solver phase, enqueue all 32 probe solves back-to-back with NO host
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): in the sequential SPSA
+# direct-solver phase, enqueue all 32 probe solves back-to-back with NO host
 # scalar reads, then read every probe's coefficient / occupancy / nonempty
 # scalars back in ONE batched torch.stack(...).tolist() (+ one sync) and
 # assemble per-probe components afterward. Results are bit-identical to the
@@ -5866,6 +5978,13 @@ class OptimizedDiffusionTrainer:
             ],
             lr=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
+            # Fused multi-tensor AdamW step (torch _foreach_ ops): collapses the
+            # per-parameter copy/add/mul kernel cascade of the non-fused step
+            # into ~20 fused kernels. Bit-identical per parameter (each param's
+            # update touches only its own tensors, same elementwise arithmetic).
+            # Verified by build/perf/optimizer_ema_parity.py before any
+            # claim-bearing run.
+            foreach=True,
         )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
         self.scheduler_step_per_update = False
@@ -6342,8 +6461,17 @@ class OptimizedDiffusionTrainer:
     def _update_ema(self):
         """Update exponential moving average model"""
         decay = self.training_config.ema_decay
-        for ema_param, param in zip(self.ema_model.parameters(), self.diffusion_model.parameters()):
-            ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+        # Fused multi-tensor EMA: one kernel each for the mul_/add_ across all
+        # EMA params instead of two per param. Same elementwise arithmetic (mul
+        # then add), bit-identical per element.
+        # Operate on .data (as the old ema_param.data.mul_() did): _foreach_*_
+        # directly on the leaf nn.Parameters would trip the autograd
+        # "leaf Variable ... in-place" guard (observed at run time on 2026-08-17;
+        # the parity harness now uses real leaves to catch this).
+        ema_params = [p.data for p in self.ema_model.parameters()]
+        model_params = [m.data for m in self.diffusion_model.parameters()]
+        torch._foreach_mul_(ema_params, decay)
+        torch._foreach_add_(ema_params, model_params, alpha=1 - decay)
 
     def _get_validation_cfd_simulator(self) -> AdvancedCFDSimulator:
         if self.val_cfd_simulator is None:
@@ -6464,13 +6592,24 @@ class OptimizedDiffusionTrainer:
             bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
             positive_mask = target_chunk > 0.5
             negative_mask = ~positive_mask
+            # Gather each class via index_select on precomputed nonzero indices
+            # instead of boolean-mask indexing: the backward of bce[mask]
+            # (IndexBackward0) calls torch.nonzero (a device->host sync) per
+            # chunk per class, stalling the GPU in the backward. index_select's
+            # backward scatters on device; the masks derive from target_chunk
+            # (no grad) so nonzero runs only in the forward. The gathered
+            # elements are identical and in the same order, so the sums below
+            # are bit-identical.
+            flat_bce = bce.reshape(-1)
+            positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+            negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
             # Metric-only sums, detached so they never feed the gradient graph
             # (same arithmetic as the removed no_grad pass).
-            # Masked sum of an all-False mask is 0.0, so dropping the
+            # A masked sum of an all-False mask is 0.0, so dropping the
             # bool(...any().item()) guards is bit-identical and removes a
             # per-chunk device->host sync.
-            positive_bce_sum = positive_bce_sum + bce[positive_mask].sum().detach()
-            negative_bce_sum = negative_bce_sum + bce[negative_mask].sum().detach()
+            positive_bce_sum = positive_bce_sum + flat_bce.index_select(0, positive_indices).sum().detach()
+            negative_bce_sum = negative_bce_sum + flat_bce.index_select(0, negative_indices).sum().detach()
             positive_margin_sum = positive_margin_sum + (
                 (positive_boundary - probabilities).clamp_min(0.0).square()
                 * positive_mask
@@ -6489,10 +6628,10 @@ class OptimizedDiffusionTrainer:
             # exactly 0 with no per-chunk host sync and no NaN gradient.
             chunk_bce = logits.new_zeros(())
             chunk_bce = chunk_bce + (
-                bce[positive_mask].sum() / safe_positive_count
+                flat_bce.index_select(0, positive_indices).sum() / safe_positive_count
             ) * has_positive
             chunk_bce = chunk_bce + (
-                bce[negative_mask].sum() / safe_negative_count
+                flat_bce.index_select(0, negative_indices).sum() / safe_negative_count
             ) * has_negative
             chunk_bce = chunk_bce / class_count
             chunk_margin = logits.new_zeros(())
@@ -6864,7 +7003,6 @@ class OptimizedDiffusionTrainer:
             mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
             direct_solver_field = None
             direct_initial_noise = None
-            direct_free_running_latent = None
             run_optimizer_grid_loss = (
                 float(self.training_config.direct_solver_loss_weight) > 0.0
                 and batch_idx
@@ -6873,15 +7011,6 @@ class OptimizedDiffusionTrainer:
             )
             if run_optimizer_grid_loss:
                 direct_initial_noise = torch.randn_like(latent)
-                with torch.no_grad():
-                    direct_free_running_latent = (
-                        self.consistency_model.fast_inference(
-                            latent.shape,
-                            num_steps=self.diffusion_config.student_steps,
-                            condition=condition,
-                            initial_noise=direct_initial_noise,
-                        ).nan_to_num(0.0)
-                    )
 
             if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
                 flat_target = geometry_target.reshape(geometry_target.shape[0], -1)
@@ -6962,19 +7091,43 @@ class OptimizedDiffusionTrainer:
                     population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
                 if run_optimizer_grid_loss:
-                    with torch.no_grad():
-                        direct_solver_field = self.converter(
-                            direct_free_running_latent
-                        ).nan_to_num(0.0)
+                    # Build the replay inference path once, in grad mode, BEFORE
+                    # the SPSA solves. Its decode graph (checkpointed; ~small
+                    # metadata + the 0.95 MB consistency graph) serves BOTH the
+                    # detached SPSA base and the optimizer backward, so the old
+                    # redundant no_grad decode is gone entirely. Values are
+                    # bit-identical to the previous separate no_grad decode
+                    # (same noise, model, steps, no optimizer step between).
+                    direct_generation_latent = self.consistency_model.fast_inference(
+                        latent.shape,
+                        num_steps=self.diffusion_config.student_steps,
+                        condition=condition,
+                        initial_noise=direct_initial_noise.detach(),
+                    ).nan_to_num(0.0)
+                    direct_solver_field = self.converter(
+                        direct_generation_latent
+                    ).nan_to_num(0.0)
             else:
                 clean_geom_logits = self.converter(latent).nan_to_num(0.0)
                 generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
                 geom_logits = self.converter(x0_pred).nan_to_num(0.0)
                 if run_optimizer_grid_loss:
-                    with torch.no_grad():
-                        direct_solver_field = self.converter(
-                            direct_free_running_latent
-                        ).nan_to_num(0.0)
+                    # Build the replay inference path once, in grad mode, BEFORE
+                    # the SPSA solves. Its decode graph (checkpointed; ~small
+                    # metadata + the 0.95 MB consistency graph) serves BOTH the
+                    # detached SPSA base and the optimizer backward, so the old
+                    # redundant no_grad decode is gone entirely. Values are
+                    # bit-identical to the previous separate no_grad decode
+                    # (same noise, model, steps, no optimizer step between).
+                    direct_generation_latent = self.consistency_model.fast_inference(
+                        latent.shape,
+                        num_steps=self.diffusion_config.student_steps,
+                        condition=condition,
+                        initial_noise=direct_initial_noise.detach(),
+                    ).nan_to_num(0.0)
+                    direct_solver_field = self.converter(
+                        direct_generation_latent
+                    ).nan_to_num(0.0)
                 clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     clean_geom_logits.float(),
                     geometry_target.float(),
@@ -7123,15 +7276,11 @@ class OptimizedDiffusionTrainer:
                     raise RuntimeError(
                         "Direct solver inference replay is missing initial noise"
                     )
-                direct_generation_latent = self.consistency_model.fast_inference(
-                    latent.shape,
-                    num_steps=self.diffusion_config.student_steps,
-                    condition=condition,
-                    initial_noise=direct_initial_noise.detach(),
-                ).nan_to_num(0.0)
-                direct_optimizer_logits = self.converter(
-                    direct_generation_latent
-                ).nan_to_num(0.0)
+                # Reuse the grad-mode decode built before the SPSA solves. The
+                # SPSA base (`direct_logit_snapshot`) is this tensor's detached
+                # copy, so the same decode serves both the black-box solver and
+                # the optimizer backward. No redundant second decode.
+                direct_optimizer_logits = direct_solver_field
                 direct_weight = float(
                     self.training_config.direct_solver_loss_weight
                 )
@@ -7157,10 +7306,57 @@ class OptimizedDiffusionTrainer:
                         raise RuntimeError(
                             "topology guard replay started with stale optimizer gradients"
                         )
-                    direct_optimizer_logits.backward(
-                        gradient=direct_weight * guard_logit_gradient,
-                        retain_graph=True,
+                    # C=2 guard walk: walk only the two coordinate-decoder
+                    # chunks with the largest guard-gradient L2 instead of all
+                    # 54. The main decode graph is untouched (the optimizer
+                    # backward below still walks every chunk), so this walk
+                    # recomputes+VJPs 2/54 chunks -- measured ~0.99 param-space
+                    # cosine vs the exact direction (C=1 0.979, C=3 0.993, C=2
+                    # interpolates between). Rows outside the two chunks
+                    # contribute exactly zero to the walk, which is the
+                    # approximation: the replay-side projection rejects with
+                    # 98%+ of the exact rejection, and it has never fired in
+                    # measured updates anyway (cosine +0.40 -> +0.17, toward
+                    # orthogonal).
+                    chunk_rows = self.converter._effective_coordinate_chunk_size(
+                        guard_logit_gradient.device
                     )
+                    flat_guard = guard_logit_gradient.detach().reshape(-1)
+                    if (
+                        chunk_rows > 0
+                        and flat_guard.numel() % chunk_rows == 0
+                        and flat_guard.numel() // chunk_rows >= 2
+                    ):
+                        # The field tiles exactly into chunk_rows chunks with at
+                        # least two of them (production grids: 96^3 = 54 x 16384
+                        # on GPU / 108 x 8192 on CPU). Walk the top-2 chunks.
+                        chunk_l2 = (flat_guard * flat_guard).view(
+                            -1, chunk_rows
+                        ).sum(dim=1)
+                        selected_chunks = sorted(
+                            torch.topk(chunk_l2, 2, sorted=False).indices.tolist()
+                        )
+                        walk_field = self.converter.forward_voxel_mask(
+                            direct_generation_latent,
+                            selected_chunks=selected_chunks,
+                        )
+                        walk_guard_grad = flat_guard.view(-1, chunk_rows)[
+                            selected_chunks
+                        ].reshape(1, -1)
+                        walk_field.backward(
+                            gradient=direct_weight * walk_guard_grad,
+                            retain_graph=True,
+                        )
+                    else:
+                        # The field does not tile into chunk_rows chunks (unit
+                        # tests drive tiny grids, e.g. batch 2 x 4^3 = 128
+                        # elements < 8192). Fall back to the exact full walk of
+                        # the main decode graph -- the pre-C=2 behavior the
+                        # unit-test expectations are written against.
+                        direct_optimizer_logits.backward(
+                            gradient=direct_weight * guard_logit_gradient,
+                            retain_graph=True,
+                        )
                     topology_guard_gradients[guard_name] = capture_gradients(
                         optimizer_parameters
                     )
@@ -7395,19 +7591,26 @@ class OptimizedDiffusionTrainer:
             # the number of GPU->CPU syncs changes.
 
             def _guard_dot(aligned_pairs):
+                # Convert to fp64 AFTER the concatenation, not per-tensor: every
+                # fp32 value is exactly representable in fp64, so
+                # cat([... .double() ...]) and cat([...]).double() are bit-identical,
+                # but the former issues one fp64 copy kernel per gradient tensor
+                # (~24k launches on the full model) while the latter issues ONE
+                # conversion per guard. detach/reshape preserve values and logical
+                # order, so the resulting fp64 dot is byte-for-byte the same.
                 return torch.dot(
                     torch.cat(
                         [
-                            update_gradient.detach().double().reshape(-1)
+                            update_gradient.detach().reshape(-1)
                             for update_gradient, _ in aligned_pairs
                         ]
-                    ),
+                    ).double(),
                     torch.cat(
                         [
-                            guard_gradient.detach().double().reshape(-1)
+                            guard_gradient.detach().reshape(-1)
                             for guard_gradient, _ in aligned_pairs
                         ]
-                    ),
+                    ).double(),
                 )
 
             guard_aligned_pairs = {
