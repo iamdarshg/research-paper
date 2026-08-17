@@ -13,11 +13,11 @@ import queue
 import random
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Iterator, List, Mapping, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
 from aircraft_diffusion_cfd import (
     AircraftDesignDataset,
@@ -576,6 +576,42 @@ class RunLocalCosineScheduler:
             max(0, int(state_dict["completed_updates"])),
         )
         self._apply_learning_rates()
+
+
+class ResumableEpochSampler(Sampler[int]):
+    """Deterministic per-epoch shuffle that survives an exact resume.
+
+    R7 (PR 41 review, item 7): the monitored train loader previously used
+    ``shuffle=False``, so every epoch visited the same sample order. This
+    sampler draws a fresh permutation per epoch seeded by ``(subset_seed,
+    epoch)``, so the order is reproducible from the seed alone. A resumed
+    process calls ``set_epoch`` with the run-state's epoch_index, regenerates
+    the identical permutation, and ``train_epoch``'s ``start_batch`` skip
+    continues at the exact ``completed_in_epoch`` offset.
+
+    The subset COMPOSITION (which samples are in the epoch) is unchanged and is
+    still fingerprinted / resume-validated via ``_dataset_sample_order``; only
+    the per-epoch iteration order becomes a fresh deterministic shuffle.
+    """
+
+    def __init__(self, size: int, *, subset_seed: int) -> None:
+        self._size = int(size)
+        self._subset_seed = int(subset_seed)
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        indices = list(range(self._size))
+        # random.seed(str) uses SHA-512 of the key, so the permutation is stable
+        # across interpreter runs (independent of PYTHONHASHSEED).
+        rng = random.Random(f"{self._subset_seed}:{self._epoch}")
+        rng.shuffle(indices)
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self._size
 
 
 def _build_epoch_dataset(
@@ -1172,10 +1208,18 @@ def main() -> int:
         use_fused_stream_bfl=(args.lbm_stream_bfl_backend == "fused_stream_bfl"),
     )
 
+    # R7 (PR 41 review, item 7): per-epoch deterministic shuffle. The sampler
+    # regenerates the current epoch's permutation from (subset_seed, epoch), so
+    # a resumed process continues at the exact completed_in_epoch offset. The
+    # subset composition (sample_order) is unchanged and stays fingerprinted.
+    train_sampler = ResumableEpochSampler(
+        len(epoch_dataset),
+        subset_seed=args.subset_seed,
+    )
     train_loader = DataLoader(
         epoch_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        sampler=train_sampler,
         num_workers=0,
         collate_fn=aircraft_collate_fn,
     )
@@ -1479,6 +1523,11 @@ def main() -> int:
             start_batch = 0
             if epoch == int(resume_state_info.get("epoch_index", 0)):
                 start_batch = int(resume_state_info.get("completed_in_epoch", 0))
+            # R7: regenerate this epoch's deterministic sample order. On resume
+            # start_epoch is the run-state epoch_index, so the permutation is
+            # re-derived identically and start_batch continues at the recorded
+            # completed_in_epoch offset.
+            train_sampler.set_epoch(epoch)
             metrics = trainer.train_epoch(
                 train_loader,
                 grid_size=resolved_grid_size,

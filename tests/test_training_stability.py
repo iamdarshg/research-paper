@@ -12,6 +12,7 @@ if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
 from run_monitored_training import (
+    ResumableEpochSampler,
     RunLocalCosineScheduler,
     _build_epoch_dataset,
     _run_state_checkpoint_due,
@@ -23,6 +24,33 @@ from run_monitored_training import (
 )
 from training_stability import compute_core_loss, summarize_stability
 from training_stability import evaluate_directional_promotion_gate
+
+
+def test_resumable_epoch_sampler_is_deterministic_per_epoch_and_resumable():
+    """R7 (PR 41 review, item 7): the sampler yields a fresh permutation per
+    epoch, reproducible from (subset_seed, epoch) alone so a resumed process
+    regenerates the current epoch's order and continues at the exact offset."""
+    size = 50
+    first = ResumableEpochSampler(size, subset_seed=7)
+    first.set_epoch(3)
+    permutation = list(first)
+    assert sorted(permutation) == list(range(size))
+
+    # Same (subset_seed, epoch) reproduces the identical permutation.
+    again = ResumableEpochSampler(size, subset_seed=7)
+    again.set_epoch(3)
+    assert list(again) == permutation
+
+    # Different epoch -> different order; different seed -> different order.
+    other_epoch = ResumableEpochSampler(size, subset_seed=7)
+    other_epoch.set_epoch(4)
+    assert list(other_epoch) != permutation
+    different_seed = ResumableEpochSampler(size, subset_seed=8)
+    different_seed.set_epoch(3)
+    assert list(different_seed) != permutation
+
+    # Length must match the sample count (DataLoader plans updates off it).
+    assert len(first) == size
 
 
 def test_load_monitored_history_round_trips_and_is_defensive(tmp_path):
