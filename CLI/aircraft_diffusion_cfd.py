@@ -5863,6 +5863,13 @@ class OptimizedDiffusionTrainer:
             ],
             lr=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
+            # Fused multi-tensor AdamW step (torch _foreach_ ops): collapses the
+            # per-parameter copy/add/mul kernel cascade of the non-fused step
+            # into ~20 fused kernels. Bit-identical per parameter (each param's
+            # update touches only its own tensors, same elementwise arithmetic).
+            # Verified by build/perf/optimizer_ema_parity.py before any
+            # claim-bearing run.
+            foreach=True,
         )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
         self.scheduler_step_per_update = False
@@ -6328,8 +6335,17 @@ class OptimizedDiffusionTrainer:
     def _update_ema(self):
         """Update exponential moving average model"""
         decay = self.training_config.ema_decay
-        for ema_param, param in zip(self.ema_model.parameters(), self.diffusion_model.parameters()):
-            ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+        # Fused multi-tensor EMA: one kernel each for the mul_/add_ across all
+        # EMA params instead of two per param. Same elementwise arithmetic (mul
+        # then add), bit-identical per element.
+        # Operate on .data (as the old ema_param.data.mul_() did): _foreach_*_
+        # directly on the leaf nn.Parameters would trip the autograd
+        # "leaf Variable ... in-place" guard (observed at run time on 2026-08-17;
+        # the parity harness now uses real leaves to catch this).
+        ema_params = [p.data for p in self.ema_model.parameters()]
+        model_params = [m.data for m in self.diffusion_model.parameters()]
+        torch._foreach_mul_(ema_params, decay)
+        torch._foreach_add_(ema_params, model_params, alpha=1 - decay)
 
     def _get_validation_cfd_simulator(self) -> AdvancedCFDSimulator:
         if self.val_cfd_simulator is None:
@@ -7381,19 +7397,26 @@ class OptimizedDiffusionTrainer:
             # the number of GPU->CPU syncs changes.
 
             def _guard_dot(aligned_pairs):
+                # Convert to fp64 AFTER the concatenation, not per-tensor: every
+                # fp32 value is exactly representable in fp64, so
+                # cat([... .double() ...]) and cat([...]).double() are bit-identical,
+                # but the former issues one fp64 copy kernel per gradient tensor
+                # (~24k launches on the full model) while the latter issues ONE
+                # conversion per guard. detach/reshape preserve values and logical
+                # order, so the resulting fp64 dot is byte-for-byte the same.
                 return torch.dot(
                     torch.cat(
                         [
-                            update_gradient.detach().double().reshape(-1)
+                            update_gradient.detach().reshape(-1)
                             for update_gradient, _ in aligned_pairs
                         ]
-                    ),
+                    ).double(),
                     torch.cat(
                         [
-                            guard_gradient.detach().double().reshape(-1)
+                            guard_gradient.detach().reshape(-1)
                             for guard_gradient, _ in aligned_pairs
                         ]
-                    ),
+                    ).double(),
                 )
 
             guard_aligned_pairs = {

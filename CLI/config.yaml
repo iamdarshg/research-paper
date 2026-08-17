@@ -216,14 +216,17 @@ experiment:
   # deferred read (all dots computed GPU-side as fp64 tensors, one stacked
   # .tolist() after the loop). Results are bit-identical to the per-guard path
   # (same fp64 torch.dot over the same flattened concatenations, same order);
-  # only the GPU->CPU sync count changes. OFF by default.
-  batch_guard_dot_reads: false
+  # only the GPU->CPU sync count changes. ON 2026-08-16 after parity re-verify
+  # on HEAD (guard_dot_parity_check*.py: bit-identical per guard).
+  batch_guard_dot_reads: true
   # EXPERIMENTAL (branch experiment/kernel-fusion-launch): enqueue all 33
   # sequential SPSA solves with NO host scalar reads, then read every probe's
   # occupancy / coefficient / nonempty scalars back in ONE batched
   # torch.stack(...).tolist() + one sync (occupancy and the coefficient
-  # arithmetic are bit-identical to the per-solve read path). OFF by default.
-  deferred_solver_reads: false
+  # arithmetic are bit-identical to the per-solve read path). ON 2026-08-16
+  # after parity re-verify on HEAD (deferred_solver_reads_parity.py: ALL PASS,
+  # full SPSA forward OFF-vs-ON byte-identical loss/grads/components).
+  deferred_solver_reads: true
 
 design:
   target_speed: 50.0
