@@ -4225,6 +4225,27 @@ def _direct_solver_supports_batch(cfd_simulator) -> bool:
     return hasattr(root_solver, "collide_stream_batch")
 
 
+def _direct_solver_supports_deferred_reads(cfd_simulator) -> bool:
+    """True if the simulator exposes the deferred batched-read solve interface
+    AND runs on CUDA (the only place that interface pays for itself).
+
+    Lever 1 (``deferred_solver_reads``) collapses the per-solve GPU->CPU scalar
+    reads of the SPSA probe loop into one batched read; on a CPU simulator there
+    are no GPU syncs to defer, so the sequential per-solve path is canonical.
+    Requiring CUDA also keeps the CPU unit tests on the sequential path, which is
+    what they observe (they mock ``_direct_measured_objective_for_single``; the
+    deferred probes bypass that function by design). This mirrors the batch gate
+    above, where the capability check is combined with a threshold only real CUDA
+    training satisfies. Stub simulators (plain ``object()``) lack the method
+    entirely; for those the forward falls back to the verbatim sequential loop
+    rather than raising ``AttributeError``.
+    """
+    if not hasattr(cfd_simulator, "simulate_aerodynamics_deferred"):
+        return False
+    device = getattr(cfd_simulator, "device", None)
+    return getattr(device, "type", "") == "cuda"
+
+
 def _find_q_solver(cfd_simulator: "AdvancedCFDSimulator"):
     """Return the inner D3Q27 solver that owns _get_q/_warm_sdf_cache."""
     root_solver = getattr(cfd_simulator, "lbm_solver", None)
@@ -5312,7 +5333,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     _clear_direct_solver_geometry_caches(cfd_simulator)
                     _clear_direct_solver_batch_workspace(cfd_simulator)
             else:
-                if _DEFERRED_SOLVER_READS:
+                if _DEFERRED_SOLVER_READS and _direct_solver_supports_deferred_reads(cfd_simulator):
                     # Lever 1: enqueue all 32 probe solves with NO host scalar
                     # reads, then read every probe's scalars in ONE batched
                     # .tolist() (+ one sync) and assemble components after.
@@ -5817,6 +5838,22 @@ class OptimizedDiffusionTrainer:
         }
         self.dtype = self.precision_dtypes.get(training_config.precision, torch.float32)
         print(f"Using precision: {training_config.precision} ({self.dtype})")
+
+        # NUMERICS (branch experiment/kernel-fusion-launch): run the
+        # neural-network GEMMs (coordinate decoder + diffusion encoder/attention)
+        # on TF32 tensor-core math when experiment.tf32_gemm_math is set. The
+        # D3Q27 LBM/SPSA solver path is elementwise-only (no matmul/einsum), so
+        # this CANNOT change the solver's arithmetic -- only NN GEMM precision.
+        # Measured 2026-08-17 (build/perf/baseline/tf32_probe.py /
+        # tf32_profile.py): gradients stay within GRAD_ATOL (0.2-0.4x), output
+        # field drifts ~2e-4 rel (49x the 4e-6 refactor-parity gate, benign at
+        # the geometry level), and steady-state drops ~44 -> ~31-34 s/u (mean
+        # 36.2 vs 49.3). fp32 STORAGE is unchanged; only GEMM math moves to
+        # TF32. Wired at trainer construction so solver-only and converter-only
+        # tests keep IEEE fp32; ON by explicit user decision 2026-08-17.
+        if bool(config_value("experiment", "tf32_gemm_math", False)):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = False  # no convs in the model; keep IEEE
 
         self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device, self.dtype)
 

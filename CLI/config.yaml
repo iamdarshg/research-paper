@@ -227,6 +227,17 @@ experiment:
   # after parity re-verify on HEAD (deferred_solver_reads_parity.py: ALL PASS,
   # full SPSA forward OFF-vs-ON byte-identical loss/grads/components).
   deferred_solver_reads: true
+  # NUMERICS (branch experiment/kernel-fusion-launch): run the neural-network
+  # GEMMs (coordinate decoder + diffusion encoder/attention) on TF32 tensor-core
+  # math. The D3Q27 LBM/SPSA solver path is elementwise-only (no matmul/einsum),
+  # so this CANNOT change the solver's arithmetic -- only NN GEMM precision.
+  # Measured 2026-08-17 (build/perf/baseline/tf32_probe.py / tf32_profile.py):
+  # gradients stay within GRAD_ATOL (0.2-0.4x), output field drifts ~2e-4 rel
+  # (49x the 4e-6 refactor-parity gate, benign at the geometry level), and
+  # steady-state drops ~44 -> ~31-34 s/u (mean 36.2 vs 49.3). fp32 STORAGE is
+  # unchanged; only GEMM math moves to TF32. ON 2026-08-17 by explicit user
+  # decision; the claim-bearing run's paper must document this precision mode.
+  tf32_gemm_math: true
 
 design:
   target_speed: 50.0
