@@ -5925,9 +5925,17 @@ class OptimizedDiffusionTrainer:
 
         # NUMERICS (branch experiment/kernel-fusion-launch): run the
         # neural-network GEMMs (coordinate decoder + diffusion encoder/attention)
-        # on TF32 tensor-core math when experiment.tf32_gemm_math is set. The
-        # D3Q27 LBM/SPSA solver path is elementwise-only (no matmul/einsum), so
-        # this CANNOT change the solver's arithmetic -- only NN GEMM precision.
+        # on TF32 tensor-core math when experiment.tf32_gemm_math is set.
+        #
+        # NOTE (R1, PR 41 review): the D3Q27 LBM/SPSA solver path is NOT
+        # elementwise-only -- the MRT moment projection runs torch.tensordot /
+        # torch.matmul against the 27x27 moment_basis in BOTH collide paths
+        # (advanced_lbm_solver.py:608/659/666 single, 1254/1288/1292 batch). A
+        # global torch.backends.cuda.matmul.allow_tf32=True WOULD therefore have
+        # changed solver arithmetic. R1 pins those solver methods to IEEE fp32
+        # with the _ieee_fp32_math decorator (save/restore around each collide),
+        # so THIS flag can still only touch NN GEMM precision -- now by
+        # construction, not by an incorrect comment.
         # Measured 2026-08-17 (build/perf/baseline/tf32_probe.py /
         # tf32_profile.py): gradients stay within GRAD_ATOL (0.2-0.4x), output
         # field drifts ~2e-4 rel (49x the 4e-6 refactor-parity gate, benign at
@@ -5938,6 +5946,13 @@ class OptimizedDiffusionTrainer:
         if bool(config_value("experiment", "tf32_gemm_math", False)):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = False  # no convs in the model; keep IEEE
+        else:
+            # Explicitly pin IEEE fp32 so a TF32 flag left on by an earlier
+            # trainer/process (or a global default change) cannot leak into a
+            # non-TF32 run. The solver is independently force-IEEE via
+            # _ieee_fp32_math regardless of this state.
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
 
         # A1 (experiment/kernel-fusion-launch): compile the backward graph.
         # Set at trainer construction so every backward in the update loop

@@ -1,5 +1,6 @@
 
 import logging
+from functools import wraps
 
 import torch
 import numpy as np
@@ -59,6 +60,31 @@ try:
     from d3q27_kernels import force_drag_d3q27
 except Exception:  # pragma: no cover - optional acceleration path
     force_drag_d3q27 = None
+
+
+def _ieee_fp32_math(fn):
+    """Run the decorated solver method with IEEE fp32 cuBLAS GEMMs.
+
+    The MRT moment projection (``torch.tensordot``/``torch.matmul`` against the
+    27x27 moment basis) is dispatched by cuBLAS and would therefore silently run
+    in TF32 whenever the training process sets
+    ``torch.backends.cuda.matmul.allow_tf32 = True`` for the neural-network
+    GEMMs. That would change the solver's collision arithmetic, which is not an
+    acceptable coupling: the solver is the physical measurement, not a model
+    layer. This decorator pins the process-wide matmul precision to IEEE for the
+    duration of the call and restores it afterwards, so solver arithmetic is
+    independent of the trainer's TF32 setting. ``fp32_precision`` is a module
+    attribute in torch 2.9, so save/restore is a plain attribute swap.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        prev = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev
+    return wrapper
 
 
 def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: float, density: float = 1.225):
@@ -566,6 +592,7 @@ class D3Q27Solver:
         S = factor * self.w.view(27, 1, 1, 1) * (term1 + term2)
         return S
 
+    @_ieee_fp32_math
     def collide_and_stream(self, omega, geometry_mask, ext_force=None, geom_hash=None):
         geometry_mask = geometry_mask.to(self.device, non_blocking=True)
         # Guard against runaway non-finite populations from previous steps.
@@ -1181,6 +1208,7 @@ class D3Q27Solver:
         term2 = (ei_u * ei_F) / (cs2**2)
         return factor * self.w.view(27, 1, 1, 1) * (term1 + term2)
 
+    @_ieee_fp32_math
     def collide_and_stream_batch(self, omega, mask_stack, ext_force=None, geom_hashes=None, q_stack=None, boundary_links_batch=None, exponents_batch=None, bfl_sparse=None):
         """One collide/stream step for C geometries at once.
 
