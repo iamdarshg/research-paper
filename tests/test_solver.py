@@ -61,6 +61,50 @@ class TestLBMSolvers(unittest.TestCase):
         self.assertGreater(coeffs['reference_area'], 0.0)
         self.assertIsInstance(coeffs['drag_coefficient'], float)
 
+    def test_effective_reynolds_and_tau_actual(self):
+        """R2 (PR 41 review): the solver must report the REALIZED relaxation
+        time and Reynolds number, not the requested config value.
+
+        ``tau_min_d3q27`` (default 0.52) clamps ``tau`` to >= 0.52, so a
+        requested Re that implies ``tau < 0.52`` is NOT realized. At 8^3 the
+        freestream is ``u_lu = mach/sqrt(3) ~= 0.0577``; Re=100 implies
+        ``nu = 4.62e-3 -> tau = 0.5139``, below the floor, so the solver
+        actually runs at ``tau = 0.52`` and ``Re_eff ~= 69.3``, not 100.
+        Re=50 implies ``tau = 0.5277`` (above the floor) and is realized
+        exactly.
+        """
+        self.config.reynolds_number = 100
+        solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
+        geometry_mask = torch.zeros((8, 8, 8), device=self.device)
+        geometry_mask[3:5, 3:5, 3:5] = 1.0
+
+        solver.collide_stream(geometry_mask, steps=1)
+        # Realized relaxation handling exposed on the solver after a solve.
+        nu_eff = (0.52 - 0.5) / 3.0
+        self.assertEqual(solver.tau_actual, 0.52)
+        self.assertAlmostEqual(solver.nu_effective, nu_eff, places=8)
+        # self.nu is the REALIZED (post-clamp) viscosity, not the requested one.
+        self.assertAlmostEqual(solver.nu, nu_eff, places=8)
+
+        coeffs = solver.compute_aerodynamic_coefficients(geometry_mask)
+        self.assertEqual(coeffs['requested_reynolds'], 100)
+        self.assertTrue(coeffs['reynolds_clamped'])
+        self.assertAlmostEqual(coeffs['tau_actual'], 0.52, places=6)
+        self.assertAlmostEqual(coeffs['effective_laminar_viscosity'], nu_eff, places=8)
+        u_lu = solver.inlet_velocity_lu
+        self.assertAlmostEqual(coeffs['effective_reynolds'], u_lu * 8.0 / nu_eff, places=4)
+
+        # Unclamped case: Re low enough that tau > 0.52 is realized exactly.
+        self.config.reynolds_number = 50
+        solver2 = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
+        solver2.collide_stream(geometry_mask, steps=1)
+        coeffs2 = solver2.compute_aerodynamic_coefficients(geometry_mask)
+        self.assertFalse(coeffs2['reynolds_clamped'])
+        self.assertAlmostEqual(coeffs2['effective_reynolds'], 50, places=3)
+        u_lu2 = solver2.inlet_velocity_lu
+        tau_unclamped = 3.0 * (u_lu2 * 8.0 / 50.0) + 0.5
+        self.assertAlmostEqual(coeffs2['tau_actual'], tau_unclamped, places=6)
+
     def test_d3q27_benchmark_like_run_is_finite(self):
         benchmark_config = CFDConfig(
             base_grid_resolution=32,

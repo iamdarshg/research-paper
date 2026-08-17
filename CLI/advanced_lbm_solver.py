@@ -1507,6 +1507,22 @@ class D3Q27CascadedSolver:
         L_lu = float(max(self.resolution, 1))
         return max(u_lu * L_lu / Re, 1e-9)
 
+    def _resolve_relaxation_time(self, nu_requested: float):
+        """Map a requested lattice viscosity to the REALIZED relaxation time.
+
+        The BGK/MRT collision kernel requires ``tau > 0.5``, and the stability
+        floor (``tau_min_d3q27``, default 0.52) pins the lowest usable value. A
+        requested Reynolds number low enough to imply ``tau < tau_min`` is
+        therefore NOT realized: the solver runs at the clamped tau and, since
+        ``nu = (tau - 0.5) / 3``, at a LOWER effective Reynolds number than the
+        config requests (R2, PR 41 review). Returns ``(tau_actual,
+        nu_effective)`` where ``nu_effective`` is the viscosity the clamped
+        solver actually evolves.
+        """
+        tau_min = float(getattr(self.phys_config, "tau_min_d3q27", 0.52))
+        tau_actual = max(3.0 * nu_requested + 0.5, tau_min)
+        return tau_actual, max((tau_actual - 0.5) / 3.0, 1e-12)
+
     def _estimate_lattice_freestream_velocity(self):
         """Convert configured physical freestream to lattice units (Issue #16).
 
@@ -1569,10 +1585,17 @@ class D3Q27CascadedSolver:
         # compute a nominal relaxation rate from config
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         dt = getattr(self.config.lbm_config, 'time_step', 0.001)
-        nu = self._estimate_kinematic_viscosity()
-        self.nu = nu
-        tau_min = float(getattr(self.phys_config, "tau_min_d3q27", 0.52))
-        tau = max(3.0 * nu + 0.5, tau_min)
+        # R2 (PR 41 review): the requested nu is NOT always realized -- the
+        # BGK/MRT stability floor (tau_min_d3q27, default 0.52) clamps tau, so
+        # the solver evolves nu_effective = (tau - 0.5)/3. self.nu (and hence
+        # reynolds_number_turbulent + the effective-Re telemetry in every
+        # coefficient dict) is set to the REALIZED value; the requested value
+        # is kept for requested_reynolds / reynolds_clamped reporting.
+        nu_requested = self._estimate_kinematic_viscosity()
+        self.nu_requested = nu_requested
+        tau, self.nu_effective = self._resolve_relaxation_time(nu_requested)
+        self.nu = self.nu_effective
+        self.tau_actual = tau
         omega = 1.0 / max(tau, 1e-12)
 
         sample_window = max(10, steps // 4)
@@ -1868,7 +1891,30 @@ class D3Q27CascadedSolver:
 
         vortex_cells = vortex_cells_f
         nu_turb_mean = nu_turb_mean_f
-        reynolds_turbulent = float(v_inf * h * self.resolution / max(nu + nu_turb_mean, 1e-12))
+        # R2 (PR 41 review): report the REALIZED Reynolds number, not the
+        # requested config value. When tau_min_d3q27 clamps tau, the solver
+        # evolves nu_effective = (tau - 0.5)/3, so the lattice-units effective
+        # Reynolds is u_lu * resolution / nu_effective (~2,494 at 96^3 /
+        # Mach 0.3 with the paper config's Re=1e6), NOT the configured 1e6.
+        # reynolds_clamped flags that the request was clamped away.
+        # reynolds_number_turbulent is also made lattice-consistent
+        # (u_lu * resolution / (nu + nu_turb_mean)), fixing the previous
+        # dimensionally-mixed v_inf * h * resolution / nu (physical v_inf with
+        # lattice nu).
+        u_lu = max(abs(float(self.inlet_velocity_lu)), 1e-6)
+        requested_reynolds = float(getattr(self.config, 'reynolds_number', float('nan')))
+        effective_laminar_viscosity = float(nu)
+        tau_actual = float(3.0 * effective_laminar_viscosity + 0.5)
+        effective_reynolds = float(
+            u_lu * self.resolution / max(effective_laminar_viscosity, 1e-12)
+        )
+        reynolds_clamped = bool(
+            requested_reynolds > 0.0
+            and effective_reynolds < requested_reynolds * (1.0 - 1e-9)
+        )
+        reynolds_turbulent = float(
+            u_lu * self.resolution / max(nu + nu_turb_mean, 1e-12)
+        )
         calibrated_drag_coefficient = float(drag_coefficient_surrogate)
         training_drag_coefficient = calibrated_drag_coefficient
         training_drag_label_source = 'lbm_calibrated'
@@ -1952,6 +1998,13 @@ class D3Q27CascadedSolver:
             'freestream_speed': v_inf,
             'density': coeffs['density'],
             'reynolds_number_turbulent': reynolds_turbulent,
+            # R2 (PR 41 review): realized-vs-requested Reynolds telemetry so the
+            # paper's Reynolds claim matches the solver's actual physics.
+            'requested_reynolds': requested_reynolds,
+            'effective_reynolds': effective_reynolds,
+            'reynolds_clamped': reynolds_clamped,
+            'tau_actual': tau_actual,
+            'effective_laminar_viscosity': effective_laminar_viscosity,
             'empty_geometry': bool(solid_volume_raw <= 0.0),
             'claim_bearing_cfd': False,
             'solver_quality_checks': solver_quality_checks,
@@ -2111,10 +2164,14 @@ class D3Q27CascadedSolver:
         geometry_masks = geometry_masks.to(self.device, non_blocking=True)
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         dt = getattr(self.config.lbm_config, 'time_step', 0.001)
-        nu = self._estimate_kinematic_viscosity()
-        self.nu = nu
-        tau_min = float(getattr(self.phys_config, "tau_min_d3q27", 0.52))
-        tau = max(3.0 * nu + 0.5, tau_min)
+        # R2 (PR 41 review): same realized-vs-requested relaxation handling as
+        # collide_stream -- tau clamps to tau_min_d3q27, self.nu is the
+        # effective post-clamp viscosity, nu_requested is kept for reporting.
+        nu_requested = self._estimate_kinematic_viscosity()
+        self.nu_requested = nu_requested
+        tau, self.nu_effective = self._resolve_relaxation_time(nu_requested)
+        self.nu = self.nu_effective
+        self.tau_actual = tau
         omega = 1.0 / max(tau, 1e-12)
 
         sample_window = max(10, steps // 4)
@@ -2167,6 +2224,17 @@ class D3Q27CascadedSolver:
         C = geometry_masks.shape[0]
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         solver = self._solver
+        # R2 (PR 41 review): realized-vs-requested Reynolds telemetry for the
+        # batch path -- same laminar values as the sequential path, computed
+        # from the effective post-clamp self.nu (see collide_stream_batch).
+        # nu_turb_mean stays unavailable on the batch path (see the
+        # reynolds_number_turbulent: None note below).
+        req_re = float(getattr(self.config, 'reynolds_number', float('nan')))
+        b_u_lu = max(abs(float(self.inlet_velocity_lu)), 1e-6)
+        b_eff_nu = float(self.nu)
+        b_eff_re = float(b_u_lu * self.resolution / max(b_eff_nu, 1e-12))
+        b_re_clamped = bool(req_re > 0.0 and b_eff_re < req_re * (1.0 - 1e-9))
+        b_tau_actual = float(3.0 * b_eff_nu + 0.5)
         results = []
         for c in range(C):
             mask = geometry_masks[c]
@@ -2319,6 +2387,13 @@ class D3Q27CascadedSolver:
                 'freestream_speed': v_inf,
                 'density': coeffs['density'],
                 'reynolds_number_turbulent': None,
+                # R2 (PR 41 review): realized-vs-requested Reynolds telemetry
+                # (batch path), same schema as the sequential path.
+                'requested_reynolds': req_re,
+                'effective_reynolds': b_eff_re,
+                'reynolds_clamped': b_re_clamped,
+                'tau_actual': b_tau_actual,
+                'effective_laminar_viscosity': b_eff_nu,
                 'empty_geometry': bool(torch.sum(solid.float()).item() <= 0.0),
                 'claim_bearing_cfd': False,
                 'solver_quality_checks': {
