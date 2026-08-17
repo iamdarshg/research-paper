@@ -84,44 +84,23 @@ def _validate_gradient_layout(
         )
 
 
-def _cat_grouped_to_dtype(
-    pieces: Sequence[torch.Tensor],
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Concatenate 1-D ``pieces`` into one 1-D tensor of ``dtype``.
-
-    Groups pieces by their native dtype so one concatenation + one conversion
-    replaces the old per-tensor ``.to(dtype)`` (one conversion kernel per
-    parameter, ~10k launches on the full model).  fp32->fp64 and fp16->fp64
-    are exact, and within a dtype group the element order is identical to the
-    per-parameter order, so when every piece shares one dtype (the production
-    fp32 path) the result is byte-for-byte the tensor the per-parameter path
-    built.  Mixed dtypes still convert exactly per group; only the relative
-    group order may differ from parameter order, which no production path has.
-    """
-    if not pieces:
-        return torch.empty(0, dtype=dtype)
-    groups: dict[torch.dtype, list[torch.Tensor]] = {}
-    for piece in pieces:
-        groups.setdefault(piece.dtype, []).append(piece)
-    flats = [torch.cat(group).to(dtype=dtype) for group in groups.values()]
-    return flats[0] if len(flats) == 1 else torch.cat(flats)
-
-
-def _flatten_present_gradients(
+def gradient_l2_norm(
     gradients: Sequence[Optional[torch.Tensor]],
     *,
-    branch_name: str,
-    dtype: torch.dtype = torch.float64,
-) -> torch.Tensor:
-    """Concatenate every present gradient into one 1-D tensor of ``dtype``.
+    branch_name: str = "<unnamed>",
+) -> float:
+    """Return a finite L2 norm, rejecting any nonfinite gradient.
 
-    ``None`` entries are skipped and every present tensor is validated as
-    strided before flattening, so the caller can reduce over a single tensor
-    with a single ``.item()`` sync.  Returns an empty 1-D tensor when no
-    gradient is present.
+    R3 (PR 41 review): the norm is computed from PER-TENSOR fp64 reductions
+    with no full-model fp64 flatten. Each present gradient's L2 norm is reduced
+    on GPU in fp64; the n per-tensor scalars are read to host in ONE
+    ``.tolist()`` and combined with a scale-and-square-root so
+    representable-extreme values (e.g. 1e308) stay finite. Any nonfinite
+    element makes its tensor's norm NaN/Inf, which surfaces here as the same
+    ``NonFiniteGradientError`` the old full-flatten path raised.
     """
-    pieces: list[torch.Tensor] = []
+
+    norm_rows: list[torch.Tensor] = []
     for parameter_index, gradient in enumerate(gradients):
         if gradient is None:
             continue
@@ -130,27 +109,24 @@ def _flatten_present_gradients(
             branch_name=branch_name,
             parameter_index=parameter_index,
         )
-        pieces.append(gradient.detach().reshape(-1))
-    return _cat_grouped_to_dtype(pieces, dtype)
-
-
-def gradient_l2_norm(
-    gradients: Sequence[Optional[torch.Tensor]],
-    *,
-    branch_name: str = "<unnamed>",
-) -> float:
-    """Return a finite L2 norm, rejecting any nonfinite gradient."""
-
-    flat = _flatten_present_gradients(
-        gradients,
-        branch_name=branch_name,
-        dtype=torch.float64,
-    )
-    if not bool(torch.isfinite(flat).all().item()):
+        # fp64 reduction on GPU; vector_norm is internally scaling-stable, so a
+        # single 1e308 element returns 1e308 (not inf from an unguarded square).
+        norm_rows.append(
+            torch.linalg.vector_norm(gradient.detach(), ord=2).to(torch.float64)
+        )
+    if not norm_rows:
+        return 0.0
+    # One host read (single device sync) for every per-tensor scalar.
+    norms = [float(v) for v in torch.stack(norm_rows).tolist()]
+    if any(not math.isfinite(value) for value in norms):
         raise NonFiniteGradientError(
             f"gradient branch {branch_name!r} contains nonfinite values"
         )
-    total_norm = float(torch.linalg.vector_norm(flat, ord=2).item())
+    peak = max(norms)
+    if peak == 0.0:
+        return 0.0
+    # Scale before squaring so per-tensor norms up to ~1.3e154 stay finite.
+    total_norm = peak * math.sqrt(sum((value / peak) ** 2.0 for value in norms))
     if not math.isfinite(total_norm):
         raise NonFiniteGradientError(
             f"gradient branch {branch_name!r} has a nonfinite L2 norm"
@@ -196,8 +172,9 @@ def _gradient_dot_product(
     if len(first) != len(second):
         raise ValueError("gradient branches must have the same buffer count")
 
-    first_pieces: list[torch.Tensor] = []
-    second_pieces: list[torch.Tensor] = []
+    # R3 (PR 41 review): per-tensor fp64 dots (no full-model fp64 flatten),
+    # one host read of the n per-tensor scalars, then an exact fp64 sum.
+    dot_rows: list[torch.Tensor] = []
     for parameter_index, (first_gradient, second_gradient) in enumerate(
         zip(first, second)
     ):
@@ -213,24 +190,23 @@ def _gradient_dot_product(
             branch_name=second_name,
             parameter_index=parameter_index,
         )
-        first_pieces.append(first_gradient.detach().reshape(-1))
-        second_pieces.append(second_gradient.detach().reshape(-1))
-    if not first_pieces:
+        dot_rows.append(
+            torch.dot(
+                first_gradient.detach().reshape(-1).to(torch.float64),
+                second_gradient.detach().reshape(-1).to(torch.float64),
+            )
+        )
+    if not dot_rows:
         return 0.0
-
-    first_flat = _cat_grouped_to_dtype(first_pieces, torch.float64)
-    second_flat = _cat_grouped_to_dtype(second_pieces, torch.float64)
-    if not bool(
-        torch.logical_and(
-            torch.isfinite(first_flat),
-            torch.isfinite(second_flat),
-        ).all().item()
-    ):
+    # One host read (single device sync) for every per-tensor scalar.
+    dots = [float(v) for v in torch.stack(dot_rows).tolist()]
+    if any(not math.isfinite(value) for value in dots):
         raise NonFiniteGradientError(
             f"gradient dot product for {first_name!r} and {second_name!r} "
             "contains nonfinite values"
         )
-    dot = float(torch.dot(first_flat, second_flat).item())
+    # Exact-order fp64 sum of the per-tensor dots.
+    dot = math.fsum(dots)
     if not math.isfinite(dot):
         raise NonFiniteGradientError(
             f"gradient dot product for {first_name!r} and {second_name!r} "
