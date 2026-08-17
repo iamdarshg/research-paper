@@ -1234,8 +1234,20 @@ def sparse_voxel_reconstruction_loss(
         negative_counts = population_negative_counts.to(logits.device, torch.float32).reshape(-1)
         dice_values: List[torch.Tensor] = []
         for row in range(flat_probabilities.shape[0]):
-            positive_sample = flat_probabilities[row][flat_target[row]]
-            negative_sample = flat_probabilities[row][~flat_target[row]]
+            # Gather via index_select on precomputed long indices instead of
+            # boolean-mask indexing: the backward of x[mask] (IndexBackward0)
+            # calls torch.nonzero (a device->host sync) per row, which stalls
+            # the GPU ~83x/update (~3.5s). index_select's backward scatters on
+            # device with no host sync. The gathered elements are the same, in
+            # the same order, so values and gradients are bit-identical.
+            positive_indices = torch.nonzero(flat_target[row], as_tuple=False).flatten()
+            negative_indices = torch.nonzero(~flat_target[row], as_tuple=False).flatten()
+            positive_sample = flat_probabilities[row].index_select(
+                0, positive_indices.to(device=flat_probabilities.device)
+            )
+            negative_sample = flat_probabilities[row].index_select(
+                0, negative_indices.to(device=flat_probabilities.device)
+            )
             positive_mean = (
                 positive_sample.mean() if positive_sample.numel() else flat_probabilities.new_zeros(())
             )
