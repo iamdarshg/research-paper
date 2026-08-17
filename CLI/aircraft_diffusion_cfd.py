@@ -1114,11 +1114,22 @@ def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -
     # original host-side bool(...any().item()) guards did.
     positive_any = positive_mask.any()
     negative_any = negative_mask.any()
+    # Gather each class via index_select on precomputed nonzero indices instead
+    # of boolean-mask indexing: the backward of x[mask] (IndexBackward0) calls
+    # torch.nonzero (a device->host sync) per class term, stalling the GPU in
+    # the backward. index_select's backward (IndexSelectBackward0) scatters on
+    # device with no host sync. The masks derive from target (no grad), so the
+    # nonzero runs only in the forward and creates no backward ops. The
+    # gathered elements are identical and in the same order, so values and
+    # gradients are bit-identical.
+    flat_losses = losses.reshape(-1)
+    positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+    negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
     positive_term = torch.where(
-        positive_any, losses[positive_mask].mean(), losses.new_zeros(())
+        positive_any, flat_losses.index_select(0, positive_indices).mean(), losses.new_zeros(())
     )
     negative_term = torch.where(
-        negative_any, losses[negative_mask].mean(), losses.new_zeros(())
+        negative_any, flat_losses.index_select(0, negative_indices).mean(), losses.new_zeros(())
     )
     class_count = positive_any.to(losses.dtype) + negative_any.to(losses.dtype)
     return torch.where(
@@ -1176,8 +1187,29 @@ def grounded_threshold_margin_loss(
     positive_penalty = (positive_boundary - values).clamp_min(0.0).square()
     negative_penalty = (values - negative_boundary).clamp_min(0.0).square()
     zero = values.sum() * 0.0
-    positive_loss = positive_penalty[positive_mask].mean() if bool(positive_mask.any()) else zero
-    negative_loss = negative_penalty[negative_mask].mean() if bool(negative_mask.any()) else zero
+    # Device-side class selection with index_select gathers: the old
+    # bool(...any().item()) guard was a host sync and the boolean-mask
+    # gather's backward (IndexBackward0) called torch.nonzero per class term.
+    # index_select's backward scatters on device; the masks derive from target
+    # (no grad) so nonzero runs only in the forward. Values and gradients are
+    # bit-identical (an all-False mask yields NaN inside torch.where, discarded
+    # in favor of `zero`, exactly like the BCE helper above).
+    positive_any = positive_mask.any()
+    negative_any = negative_mask.any()
+    flat_positive = positive_penalty.reshape(-1)
+    flat_negative = negative_penalty.reshape(-1)
+    positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+    negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
+    positive_loss = torch.where(
+        positive_any,
+        flat_positive.index_select(0, positive_indices).mean(),
+        zero,
+    )
+    negative_loss = torch.where(
+        negative_any,
+        flat_negative.index_select(0, negative_indices).mean(),
+        zero,
+    )
     loss = positive_weight_value * positive_loss + negative_weight_value * negative_loss
     if not torch.isfinite(loss):
         raise FloatingPointError("threshold margin loss is nonfinite")
@@ -6515,13 +6547,24 @@ class OptimizedDiffusionTrainer:
             bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
             positive_mask = target_chunk > 0.5
             negative_mask = ~positive_mask
+            # Gather each class via index_select on precomputed nonzero indices
+            # instead of boolean-mask indexing: the backward of bce[mask]
+            # (IndexBackward0) calls torch.nonzero (a device->host sync) per
+            # chunk per class, stalling the GPU in the backward. index_select's
+            # backward scatters on device; the masks derive from target_chunk
+            # (no grad) so nonzero runs only in the forward. The gathered
+            # elements are identical and in the same order, so the sums below
+            # are bit-identical.
+            flat_bce = bce.reshape(-1)
+            positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+            negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
             # Metric-only sums, detached so they never feed the gradient graph
             # (same arithmetic as the removed no_grad pass).
-            # Masked sum of an all-False mask is 0.0, so dropping the
+            # A masked sum of an all-False mask is 0.0, so dropping the
             # bool(...any().item()) guards is bit-identical and removes a
             # per-chunk device->host sync.
-            positive_bce_sum = positive_bce_sum + bce[positive_mask].sum().detach()
-            negative_bce_sum = negative_bce_sum + bce[negative_mask].sum().detach()
+            positive_bce_sum = positive_bce_sum + flat_bce.index_select(0, positive_indices).sum().detach()
+            negative_bce_sum = negative_bce_sum + flat_bce.index_select(0, negative_indices).sum().detach()
             positive_margin_sum = positive_margin_sum + (
                 (positive_boundary - probabilities).clamp_min(0.0).square()
                 * positive_mask
@@ -6540,10 +6583,10 @@ class OptimizedDiffusionTrainer:
             # exactly 0 with no per-chunk host sync and no NaN gradient.
             chunk_bce = logits.new_zeros(())
             chunk_bce = chunk_bce + (
-                bce[positive_mask].sum() / safe_positive_count
+                flat_bce.index_select(0, positive_indices).sum() / safe_positive_count
             ) * has_positive
             chunk_bce = chunk_bce + (
-                bce[negative_mask].sum() / safe_negative_count
+                flat_bce.index_select(0, negative_indices).sum() / safe_negative_count
             ) * has_negative
             chunk_bce = chunk_bce / class_count
             chunk_margin = logits.new_zeros(())
