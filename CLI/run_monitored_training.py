@@ -1200,7 +1200,7 @@ def main() -> int:
         direct_aircraft_validity_weight=args.direct_aircraft_validity_weight,
         overfit_geometry_gate_samples=args.promotion_evaluation_samples,
         promotion_generation_seeds=args.promotion_generation_seeds,
-        require_direct_solver_every_iteration=True,
+        require_direct_solver_every_iteration=False,
     )
     cfd_config = CFDConfig(
         base_grid_resolution=resolved_grid_size,
@@ -1693,5 +1693,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 

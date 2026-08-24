@@ -8,7 +8,7 @@
 schema_version: 1
 
 model:
-  latent_dim: 192
+  latent_dim: 512
   # Structured corpus latents are normalized geometry/condition features.
   latent_value_min: 0.0
   latent_value_max: 1.0
@@ -19,6 +19,8 @@ model:
   num_attention_layers: 4
   coordinate_decoder_threshold: 96
   coordinate_chunk_size: 16384
+  coordinate_decoder_width: 1600
+  coordinate_decoder_depth: 12
   coordinate_fourier_bands: 6
   coordinate_gradient_checkpointing: true
   enable_gradient_checkpointing: true
@@ -43,8 +45,8 @@ scaling:
   high_resolution_channel_base: 116
   high_resolution_channel_step: 48
   maximum_high_resolution_channel_base: 128
-  high_resolution_decoder_width: 928
-  maximum_high_resolution_decoder_width: 1024
+  high_resolution_decoder_width: 1600
+  maximum_high_resolution_decoder_width: 1600
   high_resolution_decoder_depth: 5
   high_resolution_decoder_depth_large_corpus: 5
   large_corpus_threshold: 4096
@@ -295,5 +297,7 @@ design:
 # cfd_cfg = CFDConfig(**config['cfd'])
 # conditioning_cfg = config['conditioning']  # Includes schema_path for the documented tensor seam
 # design_cfg = DesignSpec(**config['design'])
+
+
 
 
