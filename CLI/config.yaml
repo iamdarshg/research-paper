@@ -136,6 +136,9 @@ training:
   direct_solver_directions: 16
   direct_solver_perturbation: 0.15
   direct_solver_perturbation_grid_size: 12
+  # Batched SPSA solve chunk. C=1 is the safe default for 8 GiB GPUs;
+  # set to 4+ on A100-class (40+ GiB) for the measured ~1.1x speedup.
+  direct_solver_batch_chunk: 1
   # Maximum norm of the measured SPSA voxel gradient. The model-level gradient
   # clip independently bounds the combined neural update after backpropagation.
   direct_solver_gradient_clip: 1.0
