@@ -1191,7 +1191,7 @@ def main() -> int:
         precision="float32",
         enable_pipeline_parallelism=False,
         direct_solver_loss_weight=args.direct_solver_loss_weight,
-        direct_solver_interval=1,
+        direct_solver_interval=int(config_value("training", "direct_solver_interval", 4)),
         direct_solver_steps=args.direct_solver_steps,
         direct_solver_directions=args.direct_solver_directions,
         direct_solver_perturbation=args.direct_solver_perturbation,
@@ -1693,3 +1693,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

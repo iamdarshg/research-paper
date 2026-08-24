@@ -30,7 +30,7 @@ model:
   # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP only so
   # inductor fuses the post-GEMM add+SiLU epilogues into the GEMM kernels.
   # Opt-in, default off. Whole-model compile stays off (it previously overflowed).
-  compile_converter_decoder: false
+  compile_converter_decoder: true
 
 scaling:
   # This count selects the reported network widths. It is a capacity-planning
@@ -130,7 +130,7 @@ training:
   coordinate_training_samples: 32768
   coordinate_positive_fraction: 0.5
   direct_solver_loss_weight: 1.0
-  direct_solver_interval: 1
+  direct_solver_interval: 4
   direct_solver_steps: 5
   # 1 base solve + 16 antithetic plus/minus pairs = 33 sequential solves/loss.
   direct_solver_directions: 16
@@ -295,3 +295,5 @@ design:
 # cfd_cfg = CFDConfig(**config['cfd'])
 # conditioning_cfg = config['conditioning']  # Includes schema_path for the documented tensor seam
 # design_cfg = DesignSpec(**config['design'])
+
+
