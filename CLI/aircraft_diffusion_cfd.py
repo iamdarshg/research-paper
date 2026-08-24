@@ -4314,7 +4314,11 @@ _SDF_WARM_TARGET_INFLIGHT = 8
 # validity (scipy label) slows 2-6x (7.83 / 14.63 / 23.75 s/u at C=1/2/4). The
 # batched path stays available and parity-gated for boxes with >= 16 GiB VRAM
 # (isolated probe win: C=4 1.12x real / 1.09-1.10x isolated).
-_DIRECT_SOLVER_BATCH_CHUNK = 1
+_DIRECT_SOLVER_BATCH_CHUNK = int(
+    __import__("experiment_config", fromlist=["config_value"]).config_value(
+        "training", "direct_solver_batch_chunk", 1
+    )
+)
 
 # EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
 # coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
@@ -7058,7 +7062,12 @@ class OptimizedDiffusionTrainer:
             noisy_latent = self.noise_schedule.q_sample(latent, t, noise).nan_to_num(0.0)
 
             # Model prediction
-            pred_noise = self.diffusion_model(noisy_latent, t, condition=condition).nan_to_num(0.0)
+            _autocast_enabled = (
+                self.device.type == 'cuda'
+                and self.dtype == torch.bfloat16
+            )
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=_autocast_enabled):
+                pred_noise = self.diffusion_model(noisy_latent, t, condition=condition).nan_to_num(0.0)
             x0_pred = self.noise_schedule.predict_x0(noisy_latent, t, pred_noise).nan_to_num(0.0)
             x0_pred = bound_latent_to_corpus_support(
                 x0_pred,
