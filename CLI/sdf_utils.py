@@ -40,11 +40,10 @@ def prepare_edt_workspace(shape) -> None:
     _edt_workspace(normalized_shape)
 
 def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
-    """
-    Compute Signed Distance Field from a binary voxel grid.
-    Positive values are outside (fluid), negative values are inside (solid).
-    Uses Euclidean Distance Transform (EDT).
-    """
+    """Compute SDF. Uses GPU dilation when input is on CUDA, CPU scipy otherwise."""
+    if voxel_grid.is_cuda:
+        from gpu_sdf import gpu_sdf
+        return gpu_sdf(voxel_grid).float()
     # Ensure binary mask
     mask = (voxel_grid > 0.5).cpu().numpy()
 
