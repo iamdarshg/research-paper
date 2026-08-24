@@ -555,6 +555,8 @@ class TrainingConfig:
     geometry_reconstruction_weight: float = 1.0
     generation_reconstruction_weight: float = 1.0
     coordinate_training_samples: int = int(config_value("training", "coordinate_training_samples", 32768))
+    full_lattice_interval: int = int(config_value("training", "full_lattice_interval", 1))
+    sparse_samples_per_full: int = int(config_value("training", "sparse_samples_per_full", 262144))
     coordinate_positive_fraction: float = float(config_value("training", "coordinate_positive_fraction", 0.5))
     coordinate_decoder_threshold: int = int(config_value("model", "coordinate_decoder_threshold", 96))
     direct_solver_loss_weight: float = float(config_value("training", "direct_solver_loss_weight", 1.0))
@@ -4320,6 +4322,8 @@ _DIRECT_SOLVER_BATCH_CHUNK = int(
     )
 )
 
+_FULL_VOXEL_COUNT_128 = 128 ** 3
+
 # EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
 # coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
 # (CLI/kernel_fusion_graph.py) to cut ~13 launches/chunk to 3. OFF by default:
@@ -7527,10 +7531,13 @@ class OptimizedDiffusionTrainer:
                 )
                 for name, gradients in generated_path_gradients.items()
             }
-            # Always add an exact grounded full-lattice decoder gradient. The
+            # Full-lattice decoder gradient at configured interval.
+            # On non-full-lattice updates, skip (sparse path already provides gradient signal).
+            _fli = max(1, int(getattr(self.training_config, "full_lattice_interval", 1)))
+            _run_fl = (self.global_step % _fli == 0)
             # generated and CFD graphs have already been released, so this is
             # sequential without dropping any loss contribution.
-            if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
+            if getattr(self.converter, "decoder_mode", "dense") == "coordinate" and _run_fl:
                 grounded_full_loss = self._backward_full_grounded_coordinate_loss(
                     latent,
                     geometry_target,
@@ -10417,3 +10424,4 @@ def info_status():
 
 if __name__ == '__main__':
     cli()
+

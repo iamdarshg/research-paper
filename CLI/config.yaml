@@ -129,7 +129,9 @@ training:
   precision: float32
   save_interval: 25
   val_interval: 1
-  coordinate_training_samples: 32768
+  coordinate_training_samples: 262144
+  full_lattice_interval: 8
+  sparse_samples_per_full: 262144
   coordinate_positive_fraction: 0.5
   direct_solver_loss_weight: 1.0
   direct_solver_interval: 4
@@ -297,6 +299,7 @@ design:
 # cfd_cfg = CFDConfig(**config['cfd'])
 # conditioning_cfg = config['conditioning']  # Includes schema_path for the documented tensor seam
 # design_cfg = DesignSpec(**config['design'])
+
 
 
 
