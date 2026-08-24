@@ -1188,7 +1188,7 @@ def main() -> int:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         disconnection_penalty=30.0,
-        precision="float32",
+        precision="bfloat16",
         enable_pipeline_parallelism=False,
         direct_solver_loss_weight=args.direct_solver_loss_weight,
         direct_solver_interval=int(config_value("training", "direct_solver_interval", 4)),
@@ -1693,4 +1693,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

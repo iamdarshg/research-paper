@@ -81,7 +81,9 @@ def _ieee_fp32_math(fn):
         prev = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
         try:
-            return fn(*args, **kwargs)
+            # Also disable autocast so bf16 training does not cast solver GEMMs.
+            with torch.autocast(device_type="cuda", enabled=False):
+                return fn(*args, **kwargs)
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev
     return wrapper
