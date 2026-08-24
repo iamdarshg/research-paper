@@ -1,6 +1,7 @@
 import os
 import random
 import sys
+from experiment_config import config_value
 
 import numpy as np
 import pytest
@@ -876,7 +877,8 @@ def test_corpus_scaling_law_increases_capacity_only_with_distinct_geometries():
     target = ModelConfig.scaled_for_corpus(600, 96)
     large = ModelConfig.scaled_for_corpus(5000, 96)
 
-    assert small.latent_dim == target.latent_dim == large.latent_dim == 192
+    expected_latent = int(config_value("model", "latent_dim", 192))
+    assert small.latent_dim == target.latent_dim == large.latent_dim == expected_latent
     assert small.coordinate_decoder_width < target.coordinate_decoder_width <= large.coordinate_decoder_width
     assert target.coordinate_fourier_bands == 6
     assert target.grid_resolution == 96
@@ -902,7 +904,7 @@ def test_six_hundred_geometry_configuration_uses_global_latent_width():
     )
 
     assert parameter_count > 7_000_000
-    assert config.latent_dim == 192
+    assert config.latent_dim == int(config_value("model", "latent_dim", 192))
 
 
 def test_coordinate_decoder_uses_fourier_positions_at_96_cubed_without_full_grid_allocation():

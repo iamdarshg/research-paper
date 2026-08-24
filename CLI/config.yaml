@@ -32,7 +32,7 @@ model:
   # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP only so
   # inductor fuses the post-GEMM add+SiLU epilogues into the GEMM kernels.
   # Opt-in, default off. Whole-model compile stays off (it previously overflowed).
-  compile_converter_decoder: true
+  compile_converter_decoder: false
 
 scaling:
   # This count selects the reported network widths. It is a capacity-planning
@@ -299,6 +299,7 @@ design:
 # cfd_cfg = CFDConfig(**config['cfd'])
 # conditioning_cfg = config['conditioning']  # Includes schema_path for the documented tensor seam
 # design_cfg = DesignSpec(**config['design'])
+
 
 
 

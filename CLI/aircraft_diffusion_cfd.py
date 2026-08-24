@@ -692,8 +692,8 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
     errors: List[str] = []
     if float(training_config.direct_solver_loss_weight) <= 0.0:
         errors.append("direct_solver_loss_weight must be greater than 0")
-    if int(training_config.direct_solver_interval) != 1:
-        errors.append("direct_solver_interval must be 1")
+    if int(training_config.direct_solver_interval) < 1:
+        errors.append("direct_solver_interval must be >= 1")
     if int(training_config.direct_solver_steps) <= 0:
         errors.append("direct_solver_steps must be greater than 0")
     if int(training_config.direct_solver_directions) <= 0:
