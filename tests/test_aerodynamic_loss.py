@@ -492,8 +492,17 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertTrue(
             any(abs(value - 0.25) > 1.0e-7 for value in simulator.occupancies)
         )
+        # The intrinsic-threshold occupancy is still reported as telemetry ...
+        self.assertGreater(loss_fn.last_components["occupancy_loss"], 0.0)
+        # ... but occupancy is no longer an SPSA component (recovery fix). With
+        # a constant aero simulator and zero connectivity/validity weights, the
+        # measured gradient is exactly zero, and no occupancy SPSA telemetry
+        # key is produced.
         self.assertIsNotNone(logits.grad)
-        self.assertGreater(float(logits.grad.abs().sum()), 0.0)
+        self.assertEqual(float(logits.grad.abs().sum()), 0.0)
+        self.assertNotIn(
+            "occupancy_spsa_gradient_norm_unclipped", loss_fn.last_components
+        )
 
     def test_direct_solver_reports_components_and_applies_configured_gradient_limit(self):
         voxels = torch.full((1, 4, 4, 4), 0.5, dtype=torch.float32, requires_grad=True)
@@ -524,8 +533,9 @@ class TestAerodynamicLoss(unittest.TestCase):
         self.assertIn("aero_loss", loss_fn.last_components)
         self.assertIn("connectivity_loss", loss_fn.last_components)
         self.assertIn("aircraft_validity_loss", loss_fn.last_components)
+        # occupancy is no longer an SPSA component (recovery fix); it remains
+        # in the component dict as telemetry only.
         for prefix in (
-            "occupancy",
             "aero",
             "connectivity",
             "aircraft_validity",

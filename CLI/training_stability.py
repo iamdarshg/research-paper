@@ -37,6 +37,169 @@ def _rolling_stats(values: Iterable[float]) -> Dict[str, float]:
     }
 
 
+def evaluate_directional_promotion_gate(
+    candidate: Dict[str, Any],
+    baseline: Dict[str, Any],
+    *,
+    largest_component_floor: float = 0.70,
+    recall_tolerance: float = 0.02,
+    uniqueness_tolerance: float = 0.05,
+) -> Dict[str, Any]:
+    """Evaluate named promotion conditions without collapsing them into a rank."""
+    def value(report: Dict[str, Any], *names: str, default: float = 0.0) -> float:
+        for name in names:
+            if name in report:
+                return float(report[name])
+        return float(default)
+
+    candidate_occupancy_error = abs(
+        value(candidate, "generated_mean_occupied_fraction")
+        - value(candidate, "target_mean_occupied_fraction")
+    )
+    baseline_occupancy_error = abs(
+        value(baseline, "generated_mean_occupied_fraction")
+        - value(baseline, "target_mean_occupied_fraction")
+    )
+    candidate_component = value(
+        candidate,
+        "generated_mean_largest_component_fraction",
+        "mean_largest_component_fraction",
+    )
+    baseline_component = value(
+        baseline,
+        "generated_mean_largest_component_fraction",
+        "mean_largest_component_fraction",
+    )
+    candidate_recall = value(
+        candidate,
+        "reconstruction_recall",
+        "reconstruction_topk_recall",
+    )
+    baseline_recall = value(
+        baseline,
+        "reconstruction_recall",
+        "reconstruction_topk_recall",
+    )
+    candidate_validity = value(candidate, "generated_aircraft_valid_fraction")
+    baseline_validity = value(baseline, "generated_aircraft_valid_fraction")
+    candidate_unique = value(candidate, "generated_unique_fraction")
+    baseline_unique = value(baseline, "generated_unique_fraction")
+
+    def condition(
+        observed: Any,
+        baseline_value: Any,
+        delta: Any,
+        threshold: Any,
+        passed: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "observed": observed,
+            "baseline": baseline_value,
+            "delta": delta,
+            "threshold": threshold,
+            "passed": bool(passed),
+        }
+
+    conditions = {
+        "generated_occupancy_error": condition(
+            candidate_occupancy_error,
+            baseline_occupancy_error,
+            candidate_occupancy_error - baseline_occupancy_error,
+            "< baseline",
+            candidate_occupancy_error < baseline_occupancy_error,
+        ),
+        "largest_component_floor": condition(
+            candidate_component,
+            largest_component_floor,
+            candidate_component - largest_component_floor,
+            largest_component_floor,
+            candidate_component >= largest_component_floor,
+        ),
+        "largest_component_non_regression": condition(
+            candidate_component,
+            baseline_component,
+            candidate_component - baseline_component,
+            ">= baseline",
+            candidate_component >= baseline_component,
+        ),
+        "reconstruction_recall_non_regression": condition(
+            candidate_recall,
+            baseline_recall,
+            candidate_recall - baseline_recall,
+            -float(recall_tolerance),
+            candidate_recall >= baseline_recall - float(recall_tolerance),
+        ),
+        "generated_validity_improvement": condition(
+            candidate_validity,
+            baseline_validity,
+            candidate_validity - baseline_validity,
+            (
+                "> baseline"
+                if baseline_validity < 0.50
+                else ">= 0.50"
+            ),
+            (
+                candidate_validity > baseline_validity
+                if baseline_validity < 0.50
+                else candidate_validity >= 0.50
+            ),
+        ),
+        "uniqueness_non_regression": condition(
+            candidate_unique,
+            baseline_unique,
+            candidate_unique - baseline_unique,
+            -float(uniqueness_tolerance),
+            candidate_unique >= baseline_unique - float(uniqueness_tolerance),
+        ),
+        "fixed_global_threshold": condition(
+            candidate.get("materialization_mode"),
+            baseline.get("materialization_mode"),
+            None,
+            "fixed_global_threshold",
+            candidate.get("materialization_mode") == "fixed_global_threshold",
+        ),
+        "calibrated_threshold": condition(
+            bool(candidate.get("geometry_threshold_calibrated", False)),
+            bool(baseline.get("geometry_threshold_calibrated", False)),
+            None,
+            True,
+            bool(candidate.get("geometry_threshold_calibrated", False)),
+        ),
+    }
+    if "geometry_probability_threshold" in candidate and "geometry_probability_threshold" in baseline:
+        conditions["same_calibrated_threshold"] = condition(
+            float(candidate["geometry_probability_threshold"]),
+            float(baseline["geometry_probability_threshold"]),
+            float(candidate["geometry_probability_threshold"])
+            - float(baseline["geometry_probability_threshold"]),
+            "== baseline",
+            float(candidate["geometry_probability_threshold"])
+            == float(baseline["geometry_probability_threshold"]),
+        )
+    failed_conditions = [
+        name for name, report in conditions.items() if not report["passed"]
+    ]
+    return {
+        "status": "pass" if not failed_conditions else "fail",
+        "conditions": conditions,
+        "failed_conditions": failed_conditions,
+        "candidate": {
+            "generated_occupancy_error": candidate_occupancy_error,
+            "largest_component_fraction": candidate_component,
+            "reconstruction_recall": candidate_recall,
+            "generated_aircraft_valid_fraction": candidate_validity,
+            "generated_unique_fraction": candidate_unique,
+        },
+        "baseline": {
+            "generated_occupancy_error": baseline_occupancy_error,
+            "largest_component_fraction": baseline_component,
+            "reconstruction_recall": baseline_recall,
+            "generated_aircraft_valid_fraction": baseline_validity,
+            "generated_unique_fraction": baseline_unique,
+        },
+    }
+
+
 def summarize_stability(
     history: List[Dict[str, Any]],
     *,

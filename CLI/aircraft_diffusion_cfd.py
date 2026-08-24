@@ -16,6 +16,7 @@ Current implementation details include:
 import os
 import sys
 import json
+import logging
 import hashlib
 import math
 import pickle
@@ -27,10 +28,10 @@ import threading
 import multiprocessing as mp
 import random
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence
+from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence, Iterable
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 import asyncio
 
 import numpy as np
@@ -51,19 +52,230 @@ from scipy.stats import pearsonr
 from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
-from aircraft_validity import evaluate_aircraft_validity
+from sdf_utils import compute_all_link_distances
+from utils import compute_tensor_content_hash
+from aircraft_validity import (
+    _bbox_component_fraction,
+    _heuristic_metrics_gpu,
+    _validity_report_from_metrics,
+    evaluate_aircraft_validity,
+)
 from condition_feasibility import validate_condition_feasibility
 from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
 from geometry_store import CompactGeometryStore
 from multiobjective_gradients import (
     capture_gradients,
     clear_gradients,
+    add_gradient_buffers,
     combine_gradient_branches,
+    combine_constrained_measured_gradients,
+    gradient_l2_norm,
     gradient_cosine_similarity,
+    project_improvement_gradients_against_guards,
 )
 from validate_manifest import validate_manifest_file
 
 warnings.filterwarnings('ignore')
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# ---------------------------------------------------------------------------
+# Trusted checkpoint loading (security: CWE-502 safe-deserialization gate)
+# ---------------------------------------------------------------------------
+# The exception set torch's weights_only=True loader raises when it rejects a
+# checkpoint that embeds non-whitelisted globals (run-state RNG, custom
+# compatibility objects). Depending on how the pickle was produced this is any
+# of these, not just pickle.UnpicklingError.
+_WEIGHTS_ONLY_FALLBACK_EXCEPTIONS = (
+    pickle.UnpicklingError,
+    AttributeError,
+    TypeError,
+    ModuleNotFoundError,
+    ImportError,
+    EOFError,
+)
+
+# Only checkpoints under this root are ever eligible for the weights_only=False
+# fallback. These are trusted local artifacts from our own runs at explicit
+# paths, never untrusted input.
+_TRUSTED_CHECKPOINT_ROOT = REPO_ROOT / "build"
+
+
+def _is_trusted_checkpoint_path(path) -> bool:
+    """True when ``path`` resolves inside the trusted build/ checkpoint root."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    try:
+        trusted_root = _TRUSTED_CHECKPOINT_ROOT.resolve()
+    except OSError:
+        return False
+    return resolved == trusted_root or trusted_root in resolved.parents
+
+
+def _is_authorized_checkpoint_path(path, authorized_paths) -> bool:
+    """True when ``path`` resolves to one of the explicitly-authorized paths.
+
+    Operator-specified checkpoint paths (e.g. ``--resume-from``,
+    ``--warm-start-from``) may legitimately point outside the build/ root. When
+    the caller passes such a path explicitly, it is authorized for the
+    ``weights_only=False`` fallback (a trusted local artifact at an explicit
+    operator-chosen path); anything not explicitly authorized keeps the
+    fail-closed default.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    for candidate in authorized_paths or ():
+        try:
+            if resolved == Path(candidate).resolve():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _load_checkpoint_metadata(
+    checkpoint: Path,
+    *,
+    map_location="cpu",
+    authorized_paths=(),
+):
+    """Load checkpoint metadata preferring the safe weights_only=True loader.
+
+    ``weights_only=True`` rejects any checkpoint that embeds non-whitelisted
+    globals by raising one of ``_WEIGHTS_ONLY_FALLBACK_EXCEPTIONS``. We fall back
+    to the unsafe ``weights_only=False`` loader ONLY for a trusted local
+    artifact that resolves under the build/ root OR is one of the
+    ``authorized_paths`` the caller explicitly passed (operator-specified
+    ``--resume-from`` / ``--warm-start-from`` checkpoints may live outside
+    build/); we log a warning when we do. Untrusted paths re-raise: we never
+    deserialize untrusted input. ``map_location`` is forwarded to torch.load so
+    callers keep their existing load-device semantics.
+    """
+    try:
+        return torch.load(checkpoint, map_location=map_location, weights_only=True)
+    except _WEIGHTS_ONLY_FALLBACK_EXCEPTIONS as exc:
+        if not (
+            _is_trusted_checkpoint_path(checkpoint)
+            or _is_authorized_checkpoint_path(checkpoint, authorized_paths)
+        ):
+            logging.getLogger(__name__).error(
+                "weights_only=True rejected %s (%s); refusing weights_only=False "
+                "fallback for an untrusted checkpoint path",
+                checkpoint,
+                exc,
+            )
+            raise
+        logging.getLogger(__name__).warning(
+            "weights_only=True rejected %s (%s); falling back to "
+            "weights_only=False for trusted local checkpoint under %s",
+            checkpoint,
+            exc,
+            _TRUSTED_CHECKPOINT_ROOT,
+        )
+        return torch.load(checkpoint, map_location=map_location, weights_only=False)
+
+
+def capture_rng_state() -> Dict[str, Any]:
+    """Capture every RNG stream used by a deterministic training continuation."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore a snapshot produced by :func:`capture_rng_state`."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def iter_loader_without_rng_advance(loader: DataLoader):
+    """Create a loader iterator without consuming continuation RNG state."""
+    state = capture_rng_state()
+    iterator = iter(loader)
+    restore_rng_state(state)
+    return iterator
+
+
+def atomic_save_run_state(path: Union[str, Path], state: Mapping[str, Any]) -> None:
+    """Atomically replace a bounded latest-run-state artifact.
+
+    The temporary file is fsynced before replacement. A single previous copy is
+    retained so an interrupted replacement cannot destroy the last good state.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    previous = target.with_name(target.name + ".previous")
+    try:
+        with temporary.open("wb") as handle:
+            torch.save(dict(state), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if target.exists():
+            os.replace(target, previous)
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        if not target.exists() and previous.exists():
+            os.replace(previous, target)
+        raise
+
+
+def resolve_run_state_path(path: Union[str, Path]) -> Path:
+    """Use the last-known-good sibling when a replacement was interrupted."""
+    target = Path(path)
+    if target.exists():
+        return target
+    previous = target.with_name(target.name + ".previous")
+    if previous.exists():
+        return previous
+    raise FileNotFoundError(f"Run-state and its previous fallback are missing: {target}")
+
+
+def validate_run_state_compatibility(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> List[str]:
+    """Return immutable run fields that differ, in deterministic order."""
+    fields_to_compare = (
+        "manifest_identity",
+        "grid_size",
+        "latent_dim",
+        "split",
+        "sample_count",
+    )
+    mismatches = [
+        field_name
+        for field_name in fields_to_compare
+        if actual.get(field_name) != expected.get(field_name)
+    ]
+    actual_configuration = actual.get("configuration", {})
+    expected_configuration = expected.get("configuration", {})
+    # Intersection semantics (R4, PR 41 review): a fingerprint key added in a
+    # NEWER code version (e.g. experiment_flags) must not block resuming an
+    # older run-state that predates it. Keys present on BOTH sides are compared
+    # strictly; a key present on only one side cannot be verified and is skipped.
+    mismatches.extend(
+        f"configuration.{field_name}"
+        for field_name in sorted(
+            set(actual_configuration) & set(expected_configuration)
+        )
+        if actual_configuration.get(field_name) != expected_configuration.get(field_name)
+    )
+    return mismatches
 
 
 def _make_grad_scaler(device_type: str):
@@ -167,10 +379,20 @@ class ModelConfig:
     # Memory optimization
     enable_gradient_checkpointing: bool = bool(config_value("model", "enable_gradient_checkpointing", True))
     use_torch_compile: bool = bool(config_value("model", "use_torch_compile", False))
+    # A1 (experiment/kernel-fusion-launch): compile the backward graph with
+    # torch._dynamo.compiled_autograd so inductor fuses the checkpointed
+    # coordinate-decoder recompute-forwards and elementwise backward ops into
+    # fewer kernels. Targets the backward's ~26k small launches. Opt-in,
+    # default off; numerics must stay within GRAD_ATOL/LOSS_ATOL.
+    compiled_autograd: bool = bool(config_value("model", "compiled_autograd", False))
     coordinate_decoder_width: int = 256
     coordinate_decoder_depth: int = 2
     coordinate_fourier_bands: int = int(config_value("model", "coordinate_fourier_bands", 6))
     coordinate_chunk_size: int = int(config_value("model", "coordinate_chunk_size", 32768))
+    # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP so inductor
+    # fuses post-GEMM add+SiLU epilogues into the GEMM kernels. Whole-model
+    # compile stays off (previously overflowed).
+    compile_converter_decoder: bool = bool(config_value("model", "compile_converter_decoder", False))
 
     def __post_init__(self):
         if self.encoder_channels is None:
@@ -360,6 +582,23 @@ class TrainingConfig:
     direct_aircraft_validity_weight: float = float(config_value("training", "direct_aircraft_validity_weight", 1.0))
     direct_solver_target_occupancy: Optional[float] = None
     direct_solver_use_batch_reference_occupancy: bool = True
+    # Differentiable occupancy objective on the free-running field. The SPSA
+    # hard-threshold occupancy component was flip-noise dominated (step-function
+    # derivative through the frozen threshold, always at its clip cap) and is the
+    # measured root cause of the occupancy bang-bang oscillation. It is replaced
+    # by an analytic gradient of two smooth terms: a one-sided mean-probability
+    # saturation brake (pushes down only while mean(p) > threshold) plus a soft
+    # threshold-anchored surrogate anchoring the materialized fraction at the
+    # batch reference occupancy (~0.5% sparse airframe).
+    occupancy_mean_probability_weight: float = float(
+        config_value("training", "occupancy_mean_probability_weight", 0.5)
+    )
+    occupancy_soft_temperature: float = float(
+        config_value("training", "occupancy_soft_temperature", 0.05)
+    )
+    occupancy_soft_weight: float = float(
+        config_value("training", "occupancy_soft_weight", 0.5)
+    )
     geometry_materialization_threshold: float = float(
         config_value("training", "geometry_materialization_threshold", 0.5)
     )
@@ -372,6 +611,18 @@ class TrainingConfig:
     )
     geometry_threshold_calibration_samples: int = int(
         config_value("training", "geometry_threshold_calibration_samples", 16)
+    )
+    threshold_positive_margin: float = float(
+        config_value("training", "threshold_positive_margin", 0.05)
+    )
+    threshold_negative_margin: float = float(
+        config_value("training", "threshold_negative_margin", 0.05)
+    )
+    threshold_positive_margin_weight: float = float(
+        config_value("training", "threshold_positive_margin_weight", 1.0)
+    )
+    threshold_negative_margin_weight: float = float(
+        config_value("training", "threshold_negative_margin_weight", 1.0)
     )
     require_direct_solver_every_iteration: bool = bool(config_value("training", "require_direct_solver_every_iteration", True))
     overfit_stop_enabled: bool = False
@@ -453,6 +704,22 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
         errors.append("geometry_materialization_threshold must be in (0, 1)")
     if int(training_config.geometry_threshold_calibration_samples) <= 0:
         errors.append("geometry_threshold_calibration_samples must be greater than 0")
+    if float(training_config.threshold_positive_margin) < 0.0:
+        errors.append("threshold_positive_margin must be nonnegative")
+    if float(training_config.threshold_negative_margin) < 0.0:
+        errors.append("threshold_negative_margin must be nonnegative")
+    if float(training_config.threshold_positive_margin_weight) < 0.0:
+        errors.append("threshold_positive_margin_weight must be nonnegative")
+    if float(training_config.threshold_negative_margin_weight) < 0.0:
+        errors.append("threshold_negative_margin_weight must be nonnegative")
+    if (
+        float(training_config.geometry_materialization_threshold)
+        + float(training_config.threshold_positive_margin)
+        >= 1.0
+    ):
+        errors.append(
+            "geometry_materialization_threshold + threshold_positive_margin must be less than 1"
+        )
     if not (
         0.0
         <= float(training_config.overfit_min_generated_mean_occupied_fraction)
@@ -500,6 +767,18 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
     if not bool(training_config.direct_solver_use_batch_reference_occupancy) and not has_fixed_target:
         errors.append(
             "direct_solver_target_occupancy must be in (0, 0.50] when batch reference occupancy is disabled"
+        )
+    if float(training_config.occupancy_mean_probability_weight) < 0.0:
+        errors.append("occupancy_mean_probability_weight must be nonnegative")
+    if float(training_config.occupancy_soft_weight) < 0.0:
+        errors.append("occupancy_soft_weight must be nonnegative")
+    if (
+        float(training_config.occupancy_soft_weight) > 0.0
+        and float(training_config.occupancy_soft_temperature) <= 0.0
+    ):
+        errors.append(
+            "occupancy_soft_temperature must be greater than 0 "
+            "when occupancy_soft_weight > 0"
         )
     if errors:
         raise ValueError(
@@ -839,14 +1118,125 @@ def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -
     positive_mask = target > 0.5
     negative_mask = ~positive_mask
 
-    class_terms: List[torch.Tensor] = []
-    if bool(positive_mask.any().item()):
-        class_terms.append(losses[positive_mask].mean())
-    if bool(negative_mask.any().item()):
-        class_terms.append(losses[negative_mask].mean())
-    if not class_terms:
-        return losses.mean()
-    return torch.stack(class_terms).mean()
+    # Device-side class selection (no host syncs): an all-False mask's .mean()
+    # is NaN, so each class term is guarded on device with torch.where and the
+    # present-class count renormalizes the two-term average exactly like the
+    # original host-side bool(...any().item()) guards did.
+    positive_any = positive_mask.any()
+    negative_any = negative_mask.any()
+    # Gather each class via index_select on precomputed nonzero indices instead
+    # of boolean-mask indexing: the backward of x[mask] (IndexBackward0) calls
+    # torch.nonzero (a device->host sync) per class term, stalling the GPU in
+    # the backward. index_select's backward (IndexSelectBackward0) scatters on
+    # device with no host sync. The masks derive from target (no grad), so the
+    # nonzero runs only in the forward and creates no backward ops. The
+    # gathered elements are identical and in the same order, so values and
+    # gradients are bit-identical.
+    flat_losses = losses.reshape(-1)
+    positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+    negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
+    positive_term = torch.where(
+        positive_any, flat_losses.index_select(0, positive_indices).mean(), losses.new_zeros(())
+    )
+    negative_term = torch.where(
+        negative_any, flat_losses.index_select(0, negative_indices).mean(), losses.new_zeros(())
+    )
+    class_count = positive_any.to(losses.dtype) + negative_any.to(losses.dtype)
+    return torch.where(
+        class_count > 0,
+        (positive_term + negative_term) / class_count.clamp_min(1.0),
+        losses.mean(),
+    )
+
+
+def grounded_threshold_margin_loss(
+    probabilities_or_logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    threshold: float,
+    positive_margin: float,
+    negative_margin: float,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    from_logits: bool = False,
+    return_components: bool = False,
+) -> Union[torch.Tensor, Dict[str, Any]]:
+    """Keep both target classes separated from the fixed materialization threshold."""
+    threshold_value = float(threshold)
+    positive_margin_value = float(positive_margin)
+    negative_margin_value = float(negative_margin)
+    positive_weight_value = float(positive_weight)
+    negative_weight_value = float(negative_weight)
+    if not 0.0 < threshold_value < 1.0:
+        raise ValueError("threshold must be in (0, 1)")
+    if positive_margin_value < 0.0 or negative_margin_value < 0.0:
+        raise ValueError("margins must be nonnegative")
+    if positive_weight_value < 0.0 or negative_weight_value < 0.0:
+        raise ValueError("weights must be nonnegative")
+
+    target_tensor = target.to(
+        device=probabilities_or_logits.device,
+        dtype=torch.float32,
+    )
+    values = (
+        torch.sigmoid(probabilities_or_logits.float())
+        if from_logits
+        else probabilities_or_logits.float()
+    ).clamp(0.0, 1.0)
+    if values.shape != target_tensor.shape:
+        raise ValueError(
+            "threshold margin probabilities and target must have matching shapes"
+        )
+    positive_mask = target_tensor > 0.5
+    negative_mask = ~positive_mask
+    positive_boundary = min(
+        1.0 - torch.finfo(values.dtype).eps,
+        threshold_value + positive_margin_value,
+    )
+    negative_boundary = max(0.0, threshold_value - negative_margin_value)
+    positive_penalty = (positive_boundary - values).clamp_min(0.0).square()
+    negative_penalty = (values - negative_boundary).clamp_min(0.0).square()
+    zero = values.sum() * 0.0
+    # Device-side class selection with index_select gathers: the old
+    # bool(...any().item()) guard was a host sync and the boolean-mask
+    # gather's backward (IndexBackward0) called torch.nonzero per class term.
+    # index_select's backward scatters on device; the masks derive from target
+    # (no grad) so nonzero runs only in the forward. Values and gradients are
+    # bit-identical (an all-False mask yields NaN inside torch.where, discarded
+    # in favor of `zero`, exactly like the BCE helper above).
+    positive_any = positive_mask.any()
+    negative_any = negative_mask.any()
+    flat_positive = positive_penalty.reshape(-1)
+    flat_negative = negative_penalty.reshape(-1)
+    positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+    negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
+    positive_loss = torch.where(
+        positive_any,
+        flat_positive.index_select(0, positive_indices).mean(),
+        zero,
+    )
+    negative_loss = torch.where(
+        negative_any,
+        flat_negative.index_select(0, negative_indices).mean(),
+        zero,
+    )
+    loss = positive_weight_value * positive_loss + negative_weight_value * negative_loss
+    if not torch.isfinite(loss):
+        raise FloatingPointError("threshold margin loss is nonfinite")
+    if return_components:
+        return {
+            "loss": loss,
+            "threshold_positive_margin_loss": positive_loss,
+            "threshold_negative_margin_loss": negative_loss,
+            "threshold_positive_voxel_count": int(positive_mask.sum().item()),
+            "threshold_negative_voxel_count": int(negative_mask.sum().item()),
+            "threshold_positive_margin": positive_margin_value,
+            "threshold_negative_margin": negative_margin_value,
+            "threshold_positive_margin_weight": positive_weight_value,
+            "threshold_negative_margin_weight": negative_weight_value,
+            "geometry_probability_threshold": threshold_value,
+        }
+    return loss
 
 
 def soft_dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -886,8 +1276,20 @@ def sparse_voxel_reconstruction_loss(
         negative_counts = population_negative_counts.to(logits.device, torch.float32).reshape(-1)
         dice_values: List[torch.Tensor] = []
         for row in range(flat_probabilities.shape[0]):
-            positive_sample = flat_probabilities[row][flat_target[row]]
-            negative_sample = flat_probabilities[row][~flat_target[row]]
+            # Gather via index_select on precomputed long indices instead of
+            # boolean-mask indexing: the backward of x[mask] (IndexBackward0)
+            # calls torch.nonzero (a device->host sync) per row, which stalls
+            # the GPU ~83x/update (~3.5s). index_select's backward scatters on
+            # device with no host sync. The gathered elements are the same, in
+            # the same order, so values and gradients are bit-identical.
+            positive_indices = torch.nonzero(flat_target[row], as_tuple=False).flatten()
+            negative_indices = torch.nonzero(~flat_target[row], as_tuple=False).flatten()
+            positive_sample = flat_probabilities[row].index_select(
+                0, positive_indices.to(device=flat_probabilities.device)
+            )
+            negative_sample = flat_probabilities[row].index_select(
+                0, negative_indices.to(device=flat_probabilities.device)
+            )
             positive_mean = (
                 positive_sample.mean() if positive_sample.numel() else flat_probabilities.new_zeros(())
             )
@@ -1022,14 +1424,28 @@ class LBMPhysicsConfig:
     shape_drag_correction_min: float = 0.1
     shape_drag_correction_max: float = 3.0
 
+    def __post_init__(self) -> None:
+        self.shape_drag_correction_coefficients = tuple(
+            float(value) for value in self.shape_drag_correction_coefficients
+        )
+
+
+def capture_data_anchor_gradients(
+    parameters: Iterable[torch.nn.Parameter],
+) -> Tuple[Optional[torch.Tensor], ...]:
+    """Capture the data anchor after all grounded data terms are backpropagated."""
+    gradients = capture_gradients(parameters)
+    clear_gradients(parameters)
+    return gradients
+
 @dataclass
 class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
     solver_type: str = "D3Q27"
     base_grid_resolution: int = 32  # Consistent grid resolution - no resizing needed
-    mach_number: float = 0.025
-    reynolds_number: float = 1e6
-    simulation_steps: int = 1000
+    mach_number: float = float(config_value("cfd", "mach_number", 0.025))
+    reynolds_number: float = float(config_value("cfd", "reynolds_number", 1e6))
+    simulation_steps: int = int(config_value("cfd", "simulation_steps", 1000))
     output_interval: int = 50
     device_id: int = 0
     # Adaptive mesh refinement
@@ -2635,6 +3051,7 @@ class LatentTo3DConverter(nn.Module):
         coordinate_decoder_depth: int = 2,
         coordinate_fourier_bands: int = 0,
         enable_coordinate_gradient_checkpointing: bool = True,
+        enable_decoder_compile: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -2646,6 +3063,24 @@ class LatentTo3DConverter(nn.Module):
         self.coordinate_decoder_depth = int(coordinate_decoder_depth)
         self.coordinate_fourier_bands = int(coordinate_fourier_bands)
         self.enable_coordinate_gradient_checkpointing = bool(enable_coordinate_gradient_checkpointing)
+        self.enable_decoder_compile = bool(enable_decoder_compile)
+        self._compiled_decode_features = None
+        if self.enable_decoder_compile:
+            # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP so
+            # inductor fuses the post-GEMM add+SiLU epilogues into the GEMM
+            # kernels. Whole-model compile stays off (previously overflowed).
+            try:
+                self._compiled_decode_features = torch.compile(
+                    self._decode_coordinate_features_eager,
+                    dynamic=False,
+                )
+            except Exception as exc:  # pragma: no cover - wrapper construction
+                warnings.warn(
+                    f"torch.compile disabled for coordinate decoder "
+                    f"(construction error: {exc})",
+                    RuntimeWarning,
+                )
+                self._compiled_decode_features = None
         self.decoder_mode = "coordinate" if grid_resolution >= self.coordinate_decoder_threshold else "dense"
         total_voxels = grid_resolution ** 3
 
@@ -2675,6 +3110,8 @@ class LatentTo3DConverter(nn.Module):
             )
             self.coordinate_output = nn.Linear(self.coordinate_decoder_width, 1)
         self.register_buffer("_coordinate_grid", torch.empty(0), persistent=False)
+        self.register_buffer("_encoded_coordinate_grid", torch.empty(0), persistent=False)
+        self._cached_coordinate_fourier_bands = -1
 
     def _coordinates(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if (
@@ -2698,7 +3135,66 @@ class LatentTo3DConverter(nn.Module):
         encoded = torch.cat((coordinates, phases.sin().flatten(start_dim=-2), phases.cos().flatten(start_dim=-2)), dim=-1)
         return encoded
 
+    def _encode_full_coordinate_grid(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return the Fourier-encoded full grid, cached across calls.
+
+        The encoding is elementwise per row of the coordinate grid, so the
+        cached full-grid encoding is bit-identical to re-encoding per call,
+        and ``index_select`` of the cache reproduces the subset encoding
+        exactly. The identity path (``coordinate_fourier_bands <= 0``) is
+        returned directly and is never cached.
+        """
+        if self.coordinate_fourier_bands <= 0:
+            return self._coordinates(device, dtype)
+        grid = self._coordinates(device, dtype)
+        if (
+            self._encoded_coordinate_grid.numel()
+            != grid.numel() * (1 + 2 * self.coordinate_fourier_bands)
+            or self._encoded_coordinate_grid.device != device
+            or self._encoded_coordinate_grid.dtype != dtype
+            or self._cached_coordinate_fourier_bands != self.coordinate_fourier_bands
+        ):
+            self._encoded_coordinate_grid = self._encode_coordinates(grid)
+            self._cached_coordinate_fourier_bands = int(self.coordinate_fourier_bands)
+        return self._encoded_coordinate_grid
+
     def _decode_coordinate_features(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        if _GRAPH_DECODE_MLP:
+            # EXPERIMENTAL CUDA-graph path (branch experiment/kernel-fusion-launch):
+            # capture/replay the MLP forward to cut ~13 launches/chunk to 3. The
+            # graph binds to the configured chunk row count and the actual feature
+            # width, so partial/stacked chunks (e.g. the 3x-stacked sparse geometry
+            # decode) fall back to eager via shape drift. DecodeMLPGraph.__call__
+            # also falls back internally on capture failure and on ANY
+            # autograd-enabled call -- the torch.utils.checkpoint BACKWARD recompute
+            # must not replay (a detached result would zero gradients to latent);
+            # only the no_grad forward is safe to replay.
+            graph = getattr(self, "_graph_decode_mlp", None)
+            if graph is None:
+                from kernel_fusion_graph import DecodeMLPGraph
+
+                graph = DecodeMLPGraph(
+                    self._decode_coordinate_features_eager,
+                    self._effective_coordinate_chunk_size(decoder_input.device),
+                    decoder_input.shape[1],
+                    decoder_input.device,
+                    decoder_input.dtype,
+                )
+                self._graph_decode_mlp = graph
+            return graph(decoder_input)
+        if self._compiled_decode_features is not None:
+            try:
+                return self._compiled_decode_features(decoder_input)
+            except Exception as exc:  # pragma: no cover - runtime compile fallback
+                self._compiled_decode_features = None
+                warnings.warn(
+                    f"torch.compile coordinate decoder disabled after runtime "
+                    f"error ({type(exc).__name__}: {exc}); falling back to eager",
+                    RuntimeWarning,
+                )
+        return self._decode_coordinate_features_eager(decoder_input)
+
+    def _decode_coordinate_features_eager(self, decoder_input: torch.Tensor) -> torch.Tensor:
         hidden = self.coordinate_input(decoder_input)
         for block in self.coordinate_blocks:
             hidden = F.silu(hidden + block(hidden))
@@ -2708,10 +3204,20 @@ class LatentTo3DConverter(nn.Module):
         self,
         latent: torch.Tensor,
         encoded_coordinates: torch.Tensor,
+        latent_expanded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Expand one compact coordinate chunk only while it is being evaluated."""
+        """Expand one compact coordinate chunk only while it is being evaluated.
+
+        ``latent_expanded`` is the pre-unsqueezed ``latent[:, None, :]`` view,
+        hoisted by the callers so the ``[B, 1, D]`` view is created once per
+        decode call rather than once per chunk. It is bit-identical to
+        recomputing ``latent[:, None, :]`` here (both are views over the same
+        storage), and ``None`` preserves the exact pre-hoist behavior.
+        """
         batch_size = latent.shape[0]
-        latent_chunk = latent[:, None, :].expand(-1, encoded_coordinates.shape[0], -1)
+        if latent_expanded is None:
+            latent_expanded = latent[:, None, :]
+        latent_chunk = latent_expanded.expand(-1, encoded_coordinates.shape[0], -1)
         coord_batch = encoded_coordinates[None, :, :].expand(batch_size, -1, -1)
         decoder_input = torch.cat((latent_chunk, coord_batch), dim=-1).reshape(
             batch_size * encoded_coordinates.shape[0],
@@ -2726,19 +3232,30 @@ class LatentTo3DConverter(nn.Module):
         self,
         latent: torch.Tensor,
         encoded_coordinates: torch.Tensor,
+        latent_expanded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if (
             self.enable_coordinate_gradient_checkpointing
             and self.training
             and torch.is_grad_enabled()
         ):
+            if latent_expanded is None:
+                return activation_checkpoint(
+                    self._decode_latent_coordinate_chunk,
+                    latent,
+                    encoded_coordinates,
+                    use_reentrant=False,
+                )
             return activation_checkpoint(
                 self._decode_latent_coordinate_chunk,
                 latent,
                 encoded_coordinates,
+                latent_expanded,
                 use_reentrant=False,
             )
-        return self._decode_latent_coordinate_chunk(latent, encoded_coordinates)
+        return self._decode_latent_coordinate_chunk(
+            latent, encoded_coordinates, latent_expanded
+        )
 
     def _effective_coordinate_chunk_size(self, device: torch.device) -> int:
         """Bound CPU matrix temporaries while retaining configured GPU chunks."""
@@ -2758,13 +3275,14 @@ class LatentTo3DConverter(nn.Module):
             return dense.index_select(1, flat_indices.to(device=latent.device, dtype=torch.long))
 
         flat_indices = flat_indices.to(device=latent.device, dtype=torch.long)
-        coords = self._coordinates(latent.device, latent.dtype).index_select(0, flat_indices)
-        encoded_coords = self._encode_coordinates(coords)
+        encoded_full = self._encode_full_coordinate_grid(latent.device, latent.dtype)
+        encoded_coords = encoded_full.index_select(0, flat_indices)
         chunks = []
         chunk_size = self._effective_coordinate_chunk_size(latent.device)
-        for start in range(0, coords.shape[0], chunk_size):
+        latent_expanded = latent[:, None, :]
+        for start in range(0, encoded_coords.shape[0], chunk_size):
             coord_chunk = encoded_coords[start:start + chunk_size]
-            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk)
+            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk, latent_expanded)
             chunks.append(chunk_logits)
         return torch.cat(chunks, dim=1)
 
@@ -2775,16 +3293,52 @@ class LatentTo3DConverter(nn.Module):
             voxels = self.decoder(latent)
             return voxels.view(batch_size, *self.output_shape)
 
-        coords = self._encode_coordinates(self._coordinates(latent.device, latent.dtype))
+        coords = self._encode_full_coordinate_grid(latent.device, latent.dtype)
         chunks = []
         chunk_size = self._effective_coordinate_chunk_size(latent.device)
+        latent_expanded = latent[:, None, :]
         for start in range(0, coords.shape[0], chunk_size):
             coord_chunk = coords[start:start + chunk_size]
-            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk)
+            chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk, latent_expanded)
             chunks.append(chunk_logits)
         voxels = torch.cat(chunks, dim=1)
         voxels = voxels.view(batch_size, *self.output_shape)
         return voxels
+
+    def forward_voxel_mask(
+        self,
+        latent: torch.Tensor,
+        selected_chunks: Sequence[int],
+    ) -> torch.Tensor:
+        """Decode only ``selected_chunks`` of the coordinate grid.
+
+        Used by the C=2 topology-guard walk: the walk needs the param-space
+        direction of only the two chunks that dominate the guard gradient, so
+        this builds a graph whose backward recomputes and VJPs those chunks
+        alone. Rows in the other chunks contribute exactly zero to the walk
+        (the same zeroing the old full-width walk applied through the gradient
+        itself, measured at ~0.99 param-space cosine vs the exact direction).
+        ``selected_chunks`` are 0-based indices over the SAME chunking
+        ``forward`` uses, and the returned rows are the concatenation of the
+        selected chunks' rows in ascending chunk order.
+        """
+        batch_size = latent.shape[0]
+        coords = self._encode_full_coordinate_grid(latent.device, latent.dtype)
+        chunk_size = self._effective_coordinate_chunk_size(latent.device)
+        keep = set(int(i) for i in selected_chunks)
+        latent_expanded = latent[:, None, :]
+        selected = []
+        idx = 0
+        for start in range(0, coords.shape[0], chunk_size):
+            if idx in keep:
+                coord_chunk = coords[start:start + chunk_size]
+                selected.append(
+                    self._checkpointed_coordinate_chunk(
+                        latent, coord_chunk, latent_expanded
+                    )
+                )
+            idx += 1
+        return torch.cat(selected, dim=1)
 
 # ============================================================================
 # PIPELINE PARALLELISM: CFD + DIFFUSION OVERLAP
@@ -2873,6 +3427,49 @@ class PipelineParallelism:
 # ENHANCED CFD SIMULATION WITH FLUIDX3D INTEGRATION
 # ============================================================================
 
+# R8 (PR 41 review, item 8): mission-adaptive CFD semantics — DECISION.
+#
+# The aerodynamic *solve* is deliberately mission-independent. Every sample's
+# LBM solve runs at the same global flow conditions (mach_number from
+# config.yaml; reynolds_number=1e6 requested -> realized effective Re ~2,494
+# at 96^3 after the tau_min_d3q27 stability floor; see R2), so the aero loss
+# is a stable, cross-sample-comparable objective and every reported
+# coefficient is reproducible. Mission-adaptivity is delivered where it can be
+# measured, not in the flow regime:
+#   * design_spec.target_speed is normalized into the condition vector, so the
+#     generator learns a geometry <-> mission mapping;
+#   * per-mission flight paths (climb/cruise/maneuver/descent) are synthesized
+#     at evaluation time from the design_spec.
+# Per-sample flow conditions are intentionally NOT propagated into the solver:
+# doing so would silently change the objective per sample, break exact-resume
+# continuity, and invalidate the documented effective-Re operating point.
+SOLVER_MISSION_INDEPENDENT_FIELDS = (
+    "mach_number",
+    "reynolds_number",
+    "tau_min_d3q27",
+    "drag_reference_speed",
+)
+
+
+def _mission_independent_solver_conditions(config) -> tuple:
+    """Return the (frozen) flow-condition tuple the solver runs at.
+
+    R8 contract: every element is a global, mission-independent scalar derived
+    from ``config`` alone. A future change that derives any element from a
+    per-sample ``design_spec`` violates the decided semantics and must be
+    reviewed as a training-objective change, not a refactor.
+    """
+    lbm_config = getattr(config, "lbm_config", None)
+    tau_min = getattr(lbm_config, "tau_min_d3q27", None)
+    drag_reference_speed = getattr(lbm_config, "drag_reference_speed", None)
+    return (
+        float(getattr(config, "mach_number", 0.0)),
+        float(getattr(config, "reynolds_number", 0.0)),
+        None if tau_min is None else float(tau_min),
+        None if drag_reference_speed is None else float(drag_reference_speed),
+    )
+
+
 class AdvancedCFDSimulator:
     """Advanced CFD simulator with FluidX3D integration and adaptive mesh refinement"""
 
@@ -2884,6 +3481,17 @@ class AdvancedCFDSimulator:
         if config.solver_type != "D3Q27":
             raise ValueError("Only the D3Q27 LBM solver is supported")
         self.lbm_solver = D3Q27CascadedSolver(self.config, device, LBMPhysicsConfig)
+
+        # R8: enforce the mission-independent CFD semantics at every simulator
+        # construction site. The solve regime is a fixed, global tuple derived
+        # from config alone; it must never be derived from a per-sample
+        # design_spec (see SOLVER_MISSION_INDEPENDENT_FIELDS).
+        self.flow_conditions = _mission_independent_solver_conditions(config)
+        if not all(value is None or value > 0.0 for value in self.flow_conditions):
+            raise ValueError(
+                "solver flow conditions must be positive, mission-independent "
+                "scalars (got %r)" % (self.flow_conditions,)
+            )
 
         # Initialize a higher-resolution solver for AMR if enabled
         if self.config.use_amr:
@@ -2913,7 +3521,6 @@ class AdvancedCFDSimulator:
         self.init_flow_field()
         # Step 1: Run the base solver
         geometry_mask = (geometry > 0.5).float()
-        print(f"Running {self.config.solver_type} GPU LBM solver at base resolution...")
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
         results = dict(self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask))
 
@@ -2989,6 +3596,59 @@ class AdvancedCFDSimulator:
         results["solver_gate_support"] = self._build_solver_gate_support()
 
         return results
+
+    def simulate_aerodynamics_deferred(
+        self, geometry: torch.Tensor, steps: int = 100
+    ) -> "_DeferredCFDResults":
+        """Deferred-read mirror of ``simulate_aerodynamics`` (Lever 1).
+
+        Mirrors ``simulate_aerodynamics`` but calls
+        ``lbm_solver.compute_aerodynamic_coefficients_deferred`` instead of
+        ``compute_aerodynamic_coefficients``: the 15 coefficient scalars are
+        left un-read on the GPU (an fp64 ``[15]`` stack), and the nonempty
+        ``torch.sum(geometry_mask)`` and the ``reference_area`` fallback
+        ``(geometry_mask.sum(dim=0) > 0).float().sum()`` are captured as GPU
+        tensors instead of ``.item()``-ed. Returns a ``_DeferredCFDResults``
+        that materializes the full result dict (same keys as
+        ``simulate_aerodynamics``) later from one row of the batched
+        solver-scalar read, so the SPSA probe loop can enqueue all solves with
+        NO host scalar reads in between.
+
+        If the AMR sub-solver or external FluidX3D validation is enabled, the
+        deferred path is not supported and this falls back to the eager
+        ``simulate_aerodynamics`` (returning a plain dict). The SPSA deferred
+        probe helper rejects that case explicitly.
+        """
+        if self.amr_solver or getattr(
+            self.config, "enable_external_validation", False
+        ):
+            return self.simulate_aerodynamics(geometry, steps=steps)
+
+        self.init_flow_field()
+        geometry_mask = (geometry > 0.5).float()
+        self.lbm_solver.collide_stream(geometry_mask, steps=steps)
+        aero = self.lbm_solver.compute_aerodynamic_coefficients_deferred(geometry_mask)
+        # Deferred reads (captured as GPU tensors; consumed by the ONE batched
+        # .tolist() in _materialize_deferred_probes):
+        nonempty_sum = torch.sum(geometry_mask)
+        ref_area_fallback_sum = (geometry_mask.sum(dim=0) > 0).float().sum()
+
+        grid_resolution = getattr(self, "resolution", None)
+        if not isinstance(grid_resolution, (int, np.integer)):
+            config_resolution = getattr(self.config, "base_grid_resolution", None)
+            grid_resolution = (
+                config_resolution
+                if isinstance(config_resolution, (int, np.integer))
+                else int(geometry_mask.shape[-1])
+            )
+        return _DeferredCFDResults(
+            aero=aero,
+            nonempty_sum=nonempty_sum,
+            ref_area_fallback_sum=ref_area_fallback_sum,
+            steps=int(steps),
+            grid_resolution=int(grid_resolution),
+            solver_gate_support=self._build_solver_gate_support(),
+        )
 
     def _run_fluidx3d_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
         """Run FluidX3D for validation (simplified integration)"""
@@ -3620,6 +4280,338 @@ def _aggregate_aircraft_validity_violations(
     return mean_violation, worst_violation, mean_violation + worst_violation
 
 
+# Validity is a pure function of the CPU geometry and has no dependency on the
+# LBM results, so each direct-solver probe submits it to a small thread pool
+# before the GPU solve and collects it afterward. The GPU solve leaves the CPU
+# free to run the scipy connected-component labeling concurrently.
+_VALIDITY_POOL = ThreadPoolExecutor(max_workers=4)
+
+# Task 9: thread the 33 per-solve SDF (EDT) computations across the SPSA
+# direct-solver probes so the CPU EDT runs in parallel with the GPU LBM solves
+# instead of blocking them. scipy's distance_transform_edt releases the GIL and
+# _edt_workspace is thread-local (Task 2), so concurrent EDTs from this pool
+# never share buffers.
+_SDF_POOL = ThreadPoolExecutor(max_workers=4)
+
+# In-flight cap for the pre-warm: keeps only ~this many q tensors resident on
+# CPU at once (~0.8 GB), which is well inside the ~4.5 GiB free RAM on the
+# target box; holding all 33 (~3.1 GB) would OOM alongside the training process.
+_SDF_WARM_TARGET_INFLIGHT = 8
+
+# Task 10: batch size for the 32 SPSA direct-solver probes. Only the probe
+# solves are batched; the base solve stays sequential and byte-identical. The
+# batched path is exercised at forward() call time (so tests can monkeypatch
+# this to 1 to force the verbatim sequential fallback or to 4 for the batched
+# chunked path). C < 2 disables batching entirely and the per-direction loop
+# runs the original sequential code verbatim.
+#
+# DEFAULT IS 1 (sequential) on purpose: on the 8 GiB RTX 4060 Laptop the
+# batched path pages. Measured full-update (Task 12 fix round,
+# --warmup 1 --iterations 3, step-1305 checkpoint): C=1 = 62.66 s/u (recovers
+# the Task 9 floor ~60 s/u), C=2 = 117.22 s/u, C=4 = 183.63 s/u. The C>=2
+# batched workspaces (~2.7 GB at C=2, ~5.4-7 GB at C=4) do not fit alongside
+# the training model on 8 GiB: the GPU hits ~97% VRAM, the OS pages, and CPU
+# validity (scipy label) slows 2-6x (7.83 / 14.63 / 23.75 s/u at C=1/2/4). The
+# batched path stays available and parity-gated for boxes with >= 16 GiB VRAM
+# (isolated probe win: C=4 1.12x real / 1.09-1.10x isolated).
+_DIRECT_SOLVER_BATCH_CHUNK = 1
+
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
+# coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
+# (CLI/kernel_fusion_graph.py) to cut ~13 launches/chunk to 3. OFF by default:
+# the graph is memory-conditional on 8 GB (~350 MiB static pool) and is only
+# engaged when grad is disabled (torch.utils.checkpoint forward) at a fixed
+# [chunk_size, latent_dim+coordinate_dim] input. Capture failure, shape/device
+# drift, or any autograd-enabled call silently falls back to the compiled or
+# eager path. See docs/performance/experiment-kernel-fusion-launch.md.
+_GRAPH_DECODE_MLP = bool(config_value("experiment", "graph_decode_mlp", False))
+
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): collapse the
+# per-active-guard .item() guard-dot reads at the end of each update into ONE
+# deferred read (all dots computed GPU-side as fp64 tensors, one stacked
+# .tolist() after the loop). Results are bit-identical to the per-guard path
+# (same fp64 torch.dot over the same flattened concatenations, same order);
+# only the GPU->CPU sync count changes. OFF by default; see
+# docs/performance/experiment-kernel-fusion-launch.md.
+_BATCH_GUARD_DOT_READS = bool(
+    config_value("experiment", "batch_guard_dot_reads", False)
+)
+
+# EXPERIMENTAL (branch experiment/kernel-fusion-launch): in the sequential SPSA
+# direct-solver phase, enqueue all 32 probe solves back-to-back with NO host
+# scalar reads, then read every probe's coefficient / occupancy / nonempty
+# scalars back in ONE batched torch.stack(...).tolist() (+ one sync) and
+# assemble per-probe components afterward. Results are bit-identical to the
+# per-solve read path (same fp64 arithmetic, same reduction order; only the
+# GPU->CPU sync count changes). OFF by default; see
+# docs/performance/experiment-kernel-fusion-launch.md. When OFF, the SPSA
+# forward's sequential probe loop is byte-identical to the pre-existing code.
+_DEFERRED_SOLVER_READS = bool(
+    config_value("experiment", "deferred_solver_reads", False)
+)
+
+def _direct_solver_supports_batch(cfd_simulator) -> bool:
+    """True if the simulator's LBM solver exposes the batched ``collide_stream_batch``.
+
+    Task 10 batches the SPSA probe solves via ``cfd_simulator.lbm_solver
+    .collide_stream_batch`` (see ``_direct_measured_objectives_batch``). Real
+    training simulators (``AdvancedCFDSimulator`` -> ``D3Q27CascadedSolver``)
+    expose it and keep the batched path. Unit tests drive the forward with stub
+    simulators that provide no such method (or no ``lbm_solver`` at all); for
+    those the forward must fall back to the verbatim sequential per-direction
+    loop rather than raising ``AttributeError``.
+    """
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    if root_solver is None:
+        return False
+    return hasattr(root_solver, "collide_stream_batch")
+
+
+def _direct_solver_supports_deferred_reads(cfd_simulator) -> bool:
+    """True if the simulator exposes the deferred batched-read solve interface
+    AND runs on CUDA (the only place that interface pays for itself).
+
+    Lever 1 (``deferred_solver_reads``) collapses the per-solve GPU->CPU scalar
+    reads of the SPSA probe loop into one batched read; on a CPU simulator there
+    are no GPU syncs to defer, so the sequential per-solve path is canonical.
+    Requiring CUDA also keeps the CPU unit tests on the sequential path, which is
+    what they observe (they mock ``_direct_measured_objective_for_single``; the
+    deferred probes bypass that function by design). This mirrors the batch gate
+    above, where the capability check is combined with a threshold only real CUDA
+    training satisfies. Stub simulators (plain ``object()``) lack the method
+    entirely; for those the forward falls back to the verbatim sequential loop
+    rather than raising ``AttributeError``.
+    """
+    if not hasattr(cfd_simulator, "simulate_aerodynamics_deferred"):
+        return False
+    device = getattr(cfd_simulator, "device", None)
+    return getattr(device, "type", "") == "cuda"
+
+
+def _find_q_solver(cfd_simulator: "AdvancedCFDSimulator"):
+    """Return the inner D3Q27 solver that owns _get_q/_warm_sdf_cache."""
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    if root_solver is None:
+        return None
+    if hasattr(root_solver, "_get_q"):
+        return root_solver
+    nested_solver = getattr(root_solver, "_solver", None)
+    if nested_solver is not None and hasattr(nested_solver, "_get_q"):
+        return nested_solver
+    return None
+
+
+def _refill_sdf_pool(solver) -> None:
+    """Keep ~_SDF_WARM_TARGET_INFLIGHT SDF futures in flight on the solver.
+
+    Called from _get_q after it pops a warm entry. Bounds CPU residency while
+    keeping the EDT pool busy: each solve's first _get_q pops one entry and
+    immediately submits the next pending probe's EDT.
+    """
+    pending = getattr(solver, "_pending_sdf_specs", None)
+    if not pending:
+        return
+    warm_cache = getattr(solver, "_warm_sdf_cache", None)
+    dirs_cpu = getattr(solver, "_sdf_dirs_cpu", None)
+    if warm_cache is None or dirs_cpu is None:
+        return
+    ex_cpu, ey_cpu, ez_cpu = dirs_cpu
+    while len(warm_cache) < _SDF_WARM_TARGET_INFLIGHT and pending:
+        geom_key, geometry_cpu = pending.pop(0)
+        if geom_key not in warm_cache:
+            # OFFLOAD-3: the pool pre-computes the full-volume SDF (scipy EDT)
+            # only; D3Q27Solver._get_q runs the q-algebra on the solve device,
+            # so only the small [D, H, W] SDF crosses H2D per solve instead of
+            # the full [27, D, H, W] q field (95.5 MB at 96^3). The 5th
+            # positional arg is the return_sdf flag.
+            warm_cache[geom_key] = _SDF_POOL.submit(
+                compute_all_link_distances, geometry_cpu, ex_cpu, ey_cpu, ez_cpu, True
+            )
+
+
+def _warm_direct_solver_sdfs(
+    sample_field: torch.Tensor,
+    sample_probs: torch.Tensor,
+    deltas: Sequence[torch.Tensor],
+    eps: float,
+    input_is_logits: bool,
+    threshold: float,
+    cfd_simulator: "AdvancedCFDSimulator",
+) -> None:
+    """Pre-compute the 33 per-solve EDT/SDF (q) tensors for one SPSA sample.
+
+    Each probe geometry is materialized exactly as
+    _direct_measured_objective_for_single does (same threshold, same canonical
+    [Z,Y,X] -> solver [X,Y,Z] transform), hashed on the CUDA solver-frame
+    tensor (matching the key simulate_aerodynamics computes), and submitted to
+    _SDF_POOL. OFFLOAD-3: the pool pre-computes the full-volume SDF (scipy EDT)
+    only; D3Q27Solver._get_q pops the CPU SDF and runs the 26-link q-algebra on
+    the solve device, so the 5 LBM steps of each solve reuse it and only the
+    small SDF crosses H2D. Submission is bounded (_refill_sdf_pool keeps ~8 in
+    flight) so CPU residency stays ~0.8 GB instead of 3.1 GB.
+    """
+    solver = _find_q_solver(cfd_simulator)
+    if solver is None:
+        return
+    solver_device = getattr(cfd_simulator, "device", sample_field.device)
+    warm_cache = getattr(solver, "_warm_sdf_cache", None)
+    if warm_cache is None:
+        warm_cache = {}
+        solver._warm_sdf_cache = warm_cache
+
+    ex_cpu = solver.ex.cpu()
+    ey_cpu = solver.ey.cpu()
+    ez_cpu = solver.ez.cpu()
+
+    # Build every probe's geometry spec WITHOUT submitting yet (bounded in-flight).
+    # Order matches the solve order so the earliest solves' entries are ready first.
+    specs = []
+    probe_grids = [sample_probs]
+    for delta in deltas:
+        plus_field = sample_field + eps * delta
+        probe_grids.append(
+            torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0)
+        )
+        minus_field = sample_field - eps * delta
+        probe_grids.append(
+            torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0)
+        )
+    for grid in probe_grids:
+        geometry_cpu = _binarize_probability_grid_for_solver(
+            grid.detach().to("cpu"),
+            threshold=threshold,
+            target_occupancy=None,
+        )
+        solver_geometry_cpu = _canonical_training_geometry_to_solver_xyz(geometry_cpu)
+        solver_geometry_gpu = solver_geometry_cpu.to(solver_device)
+        geom_key = compute_tensor_content_hash(solver_geometry_gpu)
+        if geom_key not in warm_cache:
+            specs.append((geom_key, solver_geometry_cpu))
+
+    solver._pending_sdf_specs = specs
+    solver._sdf_dirs_cpu = (ex_cpu, ey_cpu, ez_cpu)
+    solver._sdf_refill = _refill_sdf_pool
+    _refill_sdf_pool(solver)
+
+
+def _clear_direct_solver_sdf_warm_cache(cfd_simulator: "AdvancedCFDSimulator") -> None:
+    """Drop the Task-9 pre-warm state after one SPSA sample's 33 probes.
+
+    Called at the END of each batch item, by which point every warm entry has
+    been popped by _get_q. It is deliberately separate from
+    _clear_direct_solver_geometry_caches, which runs per-direction inside the
+    16-direction loop and must NOT discard the still-pending futures for later
+    directions.
+    """
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    solvers = []
+    if root_solver is not None:
+        solvers.append(root_solver)
+        nested_solver = getattr(root_solver, "_solver", None)
+        if nested_solver is not None:
+            solvers.append(nested_solver)
+    for solver in solvers:
+        warm_cache = getattr(solver, "_warm_sdf_cache", None)
+        if isinstance(warm_cache, dict):
+            warm_cache.clear()
+        for attr in ("_pending_sdf_specs", "_sdf_dirs_cpu", "_sdf_refill"):
+            if hasattr(solver, attr):
+                delattr(solver, attr)
+
+
+class _DeferredCFDResults:
+    """Simulator-level record for one deferred ``simulate_aerodynamics`` call.
+
+    Holds the inner ``_DeferredAeroCoefficients`` (the un-read fp64 ``[15]``
+    GPU stack plus the frozen per-solve runtime scalars) and the deferred
+    nonempty / reference-area-fallback GPU tensors, plus the post-processing
+    state captured at solve time (steps, grid_resolution, solver_gate_support)
+    that ``simulate_aerodynamics`` would apply eagerly. ``materialize`` runs
+    the identical fp64 coefficient arithmetic (via the inner record) and the
+    identical post-processing (drag/lift extraction, reference-area fallback,
+    solver_quality_checks / solver_provenance overwrite, solver_gate_support,
+    external_validation) from one row of the batched read, so the returned dict
+    has the same keys/values as the eager ``simulate_aerodynamics`` path
+    bit-for-bit (Lever 1 deferred solver reads).
+    """
+
+    __slots__ = (
+        "aero",
+        "nonempty_sum",
+        "ref_area_fallback_sum",
+        "steps",
+        "grid_resolution",
+        "solver_gate_support",
+    )
+
+    def __init__(
+        self,
+        aero,
+        nonempty_sum: torch.Tensor,
+        ref_area_fallback_sum: torch.Tensor,
+        steps: int,
+        grid_resolution: int,
+        solver_gate_support: Dict[str, Any],
+    ):
+        self.aero = aero
+        self.nonempty_sum = nonempty_sum
+        self.ref_area_fallback_sum = ref_area_fallback_sum
+        self.steps = steps
+        self.grid_resolution = grid_resolution
+        self.solver_gate_support = solver_gate_support
+
+    def materialize(
+        self,
+        coeff_row: Sequence[float],
+        nonempty_val: float,
+        ref_area_fallback_val: float,
+    ) -> Dict[str, float]:
+        """Assemble the full result dict for this probe.
+
+        ``coeff_row`` is the 15-scalar row of the batched read (the
+        ``.tolist()`` of this probe's raw stack); ``nonempty_val`` and
+        ``ref_area_fallback_val`` are the batched-read nonempty sum and
+        reference-area fallback scalar. Reproduces ``simulate_aerodynamics``
+        post-processing exactly.
+        """
+        results = dict(self.aero.materialize(coeff_row))
+
+        drag = float(results.get("drag_coefficient", 0.0))
+        lift = float(results.get("lift_coefficient", 0.0))
+        reference_area = float(results.get("reference_area", 0.0))
+        if reference_area <= 0.0:
+            reference_area = float(ref_area_fallback_val)
+            results["reference_area"] = reference_area
+            results.setdefault("reference_area_source", "projected_frontal_voxel_area_yz")
+
+        results["drag_coefficient"] = drag
+        results["lift_coefficient"] = lift
+        results["lift_to_drag"] = float(lift / max(abs(drag), 1e-12))
+        results.setdefault("label_source", "lbm_d3q27")
+        results.setdefault("label_tier", "lbm_raw")
+        results.setdefault("claim_bearing_cfd", False)
+        results["solver_quality_checks"] = {
+            **results.get("solver_quality_checks", {}),
+            "finite_coefficients": bool(np.isfinite(drag) and np.isfinite(lift)),
+            "positive_reference_area": bool(reference_area > 0.0),
+            "nonempty_geometry": bool(nonempty_val > 0.0),
+        }
+        results["solver_provenance"] = {
+            **results.get("solver_provenance", {}),
+            "primary_solver": str(
+                results.get("solver_provenance", {}).get(
+                    "primary_solver", "D3Q27"
+                )
+            ),
+            "label_tier": str(results.get("label_tier", "lbm_raw")),
+            "grid_resolution": int(self.grid_resolution),
+            "steps": int(self.steps),
+        }
+        results["solver_gate_support"] = self.solver_gate_support
+        results["external_validation"] = {"status": "not_run"}
+        return results
+
+
 def _direct_measured_objective_for_single(
     probability_grid: torch.Tensor,
     design_spec: DesignSpec,
@@ -3635,21 +4627,50 @@ def _direct_measured_objective_for_single(
     # Materialize with one checkpoint-persisted threshold. The target occupancy
     # is a loss reference only; using it to choose voxels masks probability
     # collapse and leaks ground truth into generated geometry.
-    geometry_cpu = _binarize_probability_grid_for_solver(
-        probability_grid.detach().to("cpu"),
-        threshold=threshold,
-        target_occupancy=None,
-    )
+    # Threshold on the solver device (GPU) to avoid a per-solve CPU round trip
+    # and CPU threshold kernel; the binary mask is bit-identical to the
+    # CPU-thresholded result, so this is exact-parity. A CPU copy is kept only
+    # for the CPU connected-components validity eval (occupancy reads the GPU
+    # binary directly — exact-parity because binary is 0/1 fp32 whose integer
+    # sum (< 2^23) is exactly representable, so GPU vs CPU mean cannot differ).
     solver_device = getattr(cfd_simulator, "device", probability_grid.device)
-    solver_geometry = _canonical_training_geometry_to_solver_xyz(
-        geometry_cpu
-    ).to(solver_device)
+    binary = (probability_grid.detach().float().clamp(0.0, 1.0) > float(threshold)).to(
+        dtype=torch.float32
+    )
+    solver_geometry = _canonical_training_geometry_to_solver_xyz(binary).to(
+        solver_device
+    )
+
+    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    # OFFLOAD-1: validity metrics are computed by a composed GPU pass over the
+    # already-resident `binary` (one .cpu().tolist()), with only the scipy
+    # connected-component label staying on CPU in the pool, fed by the tiny
+    # solid-bbox crop. This drops the 3.5 MB per-solve D2H copy and the ~26-192
+    # .item()/any() drains of the old CPU _heuristic_metrics path.
+    validity_report: Dict[str, Any] = {}
+    validity_future = None
+    metrics = None
+    if needs_shape_metrics:
+        metrics, bbox_crop_cpu, occupied = _heuristic_metrics_gpu(binary)
+        if bbox_crop_cpu is not None:
+            validity_future = _VALIDITY_POOL.submit(
+                _bbox_component_fraction, bbox_crop_cpu, occupied
+            )
+
     cfd_results = cfd_simulator.simulate_aerodynamics(
         solver_geometry,
         steps=max(1, int(cfd_steps)),
     )
 
-    occupancy = float(geometry_cpu.mean().item())
+    if validity_future is not None:
+        metrics["largest_component_fraction"] = validity_future.result()
+    if needs_shape_metrics:
+        validity_report = _validity_report_from_metrics(
+            metrics,
+            occupancy_upper_bound=(0.04 if min(binary.shape) < 64 else 0.02),
+        )
+
+    occupancy = float(binary.float().mean().item())
     raw_drag = cfd_results.get("drag_coefficient")
     if (
         not isinstance(raw_drag, (int, float, np.floating))
@@ -3680,17 +4701,16 @@ def _direct_measured_objective_for_single(
     occupancy_reference = occupancy if target_occupancy is None else float(target_occupancy)
     occupancy_loss = abs(occupancy - occupancy_reference)
     weighted_occupancy_loss = float(design_spec.space_weight) * occupancy_loss
+    # NOTE: weighted_occupancy_loss is excluded from total_loss and from the
+    # SPSA component set on purpose. Its hard-threshold gradient is flip-noise
+    # dominated (step-function derivative through the frozen threshold, always
+    # at its clip cap) and is the measured root cause of the occupancy
+    # oscillation. It is reported here only as telemetry; the actual occupancy
+    # signal is the deterministic analytic gradient added at the replay site.
     aero_loss = (
         float(design_spec.drag_weight) * float(drag_coefficient)
         + float(design_spec.lift_weight) * lift_term
     )
-    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
-    validity_report: Dict[str, Any] = {}
-    if needs_shape_metrics:
-        # Generated tensors already use the canonical [Z, Y, X] training frame.
-        # Searching all axis permutations here both hides orientation errors and
-        # repeats connected-component work for every finite-difference probe.
-        validity_report = evaluate_aircraft_validity(geometry_cpu, canonicalize=False)
 
     connectivity_loss = 0.0
     if connectivity_weight > 0.0:
@@ -3719,8 +4739,7 @@ def _direct_measured_objective_for_single(
 
     drag_loss = float(design_spec.drag_weight) * float(drag_coefficient)
     total_loss = (
-        weighted_occupancy_loss
-        + aero_loss
+        aero_loss
         + float(connectivity_weight) * connectivity_loss
         + float(aircraft_validity_weight) * validity_loss
     )
@@ -3735,6 +4754,20 @@ def _direct_measured_objective_for_single(
         "occupancy": float(occupancy),
         "occupancy_loss": float(weighted_occupancy_loss),
         "connectivity_loss": float(connectivity_weight) * float(connectivity_loss),
+        "largest_component_fraction": float(
+            validity_report.get("metrics", {}).get(
+                "largest_component_fraction", 0.0
+            )
+        ),
+        "connectivity_guard_shortfall": max(
+            0.0,
+            0.70
+            - float(
+                validity_report.get("metrics", {}).get(
+                    "largest_component_fraction", 0.0
+                )
+            ),
+        ),
         "aircraft_validity_loss": float(aircraft_validity_weight) * float(validity_loss),
         "aircraft_validity_mean_violation": (
             float(aircraft_validity_weight) * float(validity_mean_violation)
@@ -3763,6 +4796,425 @@ def _direct_measured_objective_for_single(
     return components if return_components else components["total_loss"]
 
 
+def _assemble_direct_solver_components(
+    geometry_cpu: torch.Tensor,
+    design_spec: DesignSpec,
+    cfd_results: Dict[str, Any],
+    validity_report: Dict[str, Any],
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    target_occupancy: Optional[float],
+    occupancy_override: Optional[float] = None,
+) -> Dict[str, float]:
+    """Turn one probe's geometry + CFD results + validity into the component dict.
+
+    This is a faithful copy of the loss-accounting tail of
+    ``_direct_measured_objective_for_single`` (occupancy, drag/lift extraction,
+    connectivity/validity losses, and the ``components`` dict). It exists as a
+    separate helper so the batched probe path shares the exact same arithmetic
+    without refactoring the sequential single-probe path (which stays
+    byte-identical). ``occupancy_override`` lets the deferred-read path feed the
+    GPU-computed occupancy (``binary.float().mean()``) instead of the CPU mean;
+    when set, the CPU ``geometry_cpu.mean()`` is not evaluated (GPU fp32 mean
+    and CPU fp32 mean of a 0/1 tensor can differ by 1 ULP, so the sequential
+    single-probe path's occupancy is the GPU value — the deferred path must use
+    the same).
+    """
+    occupancy = (
+        float(occupancy_override)
+        if occupancy_override is not None
+        else float(geometry_cpu.mean().item())
+    )
+    raw_drag = cfd_results.get("drag_coefficient")
+    if (
+        not isinstance(raw_drag, (int, float, np.floating))
+        or not np.isfinite(float(raw_drag))
+    ):
+        raise FloatingPointError(
+            "Direct solver requires a finite raw momentum-exchange "
+            f"drag_coefficient, got {raw_drag!r}; calibrated or surrogate "
+            "fallbacks are forbidden"
+        )
+    signed_drag_coefficient = float(raw_drag)
+    drag_coefficient = abs(signed_drag_coefficient)
+    raw_lift = cfd_results.get("lift_coefficient", 0.0)
+    if (
+        not isinstance(raw_lift, (int, float, np.floating))
+        or not np.isfinite(float(raw_lift))
+    ):
+        raise FloatingPointError(
+            "Direct solver requires a finite raw momentum-exchange "
+            "lift_coefficient"
+        )
+    lift_coefficient = abs(float(raw_lift))
+    lift_term = lift_coefficient
+
+    occupancy_reference = occupancy if target_occupancy is None else float(target_occupancy)
+    occupancy_loss = abs(occupancy - occupancy_reference)
+    weighted_occupancy_loss = float(design_spec.space_weight) * occupancy_loss
+    # NOTE: weighted_occupancy_loss is excluded from total_loss and from the
+    # SPSA component set on purpose. Its hard-threshold gradient is flip-noise
+    # dominated (step-function derivative through the frozen threshold, always
+    # at its clip cap) and is the measured root cause of the occupancy
+    # oscillation. It is reported here only as telemetry; the actual occupancy
+    # signal is the deterministic analytic gradient added at the replay site.
+    aero_loss = (
+        float(design_spec.drag_weight) * float(drag_coefficient)
+        + float(design_spec.lift_weight) * lift_term
+    )
+
+    connectivity_loss = 0.0
+    if connectivity_weight > 0.0:
+        connected_fraction = float(
+            validity_report.get("metrics", {}).get("largest_component_fraction", 0.0)
+        )
+        connectivity_loss = 1.0 - connected_fraction
+
+    validity_loss = 0.0
+    validity_mean_violation = 0.0
+    validity_worst_violation = 0.0
+    if aircraft_validity_weight > 0.0:
+        violation_scores = validity_report.get("violation_scores", {})
+        if isinstance(violation_scores, Mapping) and violation_scores:
+            (
+                validity_mean_violation,
+                validity_worst_violation,
+                validity_loss,
+            ) = _aggregate_aircraft_validity_violations(
+                violation_scores
+            )
+        else:
+            validity_mean_violation = 1.0
+            validity_worst_violation = 1.0
+            validity_loss = 2.0
+
+    drag_loss = float(design_spec.drag_weight) * float(drag_coefficient)
+    total_loss = (
+        aero_loss
+        + float(connectivity_weight) * connectivity_loss
+        + float(aircraft_validity_weight) * validity_loss
+    )
+    components = {
+        "total_loss": float(total_loss),
+        "aero_loss": float(aero_loss),
+        "drag_coefficient": float(drag_coefficient),
+        "signed_drag_coefficient": float(signed_drag_coefficient),
+        "drag_loss": float(drag_loss),
+        "lift_coefficient": float(lift_coefficient),
+        "lift_loss": float(design_spec.lift_weight) * float(lift_term),
+        "occupancy": float(occupancy),
+        "occupancy_loss": float(weighted_occupancy_loss),
+        "connectivity_loss": float(connectivity_weight) * float(connectivity_loss),
+        "largest_component_fraction": float(
+            validity_report.get("metrics", {}).get(
+                "largest_component_fraction", 0.0
+            )
+        ),
+        "connectivity_guard_shortfall": max(
+            0.0,
+            0.70
+            - float(
+                validity_report.get("metrics", {}).get(
+                    "largest_component_fraction", 0.0
+                )
+            ),
+        ),
+        "aircraft_validity_loss": float(aircraft_validity_weight) * float(validity_loss),
+        "aircraft_validity_mean_violation": (
+            float(aircraft_validity_weight) * float(validity_mean_violation)
+        ),
+        "aircraft_validity_worst_violation": (
+            float(aircraft_validity_weight) * float(validity_worst_violation)
+        ),
+        "solver_used_raw_drag": 1.0,
+        "solver_drag_sign_reversed": float(signed_drag_coefficient < 0.0),
+        "solver_lbm_converged": float(bool(cfd_results.get("lbm_converged", False))),
+        "solver_force_stability": float(
+            cfd_results.get("force_stability")
+            if isinstance(cfd_results.get("force_stability"), (int, float, np.floating))
+            and np.isfinite(float(cfd_results.get("force_stability")))
+            else 1.0
+        ),
+    }
+    nonfinite_components = [
+        name for name, value in components.items() if not np.isfinite(float(value))
+    ]
+    if nonfinite_components:
+        raise FloatingPointError(
+            "Direct measured objective produced nonfinite components: "
+            + ", ".join(nonfinite_components)
+        )
+    return components
+
+
+def _direct_measured_objectives_batch(
+    probe_probability_grids: Sequence[torch.Tensor],
+    design_spec: DesignSpec,
+    cfd_simulator: "AdvancedCFDSimulator",
+    cfd_steps: int,
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    threshold: float,
+    target_occupancy: Optional[float],
+) -> List[Dict[str, float]]:
+    """Evaluate several SPSA probe grids in one batched D3Q27 solve.
+
+    ``probe_probability_grids`` is an ordered list of C probability grids in the
+    canonical [Z, Y, X] training frame (the ``+eps*delta`` / ``-eps*delta``
+    probes for one chunk, in interleaved plus/minus order). Each item is
+    binarized, submitted for validity on the pool, and stacked into a
+    ``[C, D, H, W]`` mask; the batch is solved in one ``collide_stream_batch``
+    call and per-probe components are assembled with
+    ``_assemble_direct_solver_components``. The returned list is indexed exactly
+    like ``probe_probability_grids``.
+    """
+    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    solver_device = getattr(cfd_simulator, "device", probe_probability_grids[0].device)
+
+    geometries_cpu: List[torch.Tensor] = []
+    solver_geometries: List[torch.Tensor] = []
+    validity_futures: List[Optional[Future]] = []
+    for probe in probe_probability_grids:
+        geometry_cpu = _binarize_probability_grid_for_solver(
+            probe.detach().to("cpu"),
+            threshold=threshold,
+            target_occupancy=None,
+        )
+        geometries_cpu.append(geometry_cpu)
+        solver_geometries.append(
+            _canonical_training_geometry_to_solver_xyz(geometry_cpu).to(solver_device)
+        )
+        if needs_shape_metrics:
+            validity_futures.append(
+                _VALIDITY_POOL.submit(
+                    evaluate_aircraft_validity, geometry_cpu, canonicalize=False
+                )
+            )
+        else:
+            validity_futures.append(None)
+
+    mask_stack = torch.stack([(g > 0.5).float() for g in solver_geometries], dim=0)
+    cfd_results_batch = cfd_simulator.lbm_solver.collide_stream_batch(
+        mask_stack, steps=max(1, int(cfd_steps))
+    )
+    validity_reports = [
+        future.result() if future is not None else {}
+        for future in validity_futures
+    ]
+
+    components_list = []
+    for i in range(len(probe_probability_grids)):
+        components_list.append(
+            _assemble_direct_solver_components(
+                geometries_cpu[i],
+                design_spec,
+                cfd_results_batch[i],
+                validity_reports[i],
+                connectivity_weight,
+                aircraft_validity_weight,
+                target_occupancy,
+            )
+        )
+    return components_list
+
+
+class _DeferredProbe:
+    """Capture-side record for one deferred SPSA direct-solver probe.
+
+    Holds everything needed to assemble the probe's component dict later:
+    the GPU binary, the validity pool future (NOT yet awaited — the await is
+    deferred to ``_materialize_deferred_probes`` so the CPU scipy jobs overlap
+    the 33 GPU solves), the GPU metrics dict, the deferred CFD result
+    (``_DeferredCFDResults``), and the deferred occupancy scalar. All reads
+    from this record happen in the ONE batched read in
+    ``_materialize_deferred_probes`` (Lever 1 deferred solver reads).
+    """
+
+    __slots__ = (
+        "binary",
+        "validity_future",
+        "metrics",
+        "cfd_result",
+        "occupancy_gpu",
+    )
+
+    def __init__(
+        self,
+        binary: torch.Tensor,
+        validity_future: Optional[Future],
+        metrics: Optional[Dict[str, Any]],
+        cfd_result: "_DeferredCFDResults",
+        occupancy_gpu: torch.Tensor,
+    ):
+        self.binary = binary
+        self.validity_future = validity_future
+        self.metrics = metrics
+        self.cfd_result = cfd_result
+        self.occupancy_gpu = occupancy_gpu
+
+
+def _deferred_single_probe(
+    probability_grid: torch.Tensor,
+    design_spec: DesignSpec,
+    cfd_simulator: "AdvancedCFDSimulator",
+    cfd_steps: int,
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    threshold: float,
+    target_occupancy: Optional[float],
+) -> "_DeferredProbe":
+    """Capture-side twin of ``_direct_measured_objective_for_single``.
+
+    Runs the identical thresholding / validity submission / deferred CFD solve
+    as the sequential single-probe path but performs NO host scalar reads: the
+    coefficient scalars stay on the GPU in the ``_DeferredCFDResults``, the
+    occupancy is captured as an fp32 GPU tensor, and the validity future is not
+    awaited. ``_materialize_deferred_probes`` reads every probe's scalars in one
+    batched ``.tolist()`` afterwards. ``design_spec`` and ``target_occupancy``
+    are accepted for signature parity with the sequential helper (the spec is
+    frozen into the record for assembly via the weights passed separately).
+    """
+    solver_device = getattr(cfd_simulator, "device", probability_grid.device)
+    binary = (
+        probability_grid.detach().float().clamp(0.0, 1.0) > float(threshold)
+    ).to(dtype=torch.float32)
+    solver_geometry = _canonical_training_geometry_to_solver_xyz(binary).to(
+        solver_device
+    )
+
+    needs_shape_metrics = connectivity_weight > 0.0 or aircraft_validity_weight > 0.0
+    validity_future = None
+    metrics = None
+    if needs_shape_metrics:
+        metrics, bbox_crop_cpu, occupied = _heuristic_metrics_gpu(binary)
+        if bbox_crop_cpu is not None:
+            validity_future = _VALIDITY_POOL.submit(
+                _bbox_component_fraction, bbox_crop_cpu, occupied
+            )
+
+    cfd_result = cfd_simulator.simulate_aerodynamics_deferred(
+        solver_geometry,
+        steps=max(1, int(cfd_steps)),
+    )
+    if not isinstance(cfd_result, _DeferredCFDResults):
+        # Only reachable if the flag is on but the simulator has the AMR
+        # sub-solver or external validation enabled (training config has both
+        # off, so this is a misconfiguration guard, not a training path).
+        raise RuntimeError(
+            "deferred_solver_reads is enabled but simulate_aerodynamics_deferred "
+            "fell back to the eager path (AMR sub-solver or external FluidX3D "
+            "validation active); the sequential SPSA probe loop must be used"
+        )
+    occupancy_gpu = binary.float().mean()
+    return _DeferredProbe(
+        binary=binary,
+        validity_future=validity_future,
+        metrics=metrics,
+        cfd_result=cfd_result,
+        occupancy_gpu=occupancy_gpu,
+    )
+
+
+def _materialize_deferred_probes(
+    probes: Sequence["_DeferredProbe"],
+    design_spec: DesignSpec,
+    connectivity_weight: float,
+    aircraft_validity_weight: float,
+    target_occupancy: Optional[float],
+) -> List[Dict[str, float]]:
+    """Assemble every deferred probe's component dict from ONE batched read.
+
+    Stacks every probe's deferred scalars (the 15-scalar coefficient stack, the
+    occupancy, the nonempty sum, and the reference-area fallback — all fp64 GPU
+    tensors) into one ``[P, K]`` tensor and reads them with a single
+    ``.tolist()`` (+ one sync), batches the binary D2H copy into one contiguous
+    transfer, then builds each probe's component dict with
+    ``_assemble_direct_solver_components`` (reused verbatim, occupancy fed from
+    the GPU read). The validity future awaits now overlap the 33 GPU solves that
+    already ran in the capture phase. The returned list is indexed exactly like
+    ``probes`` (interleaved plus/minus per SPSA direction).
+    """
+    raw_rows = torch.stack(
+        [
+            torch.cat(
+                [
+                    probe.cfd_result.aero.raw_stack,
+                    probe.occupancy_gpu.double().reshape(1),
+                    probe.cfd_result.nonempty_sum.double().reshape(1),
+                    probe.cfd_result.ref_area_fallback_sum.double().reshape(1),
+                ]
+            )
+            for probe in probes
+        ],
+        dim=0,
+    ).tolist()
+    batch_binaries = torch.stack([probe.binary for probe in probes]).cpu()
+
+    components_list: List[Dict[str, float]] = []
+    for i, probe in enumerate(probes):
+        row = raw_rows[i]
+        coeff_row = row[:15]
+        occupancy_val = row[15]
+        nonempty_val = row[16]
+        ref_area_fallback_val = row[17]
+
+        if probe.validity_future is not None:
+            probe.metrics["largest_component_fraction"] = probe.validity_future.result()
+        if probe.metrics is not None:
+            validity_report = _validity_report_from_metrics(
+                probe.metrics,
+                occupancy_upper_bound=(0.04 if min(probe.binary.shape) < 64 else 0.02),
+            )
+        else:
+            validity_report = {}
+
+        cfd_results = probe.cfd_result.materialize(
+            coeff_row, nonempty_val, ref_area_fallback_val
+        )
+        components_list.append(
+            _assemble_direct_solver_components(
+                batch_binaries[i],
+                design_spec,
+                cfd_results,
+                validity_report,
+                connectivity_weight,
+                aircraft_validity_weight,
+                target_occupancy,
+                occupancy_override=float(occupancy_val),
+            )
+        )
+    return components_list
+
+
+def _clear_direct_solver_batch_workspace(cfd_simulator: "AdvancedCFDSimulator") -> None:
+    """Drop the private batched-workspace buffers after a chunked SPSA solve.
+
+    The batched path allocates ``[C, 27, D, H, W]`` population buffers (two,
+    since Task 34) plus the compact active-voxel BFL tables on the inner D3Q27
+    solver. This releases them so a later chunk (or the next training batch)
+    reallocates for its own C, and so peak VRAM reflects only the current chunk
+    rather than accumulating chunk after chunk.
+    """
+    root_solver = getattr(cfd_simulator, "lbm_solver", None)
+    nested_solver = getattr(root_solver, "_solver", None) if root_solver is not None else None
+    solver = nested_solver if nested_solver is not None else root_solver
+    if solver is None:
+        return
+    for name in (
+        "_f_batch",
+        "_f_swap_batch",
+        "_velocity_x_batch",
+        "_velocity_y_batch",
+        "_velocity_z_batch",
+        "_pressure_batch",
+        "_rho_batch",
+    ):
+        if hasattr(solver, name):
+            setattr(solver, name, None)
+    if hasattr(solver, "_bfl_sparse_cache"):
+        solver._bfl_sparse_cache = {}
+
+
 def _clear_direct_solver_geometry_caches(cfd_simulator: "AdvancedCFDSimulator") -> None:
     """Drop per-geometry LBM caches after SPSA probes to avoid 96^3 cache growth."""
     solvers = []
@@ -3777,6 +5229,8 @@ def _clear_direct_solver_geometry_caches(cfd_simulator: "AdvancedCFDSimulator") 
         q_cache = getattr(solver, "_q_cache", None)
         if isinstance(q_cache, dict):
             q_cache.clear()
+        if hasattr(solver, "_bfl_sparse_cache"):
+            solver._bfl_sparse_cache = {}
         if hasattr(solver, "_boundary_cache_key"):
             solver._boundary_cache_key = None
         if hasattr(solver, "_boundary_link_cache"):
@@ -3790,7 +5244,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
     def forward(
         ctx,
         voxel_grid: torch.Tensor,
-        design_spec: DesignSpec,
+        design_spec: Union[DesignSpec, Sequence[DesignSpec]],
         cfd_simulator: "AdvancedCFDSimulator",
         cfd_steps: int,
         perturbation: float,
@@ -3804,7 +5258,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         directions: int,
         seed: int,
         input_is_logits: bool,
-        component_sink: Dict[str, float],
+        component_sink: Dict[str, Any],
     ) -> torch.Tensor:
         original_ndim = voxel_grid.ndim
         fields = voxel_grid.detach().float()
@@ -3819,15 +5273,41 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             )
 
         batch_size = int(fields.shape[0])
+        if isinstance(design_spec, DesignSpec):
+            design_specs = (design_spec,)
+        elif isinstance(design_spec, Sequence) and not isinstance(
+            design_spec, (str, bytes)
+        ):
+            design_specs = tuple(design_spec)
+        else:
+            raise TypeError(
+                "design_spec must be a DesignSpec or a sequence of DesignSpec values"
+            )
+        if len(design_specs) not in {1, batch_size}:
+            raise ValueError(
+                "design_spec sequence must contain one value or one value per "
+                f"batch item, got {len(design_specs)} values for batch size "
+                f"{batch_size}"
+            )
+        for spec_index, sample_spec in enumerate(design_specs):
+            if not isinstance(sample_spec, DesignSpec):
+                raise TypeError(
+                    "design_spec sequence entries must be DesignSpec values, "
+                    f"got {type(sample_spec).__name__} at index {spec_index}"
+                )
         grad_estimate = torch.zeros_like(fields)
         base_losses: List[float] = []
         base_component_records: List[Dict[str, float]] = []
+        accepted_guard_gradients: Dict[str, torch.Tensor] = {
+            name: torch.zeros_like(fields)
+            for name in ("connectivity_loss", "aircraft_validity_loss")
+        }
+        active_guard_union: set[str] = set()
         eps = max(float(perturbation), 1.0e-6)
         generator = torch.Generator(device=fields.device)
         generator.manual_seed(int(seed) % (2**63 - 1))
         direction_count = max(1, int(directions))
         component_names = (
-            "occupancy_loss",
             "aero_loss",
             "connectivity_loss",
             "aircraft_validity_loss",
@@ -3845,6 +5325,9 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
 
         for batch_idx in range(batch_size):
             sample_field = fields[batch_idx]
+            sample_design_spec = design_specs[
+                0 if len(design_specs) == 1 else batch_idx
+            ]
             sample_probs = (
                 torch.sigmoid(sample_field)
                 if input_is_logits
@@ -3855,23 +5338,10 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 if detached_targets is not None
                 else target_occupancy
             )
-            base_components = _direct_measured_objective_for_single(
-                sample_probs,
-                design_spec,
-                cfd_simulator,
-                cfd_steps,
-                connectivity_weight,
-                aircraft_validity_weight,
-                threshold,
-                sample_target,
-                return_components=True,
-            )
-            base_loss = float(base_components["total_loss"])
-            base_component_records.append(base_components)
-            raw_component_grads = {
-                name: torch.zeros_like(sample_field) for name in component_names
-            }
-            legacy_total_grad = torch.zeros_like(sample_field)
+            # Task 9: hoist ALL delta draws FIRST, in the original loop order with
+            # the same seeded generator, so the RNG call sequence is byte-identical
+            # to the old draw-one-use-one loop (parity: identical deltas).
+            deltas = []
             for _ in range(direction_count):
                 low_frequency_grid = int(perturbation_grid_size)
                 if low_frequency_grid > 1 and any(dim > low_frequency_grid for dim in sample_field.shape):
@@ -3902,49 +5372,230 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         dtype=torch.int8,
                     ).to(dtype=fields.dtype)
                     delta = delta.mul(2.0).sub(1.0)
-                plus_field = sample_field + eps * delta
-                minus_field = sample_field - eps * delta
-                plus_components = _direct_measured_objective_for_single(
-                    torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
-                    design_spec,
-                    cfd_simulator,
-                    cfd_steps,
-                    connectivity_weight,
-                    aircraft_validity_weight,
-                    threshold,
-                    sample_target,
-                    return_components=True,
-                )
-                minus_components = _direct_measured_objective_for_single(
-                    torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
-                    design_spec,
-                    cfd_simulator,
-                    cfd_steps,
-                    connectivity_weight,
-                    aircraft_validity_weight,
-                    threshold,
-                    sample_target,
-                    return_components=True,
-                )
-                legacy_total_grad.add_(
-                    (
-                        (plus_components["total_loss"] - minus_components["total_loss"])
-                        / (2.0 * eps)
-                    )
-                    * delta
-                )
-                for component_name in component_names:
-                    raw_component_grads[component_name].add_(
-                        (
-                            (
-                                plus_components[component_name]
-                                - minus_components[component_name]
-                            )
-                            / (2.0 * eps)
+                deltas.append(delta)
+
+            # Task 9: pre-warm the 33 SDF (q) computations so the CPU EDTs run on
+            # the thread pool in parallel with the GPU solves below.
+            _warm_direct_solver_sdfs(
+                sample_field,
+                sample_probs,
+                deltas,
+                eps,
+                input_is_logits,
+                threshold,
+                cfd_simulator,
+            )
+
+            base_components = _direct_measured_objective_for_single(
+                sample_probs,
+                sample_design_spec,
+                cfd_simulator,
+                cfd_steps,
+                connectivity_weight,
+                aircraft_validity_weight,
+                threshold,
+                sample_target,
+                return_components=True,
+            )
+            base_loss = float(base_components["total_loss"])
+            base_component_records.append(base_components)
+            # Task 10: per-probe component telemetry, in direction order
+            # (dir0 plus, dir0 minus, dir1 plus, ...) shared by both the
+            # sequential and batched probe branches, so a parity test can
+            # compare every plus/minus probe dict between the two paths.
+            probe_component_records: List[Dict[str, float]] = []
+            raw_component_grads = {
+                name: torch.zeros_like(sample_field) for name in component_names
+            }
+            legacy_total_grad = torch.zeros_like(sample_field)
+            # Task 10: batch the 32 SPSA probes into chunks of
+            # _DIRECT_SOLVER_BATCH_CHUNK simultaneous solves. The base solve is
+            # always sequential; only this probe loop may batch. When the
+            # chunk is < 2, or the simulator's LBM solver has no batched
+            # collide_stream_batch (stub simulators in unit tests), the loop
+            # below is the original sequential code verbatim (the batch path is
+            # never exercised).
+            _spsa_batch_chunk = int(_DIRECT_SOLVER_BATCH_CHUNK)
+            if _spsa_batch_chunk >= 2 and _direct_solver_supports_batch(cfd_simulator):
+                deltas_per_chunk = max(1, _spsa_batch_chunk // 2)
+                for chunk_start in range(0, direction_count, deltas_per_chunk):
+                    chunk_deltas = deltas[chunk_start:chunk_start + deltas_per_chunk]
+                    probe_grids = []
+                    for delta in chunk_deltas:
+                        plus_field = sample_field + eps * delta
+                        minus_field = sample_field - eps * delta
+                        probe_grids.append(
+                            torch.sigmoid(plus_field)
+                            if input_is_logits
+                            else plus_field.clamp(0.0, 1.0)
                         )
-                        * delta
+                        probe_grids.append(
+                            torch.sigmoid(minus_field)
+                            if input_is_logits
+                            else minus_field.clamp(0.0, 1.0)
+                        )
+                    chunk_components = _direct_measured_objectives_batch(
+                        probe_grids,
+                        sample_design_spec,
+                        cfd_simulator,
+                        cfd_steps,
+                        connectivity_weight,
+                        aircraft_validity_weight,
+                        threshold,
+                        sample_target,
                     )
-                _clear_direct_solver_geometry_caches(cfd_simulator)
+                    # chunk_components is indexed exactly like probe_grids
+                    # (interleaved plus/minus per direction); extending in chunk
+                    # order reproduces the sequential global order.
+                    probe_component_records.extend(chunk_components)
+                    for local_index, delta in enumerate(chunk_deltas):
+                        plus_components = chunk_components[2 * local_index]
+                        minus_components = chunk_components[2 * local_index + 1]
+                        legacy_total_grad.add_(
+                            (
+                                (
+                                    plus_components["total_loss"]
+                                    - minus_components["total_loss"]
+                                )
+                                / (2.0 * eps)
+                            )
+                            * delta
+                        )
+                        for component_name in component_names:
+                            raw_component_grads[component_name].add_(
+                                (
+                                    (
+                                        plus_components[component_name]
+                                        - minus_components[component_name]
+                                    )
+                                    / (2.0 * eps)
+                                )
+                                * delta
+                            )
+                    _clear_direct_solver_geometry_caches(cfd_simulator)
+                    _clear_direct_solver_batch_workspace(cfd_simulator)
+            else:
+                if _DEFERRED_SOLVER_READS and _direct_solver_supports_deferred_reads(cfd_simulator):
+                    # Lever 1: enqueue all 32 probe solves with NO host scalar
+                    # reads, then read every probe's scalars in ONE batched
+                    # .tolist() (+ one sync) and assemble components after.
+                    # Bit-identical to the sequential loop below.
+                    deferred_probes = []
+                    for delta in deltas:
+                        plus_field = sample_field + eps * delta
+                        minus_field = sample_field - eps * delta
+                        deferred_probes.append(
+                            _deferred_single_probe(
+                                torch.sigmoid(plus_field)
+                                if input_is_logits
+                                else plus_field.clamp(0.0, 1.0),
+                                sample_design_spec,
+                                cfd_simulator,
+                                cfd_steps,
+                                connectivity_weight,
+                                aircraft_validity_weight,
+                                threshold,
+                                sample_target,
+                            )
+                        )
+                        deferred_probes.append(
+                            _deferred_single_probe(
+                                torch.sigmoid(minus_field)
+                                if input_is_logits
+                                else minus_field.clamp(0.0, 1.0),
+                                sample_design_spec,
+                                cfd_simulator,
+                                cfd_steps,
+                                connectivity_weight,
+                                aircraft_validity_weight,
+                                threshold,
+                                sample_target,
+                            )
+                        )
+                        _clear_direct_solver_geometry_caches(cfd_simulator)
+                    deferred_components = _materialize_deferred_probes(
+                        deferred_probes,
+                        sample_design_spec,
+                        connectivity_weight,
+                        aircraft_validity_weight,
+                        sample_target,
+                    )
+                    for index, delta in enumerate(deltas):
+                        plus_components = deferred_components[2 * index]
+                        minus_components = deferred_components[2 * index + 1]
+                        probe_component_records.append(plus_components)
+                        probe_component_records.append(minus_components)
+                        legacy_total_grad.add_(
+                            (
+                                (
+                                    plus_components["total_loss"]
+                                    - minus_components["total_loss"]
+                                )
+                                / (2.0 * eps)
+                            )
+                            * delta
+                        )
+                        for component_name in component_names:
+                            raw_component_grads[component_name].add_(
+                                (
+                                    (
+                                        plus_components[component_name]
+                                        - minus_components[component_name]
+                                    )
+                                    / (2.0 * eps)
+                                )
+                                * delta
+                            )
+                else:
+                    for delta in deltas:
+                        plus_field = sample_field + eps * delta
+                        minus_field = sample_field - eps * delta
+                        plus_components = _direct_measured_objective_for_single(
+                            torch.sigmoid(plus_field) if input_is_logits else plus_field.clamp(0.0, 1.0),
+                            sample_design_spec,
+                            cfd_simulator,
+                            cfd_steps,
+                            connectivity_weight,
+                            aircraft_validity_weight,
+                            threshold,
+                            sample_target,
+                            return_components=True,
+                        )
+                        minus_components = _direct_measured_objective_for_single(
+                            torch.sigmoid(minus_field) if input_is_logits else minus_field.clamp(0.0, 1.0),
+                            sample_design_spec,
+                            cfd_simulator,
+                            cfd_steps,
+                            connectivity_weight,
+                            aircraft_validity_weight,
+                            threshold,
+                            sample_target,
+                            return_components=True,
+                        )
+                        probe_component_records.append(plus_components)
+                        probe_component_records.append(minus_components)
+                        legacy_total_grad.add_(
+                            (
+                                (
+                                    plus_components["total_loss"]
+                                    - minus_components["total_loss"]
+                                )
+                                / (2.0 * eps)
+                            )
+                            * delta
+                        )
+                        for component_name in component_names:
+                            raw_component_grads[component_name].add_(
+                                (
+                                    (
+                                        plus_components[component_name]
+                                        - minus_components[component_name]
+                                    )
+                                    / (2.0 * eps)
+                                )
+                                * delta
+                            )
+                        _clear_direct_solver_geometry_caches(cfd_simulator)
             legacy_total_grad.div_(direction_count)
             for component_grad in raw_component_grads.values():
                 component_grad.div_(direction_count)
@@ -3992,6 +5643,125 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                     component_limit
                 )
 
+            active_guard_names = []
+            if (
+                float(base_components.get("connectivity_guard_shortfall", 0.0)) > 0.0
+                and "connectivity_loss" in applied_component_grads
+            ):
+                active_guard_names.append("connectivity_loss")
+            if (
+                float(base_components.get("aircraft_validity_loss", 0.0)) > 0.0
+                and "aircraft_validity_loss" in applied_component_grads
+            ):
+                active_guard_names.append("aircraft_validity_loss")
+            active_guard_union.update(active_guard_names)
+            guard_gradients = {
+                name: (applied_component_grads[name],)
+                for name in ("connectivity_loss", "aircraft_validity_loss")
+                if name in active_guard_names
+            }
+            improvement_gradients = {
+                name: (gradient,)
+                for name, gradient in applied_component_grads.items()
+                if name not in guard_gradients
+            }
+            accepted_improvements, projection_telemetry = (
+                project_improvement_gradients_against_guards(
+                    improvement_gradients,
+                    guard_gradients,
+                    guard_order=(
+                        "connectivity_loss",
+                        "aircraft_validity_loss",
+                    ),
+                )
+                if guard_gradients
+                else (improvement_gradients, {})
+            )
+            accepted_component_grads, constrained_telemetry = (
+                combine_constrained_measured_gradients(
+                    {
+                        **guard_gradients,
+                        **accepted_improvements,
+                    },
+                    guard_names=tuple(guard_gradients),
+                    improvement_names=tuple(accepted_improvements),
+                )
+                if guard_gradients
+                else (
+                    {
+                        name: gradient[0]
+                        for name, gradient in accepted_improvements.items()
+                    },
+                    {},
+                )
+            )
+            if guard_gradients:
+                guard_component_values = guard_gradients
+                combined_component_gradient = accepted_component_grads[0]
+            else:
+                guard_component_values = accepted_component_grads
+                combined_component_gradient = None
+                for component_value in accepted_component_grads.values():
+                    if component_value is None:
+                        continue
+                    combined_component_gradient = (
+                        component_value.detach().clone()
+                        if combined_component_gradient is None
+                        else combined_component_gradient + component_value
+                    )
+            for guard_name, batch_guard_gradient in accepted_guard_gradients.items():
+                if guard_name not in active_guard_names:
+                    continue
+                guard_value = guard_component_values.get(guard_name)
+                if isinstance(guard_value, tuple):
+                    guard_value = guard_value[0]
+                if guard_value is None:
+                    guard_value = torch.zeros_like(sample_field)
+                batch_guard_gradient[batch_idx].copy_(guard_value.detach())
+            if combined_component_gradient is None:
+                combined_component_gradient = torch.zeros_like(sample_field)
+            accepted_component_grads = {"combined": combined_component_gradient}
+            base_components["active_guard_set"] = list(active_guard_names)
+            base_components["active_guard_names"] = list(active_guard_names)
+            base_components["guard_active_connectivity"] = float(
+                "connectivity_loss" in active_guard_names
+            )
+            base_components["guard_active_validity"] = float(
+                "aircraft_validity_loss" in active_guard_names
+            )
+            if constrained_telemetry:
+                final_invariant = constrained_telemetry["final_invariant"]
+                base_components["final_guard_active_set"] = list(
+                    final_invariant["active_guard_set"]
+                )
+                base_components["final_guard_projection_norm"] = float(
+                    final_invariant["projection_norm"]
+                )
+                base_components["final_guard_accepted_norm"] = float(
+                    final_invariant["accepted_norm"]
+                )
+            for component_name, telemetry in projection_telemetry.items():
+                prefix = component_name.removesuffix("_loss")
+                base_components[f"{prefix}_guard_projection_norm"] = float(
+                    telemetry["projection_norm"]
+                )
+                base_components[f"{prefix}_accepted_gradient_norm"] = float(
+                    telemetry["accepted_norm"]
+                )
+                base_components[f"{prefix}_guard_projected"] = float(
+                    telemetry["projected"]
+                )
+                for guard_name, cosine in telemetry["pre_cosines"].items():
+                    guard_prefix = guard_name.removesuffix("_loss")
+                    base_components[
+                        f"{prefix}_guard_cosine_before_{guard_prefix}"
+                    ] = float(cosine)
+                for guard_name, cosine in telemetry["post_cosines"].items():
+                    guard_prefix = guard_name.removesuffix("_loss")
+                    base_components[
+                        f"{prefix}_guard_cosine_after_{guard_prefix}"
+                    ] = float(cosine)
+
             for first_index, first_name in enumerate(component_names):
                 for second_name in component_names[first_index + 1:]:
                     first_gradient = raw_component_grads[first_name]
@@ -4020,7 +5790,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                         f"{first_prefix}_{second_prefix}_spsa_gradient_cosine"
                     ] = cosine
 
-            sample_grad = sum(applied_component_grads.values())
+            sample_grad = accepted_component_grads["combined"]
             grad_norm = sample_grad.norm()
             clip_value = float(gradient_clip)
             # SPSA estimates the gradient of one global measured objective, not
@@ -4046,6 +5816,10 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             base_components["spsa_gradient_norm"] = float(sample_grad.norm().item())
             base_components["spsa_gradient_norm_limit"] = float(gradient_norm_limit)
             _clear_direct_solver_geometry_caches(cfd_simulator)
+            # Task 9: drop the pre-warm state for this sample's 33 probes. Kept
+            # separate from _clear_direct_solver_geometry_caches (per-direction
+            # calls must not discard still-pending futures for later directions).
+            _clear_direct_solver_sdf_warm_cache(cfd_simulator)
 
         if original_ndim == 3:
             grad_estimate = grad_estimate[0]
@@ -4053,11 +5827,35 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         ctx.original_ndim = original_ndim
         mean_loss = float(np.mean(base_losses)) if base_losses else 0.0
         component_sink.clear()
+        # Task 10 parity telemetry: the per-probe component dicts (direction
+        # order, plus/minus interleaved) and the 16 deltas each forward consumed,
+        # so the parity test can assert per-probe loss parity and byte-identical
+        # delta consumption between the sequential and batched forward paths.
+        component_sink["_probe_components"] = list(probe_component_records)
+        component_sink["_spsa_deltas"] = [delta.detach().clone() for delta in deltas]
+        active_guard_names = [
+            name
+            for name in ("connectivity_loss", "aircraft_validity_loss")
+            if name in active_guard_union
+        ]
+        component_sink["_accepted_guard_gradients"] = {
+            name: values.div(max(batch_size, 1))
+            for name, values in accepted_guard_gradients.items()
+            if name in active_guard_union
+        }
+        component_sink["active_guard_names"] = list(active_guard_names)
+        component_sink["active_guard_set"] = list(active_guard_names)
         if base_component_records:
             for key in base_component_records[0]:
-                values = [float(record[key]) for record in base_component_records if key in record]
-                if values:
+                if key in {"active_guard_names", "active_guard_set"}:
+                    continue
+                values = [record[key] for record in base_component_records if key in record]
+                if not values:
+                    continue
+                if all(isinstance(value, (int, float, np.floating)) for value in values):
                     component_sink[key] = float(np.mean(values))
+                else:
+                    component_sink[key] = values[0]
         return voxel_grid.new_tensor(mean_loss)
 
     @staticmethod
@@ -4111,12 +5909,12 @@ class DirectSolverSPSALoss(nn.Module):
         self.directions = max(1, int(directions))
         self.seed = int(seed)
         self.input_is_logits = bool(input_is_logits)
-        self.last_components: Dict[str, float] = {}
+        self.last_components: Dict[str, Any] = {}
 
     def forward(
         self,
         voxel_grid: torch.Tensor,
-        design_spec: DesignSpec,
+        design_spec: Union[DesignSpec, Sequence[DesignSpec]],
         cfd_simulator: "AdvancedCFDSimulator",
         seed: Optional[int] = None,
         reference_occupancy: Optional[Union[float, torch.Tensor]] = None,
@@ -4183,6 +5981,46 @@ class OptimizedDiffusionTrainer:
         self.dtype = self.precision_dtypes.get(training_config.precision, torch.float32)
         print(f"Using precision: {training_config.precision} ({self.dtype})")
 
+        # NUMERICS (branch experiment/kernel-fusion-launch): run the
+        # neural-network GEMMs (coordinate decoder + diffusion encoder/attention)
+        # on TF32 tensor-core math when experiment.tf32_gemm_math is set.
+        #
+        # NOTE (R1, PR 41 review): the D3Q27 LBM/SPSA solver path is NOT
+        # elementwise-only -- the MRT moment projection runs torch.tensordot /
+        # torch.matmul against the 27x27 moment_basis in BOTH collide paths
+        # (advanced_lbm_solver.py:608/659/666 single, 1254/1288/1292 batch). A
+        # global torch.backends.cuda.matmul.allow_tf32=True WOULD therefore have
+        # changed solver arithmetic. R1 pins those solver methods to IEEE fp32
+        # with the _ieee_fp32_math decorator (save/restore around each collide),
+        # so THIS flag can still only touch NN GEMM precision -- now by
+        # construction, not by an incorrect comment.
+        # Measured 2026-08-17 (build/perf/baseline/tf32_probe.py /
+        # tf32_profile.py): gradients stay within GRAD_ATOL (0.2-0.4x), output
+        # field drifts ~2e-4 rel (49x the 4e-6 refactor-parity gate, benign at
+        # the geometry level), and steady-state drops ~44 -> ~31-34 s/u (mean
+        # 36.2 vs 49.3). fp32 STORAGE is unchanged; only GEMM math moves to
+        # TF32. Wired at trainer construction so solver-only and converter-only
+        # tests keep IEEE fp32; ON by explicit user decision 2026-08-17.
+        if bool(config_value("experiment", "tf32_gemm_math", False)):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = False  # no convs in the model; keep IEEE
+        else:
+            # Explicitly pin IEEE fp32 so a TF32 flag left on by an earlier
+            # trainer/process (or a global default change) cannot leak into a
+            # non-TF32 run. The solver is independently force-IEEE via
+            # _ieee_fp32_math regardless of this state.
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+
+        # A1 (experiment/kernel-fusion-launch): compile the backward graph.
+        # Set at trainer construction so every backward in the update loop
+        # (decoder chunk recompute + elementwise grad ops) is captured and
+        # fused by Inductor. Opt-in via model.compiled_autograd (reads through
+        # the dataclass field so programmatic construction works too); must
+        # stay within the GRAD_ATOL/LOSS_ATOL parity envelopes.
+        if bool(getattr(self.model_config, "compiled_autograd", False)):
+            torch._dynamo.config.compiled_autograd = True
+
         self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device, self.dtype)
 
         # Models with optimizations
@@ -4198,6 +6036,7 @@ class OptimizedDiffusionTrainer:
             enable_coordinate_gradient_checkpointing=bool(
                 config_value("model", "coordinate_gradient_checkpointing", True)
             ),
+            enable_decoder_compile=model_config.compile_converter_decoder,
         ).to(self.device).to(self.dtype)
 
         # 4-step consistency model
@@ -4227,6 +6066,13 @@ class OptimizedDiffusionTrainer:
             ],
             lr=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
+            # Fused multi-tensor AdamW step (torch _foreach_ ops): collapses the
+            # per-parameter copy/add/mul kernel cascade of the non-fused step
+            # into ~20 fused kernels. Bit-identical per parameter (each param's
+            # update touches only its own tensors, same elementwise arithmetic).
+            # Verified by build/perf/optimizer_ema_parity.py before any
+            # claim-bearing run.
+            foreach=True,
         )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=training_config.num_epochs)
         self.scheduler_step_per_update = False
@@ -4246,6 +6092,7 @@ class OptimizedDiffusionTrainer:
             "source": "config",
             "threshold": self.geometry_probability_threshold,
         }
+        self.last_threshold_margin_components: Dict[str, Any] = {}
         self.direct_solver_loss = DirectSolverSPSALoss(
             cfd_steps=training_config.direct_solver_steps,
             perturbation=training_config.direct_solver_perturbation,
@@ -4295,6 +6142,17 @@ class OptimizedDiffusionTrainer:
         self.update_metrics_callback: Optional[
             Callable[[Dict[str, Any]], None]
         ] = None
+        # The optional ``force`` argument requests an unconditional run-state
+        # save (used at a bounded ``stop_after_updates`` interruption so a stop
+        # that misses the checkpoint cadence still leaves a resumable state).
+        self.run_state_checkpoint_callback: Optional[
+            Callable[[int, int, bool], Optional[str]]
+        ] = None
+        self.stop_after_updates: Optional[int] = None
+        self.run_state_metadata: Dict[str, Any] = {}
+        self.run_state_log_metadata: Dict[str, Any] = {}
+        self.run_state_updates_log_path: Optional[str] = None
+        self.last_gradient_lifecycle: Dict[str, Any] = {}
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -4312,6 +6170,149 @@ class OptimizedDiffusionTrainer:
         teacher_model.eval()
         for parameter in teacher_model.parameters():
             parameter.requires_grad_(False)
+
+    def build_run_state(
+        self,
+        *,
+        epoch_index: int,
+        completed_in_epoch: int,
+        sample_order: Sequence[int],
+        compatibility: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the complete state needed to continue at the next sample."""
+        self._sync_consistency_teacher()
+        log_reconciliation = dict(self.run_state_log_metadata)
+        updates_log_path = getattr(self, "run_state_updates_log_path", None)
+        recorded_offset = log_reconciliation.get("offset")
+        if (
+            updates_log_path is not None
+            and recorded_offset is not None
+            and Path(updates_log_path).exists()
+        ):
+            with open(updates_log_path, "rb") as handle:
+                prefix = handle.read(int(recorded_offset))
+            log_reconciliation["sha256"] = hashlib.sha256(prefix).hexdigest()
+        return {
+            "run_state_version": 1,
+            "epoch_index": int(epoch_index),
+            "completed_in_epoch": int(completed_in_epoch),
+            "sample_order": [int(value) for value in sample_order],
+            "global_step": int(self.global_step),
+            "consistency_update_step": int(self.consistency_update_step),
+            "model": {
+                "diffusion_model": self.diffusion_model.state_dict(),
+                "consistency_model": self.consistency_model.state_dict(),
+                "converter": self.converter.state_dict(),
+                "ema_model": self.ema_model.state_dict(),
+            },
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "scheduler_step_per_update": bool(
+                getattr(self, "scheduler_step_per_update", False)
+            ),
+            "scaler": self.scaler.state_dict(),
+            "rng": capture_rng_state(),
+            "geometry_probability_threshold": float(
+                self.geometry_probability_threshold
+            ),
+            "geometry_threshold_calibrated": bool(
+                self.geometry_threshold_calibrated
+            ),
+            "geometry_threshold_calibration": dict(
+                self.geometry_threshold_calibration
+            ),
+            "compatibility": dict(compatibility),
+            "run_state_metadata": dict(self.run_state_metadata),
+            "log_reconciliation": log_reconciliation,
+        }
+
+    def save_run_state(
+        self,
+        path: Union[str, Path],
+        *,
+        epoch_index: int,
+        completed_in_epoch: int,
+        sample_order: Sequence[int],
+        compatibility: Mapping[str, Any],
+    ) -> None:
+        atomic_save_run_state(
+            path,
+            self.build_run_state(
+                epoch_index=epoch_index,
+                completed_in_epoch=completed_in_epoch,
+                sample_order=sample_order,
+                compatibility=compatibility,
+            ),
+        )
+
+    def load_run_state(
+        self,
+        path: Union[str, Path],
+        *,
+        expected_compatibility: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Restore an interrupted run after its original scheduler is configured."""
+        resolved_path = resolve_run_state_path(path)
+        state = _load_checkpoint_metadata(resolved_path)
+        # C1: the config-fixed threshold is authoritative and must NOT be
+        # overridden by a run-state's saved (previously-calibrated) threshold.
+        # When calibration is enabled the saved threshold IS the exact-resume
+        # state and is restored here as before. The config-fixed path (either
+        # _prepare_geometry_threshold_for_run before this call, or a later
+        # config-fixed restore) has already set geometry_probability_threshold
+        # AND direct_solver_loss.threshold, so they stay in sync.
+        if self.training_config.calibrate_geometry_materialization_threshold:
+            self._set_geometry_probability_threshold(
+                state["geometry_probability_threshold"],
+                calibrated=bool(state.get("geometry_threshold_calibrated", True)),
+                calibration=state.get("geometry_threshold_calibration"),
+            )
+        actual_compatibility = state.get("compatibility", {})
+        mismatches = validate_run_state_compatibility(
+            actual_compatibility,
+            expected_compatibility,
+        )
+        if mismatches:
+            actual_configuration = actual_compatibility.get("configuration", {})
+            expected_configuration = expected_compatibility.get("configuration", {})
+            def mismatch_value(values: Mapping[str, Any], name: str) -> Any:
+                if name.startswith("configuration."):
+                    return values.get("configuration", {}).get(
+                        name.removeprefix("configuration.")
+                    )
+                return values.get(name)
+            details = ", ".join(
+                f"{name}={mismatch_value(actual_compatibility, name)!r}"
+                f" (expected {mismatch_value(expected_compatibility, name)!r})"
+                for name in mismatches
+            )
+            raise ValueError(f"Incompatible run-state resume: {details}")
+        if int(state.get("run_state_version", 0)) != 1:
+            raise ValueError("Unsupported run-state version")
+        model_state = state["model"]
+        self.diffusion_model.load_state_dict(model_state["diffusion_model"])
+        self.consistency_model.load_state_dict(model_state["consistency_model"])
+        self.converter.load_state_dict(model_state["converter"])
+        self.ema_model.load_state_dict(model_state["ema_model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        self.scheduler_step_per_update = bool(
+            state.get("scheduler_step_per_update", True)
+        )
+        self.scaler.load_state_dict(state.get("scaler", {}))
+        self.global_step = int(state["global_step"])
+        self.consistency_update_step = int(state.get("consistency_update_step", 0))
+        restore_rng_state(state["rng"])
+        self._sync_consistency_teacher()
+        return {
+            "epoch_index": int(state["epoch_index"]),
+            "completed_in_epoch": int(state["completed_in_epoch"]),
+            "sample_order": [int(value) for value in state["sample_order"]],
+            "global_step": self.global_step,
+            "run_state_checkpoint_path": str(Path(path).resolve()),
+            "run_state_metadata": dict(state.get("run_state_metadata", {})),
+            "log_reconciliation": dict(state.get("log_reconciliation", {})),
+        }
 
     def _set_geometry_probability_threshold(
         self,
@@ -4333,6 +6334,138 @@ class OptimizedDiffusionTrainer:
             "threshold": threshold_value,
         }
         self.direct_solver_loss.threshold = threshold_value
+
+    def _analytic_occupancy_logit_gradient(
+        self,
+        logits: torch.Tensor,
+        reference_occupancy: Optional[Union[float, torch.Tensor]],
+        design_spec: Union[DesignSpec, Sequence[DesignSpec]],
+    ) -> torch.Tensor:
+        """Deterministic differentiable occupancy gradient on the free-running logits.
+
+        Replaces the SPSA finite-difference occupancy component -- flip-noise
+        dominated (step-function derivative through the hard threshold, always at
+        its clip cap, directionally random) -- with the analytic gradient of two
+        smooth, deterministic terms:
+
+          loss_occ = mean_w * max(0, sum(p) - threshold*N)         # saturation brake
+                   + soft_w * |sum(soft) - ref*N|                  # occupancy anchor
+          soft_occ  = sum(sigmoid((p - threshold) / T))
+
+        ref is the batch reference occupancy (~0.5% sparse airframe). The
+        mean-probability term is the user's "loss tied to average probability"
+        but used as a ONE-SIDED saturation brake: it pushes the field down only
+        while mean(p) sits above the threshold (the saturated 0.95 regime), and
+        never pushes a healthy sparse field back up. A two-sided target at the
+        reference is wrong: a healthy field with 0.5% positives at p=1 and the
+        rest at p~0.24 has mean ~0.24, and a two-sided loss would inflate it.
+        The soft term anchors the materialized fraction at the threshold (it
+        equals mean(p) only in the degenerate all-voxels-at-0.5 case, which is
+        exactly the 50% blob the run was oscillating in). Both are self-limiting:
+        each is ~0 at the healthy fixed point, and the soft term is
+        bimodality-aware so it cannot be satisfied by probability collapse.
+        """
+        batch_size = int(logits.shape[0])
+        mean_weight = float(self.training_config.occupancy_mean_probability_weight)
+        soft_weight = float(self.training_config.occupancy_soft_weight)
+        temperature = float(self.training_config.occupancy_soft_temperature)
+        if batch_size <= 0 or (mean_weight <= 0.0 and soft_weight <= 0.0):
+            return torch.zeros_like(logits)
+        threshold = self.geometry_probability_threshold
+        probs = torch.sigmoid(logits.detach().float())
+        prob_one_minus_prob = probs * (1.0 - probs)
+        ref_tensor = None
+        if torch.is_tensor(reference_occupancy):
+            ref_tensor = reference_occupancy.detach().reshape(-1).float().cpu()
+        if isinstance(design_spec, DesignSpec):
+            spec_list = [design_spec]
+        else:
+            spec_list = list(design_spec)
+        if len(spec_list) not in {1, batch_size}:
+            raise ValueError(
+                "design_spec sequence must contain one value or one value per "
+                f"batch item, got {len(spec_list)} values for batch size {batch_size}"
+            )
+        norm_limit = float(self.training_config.direct_occupancy_gradient_max_norm)
+        per_sample_grads = []
+        mean_probabilities: List[float] = []
+        soft_occupancies: List[float] = []
+        references: List[float] = []
+        for batch_idx in range(batch_size):
+            sample_probs = probs[batch_idx]
+            if ref_tensor is not None:
+                sample_reference = float(
+                    ref_tensor[0].item()
+                    if ref_tensor.numel() == 1
+                    else ref_tensor[batch_idx].item()
+                )
+            elif reference_occupancy is not None:
+                sample_reference = float(reference_occupancy)
+            else:
+                sample_reference = float(sample_probs.mean().item())
+            spec = spec_list[0 if len(spec_list) == 1 else batch_idx]
+            space_weight = float(getattr(spec, "space_weight", 1.0))
+            # Both gradient terms below are derivatives of sum(...) over the
+            # voxel field (sum(p) and sum(soft)), so each is the plain
+            # per-voxel derivative with no 1/N mean factor.
+            sample_grad = torch.zeros_like(sample_probs)
+            if mean_weight > 0.0:
+                mean_probability = float(sample_probs.mean().item())
+                # One-sided saturation brake: only while the field mean sits
+                # above the threshold does it push down. It never pushes a
+                # healthy sparse field back up toward the threshold.
+                if mean_probability > threshold:
+                    sample_grad = sample_grad + (
+                        mean_weight * prob_one_minus_prob[batch_idx]
+                    )
+                mean_probabilities.append(mean_probability)
+            if soft_weight > 0.0 and temperature > 0.0:
+                soft = torch.sigmoid((sample_probs - threshold) / temperature)
+                soft_occupancy = float(soft.mean().item())
+                soft_error = soft_occupancy - sample_reference
+                per_voxel = (
+                    (1.0 / temperature)
+                    * soft
+                    * (1.0 - soft)
+                    * prob_one_minus_prob[batch_idx]
+                )
+                sample_grad = sample_grad + (
+                    float(np.sign(soft_error)) * soft_weight
+                ) * per_voxel
+                soft_occupancies.append(soft_occupancy)
+            sample_grad = sample_grad * space_weight
+            # Sum-semantics: both the saturation brake (d/dlogit sum(p)) and the
+            # soft occupancy anchor (d/dlogit sum(sigmoid(...))) are plain
+            # per-voxel derivatives with no 1/N mean factor, so the per-sample
+            # L2 clip below compares norm_limit against the same unit-norm force
+            # the recovery-fix run trained at (pre-fix b5301a7).
+            sample_norm = sample_grad.norm()
+            if (
+                norm_limit > 0.0
+                and torch.isfinite(sample_norm)
+                and float(sample_norm.item()) > norm_limit
+            ):
+                sample_grad = sample_grad * (
+                    norm_limit / sample_norm.clamp_min(1.0e-12)
+                )
+            per_sample_grads.append(sample_grad)
+            references.append(sample_reference)
+        combined = torch.stack(per_sample_grads, dim=0)
+        combined = combined / max(batch_size, 1)
+        telemetry = self.direct_solver_loss.last_components
+        if mean_probabilities:
+            telemetry["occupancy_mean_probability"] = float(np.mean(mean_probabilities))
+        if soft_occupancies:
+            telemetry["occupancy_soft_surrogate"] = float(np.mean(soft_occupancies))
+        telemetry["occupancy_reference"] = float(np.mean(references))
+        # M7: `combined` was already divided by max(batch_size, 1) above, so the
+        # telemetry norm must NOT divide again (exact at C=1, under-reports for
+        # batch>1 otherwise). Telemetry only.
+        telemetry["occupancy_analytic_gradient_norm"] = float(
+            combined.norm().item()
+        )
+        telemetry["occupancy_analytic_gradient_enabled"] = 1.0
+        return combined
 
     def calibrate_geometry_materialization_threshold(
         self,
@@ -4416,8 +6549,17 @@ class OptimizedDiffusionTrainer:
     def _update_ema(self):
         """Update exponential moving average model"""
         decay = self.training_config.ema_decay
-        for ema_param, param in zip(self.ema_model.parameters(), self.diffusion_model.parameters()):
-            ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+        # Fused multi-tensor EMA: one kernel each for the mul_/add_ across all
+        # EMA params instead of two per param. Same elementwise arithmetic (mul
+        # then add), bit-identical per element.
+        # Operate on .data (as the old ema_param.data.mul_() did): _foreach_*_
+        # directly on the leaf nn.Parameters would trip the autograd
+        # "leaf Variable ... in-place" guard (observed at run time on 2026-08-17;
+        # the parity harness now uses real leaves to catch this).
+        ema_params = [p.data for p in self.ema_model.parameters()]
+        model_params = [m.data for m in self.diffusion_model.parameters()]
+        torch._foreach_mul_(ema_params, decay)
+        torch._foreach_add_(ema_params, model_params, alpha=1 - decay)
 
     def _get_validation_cfd_simulator(self) -> AdvancedCFDSimulator:
         if self.val_cfd_simulator is None:
@@ -4489,47 +6631,46 @@ class OptimizedDiffusionTrainer:
         negative_count = (flat_target.numel() - positive_count).clamp_min(0.0)
         positive_bce_sum = flat_target.new_zeros(())
         negative_bce_sum = flat_target.new_zeros(())
+        positive_margin_sum = flat_target.new_zeros(())
+        negative_margin_sum = flat_target.new_zeros(())
         intersection = flat_target.new_zeros((batch_size,))
         prediction_mass = flat_target.new_zeros((batch_size,))
         target_mass = flat_target.sum(dim=1)
+        # Immutable global voxel counts as device tensors (no host sync). The
+        # >0 guards become device masks: an all-empty class contributes exactly
+        # 0 (division uses the clamped count and the mask zeroes the term), and
+        # class_count renormalizes the per-chunk and post-loop losses exactly
+        # like the original host-side int guards did.
+        has_positive = (positive_count > 0).to(flat_target.dtype)
+        has_negative = (negative_count > 0).to(flat_target.dtype)
+        safe_positive_count = positive_count.clamp_min(1.0)
+        safe_negative_count = negative_count.clamp_min(1.0)
+        class_count = (has_positive + has_negative).clamp_min(1.0)
+        # Grad-carrying accumulators for the single final backward: the positive
+        # dice mass is `intersection` (probabilities*target == probabilities on
+        # the target voxels), so only the negative dice mass is tracked here.
+        neg_dice_mass = flat_target.new_zeros((batch_size,))
+        total_chunk_loss = flat_target.new_zeros(())
 
-        with torch.no_grad():
-            for start in range(0, total_voxels, chunk_size):
-                stop = min(start + chunk_size, total_voxels)
-                indices = torch.arange(start, stop, device=self.device)
-                target_chunk = flat_target.index_select(1, indices)
-                logits = self.converter.forward_flat_indices(latent, indices).float().nan_to_num(0.0)
-                probabilities = torch.sigmoid(logits).nan_to_num(0.0)
-                bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
-                positive_mask = target_chunk > 0.5
-                if bool(positive_mask.any().item()):
-                    positive_bce_sum += bce[positive_mask].sum()
-                if bool((~positive_mask).any().item()):
-                    negative_bce_sum += bce[~positive_mask].sum()
-                intersection += (probabilities * target_chunk).sum(dim=1)
-                prediction_mass += probabilities.sum(dim=1)
-
-        balanced_bce = flat_target.new_zeros(())
-        class_count = 0
-        if float(positive_count.item()) > 0.0:
-            balanced_bce += positive_bce_sum / positive_count
-            class_count += 1
-        if float(negative_count.item()) > 0.0:
-            balanced_bce += negative_bce_sum / negative_count
-            class_count += 1
-        balanced_bce = balanced_bce / max(class_count, 1)
-        numerator = 2.0 * intersection + 1.0
-        denominator = prediction_mass + target_mass + 1.0
-        dice_loss = (1.0 - numerator / denominator).mean()
-        full_loss = balanced_bce + self.training_config.geometry_dice_weight * dice_loss
-
-        positive_dice_coefficient = -(
-            2.0 * denominator - numerator
-        ) / denominator.square() / max(batch_size, 1)
-        negative_dice_coefficient = (
-            numerator / denominator.square() / max(batch_size, 1)
+        margin_enabled = bool(self.geometry_threshold_calibrated)
+        positive_boundary = min(
+            1.0 - torch.finfo(flat_target.dtype).eps,
+            float(self.geometry_probability_threshold)
+            + float(self.training_config.threshold_positive_margin),
         )
-        clean_weight = float(self.training_config.clean_geometry_reconstruction_weight)
+        negative_boundary = max(
+            0.0,
+            float(self.geometry_probability_threshold)
+            - float(self.training_config.threshold_negative_margin),
+        )
+        # Single grad-enabled pass over the lattice. The removed no_grad decode
+        # existed only for detached scalar metrics; those sums are accumulated
+        # here without a graph (.detach()) while the grad-carrying per-batch dice
+        # masses and per-chunk bce/margin losses accumulate for one final
+        # .backward(). Memory-safe because coordinate gradient checkpointing is
+        # enabled in training (coordinate_gradient_checkpointing=true), so each
+        # chunk's decoder graph is a small checkpoint reference recomputed on
+        # backward.
         for start in range(0, total_voxels, chunk_size):
             stop = min(start + chunk_size, total_voxels)
             indices = torch.arange(start, stop, device=self.device)
@@ -4538,35 +6679,256 @@ class OptimizedDiffusionTrainer:
             probabilities = torch.sigmoid(logits).nan_to_num(0.0)
             bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
             positive_mask = target_chunk > 0.5
+            negative_mask = ~positive_mask
+            # Gather each class via index_select on precomputed nonzero indices
+            # instead of boolean-mask indexing: the backward of bce[mask]
+            # (IndexBackward0) calls torch.nonzero (a device->host sync) per
+            # chunk per class, stalling the GPU in the backward. index_select's
+            # backward scatters on device; the masks derive from target_chunk
+            # (no grad) so nonzero runs only in the forward. The gathered
+            # elements are identical and in the same order, so the sums below
+            # are bit-identical.
+            flat_bce = bce.reshape(-1)
+            positive_indices = torch.nonzero(positive_mask.reshape(-1), as_tuple=False).flatten()
+            negative_indices = torch.nonzero(negative_mask.reshape(-1), as_tuple=False).flatten()
+            # Metric-only sums, detached so they never feed the gradient graph
+            # (same arithmetic as the removed no_grad pass).
+            # A masked sum of an all-False mask is 0.0, so dropping the
+            # bool(...any().item()) guards is bit-identical and removes a
+            # per-chunk device->host sync.
+            positive_bce_sum = positive_bce_sum + flat_bce.index_select(0, positive_indices).sum().detach()
+            negative_bce_sum = negative_bce_sum + flat_bce.index_select(0, negative_indices).sum().detach()
+            positive_margin_sum = positive_margin_sum + (
+                (positive_boundary - probabilities).clamp_min(0.0).square()
+                * positive_mask
+            ).sum().detach()
+            negative_margin_sum = negative_margin_sum + (
+                (probabilities - negative_boundary).clamp_min(0.0).square()
+                * negative_mask
+            ).sum().detach()
+            # Grad-carrying per-batch dice masses accumulated across chunks.
+            intersection = intersection + (probabilities * target_chunk).sum(dim=1)
+            prediction_mass = prediction_mass + probabilities.sum(dim=1)
+            neg_dice_mass = neg_dice_mass + (probabilities * negative_mask).sum(dim=1)
+            # Per-chunk bce/margin losses, same arithmetic as the old grad pass.
+            # The class-count guards are device masks (has_positive/has_negative
+            # with clamped divisor counts), so an all-empty class contributes
+            # exactly 0 with no per-chunk host sync and no NaN gradient.
             chunk_bce = logits.new_zeros(())
-            if float(positive_count.item()) > 0.0:
-                chunk_bce = chunk_bce + bce[positive_mask].sum() / positive_count
-            if float(negative_count.item()) > 0.0:
-                chunk_bce = chunk_bce + bce[~positive_mask].sum() / negative_count
-            chunk_bce = chunk_bce / max(class_count, 1)
-            dice_coefficients = torch.where(
-                positive_mask,
-                positive_dice_coefficient[:, None],
-                negative_dice_coefficient[:, None],
+            chunk_bce = chunk_bce + (
+                flat_bce.index_select(0, positive_indices).sum() / safe_positive_count
+            ) * has_positive
+            chunk_bce = chunk_bce + (
+                flat_bce.index_select(0, negative_indices).sum() / safe_negative_count
+            ) * has_negative
+            chunk_bce = chunk_bce / class_count
+            chunk_margin = logits.new_zeros(())
+            if margin_enabled:
+                chunk_margin = chunk_margin + (
+                    float(self.training_config.threshold_positive_margin_weight)
+                    * (
+                        (positive_boundary - probabilities).clamp_min(0.0).square()
+                        * positive_mask
+                    ).sum()
+                    / safe_positive_count
+                ) * has_positive
+                chunk_margin = chunk_margin + (
+                    float(self.training_config.threshold_negative_margin_weight)
+                    * (
+                        (probabilities - negative_boundary).clamp_min(0.0).square()
+                        * negative_mask
+                    ).sum()
+                    / safe_negative_count
+                ) * has_negative
+            total_chunk_loss = total_chunk_loss + (chunk_bce + chunk_margin)
+
+        balanced_bce = (
+            (positive_bce_sum / safe_positive_count) * has_positive
+            + (negative_bce_sum / safe_negative_count) * has_negative
+        )
+        balanced_bce = balanced_bce / class_count
+        numerator = 2.0 * intersection.detach() + 1.0
+        denominator = prediction_mass.detach() + target_mass + 1.0
+        dice_loss = (1.0 - numerator / denominator).mean()
+        full_loss = balanced_bce + self.training_config.geometry_dice_weight * dice_loss
+        positive_margin_loss = (
+            (positive_margin_sum / safe_positive_count) * has_positive
+            if margin_enabled
+            else flat_target.new_zeros(())
+        )
+        negative_margin_loss = (
+            (negative_margin_sum / safe_negative_count) * has_negative
+            if margin_enabled
+            else flat_target.new_zeros(())
+        )
+        threshold_margin_loss = (
+            float(self.training_config.threshold_positive_margin_weight)
+            * positive_margin_loss
+            + float(self.training_config.threshold_negative_margin_weight)
+            * negative_margin_loss
+        )
+        full_loss = full_loss + threshold_margin_loss
+        self.last_threshold_margin_components = {
+            "threshold_positive_margin_loss": float(positive_margin_loss.detach().item()),
+            "threshold_negative_margin_loss": float(negative_margin_loss.detach().item()),
+            "threshold_positive_voxel_count": int(positive_count.item()),
+            "threshold_negative_voxel_count": int(negative_count.item()),
+            "threshold_positive_margin": float(self.training_config.threshold_positive_margin),
+            "threshold_negative_margin": float(self.training_config.threshold_negative_margin),
+            "threshold_positive_margin_weight": float(self.training_config.threshold_positive_margin_weight),
+            "threshold_negative_margin_weight": float(self.training_config.threshold_negative_margin_weight),
+            "geometry_probability_threshold": float(self.geometry_probability_threshold),
+        }
+
+        positive_dice_coefficient = -(
+            2.0 * denominator - numerator
+        ) / denominator.square() / max(batch_size, 1)
+        negative_dice_coefficient = (
+            numerator / denominator.square() / max(batch_size, 1)
+        )
+        clean_weight = float(self.training_config.clean_geometry_reconstruction_weight)
+        # One final backward over the whole lattice. The dice objective uses the
+        # (detached) analytic per-batch coefficients against the grad-carrying
+        # dice masses, reproducing the old per-chunk dice gradient objective.
+        # Gradient accumulation order differs from per-chunk interleaved
+        # backwards (bce+margin accumulate chunk-wise; dice accumulates through
+        # the per-batch masses), so gradients are last-ulp (~1e-7 relative)
+        # while the returned loss is bit-identical.
+        dice_obj = (
+            positive_dice_coefficient.detach() * intersection
+        ).sum() + (
+            negative_dice_coefficient.detach() * neg_dice_mass
+        ).sum()
+        (
+            clean_weight
+            * (
+                total_chunk_loss
+                + self.training_config.geometry_dice_weight * dice_obj
             )
-            chunk_dice_gradient_objective = (
-                probabilities * dice_coefficients.detach()
-            ).sum()
-            (
-                clean_weight
-                * (
-                    chunk_bce
-                    + self.training_config.geometry_dice_weight
-                    * chunk_dice_gradient_objective
-                )
-            ).backward()
+        ).backward()
         return full_loss.detach()
 
-    def train_epoch(self, train_loader: DataLoader, grid_size: int = 32) -> Dict[str, float]:
+    def _backward_full_grounded_threshold_margin(
+        self,
+        latent: torch.Tensor,
+        geometry_target: torch.Tensor,
+        *,
+        loss_scale: float,
+    ) -> torch.Tensor:
+        """Backpropagate the exact calibrated margin through the student path."""
+        if not self.geometry_threshold_calibrated:
+            return latent.new_zeros(())
+        scale = float(loss_scale)
+        if scale == 0.0:
+            return latent.new_zeros(())
+
+        if getattr(self.converter, "decoder_mode", "dense") == "dense":
+            logits = self.converter(latent).nan_to_num(0.0).float()
+            loss = grounded_threshold_margin_loss(
+                logits,
+                geometry_target.float(),
+                threshold=self.geometry_probability_threshold,
+                positive_margin=self.training_config.threshold_positive_margin,
+                negative_margin=self.training_config.threshold_negative_margin,
+                positive_weight=self.training_config.threshold_positive_margin_weight,
+                negative_weight=self.training_config.threshold_negative_margin_weight,
+                from_logits=True,
+            ) * scale
+            loss.backward()
+            return loss.detach()
+
+        flat_target = geometry_target.float().reshape(geometry_target.shape[0], -1)
+        total_voxels = int(flat_target.shape[1])
+        chunk_size = max(1, int(self.model_config.coordinate_chunk_size))
+        positive_count = flat_target.sum().clamp_min(0.0)
+        negative_count = (flat_target.numel() - positive_count).clamp_min(0.0)
+        # Device-side class-count masks (no host sync), matching the grounded
+        # coordinate-loss loop: an all-empty class contributes exactly 0 with a
+        # clamped divisor so the masked term is gradient-safe.
+        has_positive = (positive_count > 0).to(flat_target.dtype)
+        has_negative = (negative_count > 0).to(flat_target.dtype)
+        safe_positive_count = positive_count.clamp_min(1.0)
+        safe_negative_count = negative_count.clamp_min(1.0)
+        positive_boundary = min(
+            1.0 - torch.finfo(flat_target.dtype).eps,
+            float(self.geometry_probability_threshold)
+            + float(self.training_config.threshold_positive_margin),
+        )
+        negative_boundary = max(
+            0.0,
+            float(self.geometry_probability_threshold)
+            - float(self.training_config.threshold_negative_margin),
+        )
+
+        positive_sum = flat_target.new_zeros(())
+        negative_sum = flat_target.new_zeros(())
+        total_chunk_loss = flat_target.new_zeros(())
+        for start in range(0, total_voxels, chunk_size):
+            stop = min(start + chunk_size, total_voxels)
+            indices = torch.arange(start, stop, device=self.device)
+            target_chunk = flat_target.index_select(1, indices)
+            logits = self.converter.forward_flat_indices(latent, indices).float()
+            probabilities = torch.sigmoid(logits).nan_to_num(0.0)
+            positive_mask = target_chunk > 0.5
+            negative_mask = ~positive_mask
+            # The detached margin sums formerly computed in a separate no_grad
+            # full-lattice decode are accumulated here; .detach() keeps them out
+            # of the gradient graph (they feed only the returned telemetry loss,
+            # not the gradient-carrying total) so the single backward below
+            # backpropagates exactly the chunk-loss margin gradient.
+            positive_sum = positive_sum + (
+                (positive_boundary - probabilities).clamp_min(0.0).square()
+                * positive_mask
+            ).sum().detach()
+            negative_sum = negative_sum + (
+                (probabilities - negative_boundary).clamp_min(0.0).square()
+                * negative_mask
+            ).sum().detach()
+            chunk_loss = logits.new_zeros(())
+            chunk_loss = chunk_loss + (
+                float(self.training_config.threshold_positive_margin_weight)
+                * (
+                    (positive_boundary - probabilities).clamp_min(0.0).square()
+                    * positive_mask
+                ).sum()
+                / safe_positive_count
+            ) * has_positive
+            chunk_loss = chunk_loss + (
+                float(self.training_config.threshold_negative_margin_weight)
+                * (
+                    (probabilities - negative_boundary).clamp_min(0.0).square()
+                    * negative_mask
+                ).sum()
+                / safe_negative_count
+            ) * has_negative
+            # Every coordinate chunk has its own decoder graph, but all chunks
+            # share the upstream latent graph. Accumulate the per-chunk margin
+            # loss in-graph and run one backward after the loop so a single
+            # autograd walk replaces the former 54 per-chunk backwards.
+            total_chunk_loss = total_chunk_loss + chunk_loss
+        (scale * total_chunk_loss).backward()
+        positive_loss = (positive_sum / safe_positive_count) * has_positive
+        negative_loss = (negative_sum / safe_negative_count) * has_negative
+        detached_loss = scale * (
+            float(self.training_config.threshold_positive_margin_weight)
+            * positive_loss
+            + float(self.training_config.threshold_negative_margin_weight)
+            * negative_loss
+        )
+        return detached_loss.detach()
+
+    def train_epoch(
+        self,
+        train_loader: DataLoader,
+        grid_size: int = 32,
+        *,
+        start_batch: int = 0,
+    ) -> Dict[str, float]:
         """Train for one epoch with all optimizations"""
         self.diffusion_model.train()
         self.converter.train()
         self.consistency_model.student_model.train()
+        self.last_threshold_margin_components = {}
 
         total_optimization_loss = 0.0
         total_mse = 0.0
@@ -4576,7 +6938,7 @@ class OptimizedDiffusionTrainer:
         total_consistency = 0.0
         total_latent_reconstruction = 0.0
         total_denoising_geometry_confidence = 0.0
-        total_diffusion_timestep = 0.0
+        total_diffusion_timestep = torch.zeros((), device=self.device)
         total_direct_solver = 0.0
         total_direct_solver_eval = 0.0
         total_direct_occupancy = 0.0
@@ -4605,13 +6967,58 @@ class OptimizedDiffusionTrainer:
         total_student_direct_gradient_applied = 0.0
         direct_solver_eval_count = 0
         direct_solver_call_count = 0
+        interrupted_early = False
         student_parameters = tuple(
             self.consistency_model.student_model.parameters()
         )
+        optimizer_parameters = tuple(
+            parameter
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        )
+        optimizer_group_indices = {}
+        parameter_index = 0
+        for group in self.optimizer.param_groups:
+            name = str(group.get("name", "unnamed"))
+            count = len(group["params"])
+            optimizer_group_indices[name] = tuple(
+                range(parameter_index, parameter_index + count)
+            )
+            parameter_index += count
+        converter_parameter_indices = frozenset(
+            optimizer_group_indices.get("coordinate_converter", ())
+        )
 
-        pbar = tqdm(train_loader, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
+        def converter_gradient_norm(
+            gradients: Sequence[Optional[torch.Tensor]],
+            *,
+            branch_name: str,
+        ) -> float:
+            return gradient_l2_norm(
+                tuple(
+                    gradients[index]
+                    for index in sorted(converter_parameter_indices)
+                ),
+                branch_name=f"{branch_name}_converter",
+            )
+
+        def without_converter_gradients(
+            gradients: Sequence[Optional[torch.Tensor]],
+        ) -> Tuple[Optional[torch.Tensor], ...]:
+            return tuple(
+                None if index in converter_parameter_indices else gradient
+                for index, gradient in enumerate(gradients)
+            )
+
+        start_batch = max(0, int(start_batch))
+        processed_updates = 0
+        loader_iterator = iter_loader_without_rng_advance(train_loader)
+        pbar = tqdm(loader_iterator, desc=f"Training with optimizations (grid={grid_size}x{grid_size}x{grid_size})")
 
         for batch_idx, batch in enumerate(pbar):
+            if batch_idx < start_batch:
+                continue
+            processed_updates += 1
             batch = transfer_training_batch_to_device(
                 batch,
                 self.device,
@@ -4621,8 +7028,6 @@ class OptimizedDiffusionTrainer:
             geometry_target = batch['geometry']
             condition = batch.get('condition_vector')
             design_spec = batch.get('design_spec', DesignSpec(target_speed=50.0))
-            if isinstance(design_spec, list):
-                design_spec = design_spec[0]
 
             # Resize geometry to current grid size
             if grid_size != geometry_target.shape[1]:
@@ -4646,7 +7051,7 @@ class OptimizedDiffusionTrainer:
                 device=self.device,
                 mode=self.training_config.timestep_sampling,
             )
-            total_diffusion_timestep += float(t.float().mean().item())
+            total_diffusion_timestep = total_diffusion_timestep + t.float().mean()
 
             # Forward diffusion
             noise = torch.randn_like(latent)
@@ -4686,7 +7091,6 @@ class OptimizedDiffusionTrainer:
             mse_loss_val = self.mse_loss(pred_noise, noise).nan_to_num(0.0)
             direct_solver_field = None
             direct_initial_noise = None
-            direct_free_running_latent = None
             run_optimizer_grid_loss = (
                 float(self.training_config.direct_solver_loss_weight) > 0.0
                 and batch_idx
@@ -4695,15 +7099,6 @@ class OptimizedDiffusionTrainer:
             )
             if run_optimizer_grid_loss:
                 direct_initial_noise = torch.randn_like(latent)
-                with torch.no_grad():
-                    direct_free_running_latent = (
-                        self.consistency_model.fast_inference(
-                            latent.shape,
-                            num_steps=self.diffusion_config.student_steps,
-                            condition=condition,
-                            initial_noise=direct_initial_noise,
-                        ).nan_to_num(0.0)
-                    )
 
             if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
                 flat_target = geometry_target.reshape(geometry_target.shape[0], -1)
@@ -4752,14 +7147,16 @@ class OptimizedDiffusionTrainer:
                 target_sample = flat_target.index_select(1, flat_indices)
                 population_positive_counts = flat_target.sum(dim=1)
                 population_negative_counts = total_voxels - population_positive_counts
-                clean_geom_logits_sample = self.converter.forward_flat_indices(
-                    latent,
+                latent_stacked = torch.cat((latent, x0_pred, generation_latent), dim=0)
+                stacked = self.converter.forward_flat_indices(
+                    latent_stacked,
                     flat_indices,
                 ).nan_to_num(0.0)
-                geom_logits_sample = self.converter.forward_flat_indices(
-                    x0_pred,
-                    flat_indices,
-                ).nan_to_num(0.0)
+                (
+                    clean_geom_logits_sample,
+                    geom_logits_sample,
+                    generation_geom_logits_sample,
+                ) = torch.chunk(stacked, 3, dim=0)
                 clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     clean_geom_logits_sample,
                     target_sample,
@@ -4774,10 +7171,6 @@ class OptimizedDiffusionTrainer:
                     population_positive_counts=population_positive_counts,
                     population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
-                generation_geom_logits_sample = self.converter.forward_flat_indices(
-                    generation_latent,
-                    flat_indices,
-                ).nan_to_num(0.0)
                 generation_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     generation_geom_logits_sample,
                     target_sample,
@@ -4786,19 +7179,43 @@ class OptimizedDiffusionTrainer:
                     population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
                 if run_optimizer_grid_loss:
-                    with torch.no_grad():
-                        direct_solver_field = self.converter(
-                            direct_free_running_latent
-                        ).nan_to_num(0.0)
+                    # Build the replay inference path once, in grad mode, BEFORE
+                    # the SPSA solves. Its decode graph (checkpointed; ~small
+                    # metadata + the 0.95 MB consistency graph) serves BOTH the
+                    # detached SPSA base and the optimizer backward, so the old
+                    # redundant no_grad decode is gone entirely. Values are
+                    # bit-identical to the previous separate no_grad decode
+                    # (same noise, model, steps, no optimizer step between).
+                    direct_generation_latent = self.consistency_model.fast_inference(
+                        latent.shape,
+                        num_steps=self.diffusion_config.student_steps,
+                        condition=condition,
+                        initial_noise=direct_initial_noise.detach(),
+                    ).nan_to_num(0.0)
+                    direct_solver_field = self.converter(
+                        direct_generation_latent
+                    ).nan_to_num(0.0)
             else:
                 clean_geom_logits = self.converter(latent).nan_to_num(0.0)
                 generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
                 geom_logits = self.converter(x0_pred).nan_to_num(0.0)
                 if run_optimizer_grid_loss:
-                    with torch.no_grad():
-                        direct_solver_field = self.converter(
-                            direct_free_running_latent
-                        ).nan_to_num(0.0)
+                    # Build the replay inference path once, in grad mode, BEFORE
+                    # the SPSA solves. Its decode graph (checkpointed; ~small
+                    # metadata + the 0.95 MB consistency graph) serves BOTH the
+                    # detached SPSA base and the optimizer backward, so the old
+                    # redundant no_grad decode is gone entirely. Values are
+                    # bit-identical to the previous separate no_grad decode
+                    # (same noise, model, steps, no optimizer step between).
+                    direct_generation_latent = self.consistency_model.fast_inference(
+                        latent.shape,
+                        num_steps=self.diffusion_config.student_steps,
+                        condition=condition,
+                        initial_noise=direct_initial_noise.detach(),
+                    ).nan_to_num(0.0)
+                    direct_solver_field = self.converter(
+                        direct_generation_latent
+                    ).nan_to_num(0.0)
                 clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     clean_geom_logits.float(),
                     geometry_target.float(),
@@ -4814,7 +7231,6 @@ class OptimizedDiffusionTrainer:
                     geometry_target.float(),
                     dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
-
             direct_solver_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_evaluated = False
             run_direct_solver_loss = (
@@ -4856,22 +7272,63 @@ class OptimizedDiffusionTrainer:
             # Backpropagate independent student branches sequentially. The
             # branch combiner limits only extreme gradients and never amplifies
             # a small finite contribution.
-            self.optimizer.zero_grad()
-            data_optimization_loss_val.backward()
-            student_data_gradients = capture_gradients(student_parameters)
-            clear_gradients(student_parameters)
+            clear_gradients(optimizer_parameters)
+            data_optimization_loss_val.backward(
+                retain_graph=bool(self.geometry_threshold_calibrated)
+            )
+            ordinary_data_gradients = capture_gradients(optimizer_parameters)
+            exact_generation_margin_loss_val = (
+                self._backward_full_grounded_threshold_margin(
+                    generation_latent,
+                    geometry_target,
+                    loss_scale=float(
+                        self.training_config.generation_reconstruction_weight
+                    ),
+                )
+                if self.geometry_threshold_calibrated
+                else data_optimization_loss_val.detach().new_zeros(())
+            )
+            data_optimization_loss_val = (
+                data_optimization_loss_val.detach()
+                + exact_generation_margin_loss_val
+            )
+            generation_weight = float(
+                self.training_config.generation_reconstruction_weight
+            )
+            if generation_weight != 0.0:
+                generation_geometry_loss_val = (
+                    generation_geometry_loss_val.detach()
+                    + exact_generation_margin_loss_val / generation_weight
+                )
+            data_gradients = capture_data_anchor_gradients(optimizer_parameters)
+            margin_gradient_delta = tuple(
+                None
+                if after is None and before is None
+                else (
+                    after.detach().clone()
+                    if before is None
+                    else (
+                        before.detach().clone().mul(-1.0)
+                        if after is None
+                        else after.detach() - before.detach()
+                    )
+                )
+                for before, after in zip(ordinary_data_gradients, data_gradients)
+            )
 
+            clear_gradients(optimizer_parameters)
             if consistency_loss.requires_grad:
                 consistency_loss.backward()
-                student_consistency_gradients = capture_gradients(
-                    student_parameters
-                )
+                consistency_gradients = capture_gradients(optimizer_parameters)
             else:
-                student_consistency_gradients = tuple(
-                    None for _ in student_parameters
+                consistency_gradients = tuple(
+                    None for _ in optimizer_parameters
                 )
-            clear_gradients(student_parameters)
-            student_direct_gradients = tuple(None for _ in student_parameters)
+            clear_gradients(optimizer_parameters)
+            direct_gradients = tuple(None for _ in optimizer_parameters)
+            topology_guard_gradients: Dict[
+                str, Tuple[Optional[torch.Tensor], ...]
+            ] = {}
             optimization_loss_val = (
                 data_optimization_loss_val.detach() + consistency_loss.detach()
             )
@@ -4894,6 +7351,11 @@ class OptimizedDiffusionTrainer:
                 direct_logit_gradient = direct_logit_gradient.detach()
                 direct_solver_loss_val = measured_direct_loss.detach()
                 del measured_direct_loss, direct_logit_leaf
+                parameter_guard_logit_gradients = (
+                    self.direct_solver_loss.last_components.pop(
+                        "_accepted_guard_gradients", {}
+                    )
+                )
 
                 # Replay the exact free-running inference path after CFD. This
                 # applies the measured SPSA gradient to the model used at
@@ -4902,23 +7364,112 @@ class OptimizedDiffusionTrainer:
                     raise RuntimeError(
                         "Direct solver inference replay is missing initial noise"
                     )
-                direct_generation_latent = self.consistency_model.fast_inference(
-                    latent.shape,
-                    num_steps=self.diffusion_config.student_steps,
-                    condition=condition,
-                    initial_noise=direct_initial_noise.detach(),
-                ).nan_to_num(0.0)
-                direct_optimizer_logits = self.converter(
-                    direct_generation_latent
-                ).nan_to_num(0.0)
-                direct_optimizer_logits.backward(
-                    gradient=(
-                        float(self.training_config.direct_solver_loss_weight)
-                        * direct_logit_gradient
+                # Reuse the grad-mode decode built before the SPSA solves. The
+                # SPSA base (`direct_logit_snapshot`) is this tensor's detached
+                # copy, so the same decode serves both the black-box solver and
+                # the optimizer backward. No redundant second decode.
+                direct_optimizer_logits = direct_solver_field
+                direct_weight = float(
+                    self.training_config.direct_solver_loss_weight
+                )
+                active_guard_names = tuple(
+                    str(name)
+                    for name in self.direct_solver_loss.last_components.get(
+                        "active_guard_names", []
                     )
                 )
-                student_direct_gradients = capture_gradients(student_parameters)
-                clear_gradients(student_parameters)
+                topology_guard_names = {
+                    "connectivity_loss": "connectivity",
+                    "aircraft_validity_loss": "validity",
+                }
+                for source_name, guard_name in topology_guard_names.items():
+                    if source_name not in active_guard_names:
+                        continue
+                    guard_logit_gradient = parameter_guard_logit_gradients.get(
+                        source_name
+                    )
+                    if guard_logit_gradient is None:
+                        continue
+                    if any(parameter.grad is not None for parameter in optimizer_parameters):
+                        raise RuntimeError(
+                            "topology guard replay started with stale optimizer gradients"
+                        )
+                    # C=2 guard walk: walk only the two coordinate-decoder
+                    # chunks with the largest guard-gradient L2 instead of all
+                    # 54. The main decode graph is untouched (the optimizer
+                    # backward below still walks every chunk), so this walk
+                    # recomputes+VJPs 2/54 chunks -- measured ~0.99 param-space
+                    # cosine vs the exact direction (C=1 0.979, C=3 0.993, C=2
+                    # interpolates between). Rows outside the two chunks
+                    # contribute exactly zero to the walk, which is the
+                    # approximation: the replay-side projection rejects with
+                    # 98%+ of the exact rejection, and it has never fired in
+                    # measured updates anyway (cosine +0.40 -> +0.17, toward
+                    # orthogonal).
+                    chunk_rows = self.converter._effective_coordinate_chunk_size(
+                        guard_logit_gradient.device
+                    )
+                    flat_guard = guard_logit_gradient.detach().reshape(-1)
+                    if (
+                        chunk_rows > 0
+                        and flat_guard.numel() % chunk_rows == 0
+                        and flat_guard.numel() // chunk_rows >= 2
+                    ):
+                        # The field tiles exactly into chunk_rows chunks with at
+                        # least two of them (production grids: 96^3 = 54 x 16384
+                        # on GPU / 108 x 8192 on CPU). Walk the top-2 chunks.
+                        chunk_l2 = (flat_guard * flat_guard).view(
+                            -1, chunk_rows
+                        ).sum(dim=1)
+                        selected_chunks = sorted(
+                            torch.topk(chunk_l2, 2, sorted=False).indices.tolist()
+                        )
+                        walk_field = self.converter.forward_voxel_mask(
+                            direct_generation_latent,
+                            selected_chunks=selected_chunks,
+                        )
+                        walk_guard_grad = flat_guard.view(-1, chunk_rows)[
+                            selected_chunks
+                        ].reshape(1, -1)
+                        walk_field.backward(
+                            gradient=direct_weight * walk_guard_grad,
+                            retain_graph=True,
+                        )
+                    else:
+                        # The field does not tile into chunk_rows chunks (unit
+                        # tests drive tiny grids, e.g. batch 2 x 4^3 = 128
+                        # elements < 8192). Fall back to the exact full walk of
+                        # the main decode graph -- the pre-C=2 behavior the
+                        # unit-test expectations are written against.
+                        direct_optimizer_logits.backward(
+                            gradient=direct_weight * guard_logit_gradient,
+                            retain_graph=True,
+                        )
+                    topology_guard_gradients[guard_name] = capture_gradients(
+                        optimizer_parameters
+                    )
+                    clear_gradients(optimizer_parameters)
+                    if any(parameter.grad is not None for parameter in optimizer_parameters):
+                        raise RuntimeError(
+                            "topology guard replay left optimizer gradients behind"
+                        )
+                if any(parameter.grad is not None for parameter in optimizer_parameters):
+                    raise RuntimeError("direct replay started with stale optimizer gradients")
+                # The occupancy component is no longer probed by SPSA. Instead
+                # add its deterministic analytic gradient (mean-probability
+                # desaturation + soft threshold-anchored surrogate) so the
+                # occupancy signal is smooth and coherent instead of flip-noise.
+                analytic_occupancy_gradient = self._analytic_occupancy_logit_gradient(
+                    direct_optimizer_logits.detach(),
+                    reference_occupancy,
+                    design_spec,
+                )
+                direct_optimizer_logits.backward(
+                    gradient=direct_weight
+                    * (direct_logit_gradient + analytic_occupancy_gradient)
+                )
+                direct_gradients = capture_gradients(optimizer_parameters)
+                clear_gradients(optimizer_parameters)
                 direct_solver_evaluated = True
                 direct_solver_call_count += int(latent.shape[0]) * (
                     1 + 2 * int(self.training_config.direct_solver_directions)
@@ -4928,11 +7479,45 @@ class OptimizedDiffusionTrainer:
                     + float(self.training_config.direct_solver_loss_weight)
                     * direct_solver_loss_val
                 )
+            generated_path_gradients = {
+                "data": data_gradients,
+                "consistency": consistency_gradients,
+                "direct": direct_gradients,
+                **topology_guard_gradients,
+            }
+            generated_path_converter_norms_before_freeze = {
+                name: converter_gradient_norm(
+                    gradients,
+                    branch_name=f"generated_{name}_before_freeze",
+                )
+                for name, gradients in generated_path_gradients.items()
+            }
             if self.training_config.freeze_decoder_for_generated_paths:
-                # Optional ablation: discard generated-path converter gradients
-                # while preserving their upstream denoiser gradients.
-                for parameter in self.converter.parameters():
-                    parameter.grad = None
+                # Captured branches, not live .grad fields, are restored below.
+                # Strip generated-path converter entries before adding the
+                # separate clean grounded decoder gradient.
+                data_gradients = without_converter_gradients(data_gradients)
+                consistency_gradients = without_converter_gradients(
+                    consistency_gradients
+                )
+                direct_gradients = without_converter_gradients(direct_gradients)
+                topology_guard_gradients = {
+                    name: without_converter_gradients(gradients)
+                    for name, gradients in topology_guard_gradients.items()
+                }
+            generated_path_gradients = {
+                "data": data_gradients,
+                "consistency": consistency_gradients,
+                "direct": direct_gradients,
+                **topology_guard_gradients,
+            }
+            generated_path_converter_norms_after_freeze = {
+                name: converter_gradient_norm(
+                    gradients,
+                    branch_name=f"generated_{name}_after_freeze",
+                )
+                for name, gradients in generated_path_gradients.items()
+            }
             # Always add an exact grounded full-lattice decoder gradient. The
             # generated and CFD graphs have already been released, so this is
             # sequential without dropping any loss contribution.
@@ -4948,18 +7533,49 @@ class OptimizedDiffusionTrainer:
                     geometry_target.float(),
                     dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
+                if self.geometry_threshold_calibrated:
+                    margin_components = grounded_threshold_margin_loss(
+                        torch.sigmoid(grounded_full_logits.float()),
+                        geometry_target.float(),
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        return_components=True,
+                    )
+                    grounded_full_loss = grounded_full_loss + margin_components["loss"]
+                    self.last_threshold_margin_components = {
+                        key: (
+                            float(value.detach().item())
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                        for key, value in margin_components.items()
+                        if key != "loss"
+                    }
                 (
                     self.training_config.clean_geometry_reconstruction_weight
                     * grounded_full_loss
                 ).backward()
             clean_geometry_loss_val = grounded_full_loss.detach()
+            clean_data_gradients = capture_gradients(optimizer_parameters)
+            clear_gradients(optimizer_parameters)
+            clean_grounded_converter_gradient_norm = converter_gradient_norm(
+                clean_data_gradients,
+                branch_name="clean_grounded",
+            )
+            data_gradients = add_gradient_buffers(
+                data_gradients,
+                clean_data_gradients,
+            )
 
             branch_telemetry = combine_gradient_branches(
-                student_parameters,
+                optimizer_parameters,
                 {
-                    "data": student_data_gradients,
-                    "consistency": student_consistency_gradients,
-                    "direct": student_direct_gradients,
+                    "data": data_gradients,
+                    "consistency": consistency_gradients,
+                    "direct": direct_gradients,
                 },
                 {
                     "data": float(
@@ -4982,23 +7598,58 @@ class OptimizedDiffusionTrainer:
                     if self.training_config.project_conflicting_direct_gradient
                     else ()
                 ),
+                final_guard_branches={
+                    "data": data_gradients,
+                    **topology_guard_gradients,
+                },
             )
+            self.last_gradient_lifecycle = {
+                "replayed_guard_names": list(topology_guard_gradients),
+                "replay_isolated": True,
+                "active_guard_gradients": {
+                    "data": data_gradients,
+                    **topology_guard_gradients,
+                },
+                "data_group_norms": {
+                    name: gradient_l2_norm(
+                        tuple(data_gradients[index] for index in indices),
+                        branch_name=f"data_{name}",
+                    )
+                    for name, indices in optimizer_group_indices.items()
+                },
+                "data_margin_gradient_norm": gradient_l2_norm(
+                    margin_gradient_delta,
+                    branch_name="exact_threshold_margin",
+                ),
+                "exact_margin_loss": float(
+                    exact_generation_margin_loss_val.detach().item()
+                ),
+                "clean_grounded_converter_gradient_norm": (
+                    clean_grounded_converter_gradient_norm
+                ),
+                "generated_path_converter_gradient_norms_before_freeze": (
+                    generated_path_converter_norms_before_freeze
+                ),
+                "generated_path_converter_gradient_norms_after_freeze": (
+                    generated_path_converter_norms_after_freeze
+                ),
+            }
             student_gradient_cosines = {
                 "data_consistency": gradient_cosine_similarity(
-                    student_data_gradients,
-                    student_consistency_gradients,
+                    data_gradients,
+                    consistency_gradients,
                     first_name="data",
                     second_name="consistency",
                 ),
                 "data_direct": gradient_cosine_similarity(
-                    student_data_gradients,
-                    student_direct_gradients,
+                    data_gradients,
+                    direct_gradients,
                     first_name="data",
                     second_name="direct",
                 ),
                 "consistency_direct": gradient_cosine_similarity(
-                    student_consistency_gradients,
-                    student_direct_gradients,
+                    consistency_gradients,
+                    direct_gradients,
                     first_name="consistency",
                     second_name="direct",
                 ),
@@ -5008,6 +7659,93 @@ class OptimizedDiffusionTrainer:
             torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), self.training_config.gradient_clip)
             torch.nn.utils.clip_grad_norm_(self.converter.parameters(), self.training_config.gradient_clip)
             torch.nn.utils.clip_grad_norm_(self.consistency_model.student_model.parameters(), self.training_config.gradient_clip)
+            clipped_gradients = capture_gradients(optimizer_parameters)
+            accepted_step_gradients, _ = project_improvement_gradients_against_guards(
+                {"step": clipped_gradients},
+                self.last_gradient_lifecycle["active_guard_gradients"],
+                guard_order=("data", "connectivity", "validity"),
+            )
+            for parameter, gradient in zip(
+                optimizer_parameters,
+                accepted_step_gradients["step"],
+            ):
+                parameter.grad = gradient
+            step_gradients = capture_gradients(optimizer_parameters)
+            # Final guard-dot sign check: the update must not be uphill on any
+            # active guard. Each dot is fp64 over the flattened concatenations
+            # (same tensors, same order). With _BATCH_GUARD_DOT_READS all dots
+            # are computed GPU-side and read back in ONE deferred .tolist();
+            # the values are bit-identical to the per-guard .item() path -- only
+            # the number of GPU->CPU syncs changes.
+
+            def _guard_dot(aligned_pairs):
+                # Convert to fp64 AFTER the concatenation, not per-tensor: every
+                # fp32 value is exactly representable in fp64, so
+                # cat([... .double() ...]) and cat([...]).double() are bit-identical,
+                # but the former issues one fp64 copy kernel per gradient tensor
+                # (~24k launches on the full model) while the latter issues ONE
+                # conversion per guard. detach/reshape preserve values and logical
+                # order, so the resulting fp64 dot is byte-for-byte the same.
+                return torch.dot(
+                    torch.cat(
+                        [
+                            update_gradient.detach().reshape(-1)
+                            for update_gradient, _ in aligned_pairs
+                        ]
+                    ).double(),
+                    torch.cat(
+                        [
+                            guard_gradient.detach().reshape(-1)
+                            for guard_gradient, _ in aligned_pairs
+                        ]
+                    ).double(),
+                )
+
+            guard_aligned_pairs = {
+                guard_name: [
+                    (update_gradient, guard_gradient)
+                    for update_gradient, guard_gradient in zip(
+                        step_gradients,
+                        guard_gradients,
+                    )
+                    if update_gradient is not None and guard_gradient is not None
+                ]
+                for guard_name, guard_gradients in self.last_gradient_lifecycle[
+                    "active_guard_gradients"
+                ].items()
+            }
+            if _BATCH_GUARD_DOT_READS:
+                guard_dot_tensors = {
+                    guard_name: _guard_dot(pairs)
+                    for guard_name, pairs in guard_aligned_pairs.items()
+                    if pairs
+                }
+                guard_dot_values = (
+                    dict(
+                        zip(
+                            guard_dot_tensors.keys(),
+                            torch.stack(list(guard_dot_tensors.values())).tolist(),
+                        )
+                    )
+                    if guard_dot_tensors
+                    else {}
+                )
+                for guard_name, _pairs in guard_aligned_pairs.items():
+                    guard_dot = guard_dot_values.get(guard_name, 0.0)
+                    if guard_dot < -1.0e-8:
+                        raise RuntimeError(
+                            f"final optimizer gradient is uphill on active {guard_name} guard: "
+                            f"dot={guard_dot:.6g}"
+                        )
+            else:
+                for guard_name, pairs in guard_aligned_pairs.items():
+                    guard_dot = float(_guard_dot(pairs).item()) if pairs else 0.0
+                    if guard_dot < -1.0e-8:
+                        raise RuntimeError(
+                            f"final optimizer gradient is uphill on active {guard_name} guard: "
+                            f"dot={guard_dot:.6g}"
+                        )
+            self.last_gradient_lifecycle["step_gradients"] = step_gradients
 
             # Optimizer step
             if self.training_config.offload_optimizer_state_between_steps:
@@ -5021,13 +7759,41 @@ class OptimizedDiffusionTrainer:
             # EMA update
             self._update_ema()
 
-            # Logging
-            total_optimization_loss += optimization_loss_val.item()
-            total_mse += mse_loss_val.item()
-            total_clean_geometry += clean_geometry_loss_val.item()
-            total_geometry += geometry_loss_val.item()
-            total_generation_geometry += generation_geometry_loss_val.item()
-            total_consistency += consistency_loss.item()
+            # Logging — read each loss exactly once (GPU->CPU) and reuse the
+            # floats in the totals, the progress postfix, and the metrics
+            # callback. A single stacked .tolist() (one sync) replaces nine
+            # separate .item() calls; each fp32 element converts to a Python
+            # float with exactly the same fp32->float conversion as .item().
+            # The loss tensors are untouched and still feed the optimization
+            # objective.
+            (
+                optimization_loss_float,
+                mse_loss_float,
+                clean_geometry_loss_float,
+                geometry_loss_float,
+                generation_geometry_loss_float,
+                consistency_float,
+                latent_reconstruction_float,
+                denoising_confidence_float,
+                direct_solver_float,
+            ) = torch.stack([
+                optimization_loss_val.detach(),
+                mse_loss_val.detach(),
+                clean_geometry_loss_val.detach(),
+                geometry_loss_val.detach(),
+                generation_geometry_loss_val.detach(),
+                consistency_loss.detach(),
+                latent_reconstruction_loss_val.detach(),
+                denoising_geometry_confidence.detach(),
+                direct_solver_loss_val.detach(),
+            ]).tolist()
+
+            total_optimization_loss += optimization_loss_float
+            total_mse += mse_loss_float
+            total_clean_geometry += clean_geometry_loss_float
+            total_geometry += geometry_loss_float
+            total_generation_geometry += generation_geometry_loss_float
+            total_consistency += consistency_float
             data_gradient_metrics = branch_telemetry["data"]
             consistency_gradient_metrics = branch_telemetry["consistency"]
             direct_gradient_metrics = branch_telemetry["direct"]
@@ -5054,11 +7820,11 @@ class OptimizedDiffusionTrainer:
                 total_consistency_student_rms += float(
                     self.last_consistency_metrics.get("student_rms", 0.0)
                 )
-            total_latent_reconstruction += latent_reconstruction_loss_val.item()
-            total_denoising_geometry_confidence += denoising_geometry_confidence.item()
-            total_direct_solver += direct_solver_loss_val.item()
+            total_latent_reconstruction += latent_reconstruction_float
+            total_denoising_geometry_confidence += denoising_confidence_float
+            total_direct_solver += direct_solver_float
             if direct_solver_evaluated:
-                total_direct_solver_eval += direct_solver_loss_val.item()
+                total_direct_solver_eval += direct_solver_float
                 components = self.direct_solver_loss.last_components
                 total_direct_occupancy += float(
                     components.get("occupancy_loss", 0.0)
@@ -5105,20 +7871,21 @@ class OptimizedDiffusionTrainer:
                 )
                 direct_solver_eval_count += 1
 
-            pbar.set_postfix({
-                'opt_loss': optimization_loss_val.item(),
-                'mse': mse_loss_val.item(),
-                'clean_geom': clean_geometry_loss_val.item(),
-                'geom': geometry_loss_val.item(),
-                'gen_geom': generation_geometry_loss_val.item(),
-                'consistency': consistency_loss.item(),
-                'latent_recon': latent_reconstruction_loss_val.item(),
-                'direct_solver': direct_solver_loss_val.item(),
-                'denoise_conf': denoising_geometry_confidence.item(),
-                'grad_data': data_gradient_metrics.applied_norm,
-                'grad_cons': consistency_gradient_metrics.applied_norm,
-                'grad_direct': direct_gradient_metrics.applied_norm,
-            })
+            if batch_idx % 5 == 0:
+                pbar.set_postfix({
+                    'opt_loss': optimization_loss_float,
+                    'mse': mse_loss_float,
+                    'clean_geom': clean_geometry_loss_float,
+                    'geom': geometry_loss_float,
+                    'gen_geom': generation_geometry_loss_float,
+                    'consistency': consistency_float,
+                    'latent_recon': latent_reconstruction_float,
+                    'direct_solver': direct_solver_float,
+                    'denoise_conf': denoising_confidence_float,
+                    'grad_data': data_gradient_metrics.applied_norm,
+                    'grad_cons': consistency_gradient_metrics.applied_norm,
+                    'grad_direct': direct_gradient_metrics.applied_norm,
+                })
 
             self.global_step += 1
             if self.update_metrics_callback is not None:
@@ -5127,26 +7894,56 @@ class OptimizedDiffusionTrainer:
                     if direct_solver_evaluated
                     else {}
                 )
+                # Task 10 parity-telemetry keys carry non-JSON-serializable
+                # payloads (_spsa_deltas: CUDA tensors, _probe_components:
+                # per-probe dicts) and exist only for in-process parity
+                # assertions. Drop them before the JSONL metrics callback,
+                # mirroring the _accepted_guard_gradients pop above; the sink
+                # itself still retains them for the parity test.
+                direct_components.pop("_spsa_deltas", None)
+                direct_components.pop("_probe_components", None)
                 self.update_metrics_callback(
                     {
                         "kind": "optimizer_update",
                         "global_step": int(self.global_step),
                         "completed_in_epoch": int(batch_idx + 1),
                         "total_in_epoch": int(len(train_loader)),
+                        "run_state_checkpoint_path": getattr(
+                            self, "run_state_checkpoint_path", None
+                        ),
+                        "resumed_from_update": (
+                            int(getattr(self, "resumed_from_update", 0))
+                            if start_batch > 0
+                            else None
+                        ),
+                        "remaining_in_epoch": int(len(train_loader) - batch_idx - 1),
                         "losses": {
-                            "optimization": float(optimization_loss_val.item()),
-                            "mse": float(mse_loss_val.item()),
-                            "clean_geometry": float(clean_geometry_loss_val.item()),
-                            "geometry": float(geometry_loss_val.item()),
+                            "optimization": float(optimization_loss_float),
+                            "mse": float(mse_loss_float),
+                            "clean_geometry": float(clean_geometry_loss_float),
+                            "geometry": float(geometry_loss_float),
                             "generation_geometry": float(
-                                generation_geometry_loss_val.item()
+                                generation_geometry_loss_float
                             ),
-                            "consistency": float(consistency_loss.item()),
+                            "consistency": float(consistency_float),
                             "latent_reconstruction": float(
-                                latent_reconstruction_loss_val.item()
+                                latent_reconstruction_float
                             ),
-                            "direct_solver": float(direct_solver_loss_val.item()),
+                            "direct_solver": float(direct_solver_float),
+                            "threshold_positive_margin_loss": float(
+                                self.last_threshold_margin_components.get(
+                                    "threshold_positive_margin_loss", 0.0
+                                )
+                            ),
+                            "threshold_negative_margin_loss": float(
+                                self.last_threshold_margin_components.get(
+                                    "threshold_negative_margin_loss", 0.0
+                                )
+                            ),
                         },
+                        "threshold_margin": dict(
+                            self.last_threshold_margin_components
+                        ),
                         "consistency": {
                             "evaluated": bool(consistency_loss.requires_grad),
                             **(
@@ -5203,34 +8000,76 @@ class OptimizedDiffusionTrainer:
                     }
                 )
 
-            # Clear memory
-            if batch_idx % 10 == 0:
-                torch.cuda.empty_cache()
+            if self.run_state_checkpoint_callback is not None:
+                self.run_state_checkpoint_callback(
+                    batch_idx + 1, len(train_loader), force=False
+                )
+            if (
+                self.stop_after_updates is not None
+                and self.global_step >= int(self.stop_after_updates)
+            ):
+                # Bounded interruption: force a final atomic run-state save even
+                # when this boundary is not on the checkpoint cadence, so a
+                # resumed segment sees the correct completed-in-epoch. The save
+                # is idempotent with the cadence path (same state, atomic
+                # ``.previous`` fallback).
+                if self.run_state_checkpoint_callback is not None:
+                    self.run_state_checkpoint_callback(
+                        batch_idx + 1, len(train_loader), force=True
+                    )
+                interrupted_early = True
+                break
 
-        avg_optimization_loss = total_optimization_loss / len(train_loader)
+        denominator = max(processed_updates, 1)
+        avg_optimization_loss = total_optimization_loss / denominator
 
-        # Log to tensorboard
-        self.writer.add_scalar('Loss/total', avg_optimization_loss, self.global_step)
-        self.writer.add_scalar('Loss/optimization', avg_optimization_loss, self.global_step)
-        self.writer.add_scalar('Loss/mse', total_mse / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/clean_geometry_reconstruction', total_clean_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/geometry_reconstruction', total_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/generation_reconstruction', total_generation_geometry / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/consistency', total_consistency / len(train_loader), self.global_step)
-        self.writer.add_scalar('Loss/direct_solver', total_direct_solver / len(train_loader), self.global_step)
+        # Log to tensorboard. When the async records writer is wired in by
+        # CLI/run_monitored_training.py, the two scalar batches below are
+        # enqueued so protobuf serialization runs on the writer thread, off the
+        # per-epoch CPU path. The writer expands each batch back into the same
+        # add_scalar tags/values/steps in the same order, so the event stream is
+        # identical to the synchronous path (torch's add_scalars would NOT
+        # preserve the "Loss/..." subtags, so batches are expanded per-tag).
+        _tb_unconditional = {
+            'Loss/total': avg_optimization_loss,
+            'Loss/optimization': avg_optimization_loss,
+            'Loss/mse': total_mse / denominator,
+            'Loss/clean_geometry_reconstruction': total_clean_geometry / denominator,
+            'Loss/geometry_reconstruction': total_geometry / denominator,
+            'Loss/generation_reconstruction': total_generation_geometry / denominator,
+            'Loss/consistency': total_consistency / denominator,
+            'Loss/direct_solver': total_direct_solver / denominator,
+        }
+        # _tb_direct is only built when there was a direct-solver eval this
+        # epoch -- the per-division denominators would otherwise be 0.0/0.
+        # The original synchronous block guarded all five divisions the same way.
+        _tb_direct = None
         if direct_solver_eval_count > 0:
-            self.writer.add_scalar('Loss/direct_solver_eval', total_direct_solver_eval / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_occupancy', total_direct_occupancy / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_aero', total_direct_aero / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_connectivity', total_direct_connectivity / direct_solver_eval_count, self.global_step)
-            self.writer.add_scalar('Loss/direct_aircraft_validity', total_direct_validity / direct_solver_eval_count, self.global_step)
+            _tb_direct = {
+                'Loss/direct_solver_eval': total_direct_solver_eval / direct_solver_eval_count,
+                'Loss/direct_occupancy': total_direct_occupancy / direct_solver_eval_count,
+                'Loss/direct_aero': total_direct_aero / direct_solver_eval_count,
+                'Loss/direct_connectivity': total_direct_connectivity / direct_solver_eval_count,
+                'Loss/direct_aircraft_validity': total_direct_validity / direct_solver_eval_count,
+            }
+        _records_writer = getattr(self, "records_writer", None)
+        if _records_writer is not None:
+            _records_writer.enqueue_tb_batch(int(self.global_step), _tb_unconditional)
+            if _tb_direct is not None:
+                _records_writer.enqueue_tb_batch(int(self.global_step), _tb_direct)
+        else:
+            for _tag, _value in _tb_unconditional.items():
+                self.writer.add_scalar(_tag, _value, self.global_step)
+            if _tb_direct is not None:
+                for _tag, _value in _tb_direct.items():
+                    self.writer.add_scalar(_tag, _value, self.global_step)
 
         avg_direct_solver_eval = (
             total_direct_solver_eval / direct_solver_eval_count
             if direct_solver_eval_count > 0
             else 0.0
         )
-        optimizer_iterations = len(train_loader)
+        optimizer_iterations = processed_updates
         validate_direct_solver_iteration_coverage(
             direct_solver_eval_count,
             optimizer_iterations,
@@ -5240,11 +8079,11 @@ class OptimizedDiffusionTrainer:
         return {
             'loss': avg_optimization_loss,
             'optimization_loss': avg_optimization_loss,
-            'mse': total_mse / len(train_loader),
-            'clean_geometry_reconstruction': total_clean_geometry / len(train_loader),
-            'geometry_reconstruction': total_geometry / len(train_loader),
-            'generation_reconstruction': total_generation_geometry / len(train_loader),
-            'consistency': total_consistency / len(train_loader),
+            'mse': total_mse / denominator,
+            'clean_geometry_reconstruction': total_clean_geometry / denominator,
+            'geometry_reconstruction': total_geometry / denominator,
+            'generation_reconstruction': total_generation_geometry / denominator,
+            'consistency': total_consistency / denominator,
             'consistency_raw_mse': (
                 total_consistency_raw_mse / max(consistency_eval_count, 1)
             ),
@@ -5256,10 +8095,10 @@ class OptimizedDiffusionTrainer:
             ),
             'consistency_eval_count': consistency_eval_count,
             'student_data_gradient_norm_raw': (
-                total_student_data_gradient_raw / len(train_loader)
+                total_student_data_gradient_raw / denominator
             ),
             'student_data_gradient_norm_applied': (
-                total_student_data_gradient_applied / len(train_loader)
+                total_student_data_gradient_applied / denominator
             ),
             'student_consistency_gradient_norm_raw': (
                 total_student_consistency_gradient_raw
@@ -5276,12 +8115,12 @@ class OptimizedDiffusionTrainer:
                 total_student_direct_gradient_applied
                 / max(direct_solver_eval_count, 1)
             ),
-            'latent_reconstruction': total_latent_reconstruction / len(train_loader),
+            'latent_reconstruction': total_latent_reconstruction / denominator,
             'denoising_geometry_confidence': (
-                total_denoising_geometry_confidence / len(train_loader)
+                total_denoising_geometry_confidence / denominator
             ),
-            'diffusion_timestep': total_diffusion_timestep / len(train_loader),
-            'direct_solver_loss': total_direct_solver / len(train_loader),
+            'diffusion_timestep': float(total_diffusion_timestep.item() / denominator),
+            'direct_solver_loss': total_direct_solver / denominator,
             'direct_solver_eval_loss': avg_direct_solver_eval,
             'direct_solver_eval_count': direct_solver_eval_count,
             'direct_solver_call_count': direct_solver_call_count,
@@ -5731,7 +8570,15 @@ class OptimizedDiffusionTrainer:
             checkpoint_path.suffix + ".tmp"
         )
         try:
-            torch.save(checkpoint, str(temporary_path))
+            with temporary_path.open("wb") as handle:
+                torch.save(checkpoint, handle)
+                handle.flush()
+                # R10 (PR 41 review, item 10): fsync the temp before the atomic
+                # replace so a crash right after replace cannot leave a torn
+                # checkpoint on disk (the temp would otherwise sit only in the
+                # OS page cache). fsync needs a handle with write access — a
+                # read-only handle fails on Windows (OSError 9).
+                os.fsync(handle.fileno())
             os.replace(temporary_path, checkpoint_path)
         except Exception:
             temporary_path.unlink(missing_ok=True)
@@ -5740,7 +8587,11 @@ class OptimizedDiffusionTrainer:
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = _load_checkpoint_metadata(
+            path,
+            map_location=self.device,
+            authorized_paths=(path,),
+        )
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
         self.converter.load_state_dict(checkpoint['converter'])
@@ -5815,7 +8666,11 @@ class OptimizedDiffusionTrainer:
 
     def warm_start_checkpoint(self, path: str) -> Dict[str, Any]:
         """Warm-start a widened decoder while preserving compatible learned models."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = _load_checkpoint_metadata(
+            path,
+            map_location=self.device,
+            authorized_paths=(Path(path).resolve(),),
+        )
         self.diffusion_model.load_state_dict(checkpoint["diffusion_model"])
         self.consistency_model.load_state_dict(checkpoint["consistency_model"])
         converter_report = load_width_expanded_state_dict(
@@ -5863,7 +8718,11 @@ class OptimizedAircraftGenerator:
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = _load_checkpoint_metadata(
+            checkpoint_path,
+            map_location=self.device,
+            authorized_paths=(checkpoint_path,),
+        )
 
         self.model_config = ModelConfig(**checkpoint['model_config'])
         self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
@@ -5898,6 +8757,7 @@ class OptimizedAircraftGenerator:
             coordinate_decoder_depth=self.model_config.coordinate_decoder_depth,
             coordinate_fourier_bands=self.model_config.coordinate_fourier_bands,
             enable_coordinate_gradient_checkpointing=False,
+            enable_decoder_compile=self.model_config.compile_converter_decoder,
         ).to(self.device)
 
         # Load consistency model
@@ -6782,7 +9642,11 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     # Load checkpoint if resuming
     model_config_override = None
     if resume_from:
-        checkpoint = torch.load(resume_from, map_location=device)
+        checkpoint = _load_checkpoint_metadata(
+            resume_from,
+            map_location=device,
+            authorized_paths=(resume_from,),
+        )
         model_config_override = ModelConfig(**checkpoint['model_config'])
         print(f"Loaded model config from checkpoint: latent_dim={model_config_override.latent_dim}")
 

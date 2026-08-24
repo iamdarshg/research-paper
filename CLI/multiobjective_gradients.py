@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -51,7 +51,27 @@ def clear_gradients(parameters: Iterable[torch.nn.Parameter]) -> None:
         parameter.grad = None
 
 
-def _validate_gradient_tensor(
+def add_gradient_buffers(
+    first: Sequence[Optional[torch.Tensor]],
+    second: Sequence[Optional[torch.Tensor]],
+) -> GradientBuffer:
+    """Add two aligned gradient buffers without mutating either input."""
+    if len(first) != len(second):
+        raise ValueError("gradient branches must have the same buffer count")
+    result: list[Optional[torch.Tensor]] = []
+    for first_value, second_value in zip(first, second):
+        if first_value is None and second_value is None:
+            result.append(None)
+        elif first_value is None:
+            result.append(second_value.detach().clone())
+        elif second_value is None:
+            result.append(first_value.detach().clone())
+        else:
+            result.append(first_value.detach().clone() + second_value.detach())
+    return tuple(result)
+
+
+def _validate_gradient_layout(
     gradient: torch.Tensor,
     *,
     branch_name: str,
@@ -62,11 +82,6 @@ def _validate_gradient_tensor(
             f"gradient branch {branch_name!r} parameter {parameter_index} "
             f"uses unsupported layout {gradient.layout}"
         )
-    if not bool(torch.isfinite(gradient).all().item()):
-        raise NonFiniteGradientError(
-            f"gradient branch {branch_name!r} parameter {parameter_index} "
-            "contains nonfinite values"
-        )
 
 
 def gradient_l2_norm(
@@ -74,38 +89,44 @@ def gradient_l2_norm(
     *,
     branch_name: str = "<unnamed>",
 ) -> float:
-    """Return a finite L2 norm, rejecting any nonfinite gradient."""
+    """Return a finite L2 norm, rejecting any nonfinite gradient.
 
-    total_norm = 0.0
+    R3 (PR 41 review): the norm is computed from PER-TENSOR fp64 reductions
+    with no full-model fp64 flatten. Each present gradient's L2 norm is reduced
+    on GPU in fp64; the n per-tensor scalars are read to host in ONE
+    ``.tolist()`` and combined with a scale-and-square-root so
+    representable-extreme values (e.g. 1e308) stay finite. Any nonfinite
+    element makes its tensor's norm NaN/Inf, which surfaces here as the same
+    ``NonFiniteGradientError`` the old full-flatten path raised.
+    """
+
+    norm_rows: list[torch.Tensor] = []
     for parameter_index, gradient in enumerate(gradients):
         if gradient is None:
             continue
-        _validate_gradient_tensor(
+        _validate_gradient_layout(
             gradient,
             branch_name=branch_name,
             parameter_index=parameter_index,
         )
-        magnitudes = gradient.detach().abs()
-        max_magnitude = (
-            float(magnitudes.max().item()) if magnitudes.numel() else 0.0
+        # fp64 reduction on GPU; vector_norm is internally scaling-stable, so a
+        # single 1e308 element returns 1e308 (not inf from an unguarded square).
+        norm_rows.append(
+            torch.linalg.vector_norm(gradient.detach(), ord=2).to(torch.float64)
         )
-        if max_magnitude == 0.0:
-            tensor_norm = 0.0
-        else:
-            normalized_norm = float(
-                torch.linalg.vector_norm(
-                    magnitudes / max_magnitude,
-                    ord=2,
-                    dtype=torch.float64,
-                ).item()
-            )
-            tensor_norm = max_magnitude * normalized_norm
-        if not math.isfinite(tensor_norm):
-            raise NonFiniteGradientError(
-                f"gradient branch {branch_name!r} has a nonfinite L2 norm"
-            )
-        total_norm = math.hypot(total_norm, tensor_norm)
-
+    if not norm_rows:
+        return 0.0
+    # One host read (single device sync) for every per-tensor scalar.
+    norms = [float(v) for v in torch.stack(norm_rows).tolist()]
+    if any(not math.isfinite(value) for value in norms):
+        raise NonFiniteGradientError(
+            f"gradient branch {branch_name!r} contains nonfinite values"
+        )
+    peak = max(norms)
+    if peak == 0.0:
+        return 0.0
+    # Scale before squaring so per-tensor norms up to ~1.3e154 stay finite.
+    total_norm = peak * math.sqrt(sum((value / peak) ** 2.0 for value in norms))
     if not math.isfinite(total_norm):
         raise NonFiniteGradientError(
             f"gradient branch {branch_name!r} has a nonfinite L2 norm"
@@ -129,28 +150,12 @@ def gradient_cosine_similarity(
     if first_norm == 0.0 or second_norm == 0.0:
         return 0.0
 
-    dot = 0.0
-    for parameter_index, (first_gradient, second_gradient) in enumerate(
-        zip(first, second)
-    ):
-        if first_gradient is None or second_gradient is None:
-            continue
-        _validate_gradient_tensor(
-            first_gradient,
-            branch_name=first_name,
-            parameter_index=parameter_index,
-        )
-        _validate_gradient_tensor(
-            second_gradient,
-            branch_name=second_name,
-            parameter_index=parameter_index,
-        )
-        dot += float(
-            torch.sum(
-                first_gradient.detach().double()
-                * second_gradient.detach().double()
-            ).item()
-        )
+    dot = _gradient_dot_product(
+        first,
+        second,
+        first_name=first_name,
+        second_name=second_name,
+    )
     cosine = dot / (first_norm * second_norm)
     if not math.isfinite(cosine):
         raise NonFiniteGradientError("gradient cosine similarity is nonfinite")
@@ -167,28 +172,41 @@ def _gradient_dot_product(
     if len(first) != len(second):
         raise ValueError("gradient branches must have the same buffer count")
 
-    dot = 0.0
+    # R3 (PR 41 review): per-tensor fp64 dots (no full-model fp64 flatten),
+    # one host read of the n per-tensor scalars, then an exact fp64 sum.
+    dot_rows: list[torch.Tensor] = []
     for parameter_index, (first_gradient, second_gradient) in enumerate(
         zip(first, second)
     ):
         if first_gradient is None or second_gradient is None:
             continue
-        _validate_gradient_tensor(
+        _validate_gradient_layout(
             first_gradient,
             branch_name=first_name,
             parameter_index=parameter_index,
         )
-        _validate_gradient_tensor(
+        _validate_gradient_layout(
             second_gradient,
             branch_name=second_name,
             parameter_index=parameter_index,
         )
-        dot += float(
-            torch.sum(
-                first_gradient.detach().double()
-                * second_gradient.detach().double()
-            ).item()
+        dot_rows.append(
+            torch.dot(
+                first_gradient.detach().reshape(-1).to(torch.float64),
+                second_gradient.detach().reshape(-1).to(torch.float64),
+            )
         )
+    if not dot_rows:
+        return 0.0
+    # One host read (single device sync) for every per-tensor scalar.
+    dots = [float(v) for v in torch.stack(dot_rows).tolist()]
+    if any(not math.isfinite(value) for value in dots):
+        raise NonFiniteGradientError(
+            f"gradient dot product for {first_name!r} and {second_name!r} "
+            "contains nonfinite values"
+        )
+    # Exact-order fp64 sum of the per-tensor dots.
+    dot = math.fsum(dots)
     if not math.isfinite(dot):
         raise NonFiniteGradientError(
             f"gradient dot product for {first_name!r} and {second_name!r} "
@@ -271,6 +289,223 @@ def project_conflicting_gradient(
         True,
         projection_norm,
     )
+
+
+def project_improvement_gradients_against_guards(
+    improvements: Mapping[str, Sequence[Optional[torch.Tensor]]],
+    guards: Mapping[str, Sequence[Optional[torch.Tensor]]],
+    *,
+    guard_order: Sequence[str] = ("reconstruction", "connectivity", "validity"),
+    tolerance: float = 1.0e-10,
+    max_passes: int = 16,
+) -> tuple[dict[str, GradientBuffer], dict[str, dict[str, Any]]]:
+    """Project measured improvement directions into all active guard half-spaces."""
+    if tolerance < 0.0 or not math.isfinite(float(tolerance)):
+        raise ValueError("tolerance must be finite and nonnegative")
+    if int(max_passes) <= 0:
+        raise ValueError("max_passes must be greater than zero")
+    ordered_guards = tuple(
+        name for name in guard_order if name in guards
+    ) + tuple(sorted(set(guards).difference(guard_order)))
+    if not ordered_guards:
+        return {
+            name: tuple(
+                None
+                if value is None
+                else value.detach().clone(memory_format=torch.preserve_format)
+                for value in gradient
+            )
+            for name, gradient in improvements.items()
+        }, {
+            name: {
+                "pre_cosines": {},
+                "post_cosines": {},
+                "active_guard_set": [],
+                "projected": False,
+                "projection_norm": 0.0,
+                "accepted_norm": gradient_l2_norm(gradient, branch_name=name),
+            }
+            for name, gradient in improvements.items()
+        }
+
+    accepted: dict[str, GradientBuffer] = {}
+    telemetry: dict[str, dict[str, Any]] = {}
+    for name, gradient in improvements.items():
+        original_dtypes = tuple(
+            None if value is None else value.dtype for value in gradient
+        )
+        current = tuple(
+            None
+            if value is None
+            else value.detach().to(dtype=torch.float64)
+            for value in gradient
+        )
+        pre_cosines = {
+            guard_name: gradient_cosine_similarity(
+                current,
+                guards[guard_name],
+                first_name=name,
+                second_name=guard_name,
+            )
+            for guard_name in ordered_guards
+        }
+        projection_norm = 0.0
+        projected = False
+        for _ in range(int(max_passes)):
+            changed = False
+            for guard_name in ordered_guards:
+                dot = _gradient_dot_product(
+                    current,
+                    guards[guard_name],
+                    first_name=name,
+                    second_name=guard_name,
+                )
+                if dot >= -float(tolerance):
+                    continue
+                guard_norm = gradient_l2_norm(
+                    guards[guard_name], branch_name=guard_name
+                )
+                if guard_norm == 0.0:
+                    continue
+                coefficient = dot / max(guard_norm * guard_norm, 1.0e-300)
+                projected_values: list[Optional[torch.Tensor]] = []
+                for value, guard_value in zip(current, guards[guard_name]):
+                    if value is None and guard_value is None:
+                        projected_values.append(None)
+                    elif value is None:
+                        projected_values.append(
+                            guard_value.detach().to(dtype=torch.float64).mul(-coefficient)
+                        )
+                    elif guard_value is None:
+                        projected_values.append(value.detach().clone())
+                    else:
+                        projected_values.append(
+                            value.detach().clone().add(
+                                guard_value.detach().to(dtype=torch.float64),
+                                alpha=-coefficient,
+                            )
+                        )
+                current = tuple(projected_values)
+                projection_norm += abs(dot) / max(guard_norm, 1.0e-300)
+                projected = True
+                changed = True
+            if not changed:
+                break
+        accepted_current = tuple(
+            None
+            if value is None
+            else value.to(dtype=original_dtypes[index])
+            for index, value in enumerate(current)
+        )
+        projection_fallback_zero = False
+        post_cosines = {
+            guard_name: gradient_cosine_similarity(
+                accepted_current,
+                guards[guard_name],
+                first_name=name,
+                second_name=guard_name,
+            )
+            for guard_name in ordered_guards
+        }
+        for guard_name in ordered_guards:
+            # Evaluate the residual on the float64 `current` projection, NOT the
+            # float32-cast `accepted_current`. After projecting out a guard's
+            # direction the true residual is ~1e-16 (float64), but rounding the
+            # accepted gradient back to its original dtype leaves a residual dot
+            # of magnitude ~1e-7 whose sign is pure accumulation noise. Checking
+            # that noise against `tolerance` is a knife-edge that spuriously
+            # zeroes the whole improvement (fallback below) for otherwise-valid
+            # gradients; the float64 residual preserves the check's intent of
+            # catching projections that genuinely failed to remove a guard.
+            final_dot = _gradient_dot_product(
+                current,
+                guards[guard_name],
+                first_name=name,
+                second_name=guard_name,
+            )
+            if final_dot < -float(tolerance):
+                accepted_current = tuple(
+                    None if value is None else torch.zeros_like(value)
+                    for value in accepted_current
+                )
+                projection_fallback_zero = True
+                break
+        if projection_fallback_zero:
+            post_cosines = {
+                guard_name: gradient_cosine_similarity(
+                    accepted_current,
+                    guards[guard_name],
+                    first_name=name,
+                    second_name=guard_name,
+                )
+                for guard_name in ordered_guards
+            }
+        accepted[name] = accepted_current
+        telemetry[name] = {
+            "pre_cosines": pre_cosines,
+            "post_cosines": post_cosines,
+            "active_guard_set": list(ordered_guards),
+            "projected": projected,
+            "projection_fallback_zero": projection_fallback_zero,
+            "projection_norm": float(projection_norm),
+            "accepted_norm": gradient_l2_norm(accepted_current, branch_name=name),
+        }
+    return accepted, telemetry
+
+
+def combine_constrained_measured_gradients(
+    components: Mapping[str, Sequence[Optional[torch.Tensor]]],
+    *,
+    guard_names: Sequence[str] = ("reconstruction", "connectivity", "validity"),
+    improvement_names: Sequence[str] = ("occupancy", "aero"),
+) -> tuple[GradientBuffer, dict[str, Any]]:
+    """Retain every measured component while constraining improvement directions."""
+    guards = {
+        name: components[name]
+        for name in guard_names
+        if name in components
+    }
+    improvements = {
+        name: components[name]
+        for name in improvement_names
+        if name in components
+    }
+    accepted, telemetry = project_improvement_gradients_against_guards(
+        improvements,
+        guards,
+    )
+    all_buffers = list(components.values())
+    if not all_buffers:
+        return tuple(), {
+            "active_guard_set": list(guards),
+            "components": telemetry,
+            "accepted_norm": 0.0,
+        }
+    buffer_count = len(all_buffers[0])
+    combined: list[Optional[torch.Tensor]] = [None] * buffer_count
+    for name, gradient in components.items():
+        selected = accepted.get(name, gradient)
+        for index, value in enumerate(selected):
+            if value is None:
+                continue
+            combined[index] = (
+                value.detach().clone(memory_format=torch.preserve_format)
+                if combined[index] is None
+                else combined[index] + value
+            )
+    result = tuple(combined)
+    final_accepted, final_telemetry = project_improvement_gradients_against_guards(
+        {"combined": result},
+        guards,
+        guard_order=tuple(guard_names),
+    )
+    result = final_accepted["combined"]
+    return result, {
+        "active_guard_set": list(guards),
+        "components": telemetry,
+        "final_invariant": final_telemetry["combined"],
+        "accepted_norm": gradient_l2_norm(result, branch_name="accepted"),
+    }
 
 
 def apply_max_norm(
@@ -360,8 +595,17 @@ def combine_gradient_branches(
     *,
     conflict_anchor: Optional[str] = None,
     project_conflicting_branches: Sequence[str] = (),
+    final_guard_branches: Optional[
+        Mapping[str, Sequence[Optional[torch.Tensor]]]
+    ] = None,
 ) -> dict[str, BranchGradientTelemetry]:
-    """Independently limit named branches and replace target ``.grad`` buffers."""
+    """Independently limit branches and enforce final parameter-space guards.
+
+    ``final_guard_branches`` are the already-measured parameter-space guard
+    directions.  They remain separate through the final combination so a
+    topology guard cannot be lost when voxel-space direct components are
+    collapsed into one student branch.
+    """
 
     parameter_list = tuple(parameters)
     unknown_limits = set(max_norms).difference(branches)
@@ -392,6 +636,14 @@ def combine_gradient_branches(
         )
         telemetry[branch_name] = branch_telemetry
         applied_branches[branch_name] = applied
+
+    final_guards = dict(final_guard_branches or {})
+    for guard_name, gradients in final_guards.items():
+        _validate_branch_against_parameters(
+            parameter_list,
+            tuple(gradients),
+            branch_name=f"final guard {guard_name}",
+        )
 
     projected_names = tuple(project_conflicting_branches)
     if conflict_anchor is None and projected_names:
@@ -444,6 +696,104 @@ def combine_gradient_branches(
                 combined[parameter_index] = gradient
             else:
                 combined[parameter_index] = combined[parameter_index] + gradient
+
+    final_anchor_cosine_before = 0.0
+    final_anchor_cosine_after = 0.0
+    final_projection_norm = 0.0
+    if conflict_anchor is not None:
+        anchor_gradients = applied_branches[conflict_anchor]
+        non_anchor_values: list[Optional[torch.Tensor]] = []
+        for index in range(len(parameter_list)):
+            value: Optional[torch.Tensor] = None
+            for branch_name, branch_values in applied_branches.items():
+                if branch_name == conflict_anchor:
+                    continue
+                branch_value = branch_values[index]
+                if branch_value is not None:
+                    value = (
+                        branch_value.detach().clone()
+                        if value is None
+                        else value + branch_value
+                    )
+            non_anchor_values.append(value)
+        non_anchor = tuple(non_anchor_values)
+        final_before = tuple(
+            None
+            if anchor_gradients[index] is None and non_anchor[index] is None
+            else (
+                non_anchor[index]
+                if anchor_gradients[index] is None
+                else (
+                    anchor_gradients[index]
+                    if non_anchor[index] is None
+                    else anchor_gradients[index] + non_anchor[index]
+                )
+            )
+            for index in range(len(parameter_list))
+        )
+        final_anchor_cosine_before = gradient_cosine_similarity(
+            final_before,
+            anchor_gradients,
+            first_name="final_update",
+            second_name=conflict_anchor,
+        )
+        projected_non_anchor, _, final_anchor_cosine_after, projected, final_projection_norm = (
+            project_conflicting_gradient(
+                non_anchor,
+                anchor_gradients,
+                branch_name="final_update_non_anchor",
+                anchor_name=conflict_anchor,
+            )
+        )
+        for index, anchor_value in enumerate(anchor_gradients):
+            value = anchor_value
+            other = projected_non_anchor[index]
+            if other is not None:
+                value = other if value is None else value + other
+            combined[index] = value
+        telemetry["final_invariant"] = BranchGradientTelemetry(
+            raw_norm=gradient_l2_norm(non_anchor, branch_name="final_non_anchor"),
+            applied_norm=gradient_l2_norm(projected_non_anchor, branch_name="final_non_anchor"),
+            scale=1.0,
+            present=any(value is not None for value in non_anchor),
+            nonzero=gradient_l2_norm(projected_non_anchor, branch_name="final_non_anchor") > 0.0,
+            anchor_cosine_before=final_anchor_cosine_before,
+            anchor_cosine_after=final_anchor_cosine_after,
+            conflict_projected=projected,
+            projection_norm=final_projection_norm,
+        )
+
+    if final_guards:
+        accepted_final, final_guard_telemetry = (
+            project_improvement_gradients_against_guards(
+                {"final_update": tuple(combined)},
+                final_guards,
+                guard_order=("data", "reconstruction", "connectivity", "validity"),
+            )
+        )
+        combined = list(accepted_final["final_update"])
+        final_update_telemetry = final_guard_telemetry["final_update"]
+        telemetry["final_guard_invariant"] = BranchGradientTelemetry(
+            raw_norm=gradient_l2_norm(
+                tuple(combined), branch_name="final_update"
+            ),
+            applied_norm=gradient_l2_norm(
+                tuple(combined), branch_name="final_update"
+            ),
+            scale=1.0,
+            present=any(value is not None for value in combined),
+            nonzero=gradient_l2_norm(
+                tuple(combined), branch_name="final_update"
+            ) > 0.0,
+            anchor_cosine_before=float(
+                final_update_telemetry["pre_cosines"].get("data", 0.0)
+            ),
+            anchor_cosine_after=float(
+                final_update_telemetry["post_cosines"].get("data", 0.0)
+            ),
+            conflict_projected=bool(final_update_telemetry["projected"]),
+            projection_norm=float(final_update_telemetry["projection_norm"]),
+        )
 
     gradient_l2_norm(combined, branch_name="<combined>")
 

@@ -146,6 +146,15 @@ if triton is not None:
         res = tl.where(qi < 0.5, res_low, res_high)
 
         out = tl.where(active, res, streamed)
+        # P6h: fuse the post-stream nan_to_num guard into the stream write so
+        # the solver can skip its separate full-array pass on the fused path.
+        # nan->0, +inf->1e6, -inf->-1e6 exactly match torch.nan_to_num; a
+        # no-op on the finite populations produced in normal runs.
+        out = tl.where(
+            out != out,
+            0.0,
+            tl.where(out == float("inf"), 1e6, tl.where(out == float("-inf"), -1e6, out)),
+        )
         tl.store(f_out + k * total + offsets, out, mask=valid)
 
 
@@ -193,6 +202,507 @@ def stream_bfl_d3q27(
         total,
         block=block_size,
     )
+    return True
+
+
+if triton is not None:
+    @triton.jit
+    def _force_drag_kernel(
+        f_pre,
+        f_out,
+        boundary_links,
+        ex_links,
+        ez_links,
+        opposite,
+        drag_weight,
+        upwind,
+        partials,
+        total: tl.constexpr,
+        n_blocks: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Momentum-exchange force + projected pressure-drag proxy in one pass.
+
+        Grid is ``(26, n_blocks)`` over directions 1..26 and voxel blocks.
+        Each (dir, block) writes its three partial sums (fx, fz, drag) to a
+        single deterministic slot in ``partials[3, 26, n_blocks]``; the host
+        reduces those with one ``torch.sum``. The formulas reproduce
+        ``D3Q27Solver._accumulate_momentum_exchange_force_nosync`` and
+        ``_accumulate_projected_pressure_drag_proxy`` with the same per-element
+        operand order and products, so the only drift versus the reference is
+        the block-partitioned reduction tree. Measured on the 32^3 parity
+        fixtures the accumulation is ~1e-7 relative to the gross (worst 5-step
+        signed drift ~1.5e-5 absolute on the small net forces), well within
+        FORCE_ATOL 2.5e-5.
+        """
+        i = tl.program_id(0)
+        pid = tl.program_id(1)
+        offsets = pid * block + tl.arange(0, block)
+        valid = offsets < total
+
+        dir_idx = i + 1
+        # boundary links are a torch.bool [26, D, H, W] mask.
+        b = tl.load(boundary_links + i * total + offsets, mask=valid, other=0).to(tl.float32)
+        ex = tl.load(ex_links + i)
+        ez = tl.load(ez_links + i)
+
+        f_in = tl.load(f_pre + dir_idx * total + offsets, mask=valid, other=0.0)
+        opp = tl.load(opposite + dir_idx)
+        f_out_v = tl.load(f_out + opp * total + offsets, mask=valid, other=0.0)
+
+        # momentum exchange: reference is (f_in * b) + (f_out_opp * b), then
+        # multiplied by the link's ex/ez component.
+        contrib = (f_in * b) + (f_out_v * b)
+        fx = ex * contrib
+        fz = ez * contrib
+
+        # projected drag: where(upwind, 2*|ex|*metric*f_pre*b, 0).
+        dw = tl.load(drag_weight + i)
+        uw = tl.load(upwind + i)
+        drag = tl.where(uw > 0.0, dw * f_in * b, 0.0)
+
+        fx_s = tl.sum(fx, axis=0)
+        fz_s = tl.sum(fz, axis=0)
+        drag_s = tl.sum(drag, axis=0)
+
+        base = i * n_blocks + pid
+        tl.store(partials + base, fx_s)
+        tl.store(partials + 26 * n_blocks + base, fz_s)
+        tl.store(partials + 2 * 26 * n_blocks + base, drag_s)
+
+
+def force_drag_d3q27(
+    f_pre: torch.Tensor,
+    f_out: torch.Tensor,
+    boundary_links: torch.Tensor,
+    ex_links: torch.Tensor,
+    ez_links: torch.Tensor,
+    opposite: torch.Tensor,
+    drag_weight: torch.Tensor,
+    upwind: torch.Tensor,
+    partials: torch.Tensor,
+    block_size: int = 256,
+) -> bool:
+    """Run the fused momentum-exchange force + projected-drag kernel on CUDA.
+
+    ``f_pre``/``f_out`` are the pre-stream and streamed ``[27, D, H, W]`` fp32
+    populations; ``boundary_links`` is the cached ``[26, D, H, W]`` bool mask.
+    ``drag_weight`` and ``upwind`` are the per-direction scalars
+    ``2*|ex|*metric`` and the ``(ex * flow_sign) > 0`` mask as ``[26]`` fp32.
+    ``partials`` is a caller-owned ``[3, 26, cdiv(D*H*W, block_size)]`` fp32
+    buffer; every slot is written exactly once, then the caller reduces it with
+    one ``torch.sum(partials, dim=(-2, -1))`` -> ``[fx, fz, drag]``. Returns
+    True when the fused path executed (``partials`` filled), False when the
+    caller must use the reference PyTorch force accumulation.
+    """
+    if triton is None or not f_pre.is_cuda:
+        return False
+    if f_pre.dim() != 4 or f_pre.shape[0] != 27:
+        return False
+    if f_pre.shape[1] != f_pre.shape[2] or f_pre.shape[1] != f_pre.shape[3]:
+        return False
+    if not (f_pre.is_contiguous() and f_out.is_contiguous()):
+        return False
+    if boundary_links.dim() != 4 or boundary_links.shape[0] != 26:
+        return False
+    if not boundary_links.is_contiguous():
+        return False
+    n = int(f_pre.shape[1])
+    total = n * n * n
+    n_blocks = triton.cdiv(total, block_size)
+    if partials.shape != (3, 26, n_blocks):
+        return False
+    if not partials.is_contiguous():
+        return False
+    grid = (26, n_blocks)
+    _force_drag_kernel[grid](
+        f_pre,
+        f_out,
+        boundary_links,
+        ex_links,
+        ez_links,
+        opposite,
+        drag_weight,
+        upwind,
+        partials,
+        total=total,
+        n_blocks=n_blocks,
+        block=block_size,
+    )
+    return True
+
+
+if triton is not None:
+    @triton.jit
+    def _stream_bfl_kernel_batch(
+        f_pre,
+        f_out,
+        solid,
+        q_field,
+        ex,
+        ey,
+        ez,
+        opposite,
+        n: tl.constexpr,
+        total: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Batched fused pull-streaming + q-dependent BFL interpolation.
+
+        Identical per-item formulas and write pattern as ``_stream_bfl_kernel``
+        with a leading batch program id ``c``. Every load is offset by
+        ``c * total`` (populations and solid) or ``c * 27 * total`` (q_field),
+        so each (c, k, x) output is written exactly once and the launch is
+        order-independent across the batch dim.
+        """
+        c = tl.program_id(0)
+        k = tl.program_id(1)
+        pid = tl.program_id(2)
+        offsets = pid * block + tl.arange(0, block)
+        valid = offsets < total
+
+        n2 = n * n
+        x = offsets // n2
+        rem = offsets - x * n2
+        y = rem // n
+        z = rem - y * n
+
+        f_pre_c = f_pre + c * 27 * total
+        f_out_c = f_out + c * 27 * total
+        solid_c = solid + c * total
+        q_c = q_field + c * 27 * total
+
+        dxk = tl.load(ex + k)
+        dyk = tl.load(ey + k)
+        dzk = tl.load(ez + k)
+
+        # Plain streaming: periodic pull from x - e_k (torch.roll parity).
+        sx = (x - dxk + n) % n
+        sy = (y - dyk + n) % n
+        sz = (z - dzk + n) % n
+        streamed = tl.load(f_pre_c + k * total + (sx * n2 + sy * n + sz), mask=valid, other=0.0)
+
+        # BFL incoming direction i = opposite(k).
+        i = tl.load(opposite + k)
+        dxi = tl.load(ex + i)
+        dyi = tl.load(ey + i)
+        dzi = tl.load(ez + i)
+
+        # Boundary link: fluid at x, solid at the in-domain neighbor x + e_i.
+        nb_x = x + dxi
+        nb_y = y + dyi
+        nb_z = z + dzi
+        nb_in = (nb_x >= 0) & (nb_x < n) & (nb_y >= 0) & (nb_y < n) & (nb_z >= 0) & (nb_z < n)
+        cell_solid = tl.load(solid_c + offsets, mask=valid, other=1) > 0
+        nb_solid = tl.load(
+            solid_c + (nb_x * n2 + nb_y * n + nb_z),
+            mask=valid & nb_in,
+            other=0,
+        ) > 0
+        active = valid & (~cell_solid) & nb_in & nb_solid & (i != 0)
+
+        qi = tl.load(q_c + i * total + offsets, mask=active, other=1.0)
+        f_i_here = tl.load(f_pre_c + i * total + offsets, mask=active, other=0.0)
+
+        # Upstream fluid neighbor for direction i sits at x - e_i.
+        up_x = x - dxi
+        up_y = y - dyi
+        up_z = z - dzi
+        up_in = (up_x >= 0) & (up_x < n) & (up_y >= 0) & (up_y < n) & (up_z >= 0) & (up_z < n)
+        f_i_up = tl.load(
+            f_pre_c + i * total + (up_x * n2 + up_y * n + up_z),
+            mask=active & up_in,
+            other=0.0,
+        )
+
+        res_low = (1.0 - 2.0 * qi) * f_i_up + 2.0 * qi * f_i_here
+        inv_2q = 1.0 / (2.0 * qi)
+        res_high = inv_2q * f_i_here + (1.0 - inv_2q) * streamed
+        res = tl.where(qi < 0.5, res_low, res_high)
+
+        out = tl.where(active, res, streamed)
+        out = tl.where(
+            out != out,
+            0.0,
+            tl.where(out == float("inf"), 1e6, tl.where(out == float("-inf"), -1e6, out)),
+        )
+        tl.store(f_out_c + k * total + offsets, out, mask=valid)
+
+
+def stream_bfl_d3q27_batch(
+    f_pre: torch.Tensor,
+    f_out: torch.Tensor,
+    solid_mask_u8: torch.Tensor,
+    q_field: torch.Tensor,
+    ex: torch.Tensor,
+    ey: torch.Tensor,
+    ez: torch.Tensor,
+    opposite: torch.Tensor,
+    block_size: int = 256,
+) -> bool:
+    """Run the batched fused D3Q27 streaming + BFL kernel on CUDA via Triton.
+
+    Operates on ``[C, 27, D, H, W]`` populations and q and ``[C, D, H, W]``
+    uint8 solid masks. Per-item results are bitwise-identical to the
+    sequential ``stream_bfl_d3q27`` (same formulas, same reduction-free
+    streaming). Returns True when the fused path executed, False when the
+    caller must fall back to a batched PyTorch reference implementation.
+    """
+    if triton is None or not f_pre.is_cuda:
+        return False
+    if f_pre.dim() != 5 or f_pre.shape[1] != 27:
+        return False
+    n = int(f_pre.shape[2])
+    if f_pre.shape[2] != f_pre.shape[3] or f_pre.shape[2] != f_pre.shape[4]:
+        return False
+    if q_field.shape != f_pre.shape:
+        return False
+    if not (f_pre.is_contiguous() and f_out.is_contiguous() and q_field.is_contiguous()):
+        return False
+    if solid_mask_u8.dtype != torch.uint8 or not solid_mask_u8.is_contiguous():
+        return False
+    C = int(f_pre.shape[0])
+    if solid_mask_u8.shape != (C, n, n, n):
+        return False
+
+    total = n * n * n
+    grid = (C, 27, triton.cdiv(total, block_size))
+    _stream_bfl_kernel_batch[grid](
+        f_pre,
+        f_out,
+        solid_mask_u8,
+        q_field,
+        ex,
+        ey,
+        ez,
+        opposite,
+        n,
+        total,
+        block=block_size,
+    )
+    return True
+
+
+if triton is not None:
+    @triton.jit
+    def _stream_kernel_batch(
+        f_pre,
+        f_out,
+        ex,
+        ey,
+        ez,
+        n: tl.constexpr,
+        total: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Plain full-lattice periodic pull-stream for a batch of geometries.
+
+        Writes ``f_out[k, x] = f_pre[k, x - e_k]`` for every voxel with
+        ``torch.roll`` parity. This is exactly the ``streamed`` branch of
+        ``_stream_bfl_kernel_batch`` with the q-dependent BFL branch removed, so
+        per-voxel values are bit-identical to that kernel's non-active output.
+        """
+        c = tl.program_id(0)
+        k = tl.program_id(1)
+        pid = tl.program_id(2)
+        offsets = pid * block + tl.arange(0, block)
+        valid = offsets < total
+
+        n2 = n * n
+        x = offsets // n2
+        rem = offsets - x * n2
+        y = rem // n
+        z = rem - y * n
+
+        dxk = tl.load(ex + k)
+        dyk = tl.load(ey + k)
+        dzk = tl.load(ez + k)
+
+        sx = (x - dxk + n) % n
+        sy = (y - dyk + n) % n
+        sz = (z - dzk + n) % n
+
+        f_pre_c = f_pre + c * 27 * total
+        streamed = tl.load(f_pre_c + k * total + (sx * n2 + sy * n + sz), mask=valid, other=0.0)
+        streamed = tl.where(
+            streamed != streamed,
+            0.0,
+            tl.where(streamed == float("inf"), 1e6, tl.where(streamed == float("-inf"), -1e6, streamed)),
+        )
+        tl.store(f_out + c * 27 * total + k * total + offsets, streamed, mask=valid)
+
+
+if triton is not None:
+    @triton.jit
+    def _bfl_correct_kernel_batch(
+        f_pre,
+        f_out,
+        ex,
+        ey,
+        ez,
+        opposite,
+        q_flat,
+        active_flat,
+        pair_start,
+        pair_count,
+        n: tl.constexpr,
+        total: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Sparse Bouzidi-Firdaouss-Lallemand boundary correction.
+
+        Grid over ``C * 26`` (c, i) pairs; each pair corrects the active
+        (boundary-link) voxels for incoming direction ``i``, overwriting the
+        plain-streamed value at ``f_out[k, x]`` (``k = opposite[i]``) with the
+        exact ``res_low``/``res_high``/``res`` formulas from
+        ``_stream_bfl_kernel_batch``. ``q_flat``/``active_flat`` are compact
+        per-pair concatenations indexed by ``pair_start``/``pair_count``; pair
+        ``p`` is item ``p // 26``, direction ``p % 26 + 1``. Must run AFTER the
+        plain full-lattice ``_stream_kernel_batch`` so ``f_out[k, x]`` already
+        holds the periodically streamed value used by the q >= 0.5 branch.
+        """
+        pair = tl.program_id(0)
+        pid = tl.program_id(1)
+
+        c = pair // 26
+        i = (pair % 26) + 1
+        k = tl.load(opposite + i)
+        dxk = tl.load(ex + k)
+        dyk = tl.load(ey + k)
+        dzk = tl.load(ez + k)
+        dxi = tl.load(ex + i)
+        dyi = tl.load(ey + i)
+        dzi = tl.load(ez + i)
+
+        start = tl.load(pair_start + pair)
+        cnt = tl.load(pair_count + pair)
+        idx = pid * block + tl.arange(0, block)
+        valid = idx < cnt
+
+        x = tl.load(active_flat + start + idx, mask=valid, other=0)
+        qi = tl.load(q_flat + start + idx, mask=valid, other=0.0)
+
+        n2 = n * n
+        x3 = x // n2
+        rem = x - x3 * n2
+        y3 = rem // n
+        z3 = rem - y3 * n
+
+        f_pre_c = f_pre + c * 27 * total
+        f_out_c = f_out + c * 27 * total
+
+        # f_i_here = f_pre[c, i, x]. Task 35: upcast bf16 loads to fp32 so the
+        # interpolation arithmetic is fp32 regardless of Triton's mixed-dtype
+        # promotion (bf16 x fp32 does NOT auto-promote); identity for fp32.
+        f_i_here = tl.load(f_pre_c + i * total + x, mask=valid, other=0.0).to(tl.float32)
+
+        # f_i_up = f_pre[c, i, x - e_i], zero-padded outside the domain.
+        up_x = x3 - dxi
+        up_y = y3 - dyi
+        up_z = z3 - dzi
+        up_in = (up_x >= 0) & (up_x < n) & (up_y >= 0) & (up_y < n) & (up_z >= 0) & (up_z < n)
+        f_i_up = tl.load(
+            f_pre_c + i * total + (up_x * n2 + up_y * n + up_z),
+            mask=valid & up_in,
+            other=0.0,
+        ).to(tl.float32)
+
+        # streamed = f_out[k, x] already written by _stream_kernel_batch (the
+        # periodically pulled value f_pre[k, x - e_k]).
+        streamed = tl.load(f_out_c + k * total + x, mask=valid, other=0.0).to(tl.float32)
+
+        res_low = (1.0 - 2.0 * qi) * f_i_up + 2.0 * qi * f_i_here
+        inv_2q = 1.0 / (2.0 * qi)
+        res_high = inv_2q * f_i_here + (1.0 - inv_2q) * streamed
+        res = tl.where(qi < 0.5, res_low, res_high)
+        res = tl.where(
+            res != res,
+            0.0,
+            tl.where(res == float("inf"), 1e6, tl.where(res == float("-inf"), -1e6, res)),
+        )
+        tl.store(f_out_c + k * total + x, res, mask=valid)
+
+
+def stream_bfl_d3q27_batch_compressed(
+    f_pre: torch.Tensor,
+    f_out: torch.Tensor,
+    sparse: dict,
+    ex: torch.Tensor,
+    ey: torch.Tensor,
+    ez: torch.Tensor,
+    opposite: torch.Tensor,
+    block_size: int = 256,
+) -> bool:
+    """Batched D3Q27 streaming + BFL via a plain stream kernel and a sparse
+    boundary-correction kernel (Task 34 compressed workspace).
+
+    ``f_pre``/``f_out`` are ``[C, 27, D, H, W]`` fp32 contiguous tensors.
+    ``sparse`` is the compact active-voxel table produced by
+    ``D3Q27Solver._build_bfl_sparse_tables``:
+
+        q_flat       [N_active] fp32  boundary-link q values, concatenated
+        active_flat  [N_active] int32 flat voxel offsets, concatenated
+        pair_start   [C*26]     int32 start index per (c, i) pair
+        pair_count   [C*26]     int32 active-voxel count per (c, i) pair
+
+    Kernel 1 (plain full-lattice pull stream) runs first and writes every
+    voxel; kernel 2 (sparse BFL correction) then overwrites only the
+    boundary-link voxels with the identical per-voxel formulas the fused
+    ``_stream_bfl_kernel_batch`` uses. The full-lattice ``[C, 27, D, H, W]``
+    q-field never exists here. Returns True when the compressed path executed.
+    """
+    if triton is None or not f_pre.is_cuda:
+        return False
+    if f_pre.dim() != 5 or f_pre.shape[1] != 27:
+        return False
+    n = int(f_pre.shape[2])
+    if f_pre.shape[2] != f_pre.shape[3] or f_pre.shape[2] != f_pre.shape[4]:
+        return False
+    if not (f_pre.is_contiguous() and f_out.is_contiguous()):
+        return False
+    C = int(f_pre.shape[0])
+
+    total = n * n * n
+    grid = (C, 27, triton.cdiv(total, block_size))
+    _stream_kernel_batch[grid](
+        f_pre,
+        f_out,
+        ex,
+        ey,
+        ez,
+        n,
+        total,
+        block=block_size,
+    )
+
+    q_flat = sparse["q_flat"]
+    active_flat = sparse["active_flat"]
+    pair_start = sparse["pair_start"]
+    pair_count = sparse["pair_count"]
+    # R12: max_count is geometry-static and cached in the sparse dict by
+    # _build_bfl_sparse_tables; read it here instead of a per-solve host sync.
+    # The .get() fallback keeps legacy hand-built dicts working.
+    max_count = sparse.get("max_count")
+    if max_count is None:
+        max_count = int(pair_count.max().item())
+    if q_flat.numel() > 0 and max_count > 0:
+        n_pairs = int(pair_count.numel())
+        grid_correct = (n_pairs, triton.cdiv(max_count, block_size))
+        _bfl_correct_kernel_batch[grid_correct](
+            f_pre,
+            f_out,
+            ex,
+            ey,
+            ez,
+            opposite,
+            q_flat,
+            active_flat,
+            pair_start,
+            pair_count,
+            n,
+            total,
+            block=block_size,
+        )
     return True
 
 

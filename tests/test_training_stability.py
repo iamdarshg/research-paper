@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -11,15 +12,136 @@ if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
 from run_monitored_training import (
+    ResumableEpochSampler,
     RunLocalCosineScheduler,
     _build_epoch_dataset,
+    _run_state_checkpoint_due,
     _geometry_non_regression,
     _geometry_promotion_metrics,
+    _load_monitored_history,
+    _restore_best_promotion_rank,
+    _sync_best_checkpoint_state,
 )
 from training_stability import compute_core_loss, summarize_stability
+from training_stability import evaluate_directional_promotion_gate
+
+
+def test_resumable_epoch_sampler_is_deterministic_per_epoch_and_resumable():
+    """R7 (PR 41 review, item 7): the sampler yields a fresh permutation per
+    epoch, reproducible from (subset_seed, epoch) alone so a resumed process
+    regenerates the current epoch's order and continues at the exact offset."""
+    size = 50
+    first = ResumableEpochSampler(size, subset_seed=7)
+    first.set_epoch(3)
+    permutation = list(first)
+    assert sorted(permutation) == list(range(size))
+
+    # Same (subset_seed, epoch) reproduces the identical permutation.
+    again = ResumableEpochSampler(size, subset_seed=7)
+    again.set_epoch(3)
+    assert list(again) == permutation
+
+    # Different epoch -> different order; different seed -> different order.
+    other_epoch = ResumableEpochSampler(size, subset_seed=7)
+    other_epoch.set_epoch(4)
+    assert list(other_epoch) != permutation
+    different_seed = ResumableEpochSampler(size, subset_seed=8)
+    different_seed.set_epoch(3)
+    assert list(different_seed) != permutation
+
+    # Length must match the sample count (DataLoader plans updates off it).
+    assert len(first) == size
+
+
+def test_load_monitored_history_round_trips_and_is_defensive(tmp_path):
+    """R6 (PR 41 review, item 6): the history payload is the source of truth
+    for the stability/early-stop window on resume. Missing / malformed /
+    history-less payloads degrade to an empty list."""
+    history_path = tmp_path / "monitored_history.json"
+    assert _load_monitored_history(history_path) == []
+
+    history_path.write_text(
+        json.dumps(
+            {
+                "config": {"num_epochs": 200},
+                "history": [
+                    {"epoch": 1, "core_loss": 1.2},
+                    {"epoch": 2, "core_loss": 1.1},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _load_monitored_history(history_path) == [
+        {"epoch": 1, "core_loss": 1.2},
+        {"epoch": 2, "core_loss": 1.1},
+    ]
+
+    history_path.write_text("{not valid json", encoding="utf-8")
+    assert _load_monitored_history(history_path) == []
+
+    history_path.write_text(json.dumps({"config": {}}), encoding="utf-8")
+    assert _load_monitored_history(history_path) == []
+
+    history_path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    assert _load_monitored_history(history_path) == []
 
 
 class TestTrainingStability(unittest.TestCase):
+    def test_directional_gate_rejects_completed_epoch_topology_regression(self):
+        baseline = {
+            "generated_mean_occupied_fraction": 0.05,
+            "target_mean_occupied_fraction": 0.02,
+            "generated_mean_largest_component_fraction": 0.9872801371,
+            "reconstruction_recall": 0.2431656392,
+            "generated_aircraft_valid_fraction": 0.0,
+            "generated_unique_fraction": 0.9479166667,
+            "materialization_mode": "fixed_global_threshold",
+            "geometry_threshold_calibrated": True,
+        }
+        candidate = {
+            "generated_mean_occupied_fraction": 0.01,
+            "target_mean_occupied_fraction": 0.02,
+            "generated_mean_largest_component_fraction": 0.5276170658,
+            "reconstruction_recall": 0.0,
+            "generated_aircraft_valid_fraction": 0.1041666667,
+            "generated_unique_fraction": 0.5416666667,
+            "materialization_mode": "fixed_global_threshold",
+            "geometry_threshold_calibrated": True,
+        }
+
+        report = evaluate_directional_promotion_gate(candidate, baseline)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(
+            report["failed_conditions"],
+            [
+                "largest_component_floor",
+                "largest_component_non_regression",
+                "reconstruction_recall_non_regression",
+                "uniqueness_non_regression",
+            ],
+        )
+        self.assertEqual(report["conditions"]["generated_occupancy_error"]["passed"], True)
+
+    def test_directional_gate_requires_strict_validity_improvement_below_half(self):
+        baseline = {
+            "generated_mean_occupied_fraction": 0.2,
+            "target_mean_occupied_fraction": 0.1,
+            "generated_mean_largest_component_fraction": 0.8,
+            "reconstruction_recall": 0.5,
+            "generated_aircraft_valid_fraction": 0.4,
+            "generated_unique_fraction": 0.8,
+            "materialization_mode": "fixed_global_threshold",
+            "geometry_threshold_calibrated": True,
+        }
+        candidate = {**baseline, "generated_mean_occupied_fraction": 0.1}
+
+        report = evaluate_directional_promotion_gate(candidate, baseline)
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["failed_conditions"], ["generated_validity_improvement"])
+
     def test_run_local_scheduler_decays_each_group_to_nonzero_floor(self):
         first = torch.nn.Parameter(torch.tensor([1.0]))
         second = torch.nn.Parameter(torch.tensor([2.0]))
@@ -45,6 +167,12 @@ class TestTrainingStability(unittest.TestCase):
         self.assertAlmostEqual(observed[-1][1], 5.0e-6)
         self.assertTrue(all(value > 0.0 for row in observed for value in row))
 
+    def test_run_state_checkpoint_cadence_is_relative_to_segment_start(self):
+        self.assertFalse(_run_state_checkpoint_due(7, 0, 8))
+        self.assertTrue(_run_state_checkpoint_due(8, 0, 8))
+        self.assertFalse(_run_state_checkpoint_due(15, 8, 8))
+        self.assertTrue(_run_state_checkpoint_due(16, 8, 8))
+
     def test_geometry_promotion_rank_includes_validity_diversity_and_shape(self):
         metrics, rank = _geometry_promotion_metrics(
             {
@@ -65,6 +193,49 @@ class TestTrainingStability(unittest.TestCase):
         )
         self.assertAlmostEqual(metrics["geometry_selection_metric"], 0.3)
         self.assertEqual(metrics["promotion_gate_passed"], 0.0)
+
+    def test_restore_best_promotion_rank_round_trips_and_falls_back(self):
+        """R5 (PR 41 review, item 5): a persisted list rank restores to the
+        tuple gate used by the lexicographic comparison, and run-states that
+        predate the field (or hold garbage) fall back without raising."""
+        persisted = [0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9]
+        self.assertEqual(
+            _restore_best_promotion_rank({"best_promotion_rank": persisted}),
+            (0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9),
+        )
+        self.assertEqual(_restore_best_promotion_rank({}), (-1.0,) * 8)
+        self.assertEqual(
+            _restore_best_promotion_rank({"best_promotion_rank": "bad"}),
+            (-1.0,) * 8,
+        )
+        self.assertEqual(
+            _restore_best_promotion_rank({"best_promotion_rank": None}),
+            (-1.0,) * 8,
+        )
+
+    def test_sync_best_checkpoint_state_mirrors_into_run_state_metadata(self):
+        """R5: the best-checkpoint selection is mirrored into the trainer's
+        run_state_metadata, which build_run_state persists verbatim."""
+        class _FakeTrainer:
+            def __init__(self):
+                self.run_state_metadata = {}
+
+        trainer = _FakeTrainer()
+        _sync_best_checkpoint_state(
+            trainer,
+            best_promotion_rank=(0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9),
+            best_geometry_metric=0.31,
+            best_checkpoint_path=r"C:\out\best_geometry_model.pt",
+        )
+        self.assertEqual(
+            trainer.run_state_metadata["best_promotion_rank"],
+            [0.75, -0.01, 0.8, 0.9, -0.02, 0.6, 0.7, 0.9],
+        )
+        self.assertEqual(trainer.run_state_metadata["best_geometry_metric"], 0.31)
+        self.assertEqual(
+            trainer.run_state_metadata["best_checkpoint_path"],
+            r"C:\out\best_geometry_model.pt",
+        )
 
     def test_geometry_non_regression_rejects_boundary_and_diversity_collapse(self):
         baseline = {

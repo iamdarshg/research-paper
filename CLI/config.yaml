@@ -23,6 +23,14 @@ model:
   coordinate_gradient_checkpointing: true
   enable_gradient_checkpointing: true
   use_torch_compile: false
+  # A1 (experiment/kernel-fusion-launch): compile the backward graph with
+  # torch._dynamo.compiled_autograd (fuses checkpointed decoder recomputes +
+  # elementwise backward ops). Opt-in, default off; parity-gated.
+  compiled_autograd: false
+  # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP only so
+  # inductor fuses the post-GEMM add+SiLU epilogues into the GEMM kernels.
+  # Opt-in, default off. Whole-model compile stays off (it previously overflowed).
+  compile_converter_decoder: false
 
 scaling:
   # This count selects the reported network widths. It is a capacity-planning
@@ -78,7 +86,7 @@ training:
   # solver step point uphill on the grounded aircraft-data objective.
   project_conflicting_direct_gradient: true
   weight_decay: 0.0001
-  offload_optimizer_state_between_steps: true
+  offload_optimizer_state_between_steps: false
   num_epochs: 200
   warmup_steps: 1000
   gradient_clip: 1.0
@@ -137,11 +145,30 @@ training:
   direct_validity_gradient_max_norm: 1.0
   direct_connectivity_weight: 1.0
   direct_aircraft_validity_weight: 1.0
-  # Calibrate this once against clean grounded reconstructions, persist it in
-  # the checkpoint, and freeze it for direct CFD, promotion, and inference.
+  # Fixed 0.5 materialization threshold. 0.5 is the natural Bayesian boundary,
+  # needs no calibration, keeps the margins (0.5 +/- 0.05) well-defined instead
+  # of clamped, and avoids the tail sensitivity that made the old calibrated
+  # 0.9752 threshold the root fragility. With calibration disabled the config
+  # value is authoritative and overrides any checkpoint/saved threshold.
   geometry_materialization_threshold: 0.5
-  calibrate_geometry_materialization_threshold: true
+  calibrate_geometry_materialization_threshold: false
   geometry_threshold_calibration_samples: 16
+  threshold_positive_margin: 0.05
+  threshold_negative_margin: 0.05
+  threshold_positive_margin_weight: 1.0
+  threshold_negative_margin_weight: 1.0
+  # Deterministic occupancy objective on the free-running field. Replaces the
+  # SPSA hard-threshold occupancy component (flip-noise dominated, always at its
+  # clip cap) with an analytic gradient of (a) a one-sided mean-probability
+  # saturation brake -- pushes down only while mean(p) exceeds the threshold --
+  # and (b) a soft threshold-anchored surrogate |mean(sigmoid((p-t)/T)) - ref|
+  # anchoring the materialized fraction at the batch reference occupancy
+  # (~0.5% sparse airframe). A two-sided mean target at 0.5 would materialize a
+  # ~50% filled blob and fight a healthy sparse field; the soft term carries the
+  # occupancy anchor instead.
+  occupancy_mean_probability_weight: 0.5
+  occupancy_soft_temperature: 0.05
+  occupancy_soft_weight: 0.5
   require_direct_solver_every_iteration: true
 
 cfd:
@@ -154,8 +181,20 @@ cfd:
   # local placeholder is never executed inside the optimizer.
   enable_external_validation: false
   mach_number: 0.3
+  # Requested Reynolds number. NOTE (R2, PR 41 review): this value is NOT
+  # fully realized -- tau_min_d3q27 (LBMPhysicsConfig default 0.52) clamps the
+  # BGK/MRT relaxation time, so the solver evolves nu_effective=(tau-0.5)/3 and
+  # the EFFECTIVE Reynolds at 96^3 / Mach 0.3 is ~2,494, not 1e6. The realized
+  # values are reported per solve in the coefficient dicts as
+  # effective_reynolds / tau_actual / reynolds_clamped and must be what the
+  # paper's Reynolds claim cites.
   reynolds_number: 1000000.0
-  simulation_steps: 500
+  # Advisory only: no training / validation path reads CFDConfig.simulation_steps
+  # (the direct solver is governed by training.direct_solver_steps, and the
+  # corpus builders use their own SIMULATION_STEPS constants). R9 (PR 41 review,
+  # item 9) aligns it with the legacy 1000 recorded in pre-existing exact-resume
+  # fingerprints so a config-sourced value cannot silently diverge.
+  simulation_steps: 1000
   output_interval: 50
   device_id: 0
 
@@ -177,6 +216,44 @@ conditioning:
     - the repo now has a partial structured conditioning path spanning dataset, model, generator, and offline densification
     - public CLI surfaces only a subset of the full schema and still needs condition-response benchmarks before claims can be strengthened
     - scalar constraints include thrust-to-weight, turn-rate, explicit thrust and engine geometry, and numeric min/max bounds
+
+experiment:
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
+  # coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
+  # (CLI/kernel_fusion_graph.py) to cut ~13 launches/chunk to 3. OFF by default:
+  # the graph is memory-conditional on 8 GB (~350 MiB static pool) and is only
+  # engaged when grad is disabled (torch.utils.checkpoint forward) at a fixed
+  # [chunk_size, latent_dim+coordinate_dim] input. Capture failure, shape/device
+  # drift, or any autograd-enabled call silently falls back to the compiled or
+  # eager path. See docs/performance/experiment-kernel-fusion-launch.md.
+  graph_decode_mlp: false
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): collapse the
+  # per-active-guard .item() guard-dot reads at the end of each update into ONE
+  # deferred read (all dots computed GPU-side as fp64 tensors, one stacked
+  # .tolist() after the loop). Results are bit-identical to the per-guard path
+  # (same fp64 torch.dot over the same flattened concatenations, same order);
+  # only the GPU->CPU sync count changes. ON 2026-08-16 after parity re-verify
+  # on HEAD (guard_dot_parity_check*.py: bit-identical per guard).
+  batch_guard_dot_reads: true
+  # EXPERIMENTAL (branch experiment/kernel-fusion-launch): enqueue all 33
+  # sequential SPSA solves with NO host scalar reads, then read every probe's
+  # occupancy / coefficient / nonempty scalars back in ONE batched
+  # torch.stack(...).tolist() + one sync (occupancy and the coefficient
+  # arithmetic are bit-identical to the per-solve read path). ON 2026-08-16
+  # after parity re-verify on HEAD (deferred_solver_reads_parity.py: ALL PASS,
+  # full SPSA forward OFF-vs-ON byte-identical loss/grads/components).
+  deferred_solver_reads: true
+  # NUMERICS (branch experiment/kernel-fusion-launch): run the neural-network
+  # GEMMs (coordinate decoder + diffusion encoder/attention) on TF32 tensor-core
+  # math. The D3Q27 LBM/SPSA solver path is elementwise-only (no matmul/einsum),
+  # so this CANNOT change the solver's arithmetic -- only NN GEMM precision.
+  # Measured 2026-08-17 (build/perf/baseline/tf32_probe.py / tf32_profile.py):
+  # gradients stay within GRAD_ATOL (0.2-0.4x), output field drifts ~2e-4 rel
+  # (49x the 4e-6 refactor-parity gate, benign at the geometry level), and
+  # steady-state drops ~44 -> ~31-34 s/u (mean 36.2 vs 49.3). fp32 STORAGE is
+  # unchanged; only GEMM math moves to TF32. ON 2026-08-17 by explicit user
+  # decision; the claim-bearing run's paper must document this precision mode.
+  tf32_gemm_math: true
 
 design:
   target_speed: 50.0
@@ -205,10 +282,10 @@ design:
 # Load this config in Python:
 #
 # import yaml
-# 
+#
 # with open('config.yaml', 'r') as f:
 #     config = yaml.safe_load(f)
-# 
+#
 # model_cfg = ModelConfig(**config['model'])
 # diff_cfg = DiffusionConfig(**config['diffusion'])
 # train_cfg = TrainingConfig(**config['training'])

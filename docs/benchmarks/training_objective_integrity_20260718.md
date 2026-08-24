@@ -152,3 +152,77 @@ not claim-bearing aerodynamic coefficients.
 The next continuation should be described as recovery training, not final model
 training. It should retain only candidates that improve the fixed validation
 rank, and publication figures must come from the fixed-threshold evaluator.
+
+## Constrained Aircraft Recovery Implementation (2026-08-13)
+
+Tasks 1 through 4 are implemented on `codex/constrained-aircraft-recovery`.
+The focused tests and the full suite passed before the final numerical guard
+projection hardening; the post-hardening focused projection tests also passed.
+The permitted real `96^3` smoke was bounded with the exact `D3Q27` /
+`fused_stream_bfl` configuration and completed one optimizer update with 33
+measured solver calls. It then stopped before the eighth-update checkpoint:
+the first run exposed the intentional-interruption coverage contract, and the
+retry exposed a float32 residual in measured guard projection. Those fixes are
+committed, but the final 8-update smoke and exact-resume continuation were not
+completed within the execution window. No promotion result is claimed.
+
+This remains an internal recovery-training result. The smoke's five-step raw
+LBM force was transient (`lbm_converged=0`) and is not external-PDE ground
+truth or a claim-bearing aerodynamic coefficient.
+
+The first review round (`f4e29c0`) added deterministic trajectory,
+crash-reconciliation, promotion-baseline, compatibility, final-guard, and
+calibrated-margin tests. Round 2 (`432c8a9`) addressed its then-scoped integration
+findings with production-path tests for separate parameter-space topology
+guards, saved-threshold compatibility, complete objective fingerprinting,
+next-epoch cadence reset, and exact full-lattice margin capture in the student
+data anchor. Fresh round-2 verification passed `428` tests with three
+warnings. No additional real smoke was run in round 2, and no live 96^3
+resume or promotion result is claimed.
+
+Round 3 (`36d73f8`) repaired the production gradient lifecycle across the
+diffusion, converter, and consistency-student optimizer groups. Production
+`train_epoch` tests now verify that all required gradients survive branch
+replay, only measured active topology guards are transported, each replay is
+isolated, and the gradients at the actual optimizer step satisfy the active
+guard invariant after clipping. The three shape-drag LBM configuration fields
+were also restored as dataclass fields and covered by payload construction
+tests. These are bounded CPU fixture results; no live 96^3 resume or promotion
+claim is made. The round-3 dedicated production suite passed `21 tests`, the
+affected focused suites passed `101 tests`, and the fresh full suite passed
+`431 tests` with three existing warnings. These bounded tests do not replace
+the unrun live smoke.
+
+Round 4 (`e6f9016`) corrected two additional production lifecycle defects.
+Measured topology guard gradients now remain aligned to original batch
+positions, with exact zero tensors for inactive samples, and the ordered union
+of active guard names cannot be overwritten by first-sample telemetry. The
+generated-path decoder freeze now filters converter entries from captured
+data, consistency, direct, and topology buffers before adding the separate
+clean grounded converter gradient. Enabled and disabled behavior is tested at
+the optimizer boundary, and the switch remains part of exact-resume
+compatibility through the full training-config fingerprint.
+
+Round-4 verification passed the dedicated selection (`5 tests`), complete
+review module (`25 tests`), affected suites (`97 tests`), and full suite (`435
+tests`, three existing warnings). This is automated implementation evidence,
+not closure: no current-code live 96-cubed exact-resume run or promotion was
+performed.
+
+Round 5 (`aa701c0`) preserves the batch-aligned aircraft mission specification
+through the measured direct objective. `DirectSolverSPSALoss` accepts one
+`DesignSpec` for backward-compatible broadcast or a sequence containing one
+value or exactly one value per batch sample. Other lengths fail before solver
+work. Each sample's base and every antithetic plus/minus evaluation use that
+sample's own `space_weight`, `drag_weight`, `lift_weight`, and remaining
+mission fields.
+
+Fresh call-recording tests use two controlled geometries and deliberately
+different objective weights. They verify both the direct SPSA interface and a
+production `train_epoch` update, including all six per-sample calls, the mean
+of the correctly weighted scalar objectives, inequality from first-spec
+reuse, finite gradients, unchanged call counts, singleton compatibility, and
+mismatch rejection. Round-5 verification passed the dedicated selection (`5
+tests`), complete review module (`30 tests`), affected suites (`97 tests`), and
+full suite (`440 tests`, three existing warnings). No current-code live
+96-cubed exact-resume run or promotion was performed.

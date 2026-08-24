@@ -3,6 +3,7 @@ from typing import Dict
 
 from lbm_utils import (
     D3Q27Lattice,
+    REFERENCE_SPEED_OF_SOUND_MPS,
     _compute_force_coefficients,
     build_lbm_compressibility_metadata,
     d3q27_lattice_freestream_velocity_from_mach,
@@ -13,17 +14,17 @@ def _scale_momentum_exchange_force(force, grid_spacing: float, mach_number: floa
     """Convert raw lattice momentum exchange into a physical force scale (Issue #16).
 
     Standard LBM force scaling: F_phys = rho_phys * (dx^4 / dt^2) * F_lattice.
-    Using consistent dt derived from sound speed: dt = dx / (343.0 * sqrt(3)).
-    This results in force_scale = rho_phys * dx^2 * (343.0 * sqrt(3))^2.
+    Using consistent dt derived from sound speed: dt = dx / (REFERENCE_SPEED_OF_SOUND_MPS * sqrt(3)).
+    This results in force_scale = rho_phys * dx^2 * (REFERENCE_SPEED_OF_SOUND_MPS * sqrt(3))^2.
 
     The extracted wall sum is treated as a perturbational lattice momentum flux
     acting on the body. Multiplying by the lattice freestream speed restores
-    force ~ U^2 at fixed Reynolds number, and dt = dx / (343.0 * sqrt(3))
+    force ~ U^2 at fixed Reynolds number, and dt = dx / (REFERENCE_SPEED_OF_SOUND_MPS * sqrt(3))
     supplies the remaining physical-unit scale rho_phys * dx^2 * c^2.
     """
     dx = float(grid_spacing)
-    # velocity_ratio = sound_speed_phys / sound_speed_lattice = 343.0 * sqrt(3)
-    velocity_ratio = 343.0 * (3.0**0.5)
+    # velocity_ratio = sound_speed_phys / sound_speed_lattice = REFERENCE_SPEED_OF_SOUND_MPS * sqrt(3)
+    velocity_ratio = REFERENCE_SPEED_OF_SOUND_MPS * (3.0**0.5)
     force_scale = float(density) * (dx**2) * (velocity_ratio**2)
     lattice_freestream_speed = abs(float(mach_number)) / (3.0**0.5)
     return lattice_freestream_speed * force * force_scale

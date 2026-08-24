@@ -11,10 +11,29 @@ LOW_MACH_VALIDATED_LIMIT = 0.3
 LOW_MACH_VALIDITY_REGIME = "validated_low_mach_envelope"
 HIGH_MACH_EXPERIMENTAL_REGIME = "experimental_high_mach_unvalidated"
 
+REFERENCE_SPEED_OF_SOUND_MPS = 343.0
+"""ISA sea-level reference speed of sound (m/s).
+
+Used for physical-unit force conversion only. Mach (dimensionless) is the
+operating point; absolute speed is derived via this reference and varies with
+temperature/pressure. The numeric value is a named reference constant, not a
+configurable operating-point input.
+"""
+
 
 def mach_to_lattice_velocity(mach_number: float) -> float:
     """Map physical Mach number to D3Q27 lattice velocity for the current isothermal model."""
     return float(mach_number) * D3Q27_LATTICE_SOUND_SPEED
+
+
+def mach_to_physical_speed(mach_number: float, a: float = REFERENCE_SPEED_OF_SOUND_MPS) -> float:
+    """Map physical Mach number to absolute speed (m/s).
+
+    Absolute speed is a derived quantity that varies with temperature and
+    pressure; this helper applies only the named ISA sea-level reference
+    speed-of-sound constant. Mach (dimensionless) is the operating point.
+    """
+    return float(mach_number) * a
 
 
 def classify_lbm_regime(mach_number: float, external_validation: str | None = None) -> dict[str, Any]:
@@ -22,7 +41,7 @@ def classify_lbm_regime(mach_number: float, external_validation: str | None = No
     mach = float(mach_number)
     mach_magnitude = abs(mach)
     base = {
-        "sound_speed_model": "D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a=343 m/s",
+        "sound_speed_model": f"D3Q27 isothermal cs=1/sqrt(3); physical scaling uses a={REFERENCE_SPEED_OF_SOUND_MPS} m/s",
         "compressibility_model": "weakly_compressible_isothermal_lbm",
         "thermal_model": "none_isothermal",
     }
@@ -92,7 +111,7 @@ def _compute_force_coefficients(force_x, force_z, mach_number, ref_area, rho_ref
     The caller is responsible for supplying a consistent reference area,
     ideally the voxelized projected area of the solid body.
     """
-    v_inf = mach_number * 343.0
+    v_inf = mach_to_physical_speed(mach_number)
     q_inf = 0.5 * rho_ref * v_inf**2
     ref_area = max(float(ref_area), 1e-12)
     denom = q_inf * ref_area + 1e-12

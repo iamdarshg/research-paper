@@ -1,6 +1,9 @@
 import os
+import random
 import sys
 
+import numpy as np
+import pytest
 import torch
 
 
@@ -28,7 +31,263 @@ from aircraft_diffusion_cfd import (
     GroupedQueryAttention,
     load_width_expanded_state_dict,
     move_optimizer_state,
+    atomic_save_run_state,
+    capture_rng_state,
+    restore_rng_state,
+    validate_run_state_compatibility,
+    grounded_threshold_margin_loss,
+    validate_solver_integrated_training_config,
 )
+
+
+def test_run_state_round_trip_restores_rng_and_is_atomic(tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    parameter.grad = torch.tensor([0.5, -0.25])
+    optimizer.step()
+    state = {
+        "model": {"value": parameter.detach().clone()},
+        "optimizer": optimizer.state_dict(),
+        "rng": capture_rng_state(),
+        "completed_in_epoch": 2,
+    }
+    path = tmp_path / "latest_run_state.pt"
+    atomic_save_run_state(path, state)
+
+    expected_python = random.random()
+    expected_numpy = float(np.random.random())
+    expected_torch = torch.rand(3)
+    parameter.data.add_(10.0)
+    random.random()
+    np.random.random()
+    torch.rand(3)
+
+    restored = torch.load(path, map_location="cpu", weights_only=False)
+    parameter.data.copy_(restored["model"]["value"])
+    restore_rng_state(restored["rng"])
+
+    assert torch.equal(parameter, state["model"]["value"])
+    assert random.random() == expected_python
+    assert float(np.random.random()) == expected_numpy
+    assert torch.equal(torch.rand(3), expected_torch)
+    assert path.exists()
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_atomic_write_checkpoint_serializes_and_cleans_tmp(tmp_path):
+    """R10 (PR 41 review, item 10): trainer.atomic_write_checkpoint must
+    follow the same write-temp / fsync / atomic-replace discipline as
+    atomic_save_run_state. A successful write leaves a loadable target (with
+    its parent directory created) and no .tmp sibling."""
+    from trainer import atomic_write_checkpoint
+
+    path = tmp_path / "sub" / "model.pt"
+    checkpoint = {"step": 7, "tensor": torch.tensor([1.0, -2.0])}
+    atomic_write_checkpoint(path, checkpoint)
+
+    assert path.exists()
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    assert loaded["step"] == 7
+    torch.testing.assert_close(loaded["tensor"], checkpoint["tensor"])
+
+
+def test_atomic_write_checkpoint_failure_preserves_existing_target(tmp_path):
+    """R10: a serialization failure must clean up the temp file and leave any
+    pre-existing checkpoint at the target untouched — a crash mid-save can
+    never manifest as a torn checkpoint at the public path."""
+    from trainer import atomic_write_checkpoint
+
+    path = tmp_path / "model.pt"
+    atomic_write_checkpoint(path, {"step": 1})
+    before = path.read_bytes()
+
+    # torch.save cannot pickle a local lambda -> serialization must fail.
+    with pytest.raises(Exception):
+        atomic_write_checkpoint(path, {"unserializable": lambda: None})
+
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    assert path.read_bytes() == before
+
+
+def test_run_state_compatibility_configuration_uses_intersection_semantics():
+    """R4 (PR 41 review, item 4): the ``configuration`` sub-dict is compared
+    over the INTERSECTION of keys, so a fingerprint key added in a newer code
+    version (here ``experiment_flags``) does not block resuming an older
+    run-state that predates it. Keys present on both sides are still compared
+    strictly: a tf32 flip must block the resume.
+    """
+    base = {
+        "manifest_identity": "manifest-a",
+        "grid_size": 96,
+        "latent_dim": 192,
+        "split": "train",
+        "sample_count": 32,
+    }
+    # Old run-state: no experiment_flags key. New code adds it. Resume is fine.
+    old_state = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.00002},
+            "cfd_config": {"solver": "D3Q27"},
+        },
+    }
+    new_expected = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.00002},
+            "cfd_config": {"solver": "D3Q27"},
+            "experiment_flags": {
+                "graph_decode_mlp": False,
+                "batch_guard_dot_reads": True,
+                "deferred_solver_reads": True,
+                "tf32_gemm_math": True,
+            },
+        },
+    }
+    assert validate_run_state_compatibility(old_state, new_expected) == []
+
+    # Both sides carry experiment_flags -> strict comparison. tf32 flipped.
+    same_code = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.00002},
+            "experiment_flags": {
+                "graph_decode_mlp": False,
+                "batch_guard_dot_reads": True,
+                "deferred_solver_reads": True,
+                "tf32_gemm_math": False,
+            },
+        },
+    }
+    assert validate_run_state_compatibility(same_code, new_expected) == [
+        "configuration.experiment_flags"
+    ]
+
+    # A shared configuration key with a different value is still caught.
+    drifted = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.001},
+            "experiment_flags": {
+                "graph_decode_mlp": False,
+                "batch_guard_dot_reads": True,
+                "deferred_solver_reads": True,
+                "tf32_gemm_math": True,
+            },
+        },
+    }
+    assert validate_run_state_compatibility(drifted, new_expected) == [
+        "configuration.training_config",
+    ]
+
+
+def test_run_state_compatibility_reports_all_immutable_mismatches():
+    expected = {
+        "manifest_identity": "manifest-a",
+        "grid_size": 96,
+        "latent_dim": 192,
+        "split": "train",
+        "sample_count": 32,
+    }
+    actual = {
+        "manifest_identity": "manifest-b",
+        "grid_size": 32,
+        "latent_dim": 64,
+        "split": "val",
+        "sample_count": 16,
+    }
+
+    errors = validate_run_state_compatibility(actual, expected)
+
+    assert errors == [
+        "manifest_identity",
+        "grid_size",
+        "latent_dim",
+        "split",
+        "sample_count",
+    ]
+
+
+def test_threshold_margin_loss_is_zero_when_both_classes_clear_fixed_threshold():
+    probabilities = torch.tensor([0.9, 0.8, 0.1, 0.2], requires_grad=True)
+    target = torch.tensor([1.0, 1.0, 0.0, 0.0])
+
+    loss = grounded_threshold_margin_loss(
+        probabilities,
+        target,
+        threshold=0.5,
+        positive_margin=0.1,
+        negative_margin=0.1,
+    )
+
+    assert loss.item() == 0.0
+    loss.backward()
+    assert torch.isfinite(probabilities.grad).all()
+
+
+def test_threshold_margin_loss_penalizes_disappearing_and_false_solid_voxels():
+    probabilities = torch.tensor([0.51, 0.99], requires_grad=True)
+    target = torch.tensor([1.0, 0.0])
+
+    loss = grounded_threshold_margin_loss(
+        probabilities,
+        target,
+        threshold=0.7,
+        positive_margin=0.1,
+        negative_margin=0.1,
+    )
+
+    assert loss.item() > 0.0
+    loss.backward()
+    assert torch.isfinite(probabilities.grad).all()
+    assert probabilities.grad[0] < 0
+    assert probabilities.grad[1] > 0
+
+
+def test_threshold_margin_loss_normalizes_positive_and_negative_regions_independently():
+    balanced = grounded_threshold_margin_loss(
+        torch.tensor([0.7, 0.7, 0.7, 0.7]),
+        torch.tensor([1.0, 1.0, 0.0, 0.0]),
+        threshold=0.5,
+        positive_margin=0.2,
+        negative_margin=0.2,
+    )
+    sparse = grounded_threshold_margin_loss(
+        torch.tensor([0.7, 0.7, 0.7, 0.7]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        threshold=0.5,
+        positive_margin=0.2,
+        negative_margin=0.2,
+    )
+
+    assert balanced.item() == pytest.approx(sparse.item())
+
+
+def test_threshold_margin_loss_uses_configured_threshold_not_batch_topk():
+    loss = grounded_threshold_margin_loss(
+        torch.tensor([0.55, 0.54, 0.01, 0.0]),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        threshold=0.5,
+        positive_margin=0.1,
+        negative_margin=0.1,
+    )
+
+    assert loss.item() > 0.0
+
+
+def test_threshold_margin_configuration_rejects_invalid_values():
+    with pytest.raises(ValueError, match="threshold_positive_margin"):
+        validate_solver_integrated_training_config(
+            TrainingConfig(threshold_positive_margin=-0.1)
+        )
+    with pytest.raises(ValueError, match="threshold_positive_margin"):
+        validate_solver_integrated_training_config(
+            TrainingConfig(
+                geometry_materialization_threshold=0.9,
+                threshold_positive_margin=0.1,
+            )
+        )
 
 
 def test_grouped_query_attention_shares_key_value_heads_and_preserves_shape():
@@ -683,3 +942,75 @@ def test_coordinate_decoder_checkpointed_chunks_backpropagate_to_latent():
     assert latent.grad is not None
     assert torch.isfinite(latent.grad).all()
     assert float(latent.grad.abs().sum()) > 0.0
+
+
+def test_train_epoch_bounded_interruption_validates_only_processed_updates():
+    class DifferentiableDirectLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.last_components = {}
+
+        def forward(
+            self,
+            logits,
+            design_spec,
+            simulator,
+            seed=None,
+            reference_occupancy=None,
+        ):
+            self.calls += 1
+            value = torch.sigmoid(logits).mean()
+            self.last_components = {
+                "aero_loss": float(value.detach()),
+                "connectivity_loss": 0.1,
+                "aircraft_validity_loss": 0.2,
+                "spsa_gradient_norm": 0.3,
+                "spsa_gradient_norm_unclipped": 0.4,
+                "aero_spsa_gradient_norm": 0.1,
+                "aero_spsa_gradient_norm_unclipped": 0.2,
+                "connectivity_spsa_gradient_norm": 0.1,
+                "connectivity_spsa_gradient_norm_unclipped": 0.2,
+                "aircraft_validity_spsa_gradient_norm": 0.1,
+                "aircraft_validity_spsa_gradient_norm_unclipped": 0.2,
+            }
+            return value
+
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        config,
+        DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4),
+        TrainingConfig(
+            num_epochs=1,
+            consistency_interval=1,
+            direct_solver_steps=1,
+            direct_solver_directions=1,
+            direct_solver_interval=1,
+            offload_optimizer_state_between_steps=False,
+        ),
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    fake_direct = DifferentiableDirectLoss()
+    trainer.direct_solver_loss = fake_direct
+    trainer.stop_after_updates = 1
+    batch = {
+        "latent": torch.zeros((1, 4)),
+        "geometry": torch.zeros((1, 4, 4, 4)),
+        "design_spec": [DesignSpec()],
+    }
+
+    metrics = trainer.train_epoch([batch, batch], grid_size=4)
+
+    assert fake_direct.calls == 1
+    assert metrics["direct_solver_eval_count"] == 1
+    assert metrics["direct_solver_iteration_coverage"] == 1.0
+    assert trainer.global_step == 1

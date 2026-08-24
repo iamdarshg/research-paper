@@ -76,6 +76,10 @@ class TrainingConfig:
     precision: str = 'float32'
     save_interval: int = 5
     val_interval: int = 2
+    threshold_positive_margin: float = 0.05
+    threshold_negative_margin: float = 0.05
+    threshold_positive_margin_weight: float = 1.0
+    threshold_negative_margin_weight: float = 1.0
     # Pipeline parallelism
     enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
     num_pipeline_stages: int = 8  # CFD + Diffusion stages
@@ -185,9 +189,9 @@ class CFDConfig:
     """FluidX3D simulation parameters with adaptive mesh refinement"""
     solver_type: str = "D3Q27"
     base_grid_resolution: int = 32  # Consistent grid resolution - no resizing needed
-    mach_number: float = 0.025
-    reynolds_number: float = 1e6
-    simulation_steps: int = 1000
+    mach_number: float = float(config_value("cfd", "mach_number", 0.025))
+    reynolds_number: float = float(config_value("cfd", "reynolds_number", 1e6))
+    simulation_steps: int = int(config_value("cfd", "simulation_steps", 1000))
     output_interval: int = 50
     device_id: int = 0
     # Adaptive mesh refinement

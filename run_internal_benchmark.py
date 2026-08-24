@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str((REPO / 'CLI').resolve()))
 from aircraft_diffusion_cfd import CFDConfig, LBMPhysicsConfig
 from advanced_lbm_solver import D3Q27CascadedSolver
+from lbm_utils import REFERENCE_SPEED_OF_SOUND_MPS
 
 OPENFOAM_PACKAGE = os.environ.get('OPENFOAM_PACKAGE', 'openfoam')
 OPENFOAM_FREESTREAM_SPEED = 80.0
@@ -1694,7 +1695,7 @@ def run_benchmark_case(
         setup_started = time.perf_counter()
         cfg = CFDConfig(
             base_grid_resolution=sweep_case['grid_resolution'],
-            mach_number=sweep_case['freestream_speed'] / 343.0,
+            mach_number=sweep_case['freestream_speed'] / REFERENCE_SPEED_OF_SOUND_MPS,
             reynolds_number=sweep_case['reynolds_number'],
             simulation_steps=sweep_case['steps'],
         )

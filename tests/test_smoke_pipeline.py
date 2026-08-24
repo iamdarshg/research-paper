@@ -260,8 +260,10 @@ class TestCLISmokePipeline(unittest.TestCase):
              mock.patch.object(cli_module.os, "replace") as mock_replace:
             trainer.save_checkpoint("fake-checkpoint.pt")
 
-        saved_payload, saved_path = mock_save.call_args.args
-        self.assertEqual(saved_path, "fake-checkpoint.pt.tmp")
+        saved_payload, saved_handle = mock_save.call_args.args
+        # R10: the checkpoint serializes to a write-handle on the .tmp sibling
+        # (which gets fsynced) before the atomic replace onto the final path.
+        self.assertEqual(saved_handle.name, "fake-checkpoint.pt.tmp")
         mock_replace.assert_called_once_with(
             Path("fake-checkpoint.pt.tmp"),
             Path("fake-checkpoint.pt"),
@@ -270,6 +272,11 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertEqual(saved_payload["cfd_config"]["base_grid_resolution"], 24)
         self.assertEqual(saved_payload["cfd_config"]["solver_type"], "D3Q27")
         self.assertEqual(saved_payload["cfd_config"]["lbm_config"]["grid_spacing"], 0.125)
+        # torch.save is mocked (nothing written) and os.replace is mocked (no
+        # final move), so the .tmp handle left in cwd is litter — remove it.
+        for litter in (Path("fake-checkpoint.pt.tmp"), Path("fake-checkpoint.pt")):
+            if litter.exists():
+                litter.unlink()
 
     def test_generator_restores_cfd_config_from_checkpoint(self):
         checkpoint = {

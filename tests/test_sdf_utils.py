@@ -10,7 +10,7 @@ CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
 if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
-from sdf_utils import _EDT_WORKSPACES, compute_sdf, prepare_edt_workspace
+from sdf_utils import _edt_workspace, compute_sdf, prepare_edt_workspace
 
 
 def test_reusable_edt_workspace_preserves_exact_signed_distance():
@@ -20,12 +20,12 @@ def test_reusable_edt_workspace_preserves_exact_signed_distance():
     expected = distance_transform_edt(~mask) - distance_transform_edt(mask)
 
     first = compute_sdf(geometry)
-    workspace_identity = id(_EDT_WORKSPACES[tuple(geometry.shape)][0])
+    workspace_identity = id(_edt_workspace(geometry.shape)[0])
     second = compute_sdf(geometry)
 
     assert np.allclose(first.numpy(), expected.astype(np.float32))
     assert torch.equal(second, first)
-    assert id(_EDT_WORKSPACES[tuple(geometry.shape)][0]) == workspace_identity
+    assert id(_edt_workspace(geometry.shape)[0]) == workspace_identity
 
 
 def test_workspace_can_be_reserved_before_solver_use():
@@ -33,4 +33,8 @@ def test_workspace_can_be_reserved_before_solver_use():
 
     prepare_edt_workspace(shape)
 
-    assert shape in _EDT_WORKSPACES
+    workspace = _edt_workspace(shape)
+    assert len(workspace) == 3
+    assert workspace[0].shape == tuple(shape)
+    assert workspace[1].shape == tuple(shape)
+    assert workspace[2].shape == (3,) + tuple(shape)

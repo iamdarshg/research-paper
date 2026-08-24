@@ -17,3 +17,8 @@ smoke_outputs*/
 tmp-checkpoints/
 deprecated/
 *.log
+# Worktree-local scratch: RAM-watch helpers and the 08-16 merge reconciliation
+# report (its merges are already in history). Never swept into the PR.
+/.ramcheck.ps1
+/.ramwatch.sh
+/MERGE-REPORT.md
