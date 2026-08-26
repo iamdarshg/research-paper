@@ -1257,6 +1257,26 @@ def test_checkpoint_metadata_loader_authorizes_operator_passed_paths(tmp_path):
         recovery._load_checkpoint_metadata(artifact_path)
 
 
+def test_load_run_state_authorizes_its_explicit_operator_path(tmp_path, monkeypatch):
+    state_path = tmp_path / "latest_run_state.pt"
+    state_path.write_bytes(b"operator-selected exact run state")
+    observed = {}
+
+    def fake_load(checkpoint, *, map_location="cpu", authorized_paths=()):
+        observed["checkpoint"] = Path(checkpoint).resolve()
+        observed["authorized_paths"] = tuple(Path(path).resolve() for path in authorized_paths)
+        raise RuntimeError("stop after observing authorization")
+
+    monkeypatch.setattr(recovery, "_load_checkpoint_metadata", fake_load)
+    trainer = object.__new__(OptimizedDiffusionTrainer)
+
+    with pytest.raises(RuntimeError, match="stop after observing authorization"):
+        trainer.load_run_state(state_path, expected_compatibility={})
+
+    assert observed["checkpoint"] == state_path.resolve()
+    assert observed["authorized_paths"] == (state_path.resolve(),)
+
+
 def test_analytic_occupancy_logit_gradient_behavior():
     """Deterministic one-sided brake, soft anchor, clipping, and ref handling."""
     import math as _math

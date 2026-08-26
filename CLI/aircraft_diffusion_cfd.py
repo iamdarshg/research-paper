@@ -6263,7 +6263,13 @@ class OptimizedDiffusionTrainer:
     ) -> Dict[str, Any]:
         """Restore an interrupted run after its original scheduler is configured."""
         resolved_path = resolve_run_state_path(path)
-        state = _load_checkpoint_metadata(resolved_path)
+        # Calling load_run_state is an explicit operator choice of this exact
+        # local artifact. Authorize only that resolved path for the guarded
+        # weights_only=False fallback; unrelated paths still fail closed.
+        state = _load_checkpoint_metadata(
+            resolved_path,
+            authorized_paths=(resolved_path,),
+        )
         # C1: the config-fixed threshold is authoritative and must NOT be
         # overridden by a run-state's saved (previously-calibrated) threshold.
         # When calibration is enabled the saved threshold IS the exact-resume
