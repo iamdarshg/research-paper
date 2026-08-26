@@ -686,14 +686,16 @@ class TrainingConfig:
 
 def validate_solver_integrated_training_config(training_config: TrainingConfig) -> None:
     """Fail closed when a run claims solver integration but can skip measured terms."""
-    if not training_config.require_direct_solver_every_iteration:
-        return
-
     errors: List[str] = []
     if float(training_config.direct_solver_loss_weight) <= 0.0:
         errors.append("direct_solver_loss_weight must be greater than 0")
     if int(training_config.direct_solver_interval) < 1:
         errors.append("direct_solver_interval must be >= 1")
+    elif (
+        training_config.require_direct_solver_every_iteration
+        and int(training_config.direct_solver_interval) != 1
+    ):
+        errors.append("direct_solver_interval must be 1")
     if int(training_config.direct_solver_steps) <= 0:
         errors.append("direct_solver_steps must be greater than 0")
     if int(training_config.direct_solver_directions) <= 0:

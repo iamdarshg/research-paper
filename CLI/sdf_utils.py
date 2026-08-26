@@ -40,10 +40,13 @@ def prepare_edt_workspace(shape) -> None:
     _edt_workspace(normalized_shape)
 
 def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
-    """Compute SDF. Uses GPU dilation when input is on CUDA, CPU scipy otherwise."""
-    if voxel_grid.is_cuda:
-        from gpu_sdf import gpu_sdf
-        return gpu_sdf(voxel_grid).float()
+    """Compute an exact Euclidean SDF with matching CPU/CUDA semantics.
+
+    SciPy owns the EDT calculation. CUDA inputs are copied back only after the
+    Euclidean field has been computed; the progressive-dilation approximation
+    is intentionally not used because it collapses sub-voxel BFL distances to
+    q=0.5 and differs from the threaded warm-SDF path.
+    """
     # Ensure binary mask
     mask = (voxel_grid > 0.5).cpu().numpy()
 

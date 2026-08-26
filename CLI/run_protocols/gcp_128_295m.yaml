@@ -1,0 +1,35 @@
+# Mainline 128^3 / 294,719,529-trainable-parameter training protocol.
+# Architecture values are assertions for operators and tests; the executable
+# source of truth is CLI/config.yaml.
+architecture:
+  expected_trainable_parameters: 294719529
+  latent_dim: 512
+  grid_size: 128
+  coordinate_decoder_width: 3328
+  coordinate_decoder_depth: 12
+
+train:
+  enabled: true
+  num_epochs: 12
+  batch_size: 1
+  learning_rate: 0.00002
+  latent_dim: 512
+  grid_size: 128
+  precision: bfloat16
+  disconnection_penalty: 30.0
+  save_dir: ../../checkpoints_128_295m
+  run_class: scaling_128_295m
+  solver: D3Q27
+  dataset_manifest: ../../build/final_combined_corpus_20260824/combined_training_manifest.jsonl
+  enable_consistency: false
+  enable_pipeline: false
+  enable_checkpointing: true
+  enable_compile: true
+  direct_solver_interval: 4
+  require_direct_solver_every_iteration: false
+  checkpoint_every_updates: 25
+
+smoke:
+  enabled: true
+  stop_after_updates: 5
+  checkpoint_every_updates: 1

@@ -12,14 +12,14 @@ model:
   # Structured corpus latents are normalized geometry/condition features.
   latent_value_min: 0.0
   latent_value_max: 1.0
-  grid_resolution: 96
+  grid_resolution: 128
   xyz_dim: 3
   attention_groups: 8
   attention_kv_groups: 4
   num_attention_layers: 4
   coordinate_decoder_threshold: 96
   coordinate_chunk_size: 16384
-  coordinate_decoder_width: 1600
+  coordinate_decoder_width: 3328
   coordinate_decoder_depth: 12
   coordinate_fourier_bands: 6
   coordinate_gradient_checkpointing: true
@@ -37,7 +37,10 @@ model:
 scaling:
   # This count selects the reported network widths. It is a capacity-planning
   # input, not a claim that these geometries ship in the repository.
-  capacity_basis_unique_geometries: 500
+  # Floor used by the mainline 128^3 run. The current combined corpus exceeds
+  # the saturation point, so this selects the fixed 294,719,529-parameter
+  # architecture even when a filtered training split reports fewer records.
+  capacity_basis_unique_geometries: 8027
   reference_unique_geometries: 600
   width_exponent: 0.20
   minimum_scale: 0.75
@@ -45,10 +48,10 @@ scaling:
   high_resolution_channel_base: 116
   high_resolution_channel_step: 48
   maximum_high_resolution_channel_base: 128
-  high_resolution_decoder_width: 1600
-  maximum_high_resolution_decoder_width: 1600
-  high_resolution_decoder_depth: 5
-  high_resolution_decoder_depth_large_corpus: 5
+  high_resolution_decoder_width: 3328
+  maximum_high_resolution_decoder_width: 3328
+  high_resolution_decoder_depth: 12
+  high_resolution_decoder_depth_large_corpus: 12
   large_corpus_threshold: 4096
 
 diffusion:
@@ -176,7 +179,10 @@ training:
   occupancy_mean_probability_weight: 0.5
   occupancy_soft_temperature: 0.05
   occupancy_soft_weight: 0.5
-  require_direct_solver_every_iteration: true
+  # Sparse direct-solver scheduling is the optimized mainline mode. Set this
+  # true only for strict scientific runs, where validation also requires an
+  # interval of exactly one.
+  require_direct_solver_every_iteration: false
 
 cfd:
   solver: D3Q27
