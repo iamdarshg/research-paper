@@ -51,6 +51,7 @@ def test_mainline_128_preset_has_exactly_294719529_trainable_parameters():
 
     assert model_config.grid_resolution == 128
     assert model_config.latent_dim == 512
+    assert model_config.coordinate_chunk_size == 8192
     assert model_config.coordinate_decoder_width == 3328
     assert model_config.coordinate_decoder_depth == 12
     assert "Trainable parameters: `294,719,529`" in build_report()

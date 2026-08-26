@@ -18,7 +18,7 @@ model:
   attention_kv_groups: 4
   num_attention_layers: 4
   coordinate_decoder_threshold: 96
-  coordinate_chunk_size: 16384
+  coordinate_chunk_size: 8192
   coordinate_decoder_width: 3328
   coordinate_decoder_depth: 12
   coordinate_fourier_bands: 6
