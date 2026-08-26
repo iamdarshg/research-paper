@@ -132,20 +132,30 @@ training:
   precision: float32
   save_interval: 25
   val_interval: 1
-  coordinate_training_samples: 262144
-  full_lattice_interval: 8
+  # Budget-constrained 128^3 schedule. The 65,536-row anchor is still
+  # stratified over positive/negative voxels; exact full-lattice grounding is
+  # retained every 64 updates instead of every 8. This keeps the objective
+  # unchanged on anchor updates while avoiding eight redundant full decodes.
+  coordinate_training_samples: 65536
+  full_lattice_interval: 64
   sparse_samples_per_full: 262144
   coordinate_positive_fraction: 0.5
   direct_solver_loss_weight: 1.0
-  direct_solver_interval: 4
+  # The direct objective remains the same 5-step, 8-direction SPSA estimate;
+  # it is evaluated every 32 updates so the bounded A100 budget is not spent
+  # on repeated black-box probes before the denoiser has moved materially.
+  direct_solver_interval: 32
   direct_solver_steps: 5
   # 1 base solve + 16 antithetic plus/minus pairs = 33 sequential solves/loss.
-  direct_solver_directions: 16
+  direct_solver_directions: 8
   direct_solver_perturbation: 0.15
   direct_solver_perturbation_grid_size: 12
   # Batched SPSA solve chunk. C=1 is the safe default for 8 GiB GPUs;
   # set to 4+ on A100-class (40+ GiB) for the measured ~1.1x speedup.
-  direct_solver_batch_chunk: 1
+  # Four simultaneous probe solves is the intended A100-class setting. The
+  # L4 durability gate overrides this to 1 because its 24 GiB envelope is
+  # tighter once the 295M model and optimizer are resident.
+  direct_solver_batch_chunk: 4
   # Maximum norm of the measured SPSA voxel gradient. The model-level gradient
   # clip independently bounds the combined neural update after backpropagation.
   direct_solver_gradient_clip: 1.0
@@ -187,6 +197,11 @@ training:
 cfd:
   solver: D3Q27
   resolution: 96
+  # The fused pull-stream/BFL kernel is parity-gated and selected by the
+  # monitored production launcher. Direct solver unit tests still request the
+  # reference path explicitly when they need it.
+  stream_bfl_backend: fused_stream_bfl
+  stream_block_size: 512
   # Solver-integrated optimization consumes raw momentum-exchange coefficients.
   # The legacy calibrated shape correction is not an optimizer input.
   use_shape_drag_correction: false

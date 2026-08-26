@@ -21,6 +21,7 @@ class TestLBMSolvers(unittest.TestCase):
     def test_d3q27_init(self):
         solver = D3Q27CascadedSolver(self.config, self.device, LBMPhysicsConfig)
         self.assertEqual(solver.f.shape, (27, 8, 8, 8))
+        self.assertEqual(solver._solver.stream_block_size, 512)
         self.assertFalse(torch.isnan(solver.f).any())
 
     def test_d3q27_opposites_are_vector_negations(self):

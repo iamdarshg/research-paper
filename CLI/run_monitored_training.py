@@ -1011,7 +1011,7 @@ def main() -> int:
     parser.add_argument(
         "--lbm-stream-bfl-backend",
         choices=("pytorch_reference", "fused_stream_bfl"),
-        default="pytorch_reference",
+        default=str(config_value("cfd", "stream_bfl_backend", "pytorch_reference")),
         help=(
             "Streaming/BFL backend for the direct D3Q27 solver. fused_stream_bfl "
             "requires the parity gates in tests/test_d3q27_kernel_parity.py and "

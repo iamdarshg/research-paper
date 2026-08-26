@@ -39,6 +39,27 @@ class TestConfigSourceOfTruth(unittest.TestCase):
                 "the duplicate CFDConfig family silently diverged on %s" % field,
             )
 
+    def test_cfd_performance_defaults_are_explicit_and_match_both_config_families(self):
+        from aircraft_diffusion_cfd import CFDConfig as TrainerCFDConfig
+
+        trainer_cfg = TrainerCFDConfig(base_grid_resolution=96)
+        config_cfg = ConfigModuleCFDConfig(base_grid_resolution=96)
+        for cfg in (trainer_cfg, config_cfg):
+            self.assertEqual(cfg.lbm_config.stream_block_size, 512)
+        self.assertEqual(trainer_cfg.lbm_config.use_fused_stream_bfl, False)
+        self.assertEqual(config_cfg.lbm_config.use_fused_stream_bfl, False)
+
+    def test_budgeted_295m_schedule_is_loaded_from_global_yaml(self):
+        from experiment_config import config_value
+
+        self.assertEqual(config_value("model", "coordinate_chunk_size"), 8192)
+        self.assertEqual(config_value("training", "coordinate_training_samples"), 65536)
+        self.assertEqual(config_value("training", "full_lattice_interval"), 64)
+        self.assertEqual(config_value("training", "direct_solver_interval"), 32)
+        self.assertEqual(config_value("training", "direct_solver_directions"), 8)
+        self.assertEqual(config_value("training", "direct_solver_batch_chunk"), 4)
+        self.assertEqual(config_value("cfd", "stream_bfl_backend"), "fused_stream_bfl")
+
 
 if __name__ == "__main__":
     unittest.main()

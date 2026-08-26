@@ -25,7 +25,13 @@ train:
   enable_pipeline: false
   enable_checkpointing: true
   enable_compile: true
-  direct_solver_interval: 4
+  stream_bfl_backend: fused_stream_bfl
+  stream_block_size: 512
+  coordinate_training_samples: 65536
+  full_lattice_interval: 64
+  direct_solver_interval: 32
+  direct_solver_directions: 8
+  direct_solver_batch_chunk: 4
   require_direct_solver_every_iteration: false
   checkpoint_every_updates: 25
 

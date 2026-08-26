@@ -119,10 +119,12 @@ class D3Q27Solver:
         inlet_velocity_lu: float = 0.0,
         use_triton_streaming: bool = False,
         use_fused_stream_bfl: bool = False,
+        stream_block_size: int = 256,
     ):
         self.res = resolution
         self.device = device
         self.inlet_velocity_lu = float(inlet_velocity_lu)
+        self.stream_block_size = max(32, min(1024, int(stream_block_size)))
 
         self.ex, self.ey, self.ez = D3Q27Lattice.get_vectors()
         self.ex = self.ex.to(device, dtype=torch.long)
@@ -412,6 +414,8 @@ class D3Q27Solver:
         ~1.5e-5 absolute, well within FORCE_ATOL 2.5e-5). Keeps fp32 throughout.
         """
         boundary_links = self._boundary_links(geometry_mask, geom_hash=geom_hash)
+        if block_size == 256:
+            block_size = self.stream_block_size
         total = self.f_pre_stream[0].numel()
         n_blocks = (total + block_size - 1) // block_size
         partials = self._force_drag_partials_cache.get(n_blocks)
@@ -681,6 +685,7 @@ class D3Q27Solver:
                 self.ey,
                 self.ez,
                 self.opposite,
+                block_size=self.stream_block_size,
             )
 
         used_fused_bfl = False
@@ -696,6 +701,7 @@ class D3Q27Solver:
                 self.ey,
                 self.ez,
                 self.opposite,
+                block_size=self.stream_block_size,
             )
             if not used_fused_bfl and not self._fused_stream_bfl_fallback_warned:
                 self.logger.log_warning(
@@ -1319,6 +1325,7 @@ class D3Q27Solver:
                 self.ey,
                 self.ez,
                 self.opposite,
+                block_size=self.stream_block_size,
             )
 
         if not used_fused_bfl:
@@ -1461,6 +1468,7 @@ class D3Q27CascadedSolver:
                 if getattr(self.config, "use_fused_stream_bfl", None) is None
                 else self.config.use_fused_stream_bfl
             ),
+            stream_block_size=int(getattr(self.phys_config, "stream_block_size", 512)),
         )
         # Issue #23: Correctly pass relaxation parameters
         self._solver.s_e = float(getattr(self.phys_config, 's_e_d3q27', 1.2))

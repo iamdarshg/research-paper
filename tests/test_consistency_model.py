@@ -925,6 +925,28 @@ def test_coordinate_decoder_uses_fourier_positions_at_96_cubed_without_full_grid
     assert converter.decoder_mode == "coordinate"
 
 
+def test_coordinate_decoder_contiguous_slice_matches_indexed_decode():
+    converter = LatentTo3DConverter(
+        latent_dim=4,
+        grid_resolution=4,
+        coordinate_decoder_threshold=1,
+        coordinate_chunk_size=5,
+        coordinate_decoder_width=16,
+        coordinate_decoder_depth=2,
+        coordinate_fourier_bands=2,
+        enable_coordinate_gradient_checkpointing=False,
+    )
+    latent = torch.randn((1, 4))
+    start, stop = 3, 29
+
+    expected = converter.forward_flat_indices(
+        latent, torch.arange(start, stop, dtype=torch.long)
+    )
+    actual = converter.forward_coordinate_slice(latent, start, stop)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_coordinate_decoder_checkpointed_chunks_backpropagate_to_latent():
     converter = LatentTo3DConverter(
         latent_dim=8,

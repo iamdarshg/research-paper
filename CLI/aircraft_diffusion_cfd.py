@@ -1413,6 +1413,9 @@ class LBMPhysicsConfig:
     momentum_exchange_correction: bool = True  # Apply momentum-exchange method
     use_triton_streaming: bool = False  # Keep disabled until fused kernel matches physics path exactly
     use_fused_stream_bfl: bool = False  # Fused pull-stream + q-dependent BFL kernel; enable only with parity evidence
+    # Triton launch geometry. 512 cuts launch count versus the legacy 256
+    # default on the target GPU class without changing solver arithmetic.
+    stream_block_size: int = int(config_value("cfd", "stream_block_size", 512))
     drag_link_metric_exponent: Optional[float] = None  # Auto D3Q27 face/edge/corner metric correction
     drag_reference_speed: float = 80.0  # Natural-unit reference speed for projected-pressure Cd labels
     drag_speed_normalization_exponent: float = 1.0  # OpenFOAM pressure fallback scales nearly linearly with U_inf
@@ -3288,6 +3291,39 @@ class LatentTo3DConverter(nn.Module):
             coord_chunk = encoded_coords[start:start + chunk_size]
             chunk_logits = self._checkpointed_coordinate_chunk(latent, coord_chunk, latent_expanded)
             chunks.append(chunk_logits)
+        return torch.cat(chunks, dim=1)
+
+    def forward_coordinate_slice(
+        self, latent: torch.Tensor, start: int, stop: int
+    ) -> torch.Tensor:
+        """Decode one contiguous flat-lattice interval without index staging.
+
+        Full-grounding walks the lattice in contiguous chunks. Slicing the
+        cached coordinate table avoids allocating an ``arange`` and copying
+        the same rows through ``index_select`` for every chunk; the decoder
+        math and row order are identical to ``forward_flat_indices``.
+        """
+        start = int(start)
+        stop = int(stop)
+        if start < 0 or stop < start:
+            raise ValueError(f"invalid coordinate slice [{start}, {stop})")
+        if self.decoder_mode == "dense":
+            return self.decoder(latent)[:, start:stop]
+
+        encoded_full = self._encode_full_coordinate_grid(latent.device, latent.dtype)
+        encoded_coords = encoded_full[start:stop]
+        chunks = []
+        chunk_size = self._effective_coordinate_chunk_size(latent.device)
+        latent_expanded = latent[:, None, :]
+        for offset in range(0, encoded_coords.shape[0], chunk_size):
+            coord_chunk = encoded_coords[offset:offset + chunk_size]
+            chunks.append(
+                self._checkpointed_coordinate_chunk(
+                    latent, coord_chunk, latent_expanded
+                )
+            )
+        if not chunks:
+            return latent.new_empty((latent.shape[0], 0))
         return torch.cat(chunks, dim=1)
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
@@ -6689,9 +6725,18 @@ class OptimizedDiffusionTrainer:
         # backward.
         for start in range(0, total_voxels, chunk_size):
             stop = min(start + chunk_size, total_voxels)
-            indices = torch.arange(start, stop, device=self.device)
-            target_chunk = flat_target.index_select(1, indices)
-            logits = self.converter.forward_flat_indices(latent, indices).float().nan_to_num(0.0)
+            target_chunk = flat_target[:, start:stop]
+            if hasattr(self.converter, "forward_coordinate_slice"):
+                logits = self.converter.forward_coordinate_slice(
+                    latent, start, stop
+                ).float().nan_to_num(0.0)
+            else:
+                # Preserve compatibility with lightweight coordinate-decoder
+                # adapters used by downstream callers and tests.
+                indices = torch.arange(start, stop, device=self.device)
+                logits = self.converter.forward_flat_indices(
+                    latent, indices
+                ).float().nan_to_num(0.0)
             probabilities = torch.sigmoid(logits).nan_to_num(0.0)
             bce = F.binary_cross_entropy_with_logits(logits, target_chunk, reduction="none")
             positive_mask = target_chunk > 0.5
@@ -6881,9 +6926,18 @@ class OptimizedDiffusionTrainer:
         total_chunk_loss = flat_target.new_zeros(())
         for start in range(0, total_voxels, chunk_size):
             stop = min(start + chunk_size, total_voxels)
-            indices = torch.arange(start, stop, device=self.device)
-            target_chunk = flat_target.index_select(1, indices)
-            logits = self.converter.forward_flat_indices(latent, indices).float()
+            target_chunk = flat_target[:, start:stop]
+            if hasattr(self.converter, "forward_coordinate_slice"):
+                logits = self.converter.forward_coordinate_slice(
+                    latent, start, stop
+                ).float()
+            else:
+                # Preserve compatibility with lightweight coordinate-decoder
+                # adapters used by downstream callers and tests.
+                indices = torch.arange(start, stop, device=self.device)
+                logits = self.converter.forward_flat_indices(
+                    latent, indices
+                ).float()
             probabilities = torch.sigmoid(logits).nan_to_num(0.0)
             positive_mask = target_chunk > 0.5
             negative_mask = ~positive_mask
