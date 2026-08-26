@@ -6,6 +6,7 @@ import os
 import random
 import sys
 from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1081,6 +1082,33 @@ def test_runner_restores_saved_threshold_before_resume_fingerprint(tmp_path):
 
     assert trainer.geometry_probability_threshold == pytest.approx(0.37)
     assert trainer.calls == [("restore", 0.37, True, {"source": "saved"})]
+
+
+def test_runner_authorizes_operator_resume_path_for_threshold_metadata(tmp_path, monkeypatch):
+    state_path = tmp_path / "latest_run_state.pt"
+    state_path.write_bytes(b"operator-selected run state")
+    observed = {}
+
+    def fake_load(checkpoint, *, map_location="cpu", authorized_paths=()):
+        observed["checkpoint"] = Path(checkpoint).resolve()
+        observed["authorized_paths"] = tuple(Path(path).resolve() for path in authorized_paths)
+        return {
+            "geometry_probability_threshold": 0.37,
+            "geometry_threshold_calibrated": True,
+            "geometry_threshold_calibration": {"source": "saved"},
+        }
+
+    monkeypatch.setattr(monitored_training, "_load_checkpoint_metadata", fake_load)
+    trainer = ThresholdProbe()
+
+    _prepare_geometry_threshold_for_run(
+        trainer,
+        calibration_loader=None,
+        resume_run_state=state_path,
+    )
+
+    assert observed["checkpoint"] == state_path.resolve()
+    assert observed["authorized_paths"] == (state_path.resolve(),)
 
 
 def test_config_fixed_threshold_overrides_saved_threshold_when_calibration_disabled(

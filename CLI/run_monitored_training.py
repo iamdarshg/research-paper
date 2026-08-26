@@ -281,8 +281,12 @@ def _prepare_geometry_threshold_for_run(
         resolved_path = resolve_run_state_path(resume_run_state)
         # I1: route the user-supplied run-state through the shared trust-gated
         # loader (weights_only=True first; weights_only=False fallback ONLY for
-        # a trusted local artifact under build/). Untrusted paths re-raise.
-        state = _load_checkpoint_metadata(resolved_path)
+        # this explicitly operator-selected exact-resume artifact). Unrelated
+        # paths remain unauthorized and fail closed.
+        state = _load_checkpoint_metadata(
+            resolved_path,
+            authorized_paths=(resolved_path,),
+        )
         if "geometry_probability_threshold" not in state:
             raise ValueError("Exact resume state is missing its saved geometry threshold")
         trainer._set_geometry_probability_threshold(
