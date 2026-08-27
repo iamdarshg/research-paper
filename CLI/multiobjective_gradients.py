@@ -288,6 +288,7 @@ def project_conflicting_gradient(
             projected.append(corrected.to(dtype=value.dtype))
         return tuple(projected)
 
+    projection_norm = abs(dot) / max(anchor_norm, 1.0e-300)
     projected_buffer = subtract_anchor_component(gradients, coefficient)
     cosine_after = gradient_cosine_similarity(
         projected_buffer,
@@ -295,8 +296,27 @@ def project_conflicting_gradient(
         first_name=branch_name,
         second_name=anchor_name,
     )
-    projection_norm = abs(dot) / max(anchor_norm, 1.0e-300)
-    if cosine_after < -1.0e-6:
+    for _ in range(8):
+        if cosine_after >= -1.0e-6:
+            break
+        # The exact FP64 projection can become opposed again when it is cast
+        # back to a parameter's native BF16/FP32 dtype.  Measure that native
+        # residual, fold it into the coefficient, and re-project the original
+        # gradients in FP64.  Re-projecting the originals avoids accumulating
+        # native-dtype rounding error across repair passes.
+        residual_dot = _gradient_dot_product(
+            projected_buffer,
+            anchor,
+            first_name=branch_name,
+            second_name=anchor_name,
+        )
+        if not math.isfinite(residual_dot):
+            raise NonFiniteGradientError(
+                f"gradient projection residual for {branch_name!r} and "
+                f"{anchor_name!r} is nonfinite"
+            )
+        coefficient += residual_dot / max(anchor_norm_squared, 1.0e-300)
+        projection_norm += abs(residual_dot) / max(anchor_norm, 1.0e-300)
         projected_buffer = subtract_anchor_component(
             gradients,
             coefficient,
@@ -309,10 +329,32 @@ def project_conflicting_gradient(
             second_name=anchor_name,
         )
     if cosine_after < -1.0e-6:
-        raise NonFiniteGradientError(
-            f"conflict projection left branch {branch_name!r} opposed to "
-            f"anchor {anchor_name!r}: cosine={cosine_after:.6g}"
+        # If native quantization cannot represent a safe projected direction,
+        # preserve the anchor objective by dropping only this optional branch.
+        # The FP64 residual check distinguishes this bounded fallback from a
+        # genuine nonfinite or failed projection.
+        high_precision = subtract_anchor_component(
+            gradients,
+            coefficient,
+            calculation_dtype=torch.float64,
         )
+        high_precision_dot = _gradient_dot_product(
+            high_precision,
+            anchor,
+            first_name=branch_name,
+            second_name=anchor_name,
+        )
+        high_precision_scale = max(branch_norm * anchor_norm, 1.0e-300)
+        if high_precision_dot < -1.0e-10 * high_precision_scale:
+            raise NonFiniteGradientError(
+                f"conflict projection left branch {branch_name!r} opposed to "
+                f"anchor {anchor_name!r}: cosine={cosine_after:.6g}"
+            )
+        projected_buffer = tuple(
+            None if value is None else torch.zeros_like(value)
+            for value in projected_buffer
+        )
+        cosine_after = 0.0
     return (
         projected_buffer,
         cosine_before,
