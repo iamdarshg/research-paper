@@ -255,6 +255,8 @@ def project_conflicting_gradient(
     def subtract_anchor_component(
         values: Sequence[Optional[torch.Tensor]],
         component_coefficient: float,
+        *,
+        calculation_dtype: Optional[torch.dtype] = None,
     ) -> GradientBuffer:
         projected: list[Optional[torch.Tensor]] = []
         for value, anchor_gradient in zip(values, anchor):
@@ -262,16 +264,22 @@ def project_conflicting_gradient(
                 projected.append(None)
                 continue
             if value is None:
-                projected.append(
-                    anchor_gradient.detach().clone(
-                        memory_format=torch.preserve_format
-                    ).mul_(-component_coefficient)
-                )
+                corrected = anchor_gradient.detach().to(
+                    dtype=calculation_dtype or anchor_gradient.dtype,
+                    copy=True,
+                ).mul_(-component_coefficient)
+                projected.append(corrected.to(dtype=anchor_gradient.dtype))
                 continue
-            corrected = value.detach().clone(memory_format=torch.preserve_format)
+            corrected = value.detach().to(
+                dtype=calculation_dtype or value.dtype,
+                copy=True,
+            )
             if anchor_gradient is not None:
-                corrected.add_(anchor_gradient, alpha=-component_coefficient)
-            projected.append(corrected)
+                corrected.add_(
+                    anchor_gradient.detach().to(dtype=corrected.dtype),
+                    alpha=-component_coefficient,
+                )
+            projected.append(corrected.to(dtype=value.dtype))
         return tuple(projected)
 
     projected_buffer = subtract_anchor_component(gradients, coefficient)
@@ -283,18 +291,11 @@ def project_conflicting_gradient(
     )
     projection_norm = abs(dot) / max(anchor_norm, 1.0e-300)
     if cosine_after < -1.0e-6:
-        residual_dot = _gradient_dot_product(
-            projected_buffer,
-            anchor,
-            first_name=branch_name,
-            second_name=anchor_name,
-        )
-        residual_coefficient = residual_dot / max(anchor_norm_squared, 1.0e-300)
         projected_buffer = subtract_anchor_component(
-            projected_buffer,
-            residual_coefficient,
+            gradients,
+            coefficient,
+            calculation_dtype=torch.float64,
         )
-        projection_norm += abs(residual_dot) / max(anchor_norm, 1.0e-300)
         cosine_after = gradient_cosine_similarity(
             projected_buffer,
             anchor,

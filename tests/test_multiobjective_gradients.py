@@ -238,6 +238,32 @@ def test_conflict_projection_does_not_reject_native_dtype_rounding_residual():
     assert cosine_after >= -1.0e-6
 
 
+def test_conflict_projection_recomputes_persistent_residual_in_high_precision():
+    anchor = (
+        torch.tensor(
+            [449450246144.0, 0.013655430637300014],
+            dtype=torch.float32,
+        ),
+    )
+    direct = (
+        torch.tensor(
+            [-949329395712.0, -0.02885287255048752],
+            dtype=torch.float32,
+        ),
+    )
+
+    projected, _, cosine_after, was_projected, _ = project_conflicting_gradient(
+        direct,
+        anchor,
+        branch_name="direct",
+        anchor_name="data",
+    )
+
+    assert was_projected
+    assert projected[0].dtype == direct[0].dtype
+    assert cosine_after >= -1.0e-6
+
+
 def test_aligned_direct_component_is_preserved_without_projection():
     parameter = torch.nn.Parameter(torch.zeros(2))
 
