@@ -250,7 +250,13 @@ def project_conflicting_gradient(
         first_name=branch_name,
         second_name=anchor_name,
     )
-    anchor_norm_squared = anchor_norm * anchor_norm
+    anchor_norm_squared = _gradient_dot_product(
+        anchor,
+        anchor,
+        first_name=anchor_name,
+        second_name=anchor_name,
+    )
+    anchor_norm = math.sqrt(max(anchor_norm_squared, 0.0))
     coefficient = dot / max(anchor_norm_squared, 1.0e-300)
     def subtract_anchor_component(
         values: Sequence[Optional[torch.Tensor]],
