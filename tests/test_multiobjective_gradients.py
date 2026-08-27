@@ -17,6 +17,7 @@ from multiobjective_gradients import (
     combine_gradient_branches,
     gradient_cosine_similarity,
     gradient_l2_norm,
+    project_conflicting_gradient,
     project_improvement_gradients_against_guards,
     combine_constrained_measured_gradients,
 )
@@ -206,6 +207,35 @@ def test_conflicting_direct_component_is_projected_off_data_anchor():
     assert telemetry["direct"].anchor_cosine_before < 0.0
     assert telemetry["direct"].anchor_cosine_after == pytest.approx(0.0)
     assert telemetry["direct"].projection_norm == pytest.approx(1.0)
+
+
+def test_conflict_projection_does_not_reject_native_dtype_rounding_residual():
+    anchor = (
+        torch.tensor(
+            [-0.029050925746560097, -1.070370308298152e-05],
+            dtype=torch.float32,
+        ),
+    )
+    direct = (
+        torch.tensor(
+            [0.04274682328104973, 1.575141868670471e-05],
+            dtype=torch.float32,
+        ),
+    )
+
+    projected, cosine_before, cosine_after, was_projected, _ = (
+        project_conflicting_gradient(
+            direct,
+            anchor,
+            branch_name="direct",
+            anchor_name="data",
+        )
+    )
+
+    assert was_projected
+    assert cosine_before < 0.0
+    assert projected[0].dtype == direct[0].dtype
+    assert cosine_after >= -1.0e-6
 
 
 def test_aligned_direct_component_is_preserved_without_projection():

@@ -252,36 +252,60 @@ def project_conflicting_gradient(
     )
     anchor_norm_squared = anchor_norm * anchor_norm
     coefficient = dot / max(anchor_norm_squared, 1.0e-300)
-    projected: list[Optional[torch.Tensor]] = []
-    for gradient, anchor_gradient in zip(gradients, anchor):
-        if gradient is None and anchor_gradient is None:
-            projected.append(None)
-            continue
-        if gradient is None:
-            projected.append(
-                anchor_gradient.detach().clone(
-                    memory_format=torch.preserve_format
-                ).mul_(-coefficient)
-            )
-            continue
-        value = gradient.detach().clone(memory_format=torch.preserve_format)
-        if anchor_gradient is not None:
-            value.add_(anchor_gradient, alpha=-coefficient)
-        projected.append(value)
+    def subtract_anchor_component(
+        values: Sequence[Optional[torch.Tensor]],
+        component_coefficient: float,
+    ) -> GradientBuffer:
+        projected: list[Optional[torch.Tensor]] = []
+        for value, anchor_gradient in zip(values, anchor):
+            if value is None and anchor_gradient is None:
+                projected.append(None)
+                continue
+            if value is None:
+                projected.append(
+                    anchor_gradient.detach().clone(
+                        memory_format=torch.preserve_format
+                    ).mul_(-component_coefficient)
+                )
+                continue
+            corrected = value.detach().clone(memory_format=torch.preserve_format)
+            if anchor_gradient is not None:
+                corrected.add_(anchor_gradient, alpha=-component_coefficient)
+            projected.append(corrected)
+        return tuple(projected)
 
-    projected_buffer = tuple(projected)
+    projected_buffer = subtract_anchor_component(gradients, coefficient)
     cosine_after = gradient_cosine_similarity(
         projected_buffer,
         anchor,
         first_name=branch_name,
         second_name=anchor_name,
     )
+    projection_norm = abs(dot) / max(anchor_norm, 1.0e-300)
+    if cosine_after < -1.0e-6:
+        residual_dot = _gradient_dot_product(
+            projected_buffer,
+            anchor,
+            first_name=branch_name,
+            second_name=anchor_name,
+        )
+        residual_coefficient = residual_dot / max(anchor_norm_squared, 1.0e-300)
+        projected_buffer = subtract_anchor_component(
+            projected_buffer,
+            residual_coefficient,
+        )
+        projection_norm += abs(residual_dot) / max(anchor_norm, 1.0e-300)
+        cosine_after = gradient_cosine_similarity(
+            projected_buffer,
+            anchor,
+            first_name=branch_name,
+            second_name=anchor_name,
+        )
     if cosine_after < -1.0e-6:
         raise NonFiniteGradientError(
             f"conflict projection left branch {branch_name!r} opposed to "
             f"anchor {anchor_name!r}: cosine={cosine_after:.6g}"
         )
-    projection_norm = abs(dot) / max(anchor_norm, 1.0e-300)
     return (
         projected_buffer,
         cosine_before,
