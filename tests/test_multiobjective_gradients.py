@@ -304,6 +304,25 @@ def test_conflict_projection_accepts_bfloat16_rounding_residual_after_fp64_proje
     assert torch.count_nonzero(projected[0]) > 0
 
 
+def test_conflict_projection_drops_finite_branch_when_native_quantization_cycles():
+    anchor = (torch.tensor([-9856.0, 3328.0], dtype=torch.bfloat16),)
+    direct = (torch.tensor([-13312.0, -51712.0], dtype=torch.bfloat16),)
+
+    projected, cosine_before, cosine_after, was_projected, _ = (
+        project_conflicting_gradient(
+            direct,
+            anchor,
+            branch_name="direct",
+            anchor_name="data",
+        )
+    )
+
+    assert was_projected
+    assert cosine_before < 0.0
+    assert cosine_after == pytest.approx(0.0)
+    assert torch.count_nonzero(projected[0]) == 0
+
+
 def test_aligned_direct_component_is_preserved_without_projection():
     parameter = torch.nn.Parameter(torch.zeros(2))
 
