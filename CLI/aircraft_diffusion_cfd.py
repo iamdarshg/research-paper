@@ -7175,6 +7175,12 @@ class OptimizedDiffusionTrainer:
             if run_optimizer_grid_loss:
                 direct_initial_noise = torch.randn_like(latent)
 
+            _fli = max(
+                1,
+                int(getattr(self.training_config, "full_lattice_interval", 1)),
+            )
+            _run_fl = self.global_step % _fli == 0
+
             if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
                 flat_target = geometry_target.reshape(geometry_target.shape[0], -1)
                 total_voxels = flat_target.shape[1]
@@ -7253,6 +7259,45 @@ class OptimizedDiffusionTrainer:
                     population_positive_counts=population_positive_counts,
                     population_negative_counts=population_negative_counts,
                 ).nan_to_num(0.0)
+                if self.geometry_threshold_calibrated and not _run_fl:
+                    clean_margin_components = grounded_threshold_margin_loss(
+                        clean_geom_logits_sample.float(),
+                        target_sample.float(),
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        from_logits=True,
+                        return_components=True,
+                    )
+                    generation_margin_components = grounded_threshold_margin_loss(
+                        generation_geom_logits_sample.float(),
+                        target_sample.float(),
+                        threshold=self.geometry_probability_threshold,
+                        positive_margin=self.training_config.threshold_positive_margin,
+                        negative_margin=self.training_config.threshold_negative_margin,
+                        positive_weight=self.training_config.threshold_positive_margin_weight,
+                        negative_weight=self.training_config.threshold_negative_margin_weight,
+                        from_logits=True,
+                        return_components=True,
+                    )
+                    clean_geometry_loss_val = (
+                        clean_geometry_loss_val + clean_margin_components["loss"]
+                    )
+                    generation_geometry_loss_val = (
+                        generation_geometry_loss_val
+                        + generation_margin_components["loss"]
+                    )
+                    self.last_threshold_margin_components = {
+                        key: (
+                            float(value.detach().item())
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                        for key, value in clean_margin_components.items()
+                        if key != "loss"
+                    }
                 if run_optimizer_grid_loss:
                     # Build the replay inference path once, in grad mode, BEFORE
                     # the SPSA solves. Its decode graph (checkpointed; ~small
@@ -7349,7 +7394,7 @@ class OptimizedDiffusionTrainer:
             # a small finite contribution.
             clear_gradients(optimizer_parameters)
             data_optimization_loss_val.backward(
-                retain_graph=bool(self.geometry_threshold_calibrated)
+                retain_graph=bool(self.geometry_threshold_calibrated and _run_fl)
             )
             ordinary_data_gradients = capture_gradients(optimizer_parameters)
             exact_generation_margin_loss_val = (
@@ -7360,7 +7405,7 @@ class OptimizedDiffusionTrainer:
                         self.training_config.generation_reconstruction_weight
                     ),
                 )
-                if self.geometry_threshold_calibrated
+                if self.geometry_threshold_calibrated and _run_fl
                 else data_optimization_loss_val.detach().new_zeros(())
             )
             data_optimization_loss_val = (
@@ -7595,15 +7640,23 @@ class OptimizedDiffusionTrainer:
             }
             # Full-lattice decoder gradient at configured interval.
             # On non-full-lattice updates, skip (sparse path already provides gradient signal).
-            _fli = max(1, int(getattr(self.training_config, "full_lattice_interval", 1)))
-            _run_fl = (self.global_step % _fli == 0)
             # generated and CFD graphs have already been released, so this is
             # sequential without dropping any loss contribution.
-            if getattr(self.converter, "decoder_mode", "dense") == "coordinate" and _run_fl:
-                grounded_full_loss = self._backward_full_grounded_coordinate_loss(
-                    latent,
-                    geometry_target,
-                )
+            if getattr(self.converter, "decoder_mode", "dense") == "coordinate":
+                if _run_fl:
+                    grounded_full_loss = self._backward_full_grounded_coordinate_loss(
+                        latent,
+                        geometry_target,
+                    )
+                    clean_data_gradients = capture_gradients(optimizer_parameters)
+                else:
+                    # The sampled clean loss already contributed its decoder
+                    # gradient through data_optimization_loss_val. Do not
+                    # accidentally materialize a full 128^3 lattice here.
+                    grounded_full_loss = clean_geometry_loss_val.detach()
+                    clean_data_gradients = tuple(
+                        None for _ in optimizer_parameters
+                    )
             else:
                 grounded_full_logits = self.converter(latent).nan_to_num(0.0)
                 grounded_full_loss = sparse_voxel_reconstruction_loss(
@@ -7636,8 +7689,8 @@ class OptimizedDiffusionTrainer:
                     self.training_config.clean_geometry_reconstruction_weight
                     * grounded_full_loss
                 ).backward()
+                clean_data_gradients = capture_gradients(optimizer_parameters)
             clean_geometry_loss_val = grounded_full_loss.detach()
-            clean_data_gradients = capture_gradients(optimizer_parameters)
             clear_gradients(optimizer_parameters)
             clean_grounded_converter_gradient_norm = converter_gradient_norm(
                 clean_data_gradients,

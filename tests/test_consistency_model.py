@@ -827,6 +827,66 @@ def test_train_epoch_recombines_data_consistency_and_direct_student_gradients():
     assert trainer.global_step == 1
 
 
+def test_non_anchor_coordinate_update_uses_only_sampled_decoder_paths():
+    """A sparse update must not materialize either exact full-lattice path."""
+    torch.manual_seed(404)
+    model_config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        conditioning_dim=0,
+        use_torch_compile=False,
+        coordinate_decoder_width=8,
+        coordinate_decoder_depth=2,
+        coordinate_fourier_bands=0,
+        coordinate_chunk_size=16,
+    )
+    trainer = OptimizedDiffusionTrainer(
+        model_config,
+        DiffusionConfig(timesteps=8, teacher_steps=8, student_steps=4),
+        TrainingConfig(
+            num_epochs=1,
+            consistency_interval=100,
+            direct_solver_loss_weight=1.0,
+            direct_solver_interval=32,
+            require_direct_solver_every_iteration=False,
+            coordinate_decoder_threshold=0,
+            coordinate_training_samples=16,
+            full_lattice_interval=64,
+            offload_optimizer_state_between_steps=False,
+        ),
+        CFDConfig(base_grid_resolution=4),
+        device=torch.device("cpu"),
+    )
+    trainer.geometry_threshold_calibrated = True
+    trainer.geometry_probability_threshold = 0.5
+    trainer.global_step = 1
+    records = []
+    trainer.update_metrics_callback = records.append
+
+    def reject_full_decode(*args, **kwargs):
+        raise AssertionError("non-anchor update entered a full-lattice decoder path")
+
+    trainer.converter.forward = reject_full_decode
+    trainer.converter.forward_coordinate_slice = reject_full_decode
+    batch = {
+        "latent": torch.zeros((1, 4)),
+        "geometry": torch.cat(
+            (torch.ones(1, 1, 4, 4), torch.zeros(1, 3, 4, 4)),
+            dim=1,
+        ),
+        "design_spec": [DesignSpec()],
+    }
+
+    metrics = trainer.train_epoch([batch, batch], grid_size=4, start_batch=1)
+
+    assert trainer.global_step == 2
+    assert records[0]["losses"]["threshold_positive_margin_loss"] > 0.0
+    assert records[0]["losses"]["threshold_negative_margin_loss"] > 0.0
+
+
 def test_restore_resume_learning_rate_if_zero_resets_completed_checkpoint_lr():
     layer = torch.nn.Linear(2, 2)
     optimizer = torch.optim.AdamW(layer.parameters(), lr=0.0)
