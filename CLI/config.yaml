@@ -194,6 +194,9 @@ training:
   # true only for strict scientific runs, where validation also requires an
   # interval of exactly one.
   require_direct_solver_every_iteration: false
+  # Exact CUDA EDT is selected automatically only after a startup parity probe.
+  # Explicit gpu_exact is fail-closed; scipy_reference remains the reference.
+  sdf_backend: auto
   # The monitored launcher follows this switch; keep evaluator calls sequential
   # unless a separately validated overlap run enables them.
   enable_pipeline_parallelism: false

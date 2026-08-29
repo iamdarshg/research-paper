@@ -52,7 +52,7 @@ from scipy.stats import pearsonr
 from skimage import measure
 import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
-from sdf_utils import compute_all_link_distances
+from sdf_utils import compute_all_link_distances, compute_sdf, gpu_exact_available
 from utils import compute_tensor_content_hash
 from aircraft_validity import (
     _bbox_component_fraction,
@@ -4478,16 +4478,41 @@ def _refill_sdf_pool(solver) -> None:
     if warm_cache is None or dirs_cpu is None:
         return
     ex_cpu, ey_cpu, ez_cpu = dirs_cpu
+    solver_device = getattr(solver, "device", None)
+    configured_backend = str(config_value("training", "sdf_backend", "auto"))
+    use_gpu_sdf = (
+        getattr(solver_device, "type", "") == "cuda"
+        and configured_backend in {"auto", "gpu_exact"}
+        and (configured_backend == "gpu_exact" or gpu_exact_available(solver_device))
+    )
     while len(warm_cache) < _SDF_WARM_TARGET_INFLIGHT and pending:
         geom_key, geometry_cpu = pending.pop(0)
         if geom_key not in warm_cache:
-            # OFFLOAD-3: the pool pre-computes the compact full-volume SDF
-            # (SciPy EDT) only; the solver performs q algebra on its device.
-            # This preserves the exact CPU reference semantics while reducing
-            # the host-to-device transfer to one [D, H, W] tensor per solve.
-            warm_cache[geom_key] = _SDF_POOL.submit(
-                compute_all_link_distances, geometry_cpu, ex_cpu, ey_cpu, ez_cpu, True
-            )
+            if use_gpu_sdf:
+                # Exact CuPy EDT runs on the solver device and returns a compact
+                # [D,H,W] SDF. The future synchronizes before consumption so the
+                # solver's q algebra sees a complete cross-thread CUDA result.
+                warm_cache[geom_key] = _SDF_POOL.submit(
+                    _compute_device_sdf,
+                    geometry_cpu,
+                    solver_device,
+                    configured_backend,
+                )
+            else:
+                # CPU solvers and auto-mode hosts without CuPy retain the exact
+                # SciPy reference prewarm path.
+                warm_cache[geom_key] = _SDF_POOL.submit(
+                    compute_all_link_distances, geometry_cpu, ex_cpu, ey_cpu, ez_cpu, True,
+                    backend=configured_backend,
+                )
+
+
+def _compute_device_sdf(geometry_cpu: torch.Tensor, device: torch.device, backend: str):
+    """Materialize one compact exact SDF directly on the solver's CUDA device."""
+    geometry = geometry_cpu.to(device, non_blocking=True)
+    sdf = compute_sdf(geometry, backend="gpu_exact" if backend == "auto" else backend)
+    torch.cuda.synchronize(device)
+    return sdf
 
 
 def _warm_direct_solver_sdfs(

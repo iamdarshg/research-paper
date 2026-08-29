@@ -1,0 +1,4 @@
+# Install this on CUDA hosts to enable the exact GPU SDF backend.
+# The main requirements remain CPU-installable; sdf_backend=auto falls back to
+# the exact SciPy reference when this optional package is absent.
+cupy-cuda12x>=14.2,<15

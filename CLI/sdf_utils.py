@@ -2,7 +2,7 @@ import threading
 import torch
 import numpy as np
 from scipy.ndimage import distance_transform_edt
-from typing import Tuple
+from typing import Dict, Tuple
 
 
 # Per-thread EDT workspaces. scipy's distance_transform_edt releases the GIL
@@ -13,6 +13,37 @@ from typing import Tuple
 # prepare_edt_workspace() still primes the calling (main) thread's workspace
 # before high-memory model construction.
 _THREAD_EDT_WORKSPACES = threading.local()
+_GPU_EXACT_PARITY: Dict[str, bool] = {}
+
+
+def _cupy_available() -> bool:
+    """Return whether the optional exact CUDA EDT implementation can import."""
+    try:
+        import cupy  # noqa: F401
+        from cupyx.scipy.ndimage import distance_transform_edt as _cupy_edt  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+def _load_cupy_edt():
+    import cupy as cp
+    from cupyx.scipy.ndimage import distance_transform_edt as cupy_edt
+
+    return cp, cupy_edt
+
+
+def _torch_to_cupy(tensor: torch.Tensor, cp):
+    """Share a CUDA tensor with CuPy without staging through host memory."""
+    try:
+        return cp.from_dlpack(tensor)
+    except (AttributeError, TypeError):
+        return cp.fromDlpack(torch.utils.dlpack.to_dlpack(tensor))
+
+
+def _cupy_to_torch(array, torch_device: torch.device) -> torch.Tensor:
+    result = torch.utils.dlpack.from_dlpack(array)
+    return result.to(device=torch_device, dtype=torch.float32)
 
 
 def _edt_workspace(shape):
@@ -39,8 +70,8 @@ def prepare_edt_workspace(shape) -> None:
         raise ValueError("EDT workspace shape must contain three positive dimensions")
     _edt_workspace(normalized_shape)
 
-def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
-    """Compute an exact Euclidean SDF with matching CPU/CUDA semantics.
+def _compute_sdf_scipy(voxel_grid: torch.Tensor) -> torch.Tensor:
+    """Compute the exact reference SDF with SciPy's established semantics.
 
     SciPy owns the EDT calculation. CUDA inputs are copied back only after the
     Euclidean field has been computed; the progressive-dilation approximation
@@ -75,6 +106,91 @@ def compute_sdf(voxel_grid: torch.Tensor) -> torch.Tensor:
     sdf = torch.from_numpy(dist_outside).to(voxel_grid.device, dtype=torch.float32)
 
     return sdf
+
+
+def _compute_sdf_gpu_exact(voxel_grid: torch.Tensor) -> torch.Tensor:
+    """Compute an exact Euclidean SDF on CUDA using CuPy's EDT implementation."""
+    if not voxel_grid.is_cuda:
+        raise RuntimeError("gpu_exact SDF requires a CUDA tensor")
+    cp, cupy_edt = _load_cupy_edt()
+    mask = (voxel_grid > 0.5).to(dtype=torch.uint8).contiguous()
+    cp_mask = _torch_to_cupy(mask, cp)
+    # CuPy's exact EDT accepts binary foreground masks. Compute the two signed
+    # sides sequentially so the peak working set remains bounded.
+    outside = cupy_edt(
+        cp.logical_not(cp_mask),
+        return_distances=True,
+        return_indices=False,
+        float64_distances=True,
+    )
+    inside = cupy_edt(
+        cp_mask,
+        return_distances=True,
+        return_indices=False,
+        float64_distances=True,
+    )
+    signed = outside - inside
+    result = _cupy_to_torch(signed, voxel_grid.device)
+    del signed, outside, inside, cp_mask, mask
+    return result
+
+
+def _gpu_exact_parity_probe(device: torch.device) -> bool:
+    key = str(device)
+    cached = _GPU_EXACT_PARITY.get(key)
+    if cached is not None:
+        return cached
+    geometry = torch.zeros((9, 11, 13), dtype=torch.float32, device=device)
+    geometry[2:7, 3:9, 4:11] = 1.0
+    geometry[4:6, 1:10, 6:8] = 1.0
+    try:
+        reference = _compute_sdf_scipy(geometry)
+        actual = _compute_sdf_gpu_exact(geometry)
+        torch.testing.assert_close(actual.cpu(), reference.cpu(), rtol=1e-5, atol=1e-5)
+        result = True
+    except (AssertionError, RuntimeError, ValueError, TypeError, OSError):
+        result = False
+    finally:
+        del geometry
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+    _GPU_EXACT_PARITY[key] = result
+    return result
+
+
+def gpu_exact_available(device: torch.device | None = None) -> bool:
+    """Return whether exact GPU EDT is installed and parity-approved."""
+    if device is None:
+        device = torch.device("cuda")
+    if device.type != "cuda" or not torch.cuda.is_available() or not _cupy_available():
+        return False
+    return _gpu_exact_parity_probe(device)
+
+
+def compute_sdf(
+    voxel_grid: torch.Tensor,
+    *,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Compute an exact SDF using the selected reference or CUDA backend.
+
+    ``auto`` selects the parity-approved CuPy implementation for CUDA tensors
+    and keeps the established SciPy path otherwise. ``gpu_exact`` is explicit
+    and fail-closed: missing CuPy, a non-CUDA tensor, or a parity failure raises
+    rather than silently selecting an approximation.
+    """
+    selected = str(backend).lower()
+    if selected not in {"auto", "scipy_reference", "gpu_exact"}:
+        raise ValueError(f"Unknown SDF backend: {backend!r}")
+    if selected == "scipy_reference":
+        return _compute_sdf_scipy(voxel_grid)
+    if selected == "gpu_exact":
+        if not gpu_exact_available(voxel_grid.device):
+            raise RuntimeError("gpu_exact SDF backend is unavailable or parity was not established")
+        return _compute_sdf_gpu_exact(voxel_grid)
+    if voxel_grid.is_cuda and gpu_exact_available(voxel_grid.device):
+        return _compute_sdf_gpu_exact(voxel_grid)
+    return _compute_sdf_scipy(voxel_grid)
 
 # Fixed D3Q27 stencil: the 26 non-zero link directions are read from the
 # stencil tensors once per stencil and cached, so the GPU q-algebra does not
@@ -177,7 +293,15 @@ def compute_link_q(sdf: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: to
     return q_all
 
 
-def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: torch.Tensor, ez: torch.Tensor, return_sdf: bool = False) -> torch.Tensor:
+def compute_all_link_distances(
+    voxel_grid: torch.Tensor,
+    ex: torch.Tensor,
+    ey: torch.Tensor,
+    ez: torch.Tensor,
+    return_sdf: bool = False,
+    *,
+    backend: str = "auto",
+) -> torch.Tensor:
     """
     Compute normalized wall distance 'q' for all 27 D3Q27 lattice directions (Issue #15).
     Returns tensor of shape [27, D, H, W].
@@ -197,7 +321,7 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
     # it avoids both the crop bbox scan (33 torch.nonzero host syncs per update)
     # and the 95.5 MB [27, D, H, W] H2D transfer per solve (3.5 MB SDF instead).
     if return_sdf:
-        return compute_sdf(voxel_grid)
+        return compute_sdf(voxel_grid, backend=backend)
 
     # Preserve the original short-circuit for an empty grid (all-1.0 q). This
     # guard only runs on the rare cold path, so its single host sync is not on
@@ -208,5 +332,5 @@ def compute_all_link_distances(voxel_grid: torch.Tensor, ex: torch.Tensor, ey: t
     if not torch.any(solid):
         return torch.ones((num_dirs, D, H, W), device=voxel_grid.device, dtype=torch.float32)
 
-    sdf = compute_sdf(voxel_grid)
+    sdf = compute_sdf(voxel_grid, backend=backend)
     return compute_link_q(sdf, ex, ey, ez)

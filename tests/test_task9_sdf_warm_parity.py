@@ -34,6 +34,7 @@ from aircraft_diffusion_cfd import (
 )
 from advanced_lbm_solver import D3Q27Solver, compute_all_link_distances
 from config import CFDConfig
+from sdf_utils import compute_sdf, gpu_exact_available
 from utils import compute_tensor_content_hash
 
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -58,6 +59,121 @@ def _simulator():
     # CUDA box without a Triton dependency.
     inner.use_fused_stream_bfl = False
     return simulator
+
+
+@pytest.mark.skipif(
+    not CUDA_AVAILABLE,
+    reason="Task 9 GPU exact SDF warm-cache test requires CUDA",
+)
+def test_gpu_exact_prewarm_keeps_sdf_on_solver_device(monkeypatch):
+    """When available, SPSA prewarm must use exact GPU EDT without CPU SDF hops."""
+
+    if not gpu_exact_available(torch.device("cuda")):
+        pytest.skip("CuPy exact EDT is not installed or parity-approved")
+
+    class ImmediateFuture:
+        def __init__(self, value):
+            self.value = value
+
+        def result(self):
+            return self.value
+
+    class InlinePool:
+        def submit(self, function, *args, **kwargs):
+            return ImmediateFuture(function(*args, **kwargs))
+
+    monkeypatch.setattr(adc, "_SDF_POOL", InlinePool())
+    solver = D3Q27Solver(
+        resolution=8,
+        device=torch.device("cuda"),
+        use_fused_stream_bfl=False,
+    )
+    simulator = type(
+        "SimulatorStub",
+        (),
+        {"device": torch.device("cuda"), "lbm_solver": type("Root", (), {"_solver": solver})()},
+    )()
+    sample_field = torch.full((8, 8, 8), 0.2, device="cuda")
+    sample_field[2:6, 2:6, 2:6] = 0.8
+    delta = torch.ones_like(sample_field)
+
+    adc._clear_direct_solver_sdf_warm_cache(simulator)
+    adc._warm_direct_solver_sdfs(
+        sample_field,
+        sample_field,
+        [delta],
+        eps=0.1,
+        input_is_logits=False,
+        threshold=0.5,
+        cfd_simulator=simulator,
+    )
+
+    warm_entry = next(iter(solver._warm_sdf_cache.values())).result()
+    assert warm_entry.is_cuda
+    expected = torch.zeros((8, 8, 8), device="cuda")
+    expected[2:6, 2:6, 2:6] = 1.0
+    torch.testing.assert_close(
+        warm_entry,
+        compute_sdf(expected, backend="gpu_exact"),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.skipif(
+    not CUDA_AVAILABLE,
+    reason="Task 9 GPU exact objective parity test requires CUDA",
+)
+def test_gpu_exact_matches_scipy_for_complete_direct_objective(monkeypatch):
+    """The exact GPU SDF must preserve the full SPSA loss and gradient."""
+    if not gpu_exact_available(torch.device("cuda")):
+        pytest.skip("CuPy exact EDT is not installed or parity-approved")
+
+    original_config_value = adc.config_value
+
+    def run(backend):
+        monkeypatch.setattr(
+            adc,
+            "config_value",
+            lambda section, key, default=None: (
+                backend
+                if section == "training" and key == "sdf_backend"
+                else original_config_value(section, key, default)
+            ),
+        )
+        sim = _simulator()
+        adc._clear_direct_solver_geometry_caches(sim)
+        adc._clear_direct_solver_sdf_warm_cache(sim)
+        prob = _probability_grid().requires_grad_(True)
+        sink = {}
+        loss = DirectSolverSPSAFunction.apply(
+            prob,
+            DesignSpec(),
+            sim,
+            1,
+            0.05,
+            10.0,
+            {"aero_loss": 10.0, "connectivity_loss": 10.0, "aircraft_validity_loss": 10.0},
+            0.5,
+            0.5,
+            0.5,
+            0.08,
+            0,
+            1,
+            SEED,
+            False,
+            sink,
+        )
+        loss.backward()
+        torch.cuda.synchronize()
+        return float(loss.detach()), prob.grad.detach().clone(), sink
+
+    reference_loss, reference_grad, reference_sink = run("scipy_reference")
+    gpu_loss, gpu_grad, gpu_sink = run("gpu_exact")
+    assert gpu_loss == pytest.approx(reference_loss, rel=1e-5, abs=1e-5)
+    torch.testing.assert_close(gpu_grad, reference_grad, rtol=1e-5, atol=1e-5)
+    for key in ("aero_loss", "connectivity_loss", "aircraft_validity_loss"):
+        assert gpu_sink[key] == pytest.approx(reference_sink[key], rel=1e-5, abs=1e-5)
 
 
 def _probability_grid():
@@ -141,6 +257,9 @@ def test_warm_vs_cold_spsa_bit_parity(monkeypatch):
     must use the pool at least once, and must leave zero warm entries behind
     (the bounded-residency memory bound).
     """
+    # This regression specifically compares the established CPU warm path to
+    # the serial CPU fallback. The GPU exact backend has its own gate below.
+    monkeypatch.setattr(adc, "gpu_exact_available", lambda *_args, **_kwargs: False)
     directions = 4
 
     counts = {"warm": 0, "cold": 0}
