@@ -300,24 +300,27 @@ def build_trainer_and_loader(
         num_epochs=1,
         batch_size=1,
         learning_rate=float(config_value("training", "learning_rate", 2e-5)),
-        direct_solver_loss_weight=1.0,
-        direct_solver_interval=1,
-        direct_solver_steps=5,
-        direct_solver_directions=16,
-        direct_solver_perturbation=0.15,
-        direct_solver_perturbation_grid_size=12,
-        direct_connectivity_weight=1.0,
-        direct_aircraft_validity_weight=1.0,
+        direct_solver_loss_weight=float(config_value("training", "direct_solver_loss_weight", 1.0)),
+        direct_solver_interval=int(config_value("training", "direct_solver_interval", 1)),
+        direct_solver_steps=int(config_value("training", "direct_solver_steps", 5)),
+        direct_solver_directions=int(config_value("training", "direct_solver_directions", 16)),
+        direct_solver_perturbation=float(config_value("training", "direct_solver_perturbation", 0.15)),
+        direct_solver_perturbation_grid_size=int(config_value("training", "direct_solver_perturbation_grid_size", 12)),
+        direct_connectivity_weight=float(config_value("training", "direct_connectivity_weight", 1.0)),
+        direct_aircraft_validity_weight=float(config_value("training", "direct_aircraft_validity_weight", 1.0)),
         overfit_geometry_gate_samples=samples,
-        promotion_generation_seeds=6,
-        require_direct_solver_every_iteration=True,
+        promotion_generation_seeds=int(config_value("training", "promotion_generation_seeds", 6)),
+        require_direct_solver_every_iteration=bool(config_value("training", "require_direct_solver_every_iteration", True)),
     )
     cfd_config = adc.CFDConfig(
         base_grid_resolution=resolved_grid_size,
         solver_type=solver,
         use_fused_stream_bfl=True,
     )
-    diffusion_config = adc.DiffusionConfig(teacher_steps=1000, student_steps=4)
+    diffusion_config = adc.DiffusionConfig(
+        teacher_steps=int(config_value("diffusion", "timesteps", 1000)),
+        student_steps=int(config_value("diffusion", "student_steps", 4)),
+    )
     trainer = adc.OptimizedDiffusionTrainer(
         model_config,
         diffusion_config,

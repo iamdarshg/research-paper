@@ -354,7 +354,7 @@ class DiffusionConfig:
     guidance_scale: float = float(config_value("diffusion", "guidance_scale", 7.5))
     # Consistency distillation settings
     teacher_steps: int = int(config_value("diffusion", "timesteps", 1000))
-    student_steps: int = 4
+    student_steps: int = int(config_value("diffusion", "student_steps", 4))
     progressive_distillation: List[int] = None  # 500â†’250â†’125â†’64â†’32â†’16â†’8â†’4
 
     def __post_init__(self):
@@ -533,7 +533,7 @@ class TrainingConfig:
     precision: str = str(config_value("training", "precision", "float32"))
     save_interval: int = int(config_value("training", "save_interval", 25))
     checkpoint_dir: str = "checkpoints"
-    val_interval: int = 2
+    val_interval: int = int(config_value("training", "val_interval", 2))
     clean_geometry_reconstruction_weight: float = float(
         config_value("training", "clean_geometry_reconstruction_weight", 1.0)
     )
@@ -680,8 +680,12 @@ class TrainingConfig:
         config_value("training", "promotion_generation_seeds", 6)
     )
     # Pipeline parallelism
-    enable_pipeline_parallelism: bool = False  # Keep expensive evaluator calls sequential by default
-    num_pipeline_stages: int = 8  # CFD + Diffusion stages
+    enable_pipeline_parallelism: bool = bool(
+        config_value("training", "enable_pipeline_parallelism", False)
+    )  # Keep expensive evaluator calls sequential by default
+    num_pipeline_stages: int = int(
+        config_value("training", "num_pipeline_stages", 8)
+    )  # CFD + Diffusion stages
 
 
 def validate_solver_integrated_training_config(training_config: TrainingConfig) -> None:
@@ -4477,11 +4481,10 @@ def _refill_sdf_pool(solver) -> None:
     while len(warm_cache) < _SDF_WARM_TARGET_INFLIGHT and pending:
         geom_key, geometry_cpu = pending.pop(0)
         if geom_key not in warm_cache:
-            # OFFLOAD-3: the pool pre-computes the full-volume SDF (scipy EDT)
-            # only; D3Q27Solver._get_q runs the q-algebra on the solve device,
-            # so only the small [D, H, W] SDF crosses H2D per solve instead of
-            # the full [27, D, H, W] q field (95.5 MB at 96^3). The 5th
-            # positional arg is the return_sdf flag.
+            # OFFLOAD-3: the pool pre-computes the compact full-volume SDF
+            # (SciPy EDT) only; the solver performs q algebra on its device.
+            # This preserves the exact CPU reference semantics while reducing
+            # the host-to-device transfer to one [D, H, W] tensor per solve.
             warm_cache[geom_key] = _SDF_POOL.submit(
                 compute_all_link_distances, geometry_cpu, ex_cpu, ey_cpu, ez_cpu, True
             )
@@ -9702,8 +9705,8 @@ def cli():
 @click.option('--learning-rate', default=float(config_value('training', 'learning_rate', 2e-4)), help='Learning rate')
 @click.option('--latent-dim', default=int(config_value('model', 'latent_dim', 192)), help='Latent dimension')
 @click.option('--grid-size', default=None, type=int, help='Optional voxel resolution override for training and CFD')
-@click.option('--precision', default='float32', help='Precision: float64, float32, float16, bfloat16, float8')
-@click.option('--disconnection-penalty', default=30.0, help='Penalty for disconnected voxels')
+@click.option('--precision', default=str(config_value('training', 'precision', 'float32')), help='Precision: float64, float32, float16, bfloat16, float8')
+@click.option('--disconnection-penalty', default=float(config_value('training', 'disconnection_penalty', 30.0)), help='Penalty for disconnected voxels')
 @click.option('--num-samples', default=500, help='Number of training samples')
 @click.option('--dataset-artifact', default=None, help='Optional densified dataset artifact (.pt)')
 @click.option('--dataset-manifest', default=None, help='Optional grounded dataset manifest (.json, .jsonl, .yaml)')
@@ -9713,10 +9716,10 @@ def cli():
 @click.option('--baseline-config', default=None, help='Required for final runs: baseline comparison config path')
 @click.option('--claim-gates', default=None, help='Required for final runs: path to FINAL_RUN_GATES.md')
 @click.option('--enable-consistency/--disable-consistency', default=True, help='Enable 4-step consistency model')
-@click.option('--enable-pipeline/--disable-pipeline', default=False, help='Enable pipeline parallelism')
-@click.option('--enable-checkpointing/--disable-checkpointing', default=True, help='Enable gradient checkpointing')
-@click.option('--enable-compile', is_flag=True, default=False, help='Enable torch.compile optimization')
-@click.option('--solver', default='D3Q27', help='CFD solver type: D3Q27')
+@click.option('--enable-pipeline/--disable-pipeline', default=bool(config_value('training', 'enable_pipeline_parallelism', False)), help='Enable pipeline parallelism')
+@click.option('--enable-checkpointing/--disable-checkpointing', default=bool(config_value('model', 'enable_gradient_checkpointing', True)), help='Enable gradient checkpointing')
+@click.option('--enable-compile', is_flag=True, default=bool(config_value('model', 'use_torch_compile', False)), help='Enable torch.compile optimization')
+@click.option('--solver', default=str(config_value('cfd', 'solver', 'D3Q27')), help='CFD solver type: D3Q27')
 @click.option('--coordinate-training-samples', default=int(config_value('training', 'coordinate_training_samples', 32768)), help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
 @click.option('--coordinate-positive-fraction', default=float(config_value('training', 'coordinate_positive_fraction', 0.5)), help='Fraction of sampled high-resolution coordinates drawn from occupied voxels when available')
 @click.option('--coordinate-decoder-threshold', default=int(config_value('model', 'coordinate_decoder_threshold', 96)), help='Use the coordinate decoder at this grid size or above; set to 1 for matched coordinate-decoder sweeps.')
@@ -9726,7 +9729,7 @@ def cli():
 @click.option('--direct-solver-directions', default=int(config_value('training', 'direct_solver_directions', 16)), help='Antithetic SPSA directions; each direction adds two sequential solver calls.')
 @click.option('--direct-solver-perturbation', default=float(config_value('training', 'direct_solver_perturbation', 0.15)), help='Two-sided SPSA voxel-probability perturbation size.')
 @click.option('--direct-solver-perturbation-grid-size', default=int(config_value('training', 'direct_solver_perturbation_grid_size', 12)), help='Optional low-frequency SPSA perturbation grid edge length; 0 uses per-voxel noise.')
-@click.option('--direct-solver-gradient-clip', default=1.0, help='L2 clip applied to the estimated direct solver gradient.')
+@click.option('--direct-solver-gradient-clip', default=float(config_value('training', 'direct_solver_gradient_clip', 1.0)), help='L2 clip applied to the estimated direct solver gradient.')
 @click.option('--direct-connectivity-weight', default=float(config_value('training', 'direct_connectivity_weight', 1.0)), help='Weight for exact connected-component loss inside the direct measured objective.')
 @click.option('--direct-aircraft-validity-weight', default=float(config_value('training', 'direct_aircraft_validity_weight', 1.0)), help='Weight for aircraft-shape regression failures inside the direct measured SPSA objective.')
 @click.option('--direct-solver-target-occupancy', default=None, type=float, help='Optional top-k occupancy fraction for direct solver binarization.')
@@ -9738,9 +9741,9 @@ def cli():
 @click.option('--overfit-patience', default=8, type=int, help='Stop after this many epochs without a meaningful new best metric.')
 @click.option('--overfit-min-delta', default=1.0e-4, type=float, help='Minimum absolute metric improvement that resets overfit-stop patience.')
 @click.option('--overfit-relative-delta', default=1.0e-3, type=float, help='Minimum relative metric improvement that resets overfit-stop patience.')
-@click.option('--overfit-geometry-gate-samples', default=8, type=int, help='Fixed sample count for reconstruction and generated-validity promotion checks.')
+@click.option('--overfit-geometry-gate-samples', default=int(config_value('training', 'overfit_geometry_gate_samples', 8)), type=int, help='Fixed sample count for reconstruction and generated-validity promotion checks.')
 @click.option('--overfit-min-reconstruction-topk-recall', default=0.2, type=float, help='Minimum mean target-occupancy top-k recall required to promote the final checkpoint.')
-@click.option('--overfit-min-generated-aircraft-valid-fraction', default=0.125, type=float, help='Minimum generated aircraft-validity pass fraction required to promote the final checkpoint.')
+@click.option('--overfit-min-generated-aircraft-valid-fraction', default=float(config_value('training', 'overfit_min_generated_aircraft_valid_fraction', 0.125)), type=float, help='Minimum generated aircraft-validity pass fraction required to promote the final checkpoint.')
 def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
           num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
           enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, coordinate_decoder_threshold,
@@ -9858,7 +9861,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
     else:
         model_config = ModelConfig(
             latent_dim=latent_dim,
-            attention_groups=4,
+            attention_groups=int(config_value('model', 'attention_groups', 8)),
             base_grid_resolution=base_resolution,
             grid_resolution=base_resolution,
             enable_gradient_checkpointing=enable_checkpointing,
@@ -9884,8 +9887,8 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         )
 
     diffusion_config = DiffusionConfig(
-        teacher_steps=1000,
-        student_steps=4  # 4-step consistency model
+        teacher_steps=int(config_value('diffusion', 'timesteps', 1000)),
+        student_steps=int(config_value('diffusion', 'student_steps', 4))
     )
 
     training_config = TrainingConfig(

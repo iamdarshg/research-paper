@@ -993,6 +993,36 @@ def _load_monitored_history(path: Path) -> List[Dict[str, Any]]:
     return [dict(record) for record in records if isinstance(record, dict)]
 
 
+def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig:
+    """Build the monitored trainer from config defaults without erasing sparse cadence."""
+    return TrainingConfig(
+        num_epochs=args.num_epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        disconnection_penalty=float(
+            config_value("training", "disconnection_penalty", 30.0)
+        ),
+        precision=str(config_value("training", "precision", "float32")),
+        enable_pipeline_parallelism=bool(
+            config_value("training", "enable_pipeline_parallelism", False)
+        ),
+        num_pipeline_stages=int(config_value("training", "num_pipeline_stages", 8)),
+        direct_solver_loss_weight=args.direct_solver_loss_weight,
+        direct_solver_interval=int(config_value("training", "direct_solver_interval", 1)),
+        direct_solver_steps=args.direct_solver_steps,
+        direct_solver_directions=args.direct_solver_directions,
+        direct_solver_perturbation=args.direct_solver_perturbation,
+        direct_solver_perturbation_grid_size=args.direct_solver_perturbation_grid_size,
+        direct_connectivity_weight=args.direct_connectivity_weight,
+        direct_aircraft_validity_weight=args.direct_aircraft_validity_weight,
+        overfit_geometry_gate_samples=args.promotion_evaluation_samples,
+        promotion_generation_seeds=args.promotion_generation_seeds,
+        require_direct_solver_every_iteration=bool(
+            config_value("training", "require_direct_solver_every_iteration", False)
+        ),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a GPU-monitored training sweep with stability checks.")
     parser.add_argument("--manifest", required=True, help="Grounded manifest used for training.")
@@ -1186,26 +1216,11 @@ def main() -> int:
     print(f"Training samples per epoch: {len(epoch_dataset)}/{len(dataset)}")
     print(f"Promotion samples: {len(promotion_dataset)}/{len(dataset)} ({args.promotion_split})")
 
-    diffusion_config = DiffusionConfig(teacher_steps=1000, student_steps=4)
-    training_config = TrainingConfig(
-        num_epochs=args.num_epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        disconnection_penalty=30.0,
-        precision="bfloat16",
-        enable_pipeline_parallelism=False,
-        direct_solver_loss_weight=args.direct_solver_loss_weight,
-        direct_solver_interval=int(config_value("training", "direct_solver_interval", 4)),
-        direct_solver_steps=args.direct_solver_steps,
-        direct_solver_directions=args.direct_solver_directions,
-        direct_solver_perturbation=args.direct_solver_perturbation,
-        direct_solver_perturbation_grid_size=args.direct_solver_perturbation_grid_size,
-        direct_connectivity_weight=args.direct_connectivity_weight,
-        direct_aircraft_validity_weight=args.direct_aircraft_validity_weight,
-        overfit_geometry_gate_samples=args.promotion_evaluation_samples,
-        promotion_generation_seeds=args.promotion_generation_seeds,
-        require_direct_solver_every_iteration=False,
+    diffusion_config = DiffusionConfig(
+        teacher_steps=int(config_value("diffusion", "timesteps", 1000)),
+        student_steps=int(config_value("diffusion", "student_steps", 4)),
     )
+    training_config = _build_monitored_training_config(args)
     cfd_config = CFDConfig(
         base_grid_resolution=resolved_grid_size,
         solver_type=args.solver,
