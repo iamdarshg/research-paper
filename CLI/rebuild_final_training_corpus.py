@@ -64,9 +64,10 @@ else:
     from validate_manifest import DEFAULT_UNIQUE_GEOMETRY_TARGET, validate_manifest_file
 
 
-GRID_SHAPE = (96, 96, 96)
+SOURCE_GRID_SHAPE = (96, 96, 96)
+GRID_SHAPE = SOURCE_GRID_SHAPE
 NORMALIZED_VOXEL_UNITS = "normalized voxel lattice; occupancy is dimensionless"
-BUILDER_VERSION = "final-training-corpus-v1"
+BUILDER_VERSION = "final-training-corpus-v2"
 PERTURBATION_METADATA_VERSION = "final-training-corpus-v1-perturbation-v1"
 PROCEDURAL_METADATA_VERSION = "final-training-corpus-v1-procedural-v1"
 
@@ -141,10 +142,10 @@ def resolve_geometry_path(record: Mapping[str, Any], manifest_path: Path) -> Pat
 
 
 def canonicalize_voxels(voxels: np.ndarray) -> np.ndarray:
-    """Canonicalize an array to the required binary uint8 96-cubed lattice."""
+    """Canonicalize a cubic voxel array to detached binary uint8 storage."""
     array = np.asarray(voxels)
-    if tuple(array.shape) != GRID_SHAPE:
-        raise ValueError(f"voxel array must have shape {GRID_SHAPE}, got {tuple(array.shape)}")
+    if array.ndim != 3 or len(set(array.shape)) != 1 or array.shape[0] <= 0:
+        raise ValueError(f"voxel array must be a non-empty cube, got {tuple(array.shape)}")
     if np.issubdtype(array.dtype, np.number) and not np.all(np.isfinite(array)):
         raise ValueError("voxel array contains non-finite values")
     try:
@@ -152,6 +153,20 @@ def canonicalize_voxels(voxels: np.ndarray) -> np.ndarray:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"voxel array cannot be thresholded to binary uint8: {exc}") from exc
     return np.ascontiguousarray(canonical)
+
+
+def resample_cubic_voxels(voxels: np.ndarray, target_grid_size: int) -> np.ndarray:
+    """Nearest-neighbour resample with an explicit deterministic index map."""
+    canonical = canonicalize_voxels(voxels)
+    target = int(target_grid_size)
+    if target <= 0:
+        raise ValueError("target_grid_size must be positive")
+    source = int(canonical.shape[0])
+    if source == target:
+        return canonical
+    indices = np.floor(np.arange(target, dtype=np.float64) * source / target).astype(np.intp)
+    indices = np.minimum(indices, source - 1)
+    return np.ascontiguousarray(canonical[np.ix_(indices, indices, indices)])
 
 
 def canonical_content_hash(voxels: np.ndarray) -> str:
@@ -234,6 +249,11 @@ def preflight_source_records(
 
         source_path = resolve_geometry_path(parent, source_manifest)
         canonical = _load_canonical_file(source_path)
+        if tuple(canonical.shape) != SOURCE_GRID_SHAPE:
+            raise ValueError(
+                f"source record {source_record_index} must have shape {SOURCE_GRID_SHAPE}, "
+                f"got {tuple(canonical.shape)}"
+            )
         actual_hash = canonical_content_hash(canonical)
         declared_hash = _declared_canonical_hash(parent)
         if declared_hash != actual_hash:
@@ -729,10 +749,24 @@ def validate_published_corpus(
     _assert_no_reparse_components(output_root, role="published output")
     manifest_path = output_root / "combined_training_manifest.jsonl"
     voxel_root = output_root / "voxels"
+    build_spec_path = output_root / "build_spec.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"published manifest does not exist: {manifest_path}")
     if not voxel_root.is_dir():
         raise FileNotFoundError(f"published voxel directory does not exist: {voxel_root}")
+    if not build_spec_path.is_file():
+        raise FileNotFoundError(f"published build specification does not exist: {build_spec_path}")
+    build_spec = json.loads(build_spec_path.read_text(encoding="utf-8"))
+    declared_shape = build_spec.get("grid_shape")
+    if (
+        not isinstance(declared_shape, list)
+        or len(declared_shape) != 3
+        or len(set(declared_shape)) != 1
+        or not isinstance(declared_shape[0], int)
+        or declared_shape[0] <= 0
+    ):
+        raise ValueError(f"published build specification has invalid grid_shape: {declared_shape!r}")
+    expected_shape = tuple(declared_shape)
 
     records = load_jsonl_manifest(manifest_path)
     if expected_total_count is not None and len(records) != expected_total_count:
@@ -758,7 +792,7 @@ def validate_published_corpus(
             raise ValueError(f"record {index} geometry cannot be loaded: {resolved_geometry}: {exc}") from exc
         if not isinstance(loaded, np.ndarray):
             raise ValueError(f"record {index} geometry is not a numpy array: {resolved_geometry}")
-        if tuple(loaded.shape) != GRID_SHAPE:
+        if tuple(loaded.shape) != expected_shape:
             raise ValueError(f"record {index} geometry shape mismatch: {tuple(loaded.shape)}")
         if loaded.dtype != np.dtype(np.uint8):
             raise ValueError(f"record {index} geometry dtype mismatch: {loaded.dtype}")
@@ -779,7 +813,7 @@ def validate_published_corpus(
         if actual_hash in unique_hashes:
             raise ValueError(f"record {index} duplicates canonical geometry hash {actual_hash}")
         unique_hashes.add(actual_hash)
-        shape_counts["96x96x96"] += 1
+        shape_counts["x".join(str(edge) for edge in expected_shape)] += 1
         dtype_counts["uint8"] += 1
         split_counts[str(record.get("split"))] += 1
 
@@ -911,13 +945,19 @@ def _assert_procedural_family_minimums(stats: Mapping[str, Any], requested_count
         raise ValueError(f"procedural family minimums not met: {missing}")
 
 
-def _replay_geometry(output_root: Path, record: Mapping[str, Any], expected_hash: str, index: int) -> None:
+def _replay_geometry(
+    output_root: Path,
+    record: Mapping[str, Any],
+    expected_hash: str,
+    index: int,
+    expected_shape: tuple[int, int, int],
+) -> None:
     resolved_geometry = _safe_published_geometry_path(output_root, record.get("geometry_path"))
     try:
         loaded = np.load(str(resolved_geometry), allow_pickle=False)
     except (OSError, ValueError) as exc:
         raise ValueError(f"replay record {index} geometry cannot be loaded: {resolved_geometry}: {exc}") from exc
-    if not isinstance(loaded, np.ndarray) or tuple(loaded.shape) != GRID_SHAPE:
+    if not isinstance(loaded, np.ndarray) or tuple(loaded.shape) != expected_shape:
         raise ValueError(f"replay record {index} geometry shape mismatch")
     if loaded.dtype != np.dtype(np.uint8) or not np.all((loaded == 0) | (loaded == 1)):
         raise ValueError(f"replay record {index} geometry is not binary uint8")
@@ -929,14 +969,25 @@ def _replay_geometry(output_root: Path, record: Mapping[str, Any], expected_hash
 
 
 def _compare_replay_record(
-    actual: Mapping[str, Any], expected: Mapping[str, Any], *, output_root: Path, index: int
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    output_root: Path,
+    index: int,
+    expected_shape: tuple[int, int, int],
 ) -> None:
     if dict(actual) != dict(expected):
         differing_keys = sorted(
             key for key in set(actual) | set(expected) if actual.get(key) != expected.get(key)
         )
         raise ValueError(f"replay record {index} identity mismatch in keys: {differing_keys[:5]}")
-    _replay_geometry(output_root, actual, expected["canonical_content_sha256"], index)
+    _replay_geometry(
+        output_root,
+        actual,
+        expected["canonical_content_sha256"],
+        index,
+        expected_shape,
+    )
 
 
 def replay_published_corpus(
@@ -962,6 +1013,17 @@ def replay_published_corpus(
 
     source_manifest = Path(source_manifest).resolve()
     build_spec = json.loads(build_spec_path.read_text(encoding="utf-8"))
+    declared_shape = build_spec.get("grid_shape")
+    if (
+        not isinstance(declared_shape, list)
+        or len(declared_shape) != 3
+        or len(set(declared_shape)) != 1
+        or not isinstance(declared_shape[0], int)
+        or declared_shape[0] <= 0
+    ):
+        raise ValueError(f"published build specification has invalid grid_shape: {declared_shape!r}")
+    expected_shape = tuple(declared_shape)
+    target_grid_size = int(expected_shape[0])
     published_batches = build_spec.get("perturbation_batches")
     if not isinstance(published_batches, list):
         raise ValueError("published build spec is missing perturbation_batches")
@@ -1011,6 +1073,7 @@ def replay_published_corpus(
         "perturbation_batches": [list(batch) for batch in batches],
         "procedural_count": procedural_count,
         "procedural_seed": procedural_seed,
+        "target_grid_size": target_grid_size,
         "expected_counts": {
             "original": expected_original_count,
             "perturbation": expected_perturbation_count,
@@ -1034,25 +1097,38 @@ def replay_published_corpus(
         expected_original_count=expected_original_count,
     )
     replay_index = 0
-    seen_hashes = {entry["source_hash"] for entry in source_entries}
+    seen_hashes: set[str] = set()
     replay_counts: Counter[str] = Counter()
     parent_split_counts: Counter[str] = Counter()
 
     for entry in source_entries:
         parent = entry["record"]
+        source_output = resample_cubic_voxels(
+            _load_canonical_file(entry["source_path"]), target_grid_size
+        )
+        output_hash = canonical_content_hash(source_output)
         parent_output = _build_original_record(
             parent,
             source_manifest_name=source_manifest.name,
             source_manifest_hash=build_spec["source_manifest_sha256"],
             source_record_index=entry["source_record_index"],
-            content_hash=entry["source_hash"],
-            voxel_file_hash=_canonical_npy_sha256(_load_canonical_file(entry["source_path"])),
-            geometry_path=f"voxels/{entry['source_hash']}.npy",
+            content_hash=output_hash,
+            voxel_file_hash=_canonical_npy_sha256(source_output),
+            geometry_path=f"voxels/{output_hash}.npy",
         )
-        _compare_replay_record(records[replay_index], parent_output, output_root=output_root, index=replay_index)
+        _compare_replay_record(
+            records[replay_index],
+            parent_output,
+            output_root=output_root,
+            index=replay_index,
+            expected_shape=expected_shape,
+        )
         replay_index += 1
         replay_counts["original"] += 1
         parent_split_counts[str(parent.get("split"))] += 0
+        if output_hash in seen_hashes:
+            raise ValueError(f"resampling produced duplicate original geometry {output_hash}")
+        seen_hashes.add(output_hash)
 
     per_transform: dict[str, dict[str, int]] = {}
     for batch in batches:
@@ -1064,25 +1140,36 @@ def replay_published_corpus(
         for entry in source_entries:
             parent = entry["record"]
             source_voxels = _load_canonical_file(entry["source_path"])
-            for transform, transformed, child_hash in iter_transform_candidates(source_voxels, batch):
+            published_parent_hash = canonical_content_hash(
+                resample_cubic_voxels(source_voxels, target_grid_size)
+            )
+            for transform, transformed_source, _source_child_hash in iter_transform_candidates(source_voxels, batch):
+                transformed = resample_cubic_voxels(transformed_source, target_grid_size)
+                child_hash = canonical_content_hash(transformed)
                 transform_stats = per_transform[transform]
                 transform_stats["candidates"] += 1
                 if child_hash in seen_hashes:
                     transform_stats["rejected_duplicate"] += 1
                     continue
-                if not validate_perturbation(transformed):
+                if not validate_perturbation(transformed_source):
                     transform_stats["rejected_invalid"] += 1
                     continue
                 expected_record = build_perturbation_record(
                     parent,
                     transform=transform,
                     parent_record_index=entry["source_record_index"],
-                    parent_hash=entry["source_hash"],
+                    parent_hash=published_parent_hash,
                     child_hash=child_hash,
                     voxel_file_hash=_canonical_npy_sha256(transformed),
                     geometry_path=f"voxels/{child_hash}.npy",
                 )
-                _compare_replay_record(records[replay_index], expected_record, output_root=output_root, index=replay_index)
+                _compare_replay_record(
+                    records[replay_index],
+                    expected_record,
+                    output_root=output_root,
+                    index=replay_index,
+                    expected_shape=expected_shape,
+                )
                 replay_index += 1
                 replay_counts["perturbation"] += 1
                 per_transform[transform]["accepted"] += 1
@@ -1093,20 +1180,29 @@ def replay_published_corpus(
     for sample in iter_procedural_samples(
         procedural_count,
         procedural_seed,
-        seen_hashes=seen_hashes,
         stats=procedural_stats,
     ):
-        child_hash = sample["canonical_content_sha256"]
+        procedural_voxels = resample_cubic_voxels(sample["voxels"], target_grid_size)
+        child_hash = canonical_content_hash(procedural_voxels)
+        if child_hash in seen_hashes:
+            raise ValueError(f"resampling produced duplicate procedural geometry {child_hash}")
+        seen_hashes.add(child_hash)
         expected_record = build_procedural_record(
             aircraft_type=sample["aircraft_type"],
             accepted_index=sample["accepted_index"],
             attempt=sample["attempt"],
             seed=sample["seed"],
             child_hash=child_hash,
-            voxel_file_hash=_canonical_npy_sha256(sample["voxels"]),
+            voxel_file_hash=_canonical_npy_sha256(procedural_voxels),
             geometry_path=f"voxels/{child_hash}.npy",
         )
-        _compare_replay_record(records[replay_index], expected_record, output_root=output_root, index=replay_index)
+        _compare_replay_record(
+            records[replay_index],
+            expected_record,
+            output_root=output_root,
+            index=replay_index,
+            expected_shape=expected_shape,
+        )
         replay_index += 1
         replay_counts["procedural"] += 1
     _assert_procedural_family_minimums(procedural_stats, procedural_count)
@@ -1178,6 +1274,7 @@ def rebuild_final_training_corpus(
     expected_perturbation_count: int = DEFAULT_EXPECTED_PERTURBATION_COUNT,
     expected_procedural_count: int = DEFAULT_EXPECTED_PROCEDURAL_COUNT,
     expected_total_count: int = DEFAULT_EXPECTED_TOTAL_COUNT,
+    target_grid_size: int = SOURCE_GRID_SHAPE[0],
 ) -> dict[str, Any]:
     """Rebuild and atomically publish the complete final corpus."""
     source_manifest = Path(source_manifest).resolve()
@@ -1190,6 +1287,10 @@ def rebuild_final_training_corpus(
     )
     if procedural_count < 0:
         raise ValueError("procedural_count must be non-negative")
+    target_grid_size = int(target_grid_size)
+    if target_grid_size <= 0:
+        raise ValueError("target_grid_size must be positive")
+    target_shape = (target_grid_size,) * 3
     batches = _normalize_batches(perturbation_batches)
 
     output_parent = output_dir.parent
@@ -1202,7 +1303,7 @@ def rebuild_final_training_corpus(
             expected_original_count=expected_original_count,
         )
         records: list[dict[str, Any]] = []
-        seen_hashes: set[str] = {entry["source_hash"] for entry in source_entries}
+        seen_hashes: set[str] = set()
         dropped_counts: Counter[str] = Counter()
 
         for entry in source_entries:
@@ -1210,9 +1311,13 @@ def rebuild_final_training_corpus(
             parent = entry["record"]
             source_path = resolve_geometry_path(parent, source_manifest)
             canonical = _load_canonical_file(source_path)
-            actual_hash = canonical_content_hash(canonical)
-            if actual_hash != entry["source_hash"]:
+            source_hash = canonical_content_hash(canonical)
+            if source_hash != entry["source_hash"]:
                 raise ValueError(f"source record {source_record_index} changed during rebuild")
+            canonical = resample_cubic_voxels(canonical, target_grid_size)
+            actual_hash = canonical_content_hash(canonical)
+            if actual_hash in seen_hashes:
+                raise ValueError(f"resampling produced duplicate original geometry {actual_hash}")
             geometry_path, voxel_file_hash = _write_canonical_voxel(
                 canonical, actual_hash, staging_dir / "voxels"
             )
@@ -1226,6 +1331,7 @@ def rebuild_final_training_corpus(
                 geometry_path=geometry_path,
             )
             records.append(output_record)
+            seen_hashes.add(actual_hash)
 
         per_transform: dict[str, dict[str, int]] = {}
         batch_counts: dict[str, dict[str, Any]] = {}
@@ -1246,7 +1352,12 @@ def rebuild_final_training_corpus(
             for entry in source_entries:
                 parent = entry["record"]
                 source_voxels = _load_canonical_file(entry["source_path"])
-                for transform, transformed, child_hash in iter_transform_candidates(source_voxels, batch):
+                published_parent_hash = canonical_content_hash(
+                    resample_cubic_voxels(source_voxels, target_grid_size)
+                )
+                for transform, transformed_source, _source_child_hash in iter_transform_candidates(source_voxels, batch):
+                    transformed = resample_cubic_voxels(transformed_source, target_grid_size)
+                    child_hash = canonical_content_hash(transformed)
                     batch_stats["candidates"] += 1
                     transform_stats = per_transform[transform]
                     transform_stats["candidates"] += 1
@@ -1255,7 +1366,7 @@ def rebuild_final_training_corpus(
                         transform_stats["rejected_duplicate"] += 1
                         dropped_counts["duplicate_canonical_geometry"] += 1
                         continue
-                    if not validate_perturbation(transformed):
+                    if not validate_perturbation(transformed_source):
                         batch_stats["rejected_invalid"] += 1
                         transform_stats["rejected_invalid"] += 1
                         continue
@@ -1266,7 +1377,7 @@ def rebuild_final_training_corpus(
                         parent,
                         transform=transform,
                         parent_record_index=entry["source_record_index"],
-                        parent_hash=entry["source_hash"],
+                        parent_hash=published_parent_hash,
                         child_hash=child_hash,
                         voxel_file_hash=voxel_file_hash,
                         geometry_path=geometry_path,
@@ -1281,12 +1392,14 @@ def rebuild_final_training_corpus(
         for sample in iter_procedural_samples(
             procedural_count,
             procedural_seed,
-            seen_hashes=seen_hashes,
             stats=procedural_stats,
         ):
-            child_hash = sample["canonical_content_sha256"]
+            procedural_voxels = resample_cubic_voxels(sample["voxels"], target_grid_size)
+            child_hash = canonical_content_hash(procedural_voxels)
+            if child_hash in seen_hashes:
+                raise ValueError(f"resampling produced duplicate procedural geometry {child_hash}")
             geometry_path, voxel_file_hash = _write_canonical_voxel(
-                sample["voxels"], child_hash, staging_dir / "voxels"
+                procedural_voxels, child_hash, staging_dir / "voxels"
             )
             records.append(
                 build_procedural_record(
@@ -1299,6 +1412,7 @@ def rebuild_final_training_corpus(
                     geometry_path=geometry_path,
                 )
             )
+            seen_hashes.add(child_hash)
         _assert_procedural_family_minimums(procedural_stats, procedural_count)
         dropped_counts["duplicate_canonical_geometry"] += int(procedural_stats.get("rejected_duplicate", 0))
 
@@ -1335,7 +1449,9 @@ def rebuild_final_training_corpus(
             "builder_commit": _git_commit_identity(),
             "dependency_versions": _dependency_versions(),
             "output_manifest_name": "combined_training_manifest.jsonl",
-            "grid_shape": list(GRID_SHAPE),
+            "source_grid_shape": list(SOURCE_GRID_SHAPE),
+            "target_grid_size": target_grid_size,
+            "grid_shape": list(target_shape),
             "voxel_dtype": "uint8",
             "geometry_naming": "voxels/<canonical_content_sha256>.npy",
             "perturbation_batches": [list(batch) for batch in batches],
@@ -1368,6 +1484,7 @@ def rebuild_final_training_corpus(
             expected_perturbation_count=expected_perturbation_count,
             expected_procedural_count=expected_procedural_count,
             expected_total_count=expected_total_count,
+            unique_geometry_target=expected_total_count,
         )
         audit = validate_published_corpus(
             staging_dir,
@@ -1449,6 +1566,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--perturb-batch", action="append", default=None)
     parser.add_argument("--procedural-count", type=int, default=DEFAULT_EXPECTED_PROCEDURAL_COUNT)
     parser.add_argument("--procedural-seed", type=int, default=42)
+    parser.add_argument("--target-grid-size", type=int, default=SOURCE_GRID_SHAPE[0])
     parser.add_argument("--expected-originals", type=int, default=DEFAULT_EXPECTED_ORIGINAL_COUNT)
     parser.add_argument("--expected-perturbations", type=int, default=DEFAULT_EXPECTED_PERTURBATION_COUNT)
     parser.add_argument("--expected-procedural", type=int, default=DEFAULT_EXPECTED_PROCEDURAL_COUNT)
@@ -1460,6 +1578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         perturbation_batches=_parse_batches(args.perturb_batch),
         procedural_count=args.procedural_count,
         procedural_seed=args.procedural_seed,
+        target_grid_size=args.target_grid_size,
         expected_original_count=args.expected_originals,
         expected_perturbation_count=args.expected_perturbations,
         expected_procedural_count=args.expected_procedural,

@@ -300,8 +300,26 @@ def test_source_semantic_and_file_hashes_are_validated_independently(tmp_path):
 
     with pytest.raises(ValueError, match="hash"):
         _run_small_build(source_manifest, output_dir)
-
     assert not output_dir.exists()
+
+
+def test_rebuild_resamples_and_replays_declared_target_grid(tmp_path):
+    builder = _builder_module()
+    source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
+    output_dir = tmp_path / "published-128"
+
+    report = _run_small_build(source_manifest, output_dir, target_grid_size=128)
+
+    record = _read_records(output_dir / "combined_training_manifest.jsonl")[0]
+    geometry = np.load(output_dir / record["geometry_path"], allow_pickle=False)
+    build_spec = json.loads((output_dir / "build_spec.json").read_text(encoding="utf-8"))
+    assert geometry.shape == (128, 128, 128)
+    assert geometry.dtype == np.uint8
+    assert build_spec["source_grid_shape"] == [96, 96, 96]
+    assert build_spec["target_grid_size"] == 128
+    assert build_spec["grid_shape"] == [128, 128, 128]
+    assert report["shape_counts"] == {"128x128x128": 1}
+    assert builder.replay_published_corpus(output_dir, source_manifest)["status"] == "pass"
 
 
 def test_perturbation_children_inherit_parent_splits_and_report_grouped_counts(tmp_path):

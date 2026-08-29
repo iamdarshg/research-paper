@@ -205,7 +205,7 @@ class TestProtocolRunner(unittest.TestCase):
             2,
         )
 
-    def test_gcp_128_production_protocol_is_unbounded_with_production_cadence(self):
+    def test_gcp_128_production_protocol_runs_exactly_two_epochs_with_production_cadence(self):
         repo_root = Path(__file__).resolve().parents[1]
         protocol_path = repo_root / "CLI" / "run_protocols" / "gcp_128_295m.yaml"
         config = run_protocol.load_protocol_config(str(protocol_path))
@@ -223,7 +223,7 @@ class TestProtocolRunner(unittest.TestCase):
             "--manifest": str(
                 (repo_root / "build" / "final_training_corpus_20260830_v2" / "combined_training_manifest.jsonl").resolve()
             ),
-            "--num-epochs": "12",
+            "--num-epochs": "2",
             "--batch-size": "1",
             "--learning-rate": "2e-05",
             "--latent-dim": "512",
@@ -262,6 +262,6 @@ class TestProtocolRunner(unittest.TestCase):
 
         self.assertEqual(len(commands), 1)
         command = commands[0]
-        self.assertEqual(command[command.index("--num-epochs") + 1], "12")
+        self.assertEqual(command[command.index("--num-epochs") + 1], "2")
         self.assertEqual(command[command.index("--checkpoint-every-updates") + 1], "1")
         self.assertEqual(command[command.index("--stop-after-updates") + 1], "5")
