@@ -178,15 +178,22 @@ def _declared_canonical_hash(record: Mapping[str, Any]) -> str:
                 f"Record {record.get('source_id')} has an invalid {field}; expected 64 lowercase hex characters"
             )
         declared[field] = value.lower()
-    if not declared:
+    if "canonical_content_sha256" not in declared:
         raise ValueError(
             f"Record {record.get('source_id')} must declare a 64-character canonical_content_sha256"
         )
-    if len(declared) == 2 and declared["canonical_content_sha256"] != declared["voxel_sha256"]:
+    return declared["canonical_content_sha256"]
+
+
+def _declared_voxel_file_hash(record: Mapping[str, Any]) -> str | None:
+    value = record.get("voxel_sha256")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _HASH_RE.fullmatch(value.lower()):
         raise ValueError(
-            f"Record {record.get('source_id')} has disagreeing hash fields: canonical_content_sha256 and voxel_sha256"
+            f"Record {record.get('source_id')} has an invalid voxel_sha256; expected 64 lowercase hex characters"
         )
-    return next(iter(declared.values()))
+    return value.lower()
 
 
 def _load_canonical_file(path: Path) -> np.ndarray:
@@ -233,6 +240,14 @@ def preflight_source_records(
             raise ValueError(
                 f"source record {source_record_index} canonical hash mismatch: declared {declared_hash}, got {actual_hash}"
             )
+        declared_voxel_hash = _declared_voxel_file_hash(parent)
+        if declared_voxel_hash is not None:
+            actual_voxel_hash = _file_sha256(source_path)
+            if declared_voxel_hash != actual_voxel_hash:
+                raise ValueError(
+                    f"source record {source_record_index} voxel file hash mismatch: "
+                    f"declared {declared_voxel_hash}, got {actual_voxel_hash}"
+                )
         if actual_hash in source_hashes:
             raise ValueError(
                 f"duplicate canonical source content in raw source manifest: {actual_hash}"
@@ -265,7 +280,13 @@ def _write_jsonl(path: Path, records: Iterable[Mapping[str, Any]]) -> None:
     path.write_bytes(rendered.encode("utf-8"))
 
 
-def _write_canonical_voxel(voxels: np.ndarray, content_hash: str, voxel_root: Path) -> str:
+def _canonical_npy_sha256(voxels: np.ndarray) -> str:
+    payload = io.BytesIO()
+    np.save(payload, canonicalize_voxels(voxels), allow_pickle=False)
+    return hashlib.sha256(payload.getvalue()).hexdigest()
+
+
+def _write_canonical_voxel(voxels: np.ndarray, content_hash: str, voxel_root: Path) -> tuple[str, str]:
     if not _HASH_RE.fullmatch(content_hash):
         raise ValueError(f"invalid content hash for output geometry: {content_hash!r}")
     canonical = canonicalize_voxels(voxels)
@@ -279,7 +300,7 @@ def _write_canonical_voxel(voxels: np.ndarray, content_hash: str, voxel_root: Pa
         existing = _load_canonical_file(destination)
         if canonical_content_hash(existing) != content_hash:
             raise ValueError(f"content-addressed output collision at {destination}")
-        return f"voxels/{destination.name}"
+        return f"voxels/{destination.name}", _file_sha256(destination)
 
     temporary_path: Path | None = None
     try:
@@ -301,7 +322,13 @@ def _write_canonical_voxel(voxels: np.ndarray, content_hash: str, voxel_root: Pa
     staged = _load_canonical_file(destination)
     if canonical_content_hash(staged) != content_hash:
         raise ValueError(f"staged content hash mismatch at {destination}")
-    return f"voxels/{destination.name}"
+    voxel_file_hash = _file_sha256(destination)
+    expected_file_hash = _canonical_npy_sha256(canonical)
+    if voxel_file_hash != expected_file_hash:
+        raise ValueError(
+            f"staged voxel file hash mismatch at {destination}: {voxel_file_hash} != {expected_file_hash}"
+        )
+    return f"voxels/{destination.name}", voxel_file_hash
 
 
 def _mark_sparse_file(handle: Any) -> bool:
@@ -520,6 +547,7 @@ def _build_original_record(
     source_manifest_hash: str,
     source_record_index: int,
     content_hash: str,
+    voxel_file_hash: str | None = None,
     geometry_path: str,
 ) -> dict[str, Any]:
     source_id = str(parent.get("source_id") or parent.get("sample_id") or "")
@@ -541,7 +569,7 @@ def _build_original_record(
             "source_manifest_record_index": source_record_index,
             "geometry_path": geometry_path,
             "canonical_content_sha256": content_hash,
-            "voxel_sha256": content_hash,
+            "voxel_sha256": voxel_file_hash or content_hash,
             "units": NORMALIZED_VOXEL_UNITS,
             "conditioning_mode": "unconditioned_source_metadata_only",
         }
@@ -563,6 +591,7 @@ def build_perturbation_record(
     parent_record_index: int,
     parent_hash: str,
     child_hash: str,
+    voxel_file_hash: str | None = None,
     geometry_path: str,
 ) -> dict[str, Any]:
     parent_source_id = str(parent.get("source_id") or parent.get("sample_id") or "")
@@ -585,7 +614,7 @@ def build_perturbation_record(
         "transform": transform,
         "geometry_path": geometry_path,
         "canonical_content_sha256": child_hash,
-        "voxel_sha256": child_hash,
+        "voxel_sha256": voxel_file_hash or child_hash,
         "split": parent_split,
         "conditioning_mode": "unconditioned_source_metadata_only",
         "geometry_provenance": (
@@ -608,6 +637,7 @@ def build_procedural_record(
     attempt: int,
     seed: int,
     child_hash: str,
+    voxel_file_hash: str | None = None,
     geometry_path: str,
 ) -> dict[str, Any]:
     if not _HASH_RE.fullmatch(child_hash):
@@ -624,7 +654,7 @@ def build_procedural_record(
         "generator_seed": seed,
         "geometry_path": geometry_path,
         "canonical_content_sha256": child_hash,
-        "voxel_sha256": child_hash,
+        "voxel_sha256": voxel_file_hash or child_hash,
         "split": "train",
         "conditioning_mode": "unconditioned_source_metadata_only",
         "geometry_provenance": "Deterministic procedural voxel geometry; NOT real CAD or measured aircraft data.",
@@ -738,9 +768,12 @@ def validate_published_corpus(
         declared_hash = _declared_canonical_hash(record)
         if declared_hash != actual_hash:
             raise ValueError(f"record {index} canonical hash mismatch: declared {declared_hash}, got {actual_hash}")
-        voxel_hash = record.get("voxel_sha256")
-        if voxel_hash and str(voxel_hash).lower() != actual_hash:
-            raise ValueError(f"record {index} voxel hash mismatch: declared {voxel_hash}, got {actual_hash}")
+        voxel_hash = _declared_voxel_file_hash(record)
+        actual_voxel_hash = _file_sha256(resolved_geometry)
+        if voxel_hash is None or voxel_hash != actual_voxel_hash:
+            raise ValueError(
+                f"record {index} voxel file hash mismatch: declared {voxel_hash}, got {actual_voxel_hash}"
+            )
         if resolved_geometry.stem != actual_hash:
             raise ValueError(f"record {index} content-addressed filename mismatch: {resolved_geometry.name}")
         if actual_hash in unique_hashes:
@@ -1013,6 +1046,7 @@ def replay_published_corpus(
             source_manifest_hash=build_spec["source_manifest_sha256"],
             source_record_index=entry["source_record_index"],
             content_hash=entry["source_hash"],
+            voxel_file_hash=_canonical_npy_sha256(_load_canonical_file(entry["source_path"])),
             geometry_path=f"voxels/{entry['source_hash']}.npy",
         )
         _compare_replay_record(records[replay_index], parent_output, output_root=output_root, index=replay_index)
@@ -1045,6 +1079,7 @@ def replay_published_corpus(
                     parent_record_index=entry["source_record_index"],
                     parent_hash=entry["source_hash"],
                     child_hash=child_hash,
+                    voxel_file_hash=_canonical_npy_sha256(transformed),
                     geometry_path=f"voxels/{child_hash}.npy",
                 )
                 _compare_replay_record(records[replay_index], expected_record, output_root=output_root, index=replay_index)
@@ -1068,6 +1103,7 @@ def replay_published_corpus(
             attempt=sample["attempt"],
             seed=sample["seed"],
             child_hash=child_hash,
+            voxel_file_hash=_canonical_npy_sha256(sample["voxels"]),
             geometry_path=f"voxels/{child_hash}.npy",
         )
         _compare_replay_record(records[replay_index], expected_record, output_root=output_root, index=replay_index)
@@ -1177,13 +1213,16 @@ def rebuild_final_training_corpus(
             actual_hash = canonical_content_hash(canonical)
             if actual_hash != entry["source_hash"]:
                 raise ValueError(f"source record {source_record_index} changed during rebuild")
-            geometry_path = _write_canonical_voxel(canonical, actual_hash, staging_dir / "voxels")
+            geometry_path, voxel_file_hash = _write_canonical_voxel(
+                canonical, actual_hash, staging_dir / "voxels"
+            )
             output_record = _build_original_record(
                 parent,
                 source_manifest_name=source_manifest.name,
                 source_manifest_hash=source_manifest_hash,
                 source_record_index=source_record_index,
                 content_hash=actual_hash,
+                voxel_file_hash=voxel_file_hash,
                 geometry_path=geometry_path,
             )
             records.append(output_record)
@@ -1220,13 +1259,16 @@ def rebuild_final_training_corpus(
                         batch_stats["rejected_invalid"] += 1
                         transform_stats["rejected_invalid"] += 1
                         continue
-                    geometry_path = _write_canonical_voxel(transformed, child_hash, staging_dir / "voxels")
+                    geometry_path, voxel_file_hash = _write_canonical_voxel(
+                        transformed, child_hash, staging_dir / "voxels"
+                    )
                     generated_record = build_perturbation_record(
                         parent,
                         transform=transform,
                         parent_record_index=entry["source_record_index"],
                         parent_hash=entry["source_hash"],
                         child_hash=child_hash,
+                        voxel_file_hash=voxel_file_hash,
                         geometry_path=geometry_path,
                     )
                     records.append(generated_record)
@@ -1243,7 +1285,9 @@ def rebuild_final_training_corpus(
             stats=procedural_stats,
         ):
             child_hash = sample["canonical_content_sha256"]
-            geometry_path = _write_canonical_voxel(sample["voxels"], child_hash, staging_dir / "voxels")
+            geometry_path, voxel_file_hash = _write_canonical_voxel(
+                sample["voxels"], child_hash, staging_dir / "voxels"
+            )
             records.append(
                 build_procedural_record(
                     aircraft_type=sample["aircraft_type"],
@@ -1251,6 +1295,7 @@ def rebuild_final_training_corpus(
                     attempt=sample["attempt"],
                     seed=sample["seed"],
                     child_hash=child_hash,
+                    voxel_file_hash=voxel_file_hash,
                     geometry_path=geometry_path,
                 )
             )

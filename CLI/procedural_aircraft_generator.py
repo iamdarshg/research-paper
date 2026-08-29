@@ -346,6 +346,7 @@ def main():
             attempt=sample["attempt"],
             seed=sample["seed"],
             child_hash=c,
+            voxel_file_hash=builder._file_sha256(od / "voxels" / fn),
             geometry_path="voxels/" + fn,
         ))
     stats["generator_version"] = PROCEDURAL_GENERATOR_VERSION

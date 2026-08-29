@@ -154,13 +154,15 @@ def main():
             temporary = od / "voxels" / ("." + fn + ".tmp")
             with temporary.open("wb") as handle:
                 np.save(handle, tv, allow_pickle=False)
-            os.replace(temporary, od / "voxels" / fn)
+            destination = od / "voxels" / fn
+            os.replace(temporary, destination)
             out.append(builder.build_perturbation_record(
                 rec,
                 transform=tf,
                 parent_record_index=idx,
                 parent_hash=entry["source_hash"],
                 child_hash=c,
+                voxel_file_hash=builder._file_sha256(destination),
                 geometry_path="voxels/" + fn,
             ))
             parent_split = str(rec.get("split"))

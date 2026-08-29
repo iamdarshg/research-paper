@@ -77,13 +77,14 @@ def _write_source_manifest(root: Path, arrays, splits=None) -> Path:
         filename = f"source-{index}.npy"
         np.save(voxel_root / filename, array, allow_pickle=False)
         content_hash = _semantic_hash(array)
+        voxel_file_hash = hashlib.sha256((voxel_root / filename).read_bytes()).hexdigest()
         record = {
             "source_id": f"source-{index}",
             "sample_id": f"sample-{index}",
             "source_type": "original",
             "geometry_path": f"voxels/{filename}",
             "canonical_content_sha256": content_hash,
-            "voxel_sha256": content_hash,
+            "voxel_sha256": voxel_file_hash,
             "split": split,
             "geometry_provenance": "controlled source fixture",
             "preprocessing_version": "controlled-source-v1",
@@ -279,15 +280,23 @@ def test_duplicate_source_id_with_different_content_fails_closed(tmp_path):
     assert not output_dir.exists()
 
 
-def test_source_hash_fields_must_agree_before_publication(tmp_path):
+def test_source_semantic_and_file_hashes_are_validated_independently(tmp_path):
     source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
+    valid_output = tmp_path / "valid-published"
+    _run_small_build(source_manifest, valid_output)
+    valid_record = _read_records(valid_output / "combined_training_manifest.jsonl")[0]
+    assert valid_record["canonical_content_sha256"] == _semantic_hash(_aircraft_like())
+    assert valid_record["voxel_sha256"] == hashlib.sha256(
+        (valid_output / valid_record["geometry_path"]).read_bytes()
+    ).hexdigest()
+
     records = _read_records(source_manifest)
     records[0]["voxel_sha256"] = "f" * 64
     source_manifest.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
-    output_dir = tmp_path / "published"
+    output_dir = tmp_path / "invalid-published"
 
     with pytest.raises(ValueError, match="hash"):
         _run_small_build(source_manifest, output_dir)
