@@ -340,7 +340,23 @@ def build_trainer_and_loader(
 # ---------------------------------------------------------------------------
 # Modes
 # ---------------------------------------------------------------------------
+def _profile_grid_size(trainer) -> int:
+    """Return the common model/solver resolution used by this profiler."""
+    model_size = getattr(getattr(trainer, "model_config", None), "grid_resolution", None)
+    solver_size = getattr(getattr(trainer, "cfd_simulator", None), "resolution", None)
+    sizes = [int(value) for value in (model_size, solver_size) if value is not None]
+    if not sizes:
+        raise RuntimeError("cannot determine profiler grid size from trainer")
+    if len(set(sizes)) != 1:
+        raise RuntimeError(
+            "trainer model/solver grid mismatch: "
+            f"model={model_size}, solver={solver_size}"
+        )
+    return sizes[0]
+
+
 def run_full_update(trainer, loader, warmup: int, iterations: int, profile_cuda: bool) -> dict:
+    grid_size = _profile_grid_size(trainer)
     trainer.scheduler_step_per_update = True
     trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         trainer.optimizer, T_max=max(1, warmup + iterations)
@@ -376,7 +392,7 @@ def run_full_update(trainer, loader, warmup: int, iterations: int, profile_cuda:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         boundary["t_prev"] = time.perf_counter()
-        trainer.train_epoch(loader, grid_size=96, start_batch=0)
+        trainer.train_epoch(loader, grid_size=grid_size, start_batch=0)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -410,7 +426,8 @@ def run_full_update(trainer, loader, warmup: int, iterations: int, profile_cuda:
 
 
 def run_direct_only(trainer, iterations: int, seed: int = 1234) -> dict:
-    field = torch.randn(1, 96, 96, 96, device=trainer.device)
+    grid_size = _profile_grid_size(trainer)
+    field = torch.randn(1, grid_size, grid_size, grid_size, device=trainer.device)
     spec = adc.DesignSpec(target_speed=90.0, wingspan_limit_m=1.2)
     times = []
     for i in range(iterations):
@@ -432,7 +449,8 @@ def run_direct_only(trainer, iterations: int, seed: int = 1234) -> dict:
 
 
 def run_solver_only(trainer, iterations: int) -> dict:
-    field = torch.rand(1, 96, 96, 96, device=trainer.device)
+    grid_size = _profile_grid_size(trainer)
+    field = torch.rand(1, grid_size, grid_size, grid_size, device=trainer.device)
     solver_geom = adc._canonical_training_geometry_to_solver_xyz(
         (field.squeeze(0) > 0.5).float()
     ).to(trainer.cfd_simulator.device)
