@@ -3363,6 +3363,18 @@ class LatentTo3DConverter(nn.Module):
         selected chunks' rows in ascending chunk order.
         """
         batch_size = latent.shape[0]
+        if self.decoder_mode == "dense":
+            dense = self.decoder(latent)
+            chunk_size = self._effective_coordinate_chunk_size(latent.device)
+            keep = set(int(i) for i in selected_chunks)
+            selected = []
+            for idx, start in enumerate(range(0, dense.shape[1], chunk_size)):
+                if idx in keep:
+                    selected.append(dense[:, start:start + chunk_size])
+            if not selected:
+                return dense.new_empty((batch_size, 0))
+            return torch.cat(selected, dim=1)
+
         coords = self._encode_full_coordinate_grid(latent.device, latent.dtype)
         chunk_size = self._effective_coordinate_chunk_size(latent.device)
         keep = set(int(i) for i in selected_chunks)

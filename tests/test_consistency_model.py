@@ -1007,6 +1007,32 @@ def test_coordinate_decoder_contiguous_slice_matches_indexed_decode():
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
+def test_dense_decoder_voxel_mask_matches_selected_dense_chunks():
+    converter = LatentTo3DConverter(
+        latent_dim=4,
+        grid_resolution=4,
+        coordinate_decoder_threshold=96,
+        coordinate_chunk_size=5,
+        enable_coordinate_gradient_checkpointing=False,
+    )
+    latent = torch.randn((1, 4))
+
+    dense = converter(latent).reshape(1, -1)
+    chunk_size = converter.coordinate_chunk_size
+    expected = torch.cat(
+        [
+            dense[:, start:min(start + chunk_size, dense.shape[1])]
+            for start in range(0, dense.shape[1], chunk_size)
+            if start // chunk_size in {0, 2}
+        ],
+        dim=1,
+    )
+    actual = converter.forward_voxel_mask(latent, [0, 2])
+
+    assert converter.decoder_mode == "dense"
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_coordinate_decoder_checkpointed_chunks_backpropagate_to_latent():
     converter = LatentTo3DConverter(
         latent_dim=8,
