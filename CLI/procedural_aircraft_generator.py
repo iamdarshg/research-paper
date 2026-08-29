@@ -19,6 +19,7 @@ AIRCRAFT_TYPES = [
     "glider", "delta_wing", "flying_wing", "biplane",
     "canard", "anhedral", "swept_wing", "lifting_body",
 ]
+PROCEDURAL_MIN_ACCEPTED_PER_TYPE = {aircraft_type: 1 for aircraft_type in AIRCRAFT_TYPES}
 PROCEDURAL_GENERATOR_VERSION = "procedural-aircraft-v1"
 
 
@@ -186,8 +187,17 @@ def generate_aircraft(rng, aircraft_type):
         shs = rng.randint(7, 15)
         swx = GRID//2 + bl//3
         _wing_symmetric(g, cz, swx, 3, shs, 1, sweep_frac=0.15, taper=0.5)
-        ty = GRID//2 + bl//2 - 3
-        _box(g, cz, cz+brz+2, ty-1, ty+1, GRID//2-2, GRID//2+2)
+        tail_x = GRID//2 + bl//2 - 3
+        _box(g, cz, cz+brz+2, cz-1, cz+1, tail_x-1, tail_x+1)
+        # The legacy corpus validator compares the two spanwise halves about
+        # the plane between voxels 47 and 48.  The primitives above are drawn
+        # about voxel 48, so mirror their union one cell toward the lower half
+        # to preserve the intended bilateral geometry on that established
+        # validation plane.  The aircraft is comfortably clear of y=0/95, so
+        # this shift cannot clip or wrap occupied voxels.
+        shifted = np.zeros_like(g)
+        shifted[:, :-1, :] = g[:, 1:, :]
+        g = np.maximum(g, shifted)
 
     return (g > 0.5).astype(np.float32)
 
@@ -219,7 +229,12 @@ def validate(v):
         mid = GRID // 2
         left = occ[:, :mid, :]; right = occ[:, GRID-mid:, :]
         ml = min(left.shape[1], right.shape[1])
-        asym = np.abs(left[:,:ml,:].astype(int) - right[:,-ml:,:].astype(int)).sum() / max(occ.sum(), 1)
+        # Compare corresponding spanwise locations after reflecting the right
+        # half.  Without this reversal a genuinely bilateral aircraft is
+        # compared in opposite tip-to-root order and can score zero symmetry.
+        asym = np.abs(
+            left[:, -ml:, :].astype(int) - right[:, :ml, :][:, ::-1, :].astype(int)
+        ).sum() / max(occ.sum(), 1)
         if max(0.0, 1.0 - asym) < MIN_SYMMETRY: return False
         return True
     except Exception:
@@ -291,36 +306,48 @@ def generate_procedural_samples(
     return samples, stats
 
 
+def _task2_builder_module():
+    try:
+        from . import rebuild_final_training_corpus as builder
+    except ImportError:
+        import rebuild_final_training_corpus as builder
+    return builder
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate procedural aircraft")
     ap.add_argument("--count", type=int, default=2000)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-    od = Path(args.output_dir); od.mkdir(parents=True, exist_ok=True)
-    (od / "voxels").mkdir(exist_ok=True)
+    builder = _task2_builder_module()
     samples, stats = generate_procedural_samples(args.count, args.seed)
+    if stats["accepted"] != args.count:
+        raise ValueError(f"procedural generator accepted {stats['accepted']} of requested {args.count}")
+    builder._assert_procedural_family_minimums(stats, args.count)
+    od = builder._safe_output_target(Path(args.output_dir))
+    od.mkdir()
+    builder._assert_no_reparse_components(od, role="standalone procedural output")
+    (od / "voxels").mkdir(exist_ok=True)
     out = []
     for sample in samples:
         atype = sample["aircraft_type"]
         vox = sample["voxels"]
         c = sample["canonical_content_sha256"]
         vid = f"proc:{atype}:{sample['accepted_index']}"
-        fn = vid.replace(":", "_") + ".npy"
-        np.save(str(od / "voxels" / fn), vox, allow_pickle=False)
-        out.append({
-            "source_id": vid, "source_type": "procedural",
-            "aircraft_type": atype, "canonical_content_sha256": c,
-            "voxel_sha256": c, "geometry_path": "voxels/" + fn,
-            "conditioning_mode": "unconditioned_source_metadata_only",
-            "split": "train",
-            "provenance": {
-                "generator_seed": args.seed, "attempt": sample["attempt"],
-                "generator_version": PROCEDURAL_GENERATOR_VERSION,
-                "description": f"Parametrically generated {atype}",
-                "claim_boundary": "Procedurally generated design, NOT real CAD."
-            }
-        })
+        fn = c + ".npy"
+        temporary = od / "voxels" / ("." + fn + ".tmp")
+        with temporary.open("wb") as handle:
+            np.save(handle, vox, allow_pickle=False)
+        os.replace(temporary, od / "voxels" / fn)
+        out.append(builder.build_procedural_record(
+            aircraft_type=atype,
+            accepted_index=sample["accepted_index"],
+            attempt=sample["attempt"],
+            seed=sample["seed"],
+            child_hash=c,
+            geometry_path="voxels/" + fn,
+        ))
     stats["generator_version"] = PROCEDURAL_GENERATOR_VERSION
     mp = od / "manifest.jsonl"; tmp = mp.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:

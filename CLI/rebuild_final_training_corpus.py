@@ -12,13 +12,17 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import importlib.metadata as importlib_metadata
 import io
 import json
 import os
+import platform
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import uuid
 from collections import Counter
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
@@ -38,7 +42,9 @@ if __package__:
         validate as validate_perturbation,
     )
     from .procedural_aircraft_generator import (
+        AIRCRAFT_TYPES,
         PROCEDURAL_GENERATOR_VERSION,
+        PROCEDURAL_MIN_ACCEPTED_PER_TYPE,
         iter_procedural_samples,
     )
     from .validate_manifest import DEFAULT_UNIQUE_GEOMETRY_TARGET, validate_manifest_file
@@ -49,7 +55,12 @@ else:
         iter_transform_candidates,
         validate as validate_perturbation,
     )
-    from procedural_aircraft_generator import PROCEDURAL_GENERATOR_VERSION, iter_procedural_samples
+    from procedural_aircraft_generator import (
+        AIRCRAFT_TYPES,
+        PROCEDURAL_GENERATOR_VERSION,
+        PROCEDURAL_MIN_ACCEPTED_PER_TYPE,
+        iter_procedural_samples,
+    )
     from validate_manifest import DEFAULT_UNIQUE_GEOMETRY_TARGET, validate_manifest_file
 
 
@@ -157,14 +168,25 @@ def _file_sha256(path: Path) -> str:
 
 
 def _declared_canonical_hash(record: Mapping[str, Any]) -> str:
-    value = record.get("canonical_content_sha256")
-    if not value:
-        value = record.get("voxel_sha256")
-    if not value or not _HASH_RE.fullmatch(str(value).lower()):
+    declared: dict[str, str] = {}
+    for field in ("canonical_content_sha256", "voxel_sha256"):
+        if field not in record:
+            continue
+        value = record[field]
+        if not isinstance(value, str) or not _HASH_RE.fullmatch(value.lower()):
+            raise ValueError(
+                f"Record {record.get('source_id')} has an invalid {field}; expected 64 lowercase hex characters"
+            )
+        declared[field] = value.lower()
+    if not declared:
         raise ValueError(
             f"Record {record.get('source_id')} must declare a 64-character canonical_content_sha256"
         )
-    return str(value).lower()
+    if len(declared) == 2 and declared["canonical_content_sha256"] != declared["voxel_sha256"]:
+        raise ValueError(
+            f"Record {record.get('source_id')} has disagreeing hash fields: canonical_content_sha256 and voxel_sha256"
+        )
+    return next(iter(declared.values()))
 
 
 def _load_canonical_file(path: Path) -> np.ndarray:
@@ -178,6 +200,55 @@ def _load_canonical_file(path: Path) -> np.ndarray:
             close()
         raise ValueError(f"Voxel geometry must be a .npy array, got {type(loaded).__name__} at {path}")
     return canonicalize_voxels(loaded)
+
+
+def preflight_source_records(
+    source_manifest: Path,
+    *,
+    expected_original_count: int | None = None,
+) -> list[dict[str, Any]]:
+    """Validate every raw source row before any duplicate filtering or admission."""
+    source_manifest = Path(source_manifest)
+    source_records = load_jsonl_manifest(source_manifest)
+    if expected_original_count is not None and len(source_records) != expected_original_count:
+        raise ValueError(
+            f"raw source record count {len(source_records)} does not equal expected {expected_original_count}"
+        )
+
+    source_ids: set[str] = set()
+    source_hashes: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for source_record_index, parent in enumerate(source_records):
+        source_id = str(parent.get("source_id") or parent.get("sample_id") or "")
+        if not source_id:
+            raise ValueError(f"source record {source_record_index} has no source_id")
+        if source_id in source_ids:
+            raise ValueError(f"duplicate source_id in raw source manifest: {source_id}")
+
+        source_path = resolve_geometry_path(parent, source_manifest)
+        canonical = _load_canonical_file(source_path)
+        actual_hash = canonical_content_hash(canonical)
+        declared_hash = _declared_canonical_hash(parent)
+        if declared_hash != actual_hash:
+            raise ValueError(
+                f"source record {source_record_index} canonical hash mismatch: declared {declared_hash}, got {actual_hash}"
+            )
+        if actual_hash in source_hashes:
+            raise ValueError(
+                f"duplicate canonical source content in raw source manifest: {actual_hash}"
+            )
+
+        source_ids.add(source_id)
+        source_hashes.add(actual_hash)
+        entries.append(
+            {
+                "record": parent,
+                "source_path": source_path,
+                "source_hash": actual_hash,
+                "source_record_index": source_record_index,
+            }
+        )
+    return entries
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -304,16 +375,110 @@ def _is_http_url(value: str) -> bool:
     return value.lower().startswith(("http://", "https://"))
 
 
-def _looks_like_absolute_path(value: str) -> bool:
+def _contains_local_path_reference(value: str) -> bool:
     if _is_http_url(value):
         return False
+    if value.lower().startswith(("file://", "file:/")):
+        return True
     return (
         Path(value).is_absolute()
         or PureWindowsPath(value).is_absolute()
         or value.startswith("\\\\")
         or value.startswith("/")
         or bool(re.match(r"^[A-Za-z]:[\\/]", value))
+        or bool(re.search(r"(?:[A-Za-z]:[\\/]|\\\\)", value))
     )
+
+
+def _looks_like_absolute_path(value: str) -> bool:
+    return _contains_local_path_reference(value)
+
+
+def _lexical_absolute_path(path: Path | str, *, role: str) -> Path:
+    raw = os.fspath(path)
+    if isinstance(raw, bytes):
+        raw = os.fsdecode(raw)
+    if not str(raw).strip() or str(raw).strip() in {".", ".."}:
+        raise ValueError(f"unsafe empty/current-directory {role} target: {path!r}")
+    candidate = Path(os.path.abspath(raw))
+    if candidate == Path(candidate.anchor):
+        raise ValueError(f"unsafe filesystem-root {role} target: {path!r}")
+    return candidate
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        if Path(path).is_symlink():
+            return True
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _assert_no_reparse_components(path: Path, *, role: str) -> None:
+    candidate = _lexical_absolute_path(path, role=role)
+    current = Path(candidate.anchor)
+    for part in candidate.parts:
+        if part == candidate.anchor:
+            continue
+        current = current / part
+        if not os.path.lexists(current):
+            break
+        if _is_reparse_point(current):
+            raise ValueError(f"{role} contains a symlink/junction/reparse point: {current}")
+
+
+def _safe_output_target(output_dir: Path | str) -> Path:
+    candidate = _lexical_absolute_path(output_dir, role="output")
+    _assert_no_reparse_components(candidate, role="output")
+    if os.path.lexists(candidate):
+        raise FileExistsError(f"refusing to replace existing output directory: {candidate}")
+    parent = candidate.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    _assert_no_reparse_components(parent, role="output parent")
+    if os.path.lexists(candidate):
+        raise FileExistsError(f"output target appeared during preparation: {candidate}")
+    return candidate
+
+
+def _assert_no_reparse_tree(root: Path) -> None:
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                child = Path(entry.path)
+                if _is_reparse_point(child):
+                    raise ValueError(f"staging tree contains a symlink/junction/reparse point: {child}")
+                if entry.is_dir(follow_symlinks=False):
+                    visit(child)
+
+    visit(root)
+
+
+def _safe_cleanup_staging(staging_dir: Path | str, expected_parent: Path | str) -> None:
+    """Delete only an owned staging child, quarantining it before recursion."""
+    stage = _lexical_absolute_path(staging_dir, role="staging")
+    parent = _lexical_absolute_path(expected_parent, role="staging parent")
+    if stage.parent != parent:
+        raise ValueError(f"staging target is outside its expected parent: {stage}")
+    if not re.fullmatch(r"\.[^\\/]+\.staging-[A-Za-z0-9_-]+", stage.name):
+        raise ValueError(f"staging target has an unexpected name: {stage.name}")
+    _assert_no_reparse_components(parent, role="staging parent")
+    if not os.path.lexists(stage):
+        return
+    if _is_reparse_point(stage):
+        raise ValueError(f"refusing to recurse into a reparse staging target: {stage}")
+
+    quarantine = parent / f".{stage.name}.cleanup-{uuid.uuid4().hex}"
+    if os.path.lexists(quarantine):
+        raise ValueError(f"unexpected cleanup quarantine collision: {quarantine}")
+    os.replace(str(stage), str(quarantine))
+    if _is_reparse_point(quarantine):
+        # Unlink the reparse entry itself; never recurse through it.
+        quarantine.unlink(missing_ok=True)
+        raise ValueError(f"staging target changed to a reparse point during cleanup: {quarantine}")
+    _assert_no_reparse_tree(quarantine)
+    shutil.rmtree(quarantine)
 
 
 def _strip_local_path_fields(value: Any, *, key: str | None = None) -> Any:
@@ -324,7 +489,7 @@ def _strip_local_path_fields(value: Any, *, key: str | None = None) -> Any:
                 child_key.endswith("_path") or child_key in {"stl_path", "source_manifest_path"}
             ):
                 continue
-            if isinstance(child_value, str) and _looks_like_absolute_path(child_value):
+            if isinstance(child_value, str) and _contains_local_path_reference(child_value):
                 continue
             cleaned[child_key] = _strip_local_path_fields(child_value, key=child_key)
         return cleaned
@@ -332,7 +497,7 @@ def _strip_local_path_fields(value: Any, *, key: str | None = None) -> Any:
         return [
             _strip_local_path_fields(item, key=key)
             for item in value
-            if not (isinstance(item, str) and _looks_like_absolute_path(item))
+            if not (isinstance(item, str) and _contains_local_path_reference(item))
         ]
     return value
 
@@ -344,7 +509,7 @@ def _assert_no_absolute_paths(value: Any, *, context: str) -> None:
     elif isinstance(value, list):
         for index, child in enumerate(value):
             _assert_no_absolute_paths(child, context=f"{context}[{index}]")
-    elif isinstance(value, str) and _looks_like_absolute_path(value):
+    elif isinstance(value, str) and _contains_local_path_reference(value):
         raise ValueError(f"{context} contains an absolute local path: {value}")
 
 
@@ -403,6 +568,9 @@ def build_perturbation_record(
     parent_source_id = str(parent.get("source_id") or parent.get("sample_id") or "")
     if not parent_source_id:
         raise ValueError("perturbation parent has no source_id")
+    parent_split = parent.get("split")
+    if not isinstance(parent_split, str) or not parent_split:
+        raise ValueError(f"perturbation parent {parent_source_id} has no usable split")
     if not _HASH_RE.fullmatch(parent_hash) or not _HASH_RE.fullmatch(child_hash):
         raise ValueError("perturbation parent and child hashes must be 64-character lowercase hex")
     if not _OUTPUT_GEOMETRY_RE.fullmatch(geometry_path):
@@ -418,7 +586,7 @@ def build_perturbation_record(
         "geometry_path": geometry_path,
         "canonical_content_sha256": child_hash,
         "voxel_sha256": child_hash,
-        "split": "train",
+        "split": parent_split,
         "conditioning_mode": "unconditioned_source_metadata_only",
         "geometry_provenance": (
             "Deterministic voxel-space transform of parent; not independent CAD or an aerodynamic, "
@@ -479,6 +647,8 @@ def _safe_published_geometry_path(output_root: Path, geometry_path: Any) -> Path
         raise ValueError(f"published geometry path escapes corpus directory: {geometry_path}") from exc
     if candidate.parent != (output_root / "voxels").resolve():
         raise ValueError(f"published geometry path is not directly under voxels/: {geometry_path}")
+    if _is_reparse_point(candidate):
+        raise ValueError(f"published geometry path is a symlink/junction/reparse point: {geometry_path}")
     if not candidate.is_file():
         raise FileNotFoundError(f"published geometry file does not exist: {geometry_path}")
     return candidate
@@ -525,7 +695,8 @@ def validate_published_corpus(
     expected_total_count: int | None = None,
 ) -> dict[str, Any]:
     """Run independent path, array, hash, and claim-bearing checks on output."""
-    output_root = Path(output_dir).resolve()
+    output_root = _lexical_absolute_path(output_dir, role="published output")
+    _assert_no_reparse_components(output_root, role="published output")
     manifest_path = output_root / "combined_training_manifest.jsonl"
     voxel_root = output_root / "voxels"
     if not manifest_path.is_file():
@@ -542,8 +713,13 @@ def validate_published_corpus(
     shape_counts: Counter[str] = Counter()
     dtype_counts: Counter[str] = Counter()
     split_counts: Counter[str] = Counter()
+    record_ids: set[str] = set()
     for index, record in enumerate(records):
         _validate_record_metadata(record, index=index)
+        source_id = str(record["source_id"])
+        if source_id in record_ids:
+            raise ValueError(f"record {index} duplicates source_id {source_id}")
+        record_ids.add(source_id)
         resolved_geometry = _safe_published_geometry_path(output_root, record.get("geometry_path"))
         expected_files.add(resolved_geometry.relative_to(output_root).as_posix())
         try:
@@ -574,6 +750,43 @@ def validate_published_corpus(
         dtype_counts["uint8"] += 1
         split_counts[str(record.get("split"))] += 1
 
+    original_parent_splits: dict[str, str] = {}
+    original_split_counts: Counter[str] = Counter()
+    descendants_by_parent_split: Counter[str] = Counter()
+    cross_split_violations = 0
+    procedural_train_count = 0
+    for index, record in enumerate(records):
+        source_type = record.get("source_type")
+        if source_type == "original":
+            split = record.get("split")
+            if not isinstance(split, str) or not split:
+                raise ValueError(f"original record {index} has no split for parent isolation")
+            original_parent_splits[str(record["source_id"])] = split
+            original_split_counts[split] += 1
+        elif source_type == "perturbation_expanded":
+            parent_source_id = record.get("parent_source_id")
+            if parent_source_id not in original_parent_splits:
+                raise ValueError(f"perturbation record {index} references unknown original parent {parent_source_id}")
+            parent_split = original_parent_splits[parent_source_id]
+            descendants_by_parent_split[parent_split] += 1
+            if record.get("split") != parent_split:
+                cross_split_violations += 1
+                raise ValueError(
+                    f"perturbation record {index} split {record.get('split')} does not inherit parent split {parent_split}"
+                )
+        elif source_type == "procedural":
+            if record.get("split") != "train":
+                raise ValueError(f"procedural record {index} must remain in train")
+            procedural_train_count += 1
+
+    parent_split_counts = {
+        "original_parents_by_split": dict(original_split_counts),
+        "descendants_by_parent_split": dict(descendants_by_parent_split),
+        "procedural_train": procedural_train_count,
+        "cross_split_violations": cross_split_violations,
+    }
+
+    _assert_no_reparse_tree(voxel_root)
     actual_files = {
         path.relative_to(output_root).as_posix()
         for path in voxel_root.rglob("*")
@@ -603,8 +816,288 @@ def validate_published_corpus(
         "shape_counts": dict(shape_counts),
         "dtype_counts": dict(dtype_counts),
         "split_counts": dict(split_counts),
+        "parent_split_counts": parent_split_counts,
         "basic_validation": _validation_summary(basic_report),
         "claim_validation": _validation_summary(claim_report),
+    }
+
+
+def _git_commit_identity() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(MODULE_DIR.parent), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("unable to record the builder git commit identity") from exc
+    commit = completed.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError(f"git returned an invalid builder commit identity: {commit!r}")
+    return commit
+
+
+def _dependency_versions() -> dict[str, str]:
+    versions: dict[str, str] = {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+    }
+    for distribution in ("scipy", "torch"):
+        try:
+            versions[distribution] = importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError as exc:
+            raise RuntimeError(f"unable to record dependency version for {distribution}") from exc
+    return versions
+
+
+def _storage_metadata(voxel_root: Path) -> dict[str, Any]:
+    files = sorted(path for path in voxel_root.glob("*.npy") if path.is_file())
+    return {
+        "geometry_format": "NumPy NPY 1.0",
+        "logical_geometry_files": len(files),
+        "logical_geometry_bytes": sum(path.stat().st_size for path in files),
+        "sparse_allocation": "best effort on Windows; dense fallback elsewhere",
+        "filesystem_compression": "not controlled by builder",
+    }
+
+
+def _assert_procedural_family_minimums(stats: Mapping[str, Any], requested_count: int) -> None:
+    minimum_total = sum(PROCEDURAL_MIN_ACCEPTED_PER_TYPE.values())
+    if requested_count < minimum_total:
+        return
+    per_type = stats.get("per_type")
+    if not isinstance(per_type, Mapping):
+        raise ValueError("procedural generator did not return per-family acceptance statistics")
+    missing = {
+        aircraft_type: minimum
+        for aircraft_type, minimum in PROCEDURAL_MIN_ACCEPTED_PER_TYPE.items()
+        if int(per_type.get(aircraft_type, 0)) < minimum
+    }
+    if missing:
+        raise ValueError(f"procedural family minimums not met: {missing}")
+
+
+def _replay_geometry(output_root: Path, record: Mapping[str, Any], expected_hash: str, index: int) -> None:
+    resolved_geometry = _safe_published_geometry_path(output_root, record.get("geometry_path"))
+    try:
+        loaded = np.load(str(resolved_geometry), allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"replay record {index} geometry cannot be loaded: {resolved_geometry}: {exc}") from exc
+    if not isinstance(loaded, np.ndarray) or tuple(loaded.shape) != GRID_SHAPE:
+        raise ValueError(f"replay record {index} geometry shape mismatch")
+    if loaded.dtype != np.dtype(np.uint8) or not np.all((loaded == 0) | (loaded == 1)):
+        raise ValueError(f"replay record {index} geometry is not binary uint8")
+    actual_hash = canonical_content_hash(loaded)
+    if actual_hash != expected_hash or resolved_geometry.stem != expected_hash:
+        raise ValueError(
+            f"replay record {index} content mismatch: expected {expected_hash}, got {actual_hash}"
+        )
+
+
+def _compare_replay_record(
+    actual: Mapping[str, Any], expected: Mapping[str, Any], *, output_root: Path, index: int
+) -> None:
+    if dict(actual) != dict(expected):
+        differing_keys = sorted(
+            key for key in set(actual) | set(expected) if actual.get(key) != expected.get(key)
+        )
+        raise ValueError(f"replay record {index} identity mismatch in keys: {differing_keys[:5]}")
+    _replay_geometry(output_root, actual, expected["canonical_content_sha256"], index)
+
+
+def replay_published_corpus(
+    output_dir: Path,
+    source_manifest: Path,
+    *,
+    perturbation_batches: Sequence[Sequence[str]] | None = None,
+    procedural_count: int | None = None,
+    procedural_seed: int | None = None,
+    expected_original_count: int | None = None,
+    expected_perturbation_count: int | None = None,
+    expected_procedural_count: int | None = None,
+    expected_total_count: int | None = None,
+    unique_geometry_target: int | None = None,
+) -> dict[str, Any]:
+    """Replay every identity and content hash in place, without a second corpus copy."""
+    output_root = _lexical_absolute_path(output_dir, role="published output")
+    _assert_no_reparse_components(output_root, role="published output")
+    manifest_path = output_root / "combined_training_manifest.jsonl"
+    build_spec_path = output_root / "build_spec.json"
+    if not manifest_path.is_file() or not build_spec_path.is_file():
+        raise FileNotFoundError("published corpus is missing its manifest or build specification")
+
+    source_manifest = Path(source_manifest).resolve()
+    build_spec = json.loads(build_spec_path.read_text(encoding="utf-8"))
+    published_batches = build_spec.get("perturbation_batches")
+    if not isinstance(published_batches, list):
+        raise ValueError("published build spec is missing perturbation_batches")
+    batches = _normalize_batches(
+        published_batches if perturbation_batches is None else perturbation_batches
+    )
+    procedural_count = int(
+        build_spec.get("procedural_count") if procedural_count is None else procedural_count
+    )
+    procedural_seed = int(
+        build_spec.get("procedural_seed") if procedural_seed is None else procedural_seed
+    )
+    if procedural_count < 0:
+        raise ValueError("procedural_count must be non-negative")
+    published_counts = build_spec.get("expected_counts")
+    if not isinstance(published_counts, dict):
+        raise ValueError("published build spec is missing expected_counts")
+    expected_original_count = int(
+        published_counts.get("original") if expected_original_count is None else expected_original_count
+    )
+    expected_perturbation_count = int(
+        published_counts.get("perturbation")
+        if expected_perturbation_count is None
+        else expected_perturbation_count
+    )
+    expected_procedural_count = int(
+        published_counts.get("procedural")
+        if expected_procedural_count is None
+        else expected_procedural_count
+    )
+    expected_total_count = int(
+        published_counts.get("total") if expected_total_count is None else expected_total_count
+    )
+    _check_expected_counts(
+        expected_original_count=expected_original_count,
+        expected_perturbation_count=expected_perturbation_count,
+        expected_procedural_count=expected_procedural_count,
+        expected_total_count=expected_total_count,
+    )
+    if unique_geometry_target is not None and unique_geometry_target != expected_total_count:
+        raise ValueError(
+            "unique_geometry_target must equal expected_total_count for a full deterministic replay"
+        )
+    expected_spec = {
+        "builder_version": BUILDER_VERSION,
+        "source_manifest_sha256": _file_sha256(source_manifest),
+        "perturbation_batches": [list(batch) for batch in batches],
+        "procedural_count": procedural_count,
+        "procedural_seed": procedural_seed,
+        "expected_counts": {
+            "original": expected_original_count,
+            "perturbation": expected_perturbation_count,
+            "procedural": expected_procedural_count,
+            "total": expected_total_count,
+        },
+    }
+    for key, expected_value in expected_spec.items():
+        if build_spec.get(key) != expected_value:
+            raise ValueError(f"build spec mismatch for {key}: {build_spec.get(key)!r} != {expected_value!r}")
+    if build_spec.get("builder_commit") != _git_commit_identity():
+        raise ValueError("published build spec builder_commit does not match the current source commit")
+    if build_spec.get("dependency_versions") != _dependency_versions():
+        raise ValueError("published build spec dependency_versions do not match the replay runtime")
+
+    records = load_jsonl_manifest(manifest_path)
+    if len(records) != expected_total_count:
+        raise ValueError(f"published record count {len(records)} does not equal expected {expected_total_count}")
+    source_entries = preflight_source_records(
+        source_manifest,
+        expected_original_count=expected_original_count,
+    )
+    replay_index = 0
+    seen_hashes = {entry["source_hash"] for entry in source_entries}
+    replay_counts: Counter[str] = Counter()
+    parent_split_counts: Counter[str] = Counter()
+
+    for entry in source_entries:
+        parent = entry["record"]
+        parent_output = _build_original_record(
+            parent,
+            source_manifest_name=source_manifest.name,
+            source_manifest_hash=build_spec["source_manifest_sha256"],
+            source_record_index=entry["source_record_index"],
+            content_hash=entry["source_hash"],
+            geometry_path=f"voxels/{entry['source_hash']}.npy",
+        )
+        _compare_replay_record(records[replay_index], parent_output, output_root=output_root, index=replay_index)
+        replay_index += 1
+        replay_counts["original"] += 1
+        parent_split_counts[str(parent.get("split"))] += 0
+
+    per_transform: dict[str, dict[str, int]] = {}
+    for batch in batches:
+        for transform in batch:
+            per_transform.setdefault(
+                transform,
+                {"candidates": 0, "accepted": 0, "rejected_invalid": 0, "rejected_duplicate": 0},
+            )
+        for entry in source_entries:
+            parent = entry["record"]
+            source_voxels = _load_canonical_file(entry["source_path"])
+            for transform, transformed, child_hash in iter_transform_candidates(source_voxels, batch):
+                transform_stats = per_transform[transform]
+                transform_stats["candidates"] += 1
+                if child_hash in seen_hashes:
+                    transform_stats["rejected_duplicate"] += 1
+                    continue
+                if not validate_perturbation(transformed):
+                    transform_stats["rejected_invalid"] += 1
+                    continue
+                expected_record = build_perturbation_record(
+                    parent,
+                    transform=transform,
+                    parent_record_index=entry["source_record_index"],
+                    parent_hash=entry["source_hash"],
+                    child_hash=child_hash,
+                    geometry_path=f"voxels/{child_hash}.npy",
+                )
+                _compare_replay_record(records[replay_index], expected_record, output_root=output_root, index=replay_index)
+                replay_index += 1
+                replay_counts["perturbation"] += 1
+                per_transform[transform]["accepted"] += 1
+                parent_split_counts[str(parent.get("split"))] += 1
+                seen_hashes.add(child_hash)
+
+    procedural_stats: dict[str, Any] = {}
+    for sample in iter_procedural_samples(
+        procedural_count,
+        procedural_seed,
+        seen_hashes=seen_hashes,
+        stats=procedural_stats,
+    ):
+        child_hash = sample["canonical_content_sha256"]
+        expected_record = build_procedural_record(
+            aircraft_type=sample["aircraft_type"],
+            accepted_index=sample["accepted_index"],
+            attempt=sample["attempt"],
+            seed=sample["seed"],
+            child_hash=child_hash,
+            geometry_path=f"voxels/{child_hash}.npy",
+        )
+        _compare_replay_record(records[replay_index], expected_record, output_root=output_root, index=replay_index)
+        replay_index += 1
+        replay_counts["procedural"] += 1
+    _assert_procedural_family_minimums(procedural_stats, procedural_count)
+
+    if replay_index != len(records) or len(seen_hashes) != expected_total_count:
+        raise ValueError(
+            f"replay count/uniqueness mismatch: records={replay_index}, unique={len(seen_hashes)}, expected={expected_total_count}"
+        )
+    for category, expected_count in {
+        "original": expected_original_count,
+        "perturbation": expected_perturbation_count,
+        "procedural": expected_procedural_count,
+    }.items():
+        if replay_counts[category] != expected_count:
+            raise ValueError(f"replay {category} count {replay_counts[category]} != expected {expected_count}")
+    return {
+        "status": "pass",
+        "record_count": replay_index,
+        "recomputed_record_count": replay_index,
+        "recomputed_geometry_count": len(seen_hashes),
+        "counts": dict(replay_counts),
+        "per_transform": per_transform,
+        "procedural": procedural_stats,
+        "parent_split_counts": {
+            "descendants_by_parent_split": dict(parent_split_counts),
+            "cross_split_violations": 0,
+        },
     }
 
 
@@ -652,7 +1145,7 @@ def rebuild_final_training_corpus(
 ) -> dict[str, Any]:
     """Rebuild and atomically publish the complete final corpus."""
     source_manifest = Path(source_manifest).resolve()
-    output_dir = Path(output_dir).resolve()
+    output_dir = _safe_output_target(output_dir)
     _check_expected_counts(
         expected_original_count=expected_original_count,
         expected_perturbation_count=expected_perturbation_count,
@@ -662,38 +1155,28 @@ def rebuild_final_training_corpus(
     if procedural_count < 0:
         raise ValueError("procedural_count must be non-negative")
     batches = _normalize_batches(perturbation_batches)
-    if output_dir.exists() or output_dir.is_symlink():
-        raise FileExistsError(f"refusing to replace existing output directory: {output_dir}")
 
     output_parent = output_dir.parent
-    output_parent.mkdir(parents=True, exist_ok=True)
     staging_dir: Path | None = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.staging-", dir=str(output_parent)))
+    _assert_no_reparse_components(staging_dir, role="staging")
     try:
         source_manifest_hash = _file_sha256(source_manifest)
-        source_records = load_jsonl_manifest(source_manifest)
+        source_entries = preflight_source_records(
+            source_manifest,
+            expected_original_count=expected_original_count,
+        )
         records: list[dict[str, Any]] = []
-        source_entries: list[dict[str, Any]] = []
-        seen_hashes: set[str] = set()
-        source_ids: set[str] = set()
+        seen_hashes: set[str] = {entry["source_hash"] for entry in source_entries}
         dropped_counts: Counter[str] = Counter()
 
-        for source_record_index, parent in enumerate(source_records):
-            source_id = str(parent.get("source_id") or parent.get("sample_id") or "")
-            if not source_id:
-                raise ValueError(f"source record {source_record_index} has no source_id")
+        for entry in source_entries:
+            source_record_index = entry["source_record_index"]
+            parent = entry["record"]
             source_path = resolve_geometry_path(parent, source_manifest)
             canonical = _load_canonical_file(source_path)
             actual_hash = canonical_content_hash(canonical)
-            declared_hash = _declared_canonical_hash(parent)
-            if declared_hash != actual_hash:
-                raise ValueError(
-                    f"source record {source_record_index} canonical hash mismatch: declared {declared_hash}, got {actual_hash}"
-                )
-            if source_id in source_ids and actual_hash not in seen_hashes:
-                raise ValueError(f"duplicate source_id with different geometry: {source_id}")
-            if actual_hash in seen_hashes:
-                dropped_counts["duplicate_canonical_geometry"] += 1
-                continue
+            if actual_hash != entry["source_hash"]:
+                raise ValueError(f"source record {source_record_index} changed during rebuild")
             geometry_path = _write_canonical_voxel(canonical, actual_hash, staging_dir / "voxels")
             output_record = _build_original_record(
                 parent,
@@ -704,16 +1187,6 @@ def rebuild_final_training_corpus(
                 geometry_path=geometry_path,
             )
             records.append(output_record)
-            source_entries.append(
-                {
-                    "record": output_record,
-                    "source_path": source_path,
-                    "source_hash": actual_hash,
-                    "source_record_index": source_record_index,
-                }
-            )
-            source_ids.add(source_id)
-            seen_hashes.add(actual_hash)
 
         per_transform: dict[str, dict[str, int]] = {}
         batch_counts: dict[str, dict[str, Any]] = {}
@@ -781,6 +1254,7 @@ def rebuild_final_training_corpus(
                     geometry_path=geometry_path,
                 )
             )
+        _assert_procedural_family_minimums(procedural_stats, procedural_count)
         dropped_counts["duplicate_canonical_geometry"] += int(procedural_stats.get("rejected_duplicate", 0))
 
         admitted_counts = {
@@ -813,6 +1287,8 @@ def rebuild_final_training_corpus(
             "builder_version": BUILDER_VERSION,
             "source_manifest_name": source_manifest.name,
             "source_manifest_sha256": source_manifest_hash,
+            "builder_commit": _git_commit_identity(),
+            "dependency_versions": _dependency_versions(),
             "output_manifest_name": "combined_training_manifest.jsonl",
             "grid_shape": list(GRID_SHAPE),
             "voxel_dtype": "uint8",
@@ -831,10 +1307,23 @@ def rebuild_final_training_corpus(
                 "procedural": PROCEDURAL_GENERATOR_VERSION,
             },
             "conditioning_policy": "complete null design_spec with false field availability; generated records are unconditioned",
+            "split_policy": "perturbation descendants inherit parent split; procedural records are train",
+            "storage": _storage_metadata(staging_dir / "voxels"),
         }
         _assert_no_absolute_paths(build_spec, context="build_spec")
         _write_json(staging_dir / "build_spec.json", build_spec)
 
+        replay = replay_published_corpus(
+            staging_dir,
+            source_manifest,
+            perturbation_batches=batches,
+            procedural_count=procedural_count,
+            procedural_seed=procedural_seed,
+            expected_original_count=expected_original_count,
+            expected_perturbation_count=expected_perturbation_count,
+            expected_procedural_count=expected_procedural_count,
+            expected_total_count=expected_total_count,
+        )
         audit = validate_published_corpus(
             staging_dir,
             unique_geometry_target=expected_total_count,
@@ -853,7 +1342,7 @@ def rebuild_final_training_corpus(
             "record_count": len(records),
             "unique_geometry_count": len(seen_hashes),
             "source_counts": {
-                "original_input": len(source_records),
+                "original_input": len(source_entries),
                 "original_admitted": len(source_entries),
             },
             "batch_counts": {
@@ -868,6 +1357,9 @@ def rebuild_final_training_corpus(
             "split_counts": audit["split_counts"],
             "shape_counts": audit["shape_counts"],
             "dtype_counts": audit["dtype_counts"],
+            "storage": build_spec["storage"],
+            "deterministic_replay": replay,
+            "parent_split_counts": audit["parent_split_counts"],
             "basic_validation": audit["basic_validation"],
             "claim_validation": audit["claim_validation"],
             "claim_boundary": (
@@ -877,18 +1369,23 @@ def rebuild_final_training_corpus(
             ),
             "scientific_caveats": [
                 "All generated records use complete-null conditioning metadata and are unconditioned source-metadata-only inputs.",
-                "Generated variants of original holdout/test parents are intentionally assigned to train to reproduce the historical target; this creates parent-derived split leakage and must be reported.",
+                "Every perturbation descendant inherits its original parent split; parent-grouped counts are recorded so evaluation families cannot be mistaken for independent samples.",
             ],
         }
         _assert_no_absolute_paths(report, context="report")
         _write_json(staging_dir / "report.json", report)
 
         os.replace(str(staging_dir), str(output_dir))
+        _assert_no_reparse_components(output_dir, role="published output")
         staging_dir = None
         return report
     finally:
         if staging_dir is not None and staging_dir.exists():
-            shutil.rmtree(staging_dir)
+            try:
+                _safe_cleanup_staging(staging_dir, output_parent)
+            except Exception:
+                # Never mask the build failure or recurse after ownership is uncertain.
+                pass
 
 
 def _parse_batches(values: Sequence[str] | None) -> tuple[tuple[str, ...], ...]:

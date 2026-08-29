@@ -3,6 +3,7 @@ import importlib
 import json
 import re
 import shutil
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -141,9 +142,10 @@ def test_build_perturbation_record_has_truthful_claim_metadata():
     assert record["geometry_path"] == "voxels/" + "b" * 64 + ".npy"
     assert record["canonical_content_sha256"] == "b" * 64
     assert record["voxel_sha256"] == "b" * 64
-    assert record["split"] == "train"
+    assert record["split"] == "holdout"
     assert record["conditioning_mode"] == "unconditioned_source_metadata_only"
     assert record["design_family"] == "generated_perturbation"
+    assert record["split"] == "holdout"
     assert "not independent CAD" in record["geometry_provenance"]
     assert record["preprocessing_version"] == "final-training-corpus-v1-perturbation-v1"
     assert record["units"] == "normalized voxel lattice; occupancy is dimensionless"
@@ -181,7 +183,7 @@ def test_generated_records_have_complete_null_unavailable_conditioning():
     builder = _builder_module()
     records = [
         builder.build_perturbation_record(
-            {"source_id": "parent"},
+            {"source_id": "parent", "split": "train"},
             transform="nose_thin",
             parent_record_index=0,
             parent_hash="a" * 64,
@@ -229,24 +231,97 @@ def test_missing_original_geometry_fails_closed_without_publishing(tmp_path):
     assert not any("staging" in path.name for path in tmp_path.iterdir())
 
 
-def test_canonical_duplicate_is_deduplicated_and_reported(tmp_path):
+def test_raw_source_count_is_checked_before_duplicate_content_filtering(tmp_path):
     array = _aircraft_like()
     source_manifest = _write_source_manifest(tmp_path, [array, array.copy()])
+    output_dir = tmp_path / "published"
+
+    with pytest.raises(ValueError, match="raw source record count"):
+        _run_small_build(source_manifest, output_dir)
+
+    assert not output_dir.exists()
+
+
+def test_duplicate_canonical_source_content_fails_closed(tmp_path):
+    array = _aircraft_like()
+    source_manifest = _write_source_manifest(tmp_path, [array, array.copy()])
+    output_dir = tmp_path / "published"
+
+    with pytest.raises(ValueError, match="duplicate.*canonical"):
+        _run_small_build(
+            source_manifest,
+            output_dir,
+            expected_original_count=2,
+            expected_total_count=2,
+        )
+
+    assert not output_dir.exists()
+
+
+def test_duplicate_source_id_with_different_content_fails_closed(tmp_path):
+    source_manifest = _write_source_manifest(tmp_path, [_aircraft_like(0), _aircraft_like(1)])
+    records = _read_records(source_manifest)
+    records[1]["source_id"] = records[0]["source_id"]
+    source_manifest.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "published"
+
+    with pytest.raises(ValueError, match="duplicate source_id"):
+        _run_small_build(
+            source_manifest,
+            output_dir,
+            expected_original_count=2,
+            expected_total_count=2,
+        )
+
+    assert not output_dir.exists()
+
+
+def test_source_hash_fields_must_agree_before_publication(tmp_path):
+    source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
+    records = _read_records(source_manifest)
+    records[0]["voxel_sha256"] = "f" * 64
+    source_manifest.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "published"
+
+    with pytest.raises(ValueError, match="hash"):
+        _run_small_build(source_manifest, output_dir)
+
+    assert not output_dir.exists()
+
+
+def test_perturbation_children_inherit_parent_splits_and_report_grouped_counts(tmp_path):
+    source_manifest = _write_source_manifest(
+        tmp_path,
+        [_aircraft_like(0), _aircraft_like(1), _aircraft_like(2)],
+        splits=["train", "val", "test"],
+    )
     output_dir = tmp_path / "published"
 
     report = _run_small_build(
         source_manifest,
         output_dir,
-        expected_original_count=1,
-        expected_total_count=1,
+        perturbation_batches=(("wing_dihedral_up",),),
+        expected_original_count=3,
+        expected_perturbation_count=3,
+        expected_total_count=6,
     )
 
     records = _read_records(output_dir / "combined_training_manifest.jsonl")
-    assert len(records) == 1
-    assert report["record_count"] == 1
-    assert report["unique_geometry_count"] == 1
-    assert report["dropped_counts"]["duplicate_canonical_geometry"] == 1
-
+    originals = {record["source_id"]: record for record in records[:3]}
+    children = records[3:]
+    assert all(child["split"] == originals[child["parent_source_id"]]["split"] for child in children)
+    assert report["parent_split_counts"]["descendants_by_parent_split"] == {
+        "train": 1,
+        "val": 1,
+        "test": 1,
+    }
+    assert report["parent_split_counts"]["cross_split_violations"] == 0
 
 def test_rebuild_uses_two_explicit_perturbation_batches_and_seed_42(tmp_path):
     source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
@@ -314,6 +389,25 @@ def test_rebuild_writes_only_relative_content_addressed_geometry_paths(tmp_path)
     assert str(source_manifest.resolve()) not in manifest_text
 
 
+def test_rebuild_sanitizes_nested_file_urls_and_embedded_local_paths(tmp_path):
+    source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
+    records = _read_records(source_manifest)
+    records[0]["nested_metadata"] = {
+        "local_file_url": "file:///C:/Users/Darsh Gupta/AppData/Local/raw.stl",
+        "note": r"derived from D:\CodeProjects\research-paper\raw.stl",
+    }
+    source_manifest.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "published"
+    _run_small_build(source_manifest, output_dir)
+
+    manifest_text = (output_dir / "combined_training_manifest.jsonl").read_text(encoding="utf-8")
+    assert "file:///C:/Users" not in manifest_text
+    assert "D:\\CodeProjects\\research-paper" not in manifest_text
+
+
 def test_sparse_npy_writer_preserves_an_occupied_final_voxel(tmp_path):
     array = _aircraft_like()
     array[-1, -1, -1] = 1
@@ -325,6 +419,52 @@ def test_sparse_npy_writer_preserves_an_occupied_final_voxel(tmp_path):
     loaded = np.load(output_dir / record["geometry_path"], allow_pickle=False)
     assert loaded[-1, -1, -1] == 1
     assert _semantic_hash(loaded) == record["canonical_content_sha256"]
+
+
+def test_cleanup_rejects_empty_or_current_directory_targets(tmp_path, monkeypatch):
+    builder = _builder_module()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("must survive", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    for candidate in (Path(), Path(".")):
+        with pytest.raises(ValueError, match="staging|target|directory"):
+            builder._safe_cleanup_staging(candidate, tmp_path)
+
+    assert sentinel.read_text(encoding="utf-8") == "must survive"
+
+
+def test_cleanup_rejects_reparse_staging_target_without_following_it(tmp_path):
+    builder = _builder_module()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("must survive", encoding="utf-8")
+    staging_link = tmp_path / ".published.staging-attacker"
+    try:
+        staging_link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="reparse|symlink|staging"):
+        builder._safe_cleanup_staging(staging_link, tmp_path)
+
+    assert sentinel.read_text(encoding="utf-8") == "must survive"
+
+
+def test_builder_rejects_symlinked_output_target_before_publication(tmp_path):
+    source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
+    output_target = tmp_path / "outside-target"
+    output_link = tmp_path / "published-link"
+    try:
+        output_link.symlink_to(output_target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="reparse|symlink|unsafe|output"):
+        _run_small_build(source_manifest, output_link)
+
+    assert not output_target.exists()
 
 
 def test_rebuild_loads_after_output_directory_relocation(tmp_path):
@@ -350,6 +490,27 @@ def test_rebuild_loads_after_output_directory_relocation(tmp_path):
     dataset = AircraftDesignDataset(manifest_path=str(representative), grid_size=96, latent_dim=8)
     assert len(dataset) == 1
     assert tuple(dataset[0]["geometry"].shape) == (96, 96, 96)
+
+
+def test_full_replay_recomputes_published_identity_and_build_identity(tmp_path):
+    source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
+    output_dir = tmp_path / "published"
+    _run_small_build(source_manifest, output_dir)
+
+    builder = _builder_module()
+    replay = builder.replay_published_corpus(
+        output_dir,
+        source_manifest,
+        unique_geometry_target=1,
+        expected_total_count=1,
+    )
+    assert replay["status"] == "pass"
+    assert replay["record_count"] == 1
+    assert replay["recomputed_geometry_count"] == 1
+    build_spec = json.loads((output_dir / "build_spec.json").read_text(encoding="utf-8"))
+    assert build_spec["builder_commit"]
+    assert build_spec["dependency_versions"]["numpy"]
+    assert build_spec["storage"]["filesystem_compression"] == "not controlled by builder"
 
 
 @pytest.mark.parametrize("bad_kind", ["shape", "hash"])
@@ -405,6 +566,115 @@ def test_full_target_contract_is_declared_by_default():
         ("wing_dihedral_up", "tail_widen_30"),
         ("wing_dihedral_down", "tail_widen_50", "nose_thin", "airfoil_thicken"),
     )
+
+
+def test_seed_42_procedural_stream_has_each_declared_family(tmp_path):
+    del tmp_path
+    generator = importlib.import_module("CLI.procedural_aircraft_generator")
+    samples, stats = generator.generate_procedural_samples(2000, 42)
+
+    assert len(samples) == 2000
+    assert stats["accepted"] == 2000
+    assert all(stats["per_type"][aircraft_type] >= 1 for aircraft_type in generator.AIRCRAFT_TYPES)
+
+
+def test_standalone_perturbation_cli_emits_claim_bearing_records(tmp_path, monkeypatch):
+    source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
+    output_dir = tmp_path / "perturb-output"
+    perturb = importlib.import_module("CLI.perturb_corpus")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "perturb_corpus",
+            "--manifest",
+            str(source_manifest),
+            "--output-dir",
+            str(output_dir),
+            "--transforms",
+            "wing_dihedral_up",
+        ],
+    )
+
+    assert perturb.main() == 0
+    records = _read_records(output_dir / "manifest.jsonl")
+    assert records
+    record = records[0]
+    assert record["geometry_path"] == "voxels/" + record["canonical_content_sha256"] + ".npy"
+    assert record["geometry_provenance"]
+    assert record["preprocessing_version"] == "final-training-corpus-v1-perturbation-v1"
+    assert record["units"] == "normalized voxel lattice; occupancy is dimensionless"
+    assert record["design_family"] == "generated_perturbation"
+    assert set(record["design_spec"]) == set(DESIGN_SPEC_FIELDS)
+    assert all(value is None for value in record["design_spec"].values())
+    assert record["design_spec_availability"] == {field: False for field in DESIGN_SPEC_FIELDS}
+    assert set(record["design_spec_provenance"]) == set(DESIGN_SPEC_FIELDS)
+
+
+def test_standalone_perturbation_cli_fails_closed_on_missing_geometry(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_manifest = source_root / "manifest.jsonl"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "source_id": "missing",
+                "geometry_path": "voxels/missing.npy",
+                "canonical_content_sha256": "a" * 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "perturb-output"
+    perturb = importlib.import_module("CLI.perturb_corpus")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "perturb_corpus",
+            "--manifest",
+            str(source_manifest),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        perturb.main()
+    assert not output_dir.exists()
+
+
+def test_standalone_procedural_cli_emits_claim_bearing_records(tmp_path, monkeypatch):
+    output_dir = tmp_path / "procedural-output"
+    procedural = importlib.import_module("CLI.procedural_aircraft_generator")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "procedural_aircraft_generator",
+            "--count",
+            "1",
+            "--seed",
+            "42",
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    assert procedural.main() == 0
+    records = _read_records(output_dir / "manifest.jsonl")
+    assert len(records) == 1
+    record = records[0]
+    assert record["geometry_path"] == "voxels/" + record["canonical_content_sha256"] + ".npy"
+    assert record["geometry_provenance"]
+    assert record["preprocessing_version"] == "final-training-corpus-v1-procedural-v1"
+    assert record["units"] == "normalized voxel lattice; occupancy is dimensionless"
+    assert record["design_family"].startswith("generated_procedural_")
+    assert set(record["design_spec"]) == set(DESIGN_SPEC_FIELDS)
+    assert all(value is None for value in record["design_spec"].values())
+    assert record["design_spec_availability"] == {field: False for field in DESIGN_SPEC_FIELDS}
+    assert set(record["design_spec_provenance"]) == set(DESIGN_SPEC_FIELDS)
 
 
 def test_published_corpus_validation_rejects_deleted_geometry(tmp_path):

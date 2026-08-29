@@ -221,7 +221,7 @@ class TestProtocolRunner(unittest.TestCase):
 
         expected_values = {
             "--manifest": str(
-                (repo_root / "build" / "final_combined_corpus_20260824" / "combined_training_manifest.jsonl").resolve()
+                (repo_root / "build" / "final_training_corpus_20260830_v2" / "combined_training_manifest.jsonl").resolve()
             ),
             "--num-epochs": "12",
             "--batch-size": "1",

@@ -21,7 +21,7 @@ train:
   save_dir: ../../checkpoints_128_295m
   run_class: scaling_128_295m
   solver: D3Q27
-  dataset_manifest: ../../build/final_combined_corpus_20260824/combined_training_manifest.jsonl
+  dataset_manifest: ../../build/final_training_corpus_20260830_v2/combined_training_manifest.jsonl
   enable_consistency: false
   enable_pipeline: false
   enable_checkpointing: true

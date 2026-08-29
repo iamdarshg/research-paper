@@ -108,46 +108,67 @@ def validate(v):
     except Exception: return False
 
 
+def _task2_builder_module():
+    try:
+        from . import rebuild_final_training_corpus as builder
+    except ImportError:
+        import rebuild_final_training_corpus as builder
+    return builder
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--manifest",required=True)
     ap.add_argument("--output-dir",required=True)
     ap.add_argument("--transforms",default=",".join(TRANSFORMS))
     a=ap.parse_args()
-    od=Path(a.output_dir); od.mkdir(parents=True,exist_ok=True); (od/"voxels").mkdir(exist_ok=True)
+    builder = _task2_builder_module()
     tfs=[t.strip() for t in a.transforms.split(",") if t.strip()]
-    src=[]
-    with open(a.manifest,encoding="utf-8") as f:
-        for ln in f:
-            ln=ln.strip()
-            if ln: src.append(json.loads(ln))
-    seen=set()
-    for r in src:
-        h=r.get("canonical_content_sha256") or r.get("voxel_sha256")
-        if h: seen.add(h)
+    unknown = [transform for transform in tfs if transform not in TRANSFORMS]
+    if unknown:
+        raise ValueError(f"Unknown perturbation transforms: {unknown}")
+
+    entries = builder.preflight_source_records(Path(a.manifest))
+    seen = {entry["source_hash"] for entry in entries}
+    od = builder._safe_output_target(Path(a.output_dir))
+    od.mkdir()
+    builder._assert_no_reparse_components(od, role="standalone perturbation output")
+    (od / "voxels").mkdir(exist_ok=True)
     out=[]
-    stats={"source":len(src),"candidates":0,"accepted":0,"rejected_invalid":0,"rejected_duplicate":0}
+    stats={"source":len(entries),"candidates":0,"accepted":0,"rejected_invalid":0,"rejected_duplicate":0}
     per_t={t:{"ok":0,"no":0} for t in tfs}
-    bd=Path(a.manifest).parent
-    for idx,rec in enumerate(src):
-        sid=rec.get("source_id","unk_"+str(idx)); gp=rec.get("geometry_path")
-        if not gp: continue
-        p=Path(gp);
-        if not p.is_absolute(): p=bd/p
-        if not p.exists(): continue
-        vox=np.load(str(p));
-        if vox.ndim!=3: continue
+    parent_split_counts = {}
+    for entry in entries:
+        idx = entry["source_record_index"]
+        rec = entry["record"]
+        sid = str(rec.get("source_id") or rec.get("sample_id") or "")
+        vox = builder.canonicalize_voxels(np.load(str(entry["source_path"]), allow_pickle=False))
+        if builder.canonical_content_hash(vox) != entry["source_hash"]:
+            raise ValueError(f"source record {idx} changed during perturbation build")
         for tf in tfs:
             stats["candidates"]+=1
             tv=canonicalize_voxels(apply_transform(vox,tf)); c=canonical_content_hash(tv)
             if c in seen: stats["rejected_duplicate"]+=1; per_t[tf]["no"]+=1; continue
             if not validate(tv): stats["rejected_invalid"]+=1; per_t[tf]["no"]+=1; continue
-            vid="perturb:"+tf+":"+sid; fn=vid.replace(":","_").replace("/","_")+".npy"
-            np.save(str(od/"voxels"/fn),tv, allow_pickle=False)
-            out.append({"source_id":vid,"source_type":"perturbation_expanded","parent_source_id":sid,"transform":tf,"canonical_content_sha256":c,"voxel_sha256":c,"geometry_path":"voxels/"+fn,"conditioning_mode":rec.get("conditioning_mode","unconditioned_source_metadata_only"),"split":"train","provenance":{"parent_manifest_name":Path(a.manifest).name,"transform":tf,"generator_version":PERTURBATION_GENERATOR_VERSION,"description":"Aerodynamic shape perturbation"}})
+            fn = c + ".npy"
+            temporary = od / "voxels" / ("." + fn + ".tmp")
+            with temporary.open("wb") as handle:
+                np.save(handle, tv, allow_pickle=False)
+            os.replace(temporary, od / "voxels" / fn)
+            out.append(builder.build_perturbation_record(
+                rec,
+                transform=tf,
+                parent_record_index=idx,
+                parent_hash=entry["source_hash"],
+                child_hash=c,
+                geometry_path="voxels/" + fn,
+            ))
+            parent_split = str(rec.get("split"))
+            parent_split_counts[parent_split] = parent_split_counts.get(parent_split, 0) + 1
             seen.add(c); stats["accepted"]+=1; per_t[tf]["ok"]+=1
     stats["per_transform"]=per_t; stats["expanded_total"]=len(out)
     stats["generator_version"] = PERTURBATION_GENERATOR_VERSION
+    stats["parent_split_counts"] = {"descendants_by_parent_split": parent_split_counts, "cross_split_violations": 0}
     stats["claim_boundary"]="Perturbed variants are shape-modified versions of validated parents, NOT independent aircraft."
     mp=od/"manifest.jsonl"; tmp=mp.with_suffix(".tmp")
     with tmp.open("w",encoding="utf-8") as f:
