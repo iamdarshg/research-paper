@@ -203,3 +203,45 @@ class TestProtocolRunner(unittest.TestCase):
             sum(1 for command in final_commands if command[1] == str((repo_root / "CLI" / "validate_manifest.py").resolve())),
             2,
         )
+
+    def test_gcp_128_protocol_uses_monitored_runner_with_explicit_production_contract(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        protocol_path = repo_root / "CLI" / "run_protocols" / "gcp_128_295m.yaml"
+        config = run_protocol.load_protocol_config(str(protocol_path))
+
+        commands = run_protocol.build_protocol_commands(config)
+
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertEqual(
+            Path(command[1]).resolve(),
+            (repo_root / "CLI" / "run_monitored_training.py").resolve(),
+        )
+
+        expected_values = {
+            "--manifest": str(
+                (repo_root / "build" / "final_combined_corpus_20260824" / "combined_training_manifest.jsonl").resolve()
+            ),
+            "--num-epochs": "12",
+            "--batch-size": "1",
+            "--learning-rate": "2e-05",
+            "--latent-dim": "512",
+            "--grid-size": "128",
+            "--precision": "bfloat16",
+            "--solver": "D3Q27",
+            "--lbm-stream-bfl-backend": "fused_stream_bfl",
+            "--coordinate-training-samples": "65536",
+            "--full-lattice-interval": "64",
+            "--sparse-samples-per-full": "262144",
+            "--direct-solver-interval": "32",
+            "--direct-solver-steps": "5",
+            "--direct-solver-directions": "8",
+            "--direct-solver-batch-chunk": "4",
+            "--checkpoint-every-updates": "1",
+            "--stop-after-updates": "5",
+        }
+        for flag, value in expected_values.items():
+            self.assertIn(flag, command)
+            self.assertEqual(command[command.index(flag) + 1], value)
+
+        self.assertIn("--no-require-direct-solver-every-iteration", command)

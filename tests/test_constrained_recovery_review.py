@@ -1533,6 +1533,11 @@ def test_resume_fingerprint_contains_live_training_behavior():
         freeze_decoder_for_generated_paths=False,
         geometry_reconstruction_weight=1.2,
         generation_reconstruction_weight=0.8,
+        coordinate_training_samples=65536,
+        full_lattice_interval=64,
+        sparse_samples_per_full=262144,
+        direct_solver_interval=32,
+        direct_solver_directions=8,
         threshold_positive_margin=0.04,
         threshold_negative_margin=0.03,
     )
@@ -1561,6 +1566,8 @@ def test_resume_fingerprint_contains_live_training_behavior():
                 "promotion_generation_seeds": 3,
                 "solver": "D3Q27",
                 "lbm_stream_bfl_backend": "pytorch_reference",
+                "direct_solver_batch_chunk": 4,
+                "stream_block_size": 512,
             },
         )(),
         training_config=training,
@@ -1578,6 +1585,13 @@ def test_resume_fingerprint_contains_live_training_behavior():
     assert configuration["training_config"]["consistency_loss_type"] == "mse"
     assert configuration["training_config"]["geometry_reconstruction_weight"] == 1.2
     assert configuration["training_config"]["generation_reconstruction_weight"] == 0.8
+    assert configuration["training_config"]["coordinate_training_samples"] == 65536
+    assert configuration["training_config"]["full_lattice_interval"] == 64
+    assert configuration["training_config"]["sparse_samples_per_full"] == 262144
+    assert configuration["training_config"]["direct_solver_interval"] == 32
+    assert configuration["training_config"]["direct_solver_directions"] == 8
+    assert configuration["direct_solver_batch_chunk"] == 4
+    assert configuration["cfd_config"]["lbm_config"]["stream_block_size"] == 512
     assert configuration["geometry_materialization_threshold"] == 0.37
     assert configuration["training_config"]["project_conflicting_direct_gradient"] is False
     assert configuration["training_config"]["freeze_decoder_for_generated_paths"] is False
@@ -1898,19 +1912,19 @@ def test_interrupted_two_plus_two_resume_is_trajectory_equivalent(tmp_path, monk
 
 
 # ---------------------------------------------------------------------------
-# Task 1 (PR-41 GPT-5.6 review): honor the documented Mach 0.3 operating point.
+# Task 1 (final-run readiness): honor the configured Mach 0.1 production point.
 # The configured Mach (dimensionless) is the operating-point truth; absolute
 # speed is a derived quantity. These tests pin the config->reality seam.
 # ---------------------------------------------------------------------------
 
 
 def test_both_cfdconfig_classes_read_mach_number_from_config_yaml():
-    """Both CFDConfig classes must read cfd.mach_number (0.3) from the repo config.yaml."""
+    """Both CFDConfig classes must read cfd.mach_number (0.1) from config.yaml."""
     from aircraft_diffusion_cfd import CFDConfig as RecoveryCFDConfig
     from config import CFDConfig as ConfigCFDConfig
 
-    assert ConfigCFDConfig().mach_number == 0.3
-    assert RecoveryCFDConfig().mach_number == 0.3
+    assert ConfigCFDConfig().mach_number == 0.1
+    assert RecoveryCFDConfig().mach_number == 0.1
     # An explicit constructor override must still win over the YAML default.
     assert ConfigCFDConfig(mach_number=0.05).mach_number == 0.05
     assert RecoveryCFDConfig(mach_number=0.05).mach_number == 0.05

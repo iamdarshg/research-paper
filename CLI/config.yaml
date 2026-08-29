@@ -216,11 +216,11 @@ cfd:
   # External PDE validation is a separate evidence run. The non-claim-bearing
   # local placeholder is never executed inside the optimizer.
   enable_external_validation: false
-  mach_number: 0.3
+  mach_number: 0.1
   # Requested Reynolds number. NOTE (R2, PR 41 review): this value is NOT
   # fully realized -- tau_min_d3q27 (LBMPhysicsConfig default 0.52) clamps the
   # BGK/MRT relaxation time, so the solver evolves nu_effective=(tau-0.5)/3 and
-  # the EFFECTIVE Reynolds at 96^3 / Mach 0.3 is ~2,494, not 1e6. The realized
+  # the EFFECTIVE Reynolds at 96^3 / Mach 0.1 is ~831, not 1e6. The realized
   # values are reported per solve in the coefficient dicts as
   # effective_reynolds / tau_actual / reynolds_clamped and must be what the
   # paper's Reynolds claim cites.

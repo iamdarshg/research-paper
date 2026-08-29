@@ -10,6 +10,7 @@ architecture:
 
 train:
   enabled: true
+  runner: monitored
   num_epochs: 12
   batch_size: 1
   learning_rate: 0.00002
@@ -28,8 +29,10 @@ train:
   stream_bfl_backend: fused_stream_bfl
   stream_block_size: 512
   coordinate_training_samples: 65536
+  sparse_samples_per_full: 262144
   full_lattice_interval: 64
   direct_solver_interval: 32
+  direct_solver_steps: 5
   direct_solver_directions: 8
   direct_solver_batch_chunk: 4
   require_direct_solver_every_iteration: false

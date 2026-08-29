@@ -74,6 +74,7 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
     aircraft_validity_input_builder_script = str((cli_dir / "build_aircraft_validity_inputs.py").resolve())
     manufacturing_constraints_script = str((cli_dir / "condition_feasibility.py").resolve())
     final_evidence_script = str((cli_dir / "final_evidence.py").resolve())
+    monitored_training_script = str((cli_dir / "run_monitored_training.py").resolve())
 
     commands: List[List[str]] = []
     run_id = _protocol_run_id(config)
@@ -108,41 +109,82 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
         commands.append(manifest_cmd)
 
     if train_cfg.get("enabled", True):
-        train_cmd = [python_exe, cli_script, "train"]
-        for flag, key in (
-            ("--num-epochs", "num_epochs"),
-            ("--batch-size", "batch_size"),
-            ("--learning-rate", "learning_rate"),
-            ("--latent-dim", "latent_dim"),
-            ("--grid-size", "grid_size"),
-            ("--precision", "precision"),
-            ("--disconnection-penalty", "disconnection_penalty"),
-            ("--num-samples", "num_samples"),
-            ("--run-class", "run_class"),
-            ("--solver", "solver"),
-        ):
-            _add_option(train_cmd, flag, train_cfg.get(key))
-        for flag, key in (
-            ("--dataset-artifact", "dataset_artifact"),
-            ("--dataset-manifest", "dataset_manifest"),
-            ("--resume-from", "resume_from"),
-            ("--save-dir", "save_dir"),
-            ("--baseline-config", "baseline_config"),
-            ("--claim-gates", "claim_gates"),
-        ):
-            value = train_cfg.get(key)
-            if key in {"dataset_artifact", "dataset_manifest", "resume_from", "save_dir", "baseline_config", "claim_gates"}:
-                value = _resolve_path(config, value)
-            _add_option(train_cmd, flag, value)
-        for enable_flag, disable_flag, key in (
-            ("--enable-consistency", "--disable-consistency", "enable_consistency"),
-            ("--enable-pipeline", "--disable-pipeline", "enable_pipeline"),
-            ("--enable-checkpointing", "--disable-checkpointing", "enable_checkpointing"),
-        ):
-            if key in train_cfg:
-                _add_dual_flag(train_cmd, enable_flag, disable_flag, bool(train_cfg[key]))
-        if "enable_compile" in train_cfg:
-            _add_option(train_cmd, "--enable-compile", bool(train_cfg["enable_compile"]))
+        if train_cfg.get("runner") == "monitored":
+            train_cmd = [python_exe, monitored_training_script]
+            smoke_cfg = dict(config.get("smoke", {}))
+            checkpoint_every_updates = train_cfg.get("checkpoint_every_updates")
+            if smoke_cfg.get("enabled") and "checkpoint_every_updates" in smoke_cfg:
+                checkpoint_every_updates = smoke_cfg["checkpoint_every_updates"]
+            for flag, key in (
+                ("--manifest", "dataset_manifest"),
+                ("--num-epochs", "num_epochs"),
+                ("--batch-size", "batch_size"),
+                ("--learning-rate", "learning_rate"),
+                ("--latent-dim", "latent_dim"),
+                ("--grid-size", "grid_size"),
+                ("--precision", "precision"),
+                ("--solver", "solver"),
+                ("--lbm-stream-bfl-backend", "stream_bfl_backend"),
+                ("--coordinate-training-samples", "coordinate_training_samples"),
+                ("--sparse-samples-per-full", "sparse_samples_per_full"),
+                ("--full-lattice-interval", "full_lattice_interval"),
+                ("--direct-solver-interval", "direct_solver_interval"),
+                ("--direct-solver-steps", "direct_solver_steps"),
+                ("--direct-solver-directions", "direct_solver_directions"),
+                ("--direct-solver-batch-chunk", "direct_solver_batch_chunk"),
+                ("--stream-block-size", "stream_block_size"),
+                ("--save-dir", "save_dir"),
+            ):
+                value = train_cfg.get(key)
+                if key in {"dataset_manifest", "save_dir"}:
+                    value = _resolve_path(config, value)
+                _add_option(train_cmd, flag, value)
+            _add_option(train_cmd, "--checkpoint-every-updates", checkpoint_every_updates)
+            if "require_direct_solver_every_iteration" in train_cfg:
+                _add_dual_flag(
+                    train_cmd,
+                    "--require-direct-solver-every-iteration",
+                    "--no-require-direct-solver-every-iteration",
+                    bool(train_cfg["require_direct_solver_every_iteration"]),
+                )
+            if smoke_cfg.get("enabled"):
+                _add_option(train_cmd, "--stop-after-updates", smoke_cfg.get("stop_after_updates"))
+        else:
+            train_cmd = [python_exe, cli_script, "train"]
+            for flag, key in (
+                ("--num-epochs", "num_epochs"),
+                ("--batch-size", "batch_size"),
+                ("--learning-rate", "learning_rate"),
+                ("--latent-dim", "latent_dim"),
+                ("--grid-size", "grid_size"),
+                ("--precision", "precision"),
+                ("--disconnection-penalty", "disconnection_penalty"),
+                ("--num-samples", "num_samples"),
+                ("--run-class", "run_class"),
+                ("--solver", "solver"),
+            ):
+                _add_option(train_cmd, flag, train_cfg.get(key))
+            for flag, key in (
+                ("--dataset-artifact", "dataset_artifact"),
+                ("--dataset-manifest", "dataset_manifest"),
+                ("--resume-from", "resume_from"),
+                ("--save-dir", "save_dir"),
+                ("--baseline-config", "baseline_config"),
+                ("--claim-gates", "claim_gates"),
+            ):
+                value = train_cfg.get(key)
+                if key in {"dataset_artifact", "dataset_manifest", "resume_from", "save_dir", "baseline_config", "claim_gates"}:
+                    value = _resolve_path(config, value)
+                _add_option(train_cmd, flag, value)
+            for enable_flag, disable_flag, key in (
+                ("--enable-consistency", "--disable-consistency", "enable_consistency"),
+                ("--enable-pipeline", "--disable-pipeline", "enable_pipeline"),
+                ("--enable-checkpointing", "--disable-checkpointing", "enable_checkpointing"),
+            ):
+                if key in train_cfg:
+                    _add_dual_flag(train_cmd, enable_flag, disable_flag, bool(train_cfg[key]))
+            if "enable_compile" in train_cfg:
+                _add_option(train_cmd, "--enable-compile", bool(train_cfg["enable_compile"]))
         commands.append(train_cmd)
 
     if baseline_cfg.get("enabled"):

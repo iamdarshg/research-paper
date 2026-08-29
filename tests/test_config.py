@@ -23,7 +23,7 @@ class TestConfigSourceOfTruth(unittest.TestCase):
     def test_flow_fields_are_sourced_from_global_yaml(self):
         cfg = ConfigModuleCFDConfig(base_grid_resolution=96)
         # Values declared in CLI/config.yaml (the source of truth).
-        self.assertEqual(cfg.mach_number, 0.3)
+        self.assertEqual(cfg.mach_number, 0.1)
         self.assertEqual(cfg.reynolds_number, 1e6)
         self.assertEqual(cfg.simulation_steps, 1000)
 

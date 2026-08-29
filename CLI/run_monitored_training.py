@@ -19,10 +19,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
+import aircraft_diffusion_cfd as _aircraft_diffusion_cfd
 from aircraft_diffusion_cfd import (
     AircraftDesignDataset,
     CFDConfig,
     DiffusionConfig,
+    LBMPhysicsConfig,
     ModelConfig,
     OptimizedDiffusionTrainer,
     TrainingConfig,
@@ -371,6 +373,7 @@ def _build_objective_configuration_fingerprint(
         "promotion_generation_seeds": int(args.promotion_generation_seeds),
         "solver": str(args.solver),
         "lbm_stream_bfl_backend": str(args.lbm_stream_bfl_backend),
+        "direct_solver_batch_chunk": int(args.direct_solver_batch_chunk),
         "geometry_materialization_threshold": float(geometry_probability_threshold),
         "training_config": _dataclass_fingerprint(training_config),
         "model_config": _dataclass_fingerprint(model_config),
@@ -1002,13 +1005,16 @@ def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig
         disconnection_penalty=float(
             config_value("training", "disconnection_penalty", 30.0)
         ),
-        precision=str(config_value("training", "precision", "float32")),
+        precision=str(args.precision),
         enable_pipeline_parallelism=bool(
             config_value("training", "enable_pipeline_parallelism", False)
         ),
         num_pipeline_stages=int(config_value("training", "num_pipeline_stages", 8)),
         direct_solver_loss_weight=args.direct_solver_loss_weight,
-        direct_solver_interval=int(config_value("training", "direct_solver_interval", 1)),
+        coordinate_training_samples=int(args.coordinate_training_samples),
+        full_lattice_interval=int(args.full_lattice_interval),
+        sparse_samples_per_full=int(args.sparse_samples_per_full),
+        direct_solver_interval=int(args.direct_solver_interval),
         direct_solver_steps=args.direct_solver_steps,
         direct_solver_directions=args.direct_solver_directions,
         direct_solver_perturbation=args.direct_solver_perturbation,
@@ -1017,9 +1023,17 @@ def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig
         direct_aircraft_validity_weight=args.direct_aircraft_validity_weight,
         overfit_geometry_gate_samples=args.promotion_evaluation_samples,
         promotion_generation_seeds=args.promotion_generation_seeds,
-        require_direct_solver_every_iteration=bool(
-            config_value("training", "require_direct_solver_every_iteration", False)
-        ),
+        require_direct_solver_every_iteration=bool(args.require_direct_solver_every_iteration),
+    )
+
+
+def _build_monitored_cfd_config(args: argparse.Namespace, resolved_grid_size: int) -> CFDConfig:
+    """Construct CFD settings from the monitored runner's explicit contract."""
+    return CFDConfig(
+        base_grid_resolution=resolved_grid_size,
+        solver_type=args.solver,
+        use_fused_stream_bfl=(args.lbm_stream_bfl_backend == "fused_stream_bfl"),
+        lbm_config=LBMPhysicsConfig(stream_block_size=int(args.stream_block_size)),
     )
 
 
@@ -1031,6 +1045,7 @@ def main() -> int:
     parser.add_argument("--latent-dim", type=int, default=int(config_value("model", "latent_dim", 192)))
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-5)))
+    parser.add_argument("--precision", default=str(config_value("training", "precision", "float32")))
     parser.add_argument(
         "--lr-min-ratio",
         type=float,
@@ -1048,6 +1063,7 @@ def main() -> int:
             "tests/test_direct_solver_fused_parity.py to pass on this machine."
         ),
     )
+    parser.add_argument("--stream-block-size", type=int, default=int(config_value("cfd", "stream_block_size", 512)))
     parser.add_argument("--save-dir", default="./checkpoints_monitored")
     parser.add_argument("--resume-from", default=None)
     parser.add_argument(
@@ -1114,12 +1130,22 @@ def main() -> int:
     parser.add_argument("--oscillation-cv-threshold", type=float, default=0.30)
     parser.add_argument("--early-stop-on-convergence", action="store_true")
     parser.add_argument("--direct-solver-loss-weight", type=float, default=float(config_value("training", "direct_solver_loss_weight", 1.0)))
+    parser.add_argument("--coordinate-training-samples", type=int, default=int(config_value("training", "coordinate_training_samples", 32768)))
+    parser.add_argument("--full-lattice-interval", type=int, default=int(config_value("training", "full_lattice_interval", 1)))
+    parser.add_argument("--sparse-samples-per-full", type=int, default=int(config_value("training", "sparse_samples_per_full", 262144)))
+    parser.add_argument("--direct-solver-interval", type=int, default=int(config_value("training", "direct_solver_interval", 1)))
     parser.add_argument("--direct-solver-steps", type=int, default=int(config_value("training", "direct_solver_steps", 5)))
     parser.add_argument("--direct-solver-directions", type=int, default=int(config_value("training", "direct_solver_directions", 16)))
+    parser.add_argument("--direct-solver-batch-chunk", type=int, default=int(config_value("training", "direct_solver_batch_chunk", 1)))
     parser.add_argument("--direct-connectivity-weight", type=float, default=float(config_value("training", "direct_connectivity_weight", 1.0)))
     parser.add_argument("--direct-aircraft-validity-weight", type=float, default=float(config_value("training", "direct_aircraft_validity_weight", 1.0)))
     parser.add_argument("--direct-solver-perturbation", type=float, default=float(config_value("training", "direct_solver_perturbation", 0.15)))
     parser.add_argument("--direct-solver-perturbation-grid-size", type=int, default=int(config_value("training", "direct_solver_perturbation_grid_size", 12)))
+    parser.add_argument(
+        "--require-direct-solver-every-iteration",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config_value("training", "require_direct_solver_every_iteration", False)),
+    )
     args = parser.parse_args()
     if sum(bool(value) for value in (args.resume_from, args.resume_run_state, args.warm_start_from)) > 1:
         parser.error("--resume-run-state, --resume-from, and --warm-start-from are mutually exclusive")
@@ -1133,7 +1159,22 @@ def main() -> int:
         parser.error("--checkpoint-every-updates must be nonnegative")
     if args.stop_after_updates < 0:
         parser.error("--stop-after-updates must be nonnegative")
+    if args.coordinate_training_samples <= 0:
+        parser.error("--coordinate-training-samples must be greater than 0")
+    if args.full_lattice_interval <= 0:
+        parser.error("--full-lattice-interval must be greater than 0")
+    if args.sparse_samples_per_full <= 0:
+        parser.error("--sparse-samples-per-full must be greater than 0")
+    if args.direct_solver_interval <= 0:
+        parser.error("--direct-solver-interval must be greater than 0")
+    if args.direct_solver_directions <= 0:
+        parser.error("--direct-solver-directions must be greater than 0")
+    if args.direct_solver_batch_chunk <= 0:
+        parser.error("--direct-solver-batch-chunk must be greater than 0")
+    if args.stream_block_size <= 0:
+        parser.error("--stream-block-size must be greater than 0")
 
+    _aircraft_diffusion_cfd._DIRECT_SOLVER_BATCH_CHUNK = int(args.direct_solver_batch_chunk)
     os.environ["OMP_NUM_THREADS"] = str(args.cpu_threads)
     os.environ["MKL_NUM_THREADS"] = str(args.cpu_threads)
     torch.set_num_threads(args.cpu_threads)
@@ -1221,11 +1262,7 @@ def main() -> int:
         student_steps=int(config_value("diffusion", "student_steps", 4)),
     )
     training_config = _build_monitored_training_config(args)
-    cfd_config = CFDConfig(
-        base_grid_resolution=resolved_grid_size,
-        solver_type=args.solver,
-        use_fused_stream_bfl=(args.lbm_stream_bfl_backend == "fused_stream_bfl"),
-    )
+    cfd_config = _build_monitored_cfd_config(args, resolved_grid_size)
 
     # R7 (PR 41 review, item 7): per-epoch deterministic shuffle. The sampler
     # regenerates the current epoch's permutation from (subset_seed, epoch), so
