@@ -2,8 +2,8 @@
 # Perturb corpus with aerodynamic shape modifications.
 from __future__ import annotations
 import argparse, hashlib, json, os, sys
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable, Iterator
 import numpy as np
 import torch
 from scipy.ndimage import binary_dilation, label as scipy_label
@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aircraft_validity import canonicalize_aircraft_voxels
 
 TRANSFORMS = ("tail_widen_30","tail_widen_50","wing_dihedral_up","wing_dihedral_down","nose_thin","airfoil_thicken")
+PERTURBATION_GENERATOR_VERSION = "perturbation-transform-v1"
 MIN_OCC = 0.005
 MIN_SYMMETRY = 0.25
 MIN_SPAN = 0.03
@@ -72,7 +73,23 @@ def apply_transform(v, tf):
     raise ValueError("Unknown: "+tf)
 
 
-def chash(v): return hashlib.sha256(((v>0.5).astype(np.uint8)).tobytes()).hexdigest()
+def canonicalize_voxels(v: np.ndarray) -> np.ndarray:
+    """Return a detached binary uint8 array of a transformed candidate."""
+    return np.ascontiguousarray((np.asarray(v) > 0.5).astype(np.uint8, copy=False))
+
+
+def canonical_content_hash(v: np.ndarray) -> str:
+    return hashlib.sha256(canonicalize_voxels(v).tobytes()).hexdigest()
+
+
+def iter_transform_candidates(v: np.ndarray, transforms: Iterable[str]) -> Iterator[tuple[str, np.ndarray, str]]:
+    """Yield deterministic transformed arrays in the caller-provided order."""
+    for transform in transforms:
+        transformed = canonicalize_voxels(apply_transform(v, transform))
+        yield transform, transformed, canonical_content_hash(transformed)
+
+
+def chash(v): return canonical_content_hash(v)
 
 
 def validate(v):
@@ -122,15 +139,15 @@ def main():
         if vox.ndim!=3: continue
         for tf in tfs:
             stats["candidates"]+=1
-            tv=apply_transform(vox,tf); c=chash(tv)
+            tv=canonicalize_voxels(apply_transform(vox,tf)); c=canonical_content_hash(tv)
             if c in seen: stats["rejected_duplicate"]+=1; per_t[tf]["no"]+=1; continue
             if not validate(tv): stats["rejected_invalid"]+=1; per_t[tf]["no"]+=1; continue
             vid="perturb:"+tf+":"+sid; fn=vid.replace(":","_").replace("/","_")+".npy"
-            np.save(str(od/"voxels"/fn),(tv>0.5).astype(np.uint8))
-            out.append({"source_id":vid,"source_type":"perturbation_expanded","parent_source_id":sid,"transform":tf,"canonical_content_sha256":c,"voxel_sha256":c,"geometry_path":"voxels/"+fn,"conditioning_mode":rec.get("conditioning_mode","unconditioned_source_metadata_only"),"split":"train","provenance":{"parent_manifest":str(Path(a.manifest).resolve()),"transform":tf,"timestamp":datetime.now(timezone.utc).isoformat(),"description":"Aerodynamic shape perturbation"}})
+            np.save(str(od/"voxels"/fn),tv, allow_pickle=False)
+            out.append({"source_id":vid,"source_type":"perturbation_expanded","parent_source_id":sid,"transform":tf,"canonical_content_sha256":c,"voxel_sha256":c,"geometry_path":"voxels/"+fn,"conditioning_mode":rec.get("conditioning_mode","unconditioned_source_metadata_only"),"split":"train","provenance":{"parent_manifest_name":Path(a.manifest).name,"transform":tf,"generator_version":PERTURBATION_GENERATOR_VERSION,"description":"Aerodynamic shape perturbation"}})
             seen.add(c); stats["accepted"]+=1; per_t[tf]["ok"]+=1
     stats["per_transform"]=per_t; stats["expanded_total"]=len(out)
-    stats["created_at"]=datetime.now(timezone.utc).isoformat()
+    stats["generator_version"] = PERTURBATION_GENERATOR_VERSION
     stats["claim_boundary"]="Perturbed variants are shape-modified versions of validated parents, NOT independent aircraft."
     mp=od/"manifest.jsonl"; tmp=mp.with_suffix(".tmp")
     with tmp.open("w",encoding="utf-8") as f:

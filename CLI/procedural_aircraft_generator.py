@@ -3,8 +3,8 @@
 # Axis convention: g[z_vertical, y_spanwise, x_lengthwise]
 from __future__ import annotations
 import argparse, hashlib, json, os, sys, random, math
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 import numpy as np
 from scipy.ndimage import label as scipy_label
 
@@ -19,6 +19,7 @@ AIRCRAFT_TYPES = [
     "glider", "delta_wing", "flying_wing", "biplane",
     "canard", "anhedral", "swept_wing", "lifting_body",
 ]
+PROCEDURAL_GENERATOR_VERSION = "procedural-aircraft-v1"
 
 
 def _ellipsoid(g, cz, cy_center, x_center, rz, ry, rx):
@@ -191,8 +192,17 @@ def generate_aircraft(rng, aircraft_type):
     return (g > 0.5).astype(np.float32)
 
 
+def canonicalize_voxels(v: np.ndarray) -> np.ndarray:
+    """Return a detached binary uint8 array for deterministic persistence."""
+    return np.ascontiguousarray((np.asarray(v) > 0.5).astype(np.uint8, copy=False))
+
+
+def canonical_content_hash(v: np.ndarray) -> str:
+    return hashlib.sha256(canonicalize_voxels(v).tobytes()).hexdigest()
+
+
 def chash(v):
-    return hashlib.sha256(((v>0.5).astype(np.uint8)).tobytes()).hexdigest()
+    return canonical_content_hash(v)
 
 
 def validate(v):
@@ -216,6 +226,71 @@ def validate(v):
         return False
 
 
+def iter_procedural_samples(
+    count: int,
+    seed: int,
+    *,
+    seen_hashes: set[str] | None = None,
+    stats: dict | None = None,
+) -> Iterator[dict]:
+    """Yield accepted procedural samples without writing filesystem artifacts."""
+    if count < 0:
+        raise ValueError("count must be non-negative")
+    known_hashes = seen_hashes if seen_hashes is not None else set()
+    state = stats if stats is not None else {}
+    state.clear()
+    state.update(
+        {
+            "target": count,
+            "attempts": 0,
+            "generated": 0,
+            "accepted": 0,
+            "rejected_invalid": 0,
+            "rejected_duplicate": 0,
+            "per_type": {aircraft_type: 0 for aircraft_type in AIRCRAFT_TYPES},
+        }
+    )
+    rng = random.Random(seed)
+    while state["accepted"] < count and state["attempts"] < count * 10:
+        state["attempts"] += 1
+        aircraft_type = rng.choice(AIRCRAFT_TYPES)
+        voxels = generate_aircraft(rng, aircraft_type)
+        state["generated"] += 1
+        canonical = canonicalize_voxels(voxels)
+        content_hash = canonical_content_hash(canonical)
+        if content_hash in known_hashes:
+            state["rejected_duplicate"] += 1
+            continue
+        if not validate(canonical):
+            state["rejected_invalid"] += 1
+            continue
+
+        accepted_index = state["accepted"]
+        known_hashes.add(content_hash)
+        state["accepted"] += 1
+        state["per_type"][aircraft_type] += 1
+        yield {
+            "aircraft_type": aircraft_type,
+            "accepted_index": accepted_index,
+            "attempt": state["attempts"],
+            "seed": seed,
+            "canonical_content_sha256": content_hash,
+            "voxels": canonical,
+        }
+
+
+def generate_procedural_samples(
+    count: int,
+    seed: int,
+    *,
+    seen_hashes: set[str] | None = None,
+) -> tuple[list[dict], dict]:
+    """Materialize the deterministic stream for small standalone callers."""
+    stats: dict = {}
+    samples = list(iter_procedural_samples(count, seed, seen_hashes=seen_hashes, stats=stats))
+    return samples, stats
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate procedural aircraft")
     ap.add_argument("--count", type=int, default=2000)
@@ -224,23 +299,15 @@ def main():
     args = ap.parse_args()
     od = Path(args.output_dir); od.mkdir(parents=True, exist_ok=True)
     (od / "voxels").mkdir(exist_ok=True)
-    rng = random.Random(args.seed)
-    seen = set(); out = []
-    type_counts = {t: 0 for t in AIRCRAFT_TYPES}
-    stats = {"target": args.count, "generated": 0, "accepted": 0,
-             "rejected_invalid": 0, "rejected_duplicate": 0, "per_type": type_counts}
-    attempts = 0
-    while stats["accepted"] < args.count and attempts < args.count * 10:
-        attempts += 1
-        atype = rng.choice(AIRCRAFT_TYPES)
-        vox = generate_aircraft(rng, atype)
-        stats["generated"] += 1
-        c = chash(vox)
-        if c in seen: stats["rejected_duplicate"] += 1; continue
-        if not validate(vox): stats["rejected_invalid"] += 1; continue
-        vid = f"proc:{atype}:{stats['accepted']}"
+    samples, stats = generate_procedural_samples(args.count, args.seed)
+    out = []
+    for sample in samples:
+        atype = sample["aircraft_type"]
+        vox = sample["voxels"]
+        c = sample["canonical_content_sha256"]
+        vid = f"proc:{atype}:{sample['accepted_index']}"
         fn = vid.replace(":", "_") + ".npy"
-        np.save(str(od / "voxels" / fn), vox.astype(np.uint8))
+        np.save(str(od / "voxels" / fn), vox, allow_pickle=False)
         out.append({
             "source_id": vid, "source_type": "procedural",
             "aircraft_type": atype, "canonical_content_sha256": c,
@@ -248,14 +315,13 @@ def main():
             "conditioning_mode": "unconditioned_source_metadata_only",
             "split": "train",
             "provenance": {
-                "generator_seed": args.seed, "attempt": attempts,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "generator_seed": args.seed, "attempt": sample["attempt"],
+                "generator_version": PROCEDURAL_GENERATOR_VERSION,
                 "description": f"Parametrically generated {atype}",
                 "claim_boundary": "Procedurally generated design, NOT real CAD."
             }
         })
-        seen.add(c); stats["accepted"] += 1; type_counts[atype] += 1
-    stats["created_at"] = datetime.now(timezone.utc).isoformat()
+    stats["generator_version"] = PROCEDURAL_GENERATOR_VERSION
     mp = od / "manifest.jsonl"; tmp = mp.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         for r in out: f.write(json.dumps(r, sort_keys=True, ensure_ascii=True) + "\n")
