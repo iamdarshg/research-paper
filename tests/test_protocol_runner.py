@@ -1,3 +1,4 @@
+import inspect
 import os
 import sys
 import tempfile
@@ -204,7 +205,7 @@ class TestProtocolRunner(unittest.TestCase):
             2,
         )
 
-    def test_gcp_128_protocol_uses_monitored_runner_with_explicit_production_contract(self):
+    def test_gcp_128_production_protocol_is_unbounded_with_production_cadence(self):
         repo_root = Path(__file__).resolve().parents[1]
         protocol_path = repo_root / "CLI" / "run_protocols" / "gcp_128_295m.yaml"
         config = run_protocol.load_protocol_config(str(protocol_path))
@@ -237,11 +238,30 @@ class TestProtocolRunner(unittest.TestCase):
             "--direct-solver-steps": "5",
             "--direct-solver-directions": "8",
             "--direct-solver-batch-chunk": "4",
-            "--checkpoint-every-updates": "1",
-            "--stop-after-updates": "5",
+            "--checkpoint-every-updates": "25",
         }
         for flag, value in expected_values.items():
             self.assertIn(flag, command)
             self.assertEqual(command[command.index(flag) + 1], value)
 
         self.assertIn("--no-require-direct-solver-every-iteration", command)
+        self.assertIn("--enable-compile", command)
+        self.assertIn("--enable-gradient-checkpointing", command)
+        self.assertNotIn("--stop-after-updates", command)
+
+    def test_gcp_128_smoke_mode_is_explicitly_bounded(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        protocol_path = repo_root / "CLI" / "run_protocols" / "gcp_128_295m.yaml"
+        config = run_protocol.load_protocol_config(str(protocol_path))
+        mode_parameter = inspect.signature(
+            run_protocol.build_protocol_commands
+        ).parameters.get("mode")
+
+        self.assertIsNotNone(mode_parameter)
+        commands = run_protocol.build_protocol_commands(config, mode="smoke")
+
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertEqual(command[command.index("--num-epochs") + 1], "12")
+        self.assertEqual(command[command.index("--checkpoint-every-updates") + 1], "1")
+        self.assertEqual(command[command.index("--stop-after-updates") + 1], "5")

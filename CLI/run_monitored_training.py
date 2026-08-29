@@ -25,6 +25,7 @@ from aircraft_diffusion_cfd import (
     CFDConfig,
     DiffusionConfig,
     LBMPhysicsConfig,
+    MONITORED_EXACT_RESUME_SCHEMA,
     ModelConfig,
     OptimizedDiffusionTrainer,
     TrainingConfig,
@@ -374,6 +375,7 @@ def _build_objective_configuration_fingerprint(
         "solver": str(args.solver),
         "lbm_stream_bfl_backend": str(args.lbm_stream_bfl_backend),
         "direct_solver_batch_chunk": int(args.direct_solver_batch_chunk),
+        "checkpoint_every_updates": int(args.checkpoint_every_updates),
         "geometry_materialization_threshold": float(geometry_probability_threshold),
         "training_config": _dataclass_fingerprint(training_config),
         "model_config": _dataclass_fingerprint(model_config),
@@ -1029,12 +1031,27 @@ def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig
 
 def _build_monitored_cfd_config(args: argparse.Namespace, resolved_grid_size: int) -> CFDConfig:
     """Construct CFD settings from the monitored runner's explicit contract."""
+    lbm_config = LBMPhysicsConfig(stream_block_size=int(args.stream_block_size))
+    lbm_config.grid_spacing = (
+        lbm_config.physical_length_scale / int(resolved_grid_size)
+    )
     return CFDConfig(
         base_grid_resolution=resolved_grid_size,
         solver_type=args.solver,
         use_fused_stream_bfl=(args.lbm_stream_bfl_backend == "fused_stream_bfl"),
-        lbm_config=LBMPhysicsConfig(stream_block_size=int(args.stream_block_size)),
+        lbm_config=lbm_config,
     )
+
+
+def _apply_monitored_model_runtime_config(
+    model_config: ModelConfig, args: argparse.Namespace
+) -> ModelConfig:
+    """Apply explicit monitored model execution flags before trainer creation."""
+    model_config.use_torch_compile = bool(args.enable_compile)
+    model_config.enable_gradient_checkpointing = bool(
+        args.enable_gradient_checkpointing
+    )
+    return model_config
 
 
 def main() -> int:
@@ -1046,6 +1063,16 @@ def main() -> int:
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-5)))
     parser.add_argument("--precision", default=str(config_value("training", "precision", "float32")))
+    parser.add_argument(
+        "--enable-compile",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config_value("model", "use_torch_compile", False)),
+    )
+    parser.add_argument(
+        "--enable-gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config_value("model", "enable_gradient_checkpointing", True)),
+    )
     parser.add_argument(
         "--lr-min-ratio",
         type=float,
@@ -1233,6 +1260,7 @@ def main() -> int:
                 f"{checkpoint_model_config.latent_dim} != {args.latent_dim}"
             )
         model_config = checkpoint_model_config
+    model_config = _apply_monitored_model_runtime_config(model_config, args)
     if int(dataset.latent_dim) != int(model_config.latent_dim):
         dataset = AircraftDesignDataset(
             num_samples=0,
@@ -1321,6 +1349,7 @@ def main() -> int:
         args.resume_run_state or (Path(args.save_dir) / "latest_run_state.pt")
     ).resolve()
     run_compatibility = {
+        "compatibility_schema": MONITORED_EXACT_RESUME_SCHEMA,
         "manifest_identity": _manifest_identity(args.manifest),
         "grid_size": int(resolved_grid_size),
         "latent_dim": int(model_config.latent_dim),

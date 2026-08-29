@@ -99,6 +99,7 @@ _WEIGHTS_ONLY_FALLBACK_EXCEPTIONS = (
 # fallback. These are trusted local artifacts from our own runs at explicit
 # paths, never untrusted input.
 _TRUSTED_CHECKPOINT_ROOT = REPO_ROOT / "build"
+MONITORED_EXACT_RESUME_SCHEMA = "monitored-exact-resume-v1"
 
 
 def _is_trusted_checkpoint_path(path) -> bool:
@@ -250,7 +251,11 @@ def validate_run_state_compatibility(
     expected: Mapping[str, Any],
 ) -> List[str]:
     """Return immutable run fields that differ, in deterministic order."""
+    strict_monitored = (
+        expected.get("compatibility_schema") == MONITORED_EXACT_RESUME_SCHEMA
+    )
     fields_to_compare = (
+        *(("compatibility_schema",) if strict_monitored else ()),
         "manifest_identity",
         "grid_size",
         "latent_dim",
@@ -264,17 +269,41 @@ def validate_run_state_compatibility(
     ]
     actual_configuration = actual.get("configuration", {})
     expected_configuration = expected.get("configuration", {})
-    # Intersection semantics (R4, PR 41 review): a fingerprint key added in a
-    # NEWER code version (e.g. experiment_flags) must not block resuming an
-    # older run-state that predates it. Keys present on BOTH sides are compared
-    # strictly; a key present on only one side cannot be verified and is skipped.
-    mismatches.extend(
-        f"configuration.{field_name}"
-        for field_name in sorted(
-            set(actual_configuration) & set(expected_configuration)
+    if strict_monitored:
+        def compare_required(
+            actual_value: Any, expected_value: Any, path: str
+        ) -> None:
+            if isinstance(expected_value, Mapping):
+                if not isinstance(actual_value, Mapping):
+                    mismatches.append(path)
+                    return
+                for key in sorted(expected_value):
+                    child_path = f"{path}.{key}"
+                    if key not in actual_value:
+                        mismatches.append(child_path)
+                    else:
+                        compare_required(
+                            actual_value[key], expected_value[key], child_path
+                        )
+                return
+            if actual_value != expected_value:
+                mismatches.append(path)
+
+        compare_required(
+            actual_configuration, expected_configuration, "configuration"
         )
-        if actual_configuration.get(field_name) != expected_configuration.get(field_name)
-    )
+    else:
+        # Legacy non-monitored states retain their historical intersection
+        # semantics. Exact monitored resumes use the versioned strict branch
+        # above and reject every missing or changed immutable key.
+        mismatches.extend(
+            f"configuration.{field_name}"
+            for field_name in sorted(
+                set(actual_configuration) & set(expected_configuration)
+            )
+            if actual_configuration.get(field_name)
+            != expected_configuration.get(field_name)
+        )
     return mismatches
 
 

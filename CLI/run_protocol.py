@@ -62,7 +62,11 @@ def _protocol_run_id(config: Dict[str, Any]) -> str:
     return f"protocol-{protocol_hash[:12]}"
 
 
-def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
+def build_protocol_commands(
+    config: Dict[str, Any], *, mode: str = "production"
+) -> List[List[str]]:
+    if mode not in {"production", "smoke"}:
+        raise ValueError(f"Unsupported protocol mode: {mode}")
     config_path = Path(config["_config_path"]).resolve()
     cli_dir = config_path.parent.parent
     python_exe = sys.executable
@@ -113,7 +117,9 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
             train_cmd = [python_exe, monitored_training_script]
             smoke_cfg = dict(config.get("smoke", {}))
             checkpoint_every_updates = train_cfg.get("checkpoint_every_updates")
-            if smoke_cfg.get("enabled") and "checkpoint_every_updates" in smoke_cfg:
+            if mode == "smoke" and not smoke_cfg.get("enabled"):
+                raise ValueError("Smoke mode requires smoke.enabled: true")
+            if mode == "smoke" and "checkpoint_every_updates" in smoke_cfg:
                 checkpoint_every_updates = smoke_cfg["checkpoint_every_updates"]
             for flag, key in (
                 ("--manifest", "dataset_manifest"),
@@ -147,8 +153,26 @@ def build_protocol_commands(config: Dict[str, Any]) -> List[List[str]]:
                     "--no-require-direct-solver-every-iteration",
                     bool(train_cfg["require_direct_solver_every_iteration"]),
                 )
-            if smoke_cfg.get("enabled"):
-                _add_option(train_cmd, "--stop-after-updates", smoke_cfg.get("stop_after_updates"))
+            if "enable_compile" in train_cfg:
+                _add_dual_flag(
+                    train_cmd,
+                    "--enable-compile",
+                    "--no-enable-compile",
+                    bool(train_cfg["enable_compile"]),
+                )
+            if "enable_checkpointing" in train_cfg:
+                _add_dual_flag(
+                    train_cmd,
+                    "--enable-gradient-checkpointing",
+                    "--no-enable-gradient-checkpointing",
+                    bool(train_cfg["enable_checkpointing"]),
+                )
+            if mode == "smoke":
+                _add_option(
+                    train_cmd,
+                    "--stop-after-updates",
+                    smoke_cfg.get("stop_after_updates"),
+                )
         else:
             train_cmd = [python_exe, cli_script, "train"]
             for flag, key in (
@@ -342,11 +366,17 @@ def run_commands(commands: Iterable[List[str]], *, dry_run: bool = False) -> Non
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a checked-in smoke/final evaluation protocol.")
     parser.add_argument("--config", required=True, help="Path to a protocol YAML file.")
+    parser.add_argument(
+        "--mode",
+        choices=("production", "smoke"),
+        default="production",
+        help="Emit the full production command or the explicitly bounded smoke command.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
     args = parser.parse_args()
 
     config = load_protocol_config(args.config)
-    commands = build_protocol_commands(config)
+    commands = build_protocol_commands(config, mode=args.mode)
     run_commands(commands, dry_run=args.dry_run)
     return 0
 

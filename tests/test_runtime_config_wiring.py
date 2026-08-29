@@ -79,6 +79,30 @@ def test_monitored_cfd_config_uses_explicit_backend_and_stream_block_size():
     assert cfd.solver_type == "D3Q27"
     assert cfd.use_fused_stream_bfl is True
     assert cfd.lbm_config.stream_block_size == 512
+    assert cfd.lbm_config.grid_spacing == 1.0 / 128
+
+
+def test_monitored_model_config_uses_explicit_compile_and_checkpoint_flags():
+    args = SimpleNamespace(
+        enable_compile=True,
+        enable_gradient_checkpointing=True,
+    )
+    model = adc.ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        base_grid_resolution=4,
+        grid_resolution=4,
+        use_torch_compile=False,
+        enable_gradient_checkpointing=False,
+    )
+
+    assert hasattr(monitored_training, "_apply_monitored_model_runtime_config")
+    configured = monitored_training._apply_monitored_model_runtime_config(model, args)
+
+    assert configured is model
+    assert configured.use_torch_compile is True
+    assert configured.enable_gradient_checkpointing is True
 
 
 def test_train_command_defaults_follow_config():

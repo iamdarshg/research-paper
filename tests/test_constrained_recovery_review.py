@@ -892,6 +892,10 @@ def test_runner_main_restores_saved_threshold_and_resets_cadence(tmp_path, monke
             raise AssertionError("resume-run-state must use the saved threshold")
 
         def load_run_state(self, path, *, expected_compatibility):
+            assert (
+                expected_compatibility.get("compatibility_schema")
+                == "monitored-exact-resume-v1"
+            )
             assert expected_compatibility["configuration"][
                 "geometry_materialization_threshold"
             ] == pytest.approx(0.37)
@@ -1568,6 +1572,7 @@ def test_resume_fingerprint_contains_live_training_behavior():
                 "lbm_stream_bfl_backend": "pytorch_reference",
                 "direct_solver_batch_chunk": 4,
                 "stream_block_size": 512,
+                "checkpoint_every_updates": 25,
             },
         )(),
         training_config=training,
@@ -1591,6 +1596,7 @@ def test_resume_fingerprint_contains_live_training_behavior():
     assert configuration["training_config"]["direct_solver_interval"] == 32
     assert configuration["training_config"]["direct_solver_directions"] == 8
     assert configuration["direct_solver_batch_chunk"] == 4
+    assert configuration["checkpoint_every_updates"] == 25
     assert configuration["cfd_config"]["lbm_config"]["stream_block_size"] == 512
     assert configuration["geometry_materialization_threshold"] == 0.37
     assert configuration["training_config"]["project_conflicting_direct_gradient"] is False
@@ -1930,8 +1936,8 @@ def test_both_cfdconfig_classes_read_mach_number_from_config_yaml():
     assert RecoveryCFDConfig(mach_number=0.05).mach_number == 0.05
 
 
-def test_mach_helpers_map_documented_mach_to_lattice_and_physical_speed():
-    """mach_to_lattice_velocity(0.3) == 0.3/sqrt(3); physical speed uses the named constant."""
+def test_mach_helpers_map_explicit_override_to_lattice_and_physical_speed():
+    """An explicit Mach override maps directly to lattice and physical speed."""
     expected_lattice = 0.3 / math.sqrt(3.0)
     assert mach_to_lattice_velocity(0.3) == pytest.approx(
         expected_lattice, rel=COMPONENT_RTOL, abs=COMPONENT_ATOL

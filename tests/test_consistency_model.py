@@ -183,6 +183,41 @@ def test_run_state_compatibility_configuration_uses_intersection_semantics():
     ]
 
 
+def test_monitored_exact_resume_requires_every_expected_nested_identity_key():
+    base = {
+        "manifest_identity": "manifest-a",
+        "grid_size": 128,
+        "latent_dim": 512,
+        "split": "train",
+        "sample_count": 32,
+    }
+    actual = {
+        **base,
+        "configuration": {
+            "training_config": {"learning_rate": 0.00002},
+        },
+    }
+    expected = {
+        **base,
+        "compatibility_schema": "monitored-exact-resume-v1",
+        "configuration": {
+            "training_config": {
+                "learning_rate": 0.00002,
+                "precision": "bfloat16",
+            },
+            "direct_solver_batch_chunk": 4,
+            "experiment_flags": {"tf32_gemm_math": False},
+        },
+    }
+
+    assert validate_run_state_compatibility(actual, expected) == [
+        "compatibility_schema",
+        "configuration.direct_solver_batch_chunk",
+        "configuration.experiment_flags",
+        "configuration.training_config.precision",
+    ]
+
+
 def test_run_state_compatibility_reports_all_immutable_mismatches():
     expected = {
         "manifest_identity": "manifest-a",
