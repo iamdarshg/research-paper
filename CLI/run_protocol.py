@@ -95,6 +95,19 @@ def build_protocol_commands(
         train_cfg["save_dir"] = smoke_cfg.get(
             "save_dir", f"{production_save_dir.rstrip('/\\')}_smoke"
         )
+        if train_cfg.get("resume_run_state"):
+            if not (
+                smoke_cfg.get("resume_run_state")
+                and smoke_cfg.get("updates_output")
+            ):
+                raise ValueError(
+                    "A resumable monitored smoke run requires isolated "
+                    "resume_run_state and updates_output paths in smoke config"
+                )
+            train_cfg["resume_run_state"] = smoke_cfg["resume_run_state"]
+            train_cfg["updates_output"] = smoke_cfg["updates_output"]
+            if smoke_cfg.get("history_output"):
+                train_cfg["history_output"] = smoke_cfg["history_output"]
     manifest_cfg = dict(config.get("validate_manifest", {}))
     baseline_cfg = dict(config.get("evaluate_baselines", {}))
     condition_cfg = dict(config.get("validate_conditions", {}))
@@ -164,9 +177,16 @@ def build_protocol_commands(
                 ("--direct-solver-batch-chunk", "direct_solver_batch_chunk"),
                 ("--stream-block-size", "stream_block_size"),
                 ("--save-dir", "save_dir"),
+                ("--history-output", "history_output"),
+                ("--updates-output", "updates_output"),
             ):
                 value = train_cfg.get(key)
-                if key in {"dataset_manifest", "save_dir"}:
+                if key in {
+                    "dataset_manifest",
+                    "save_dir",
+                    "history_output",
+                    "updates_output",
+                }:
                     value = _resolve_path(config, value)
                 _add_option(train_cmd, flag, value)
             for flag, key in (

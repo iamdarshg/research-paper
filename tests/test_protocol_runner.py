@@ -307,6 +307,61 @@ class TestProtocolRunner(unittest.TestCase):
                 smoke_checkpoint,
             )
 
+    def test_monitored_smoke_rejects_production_resume_without_isolated_state(self):
+        config = {
+            "_config_path": str(Path(__file__).resolve()),
+            "_config_dir": str(Path(__file__).resolve().parent),
+            "train": {
+                "enabled": True,
+                "runner": "monitored",
+                "resume_run_state": "production/latest_run_state.pt",
+            },
+            "smoke": {"enabled": True, "stop_after_updates": 2},
+        }
+
+        with self.assertRaisesRegex(
+            ValueError, "isolated resume_run_state and updates_output"
+        ):
+            run_protocol.build_protocol_commands(config, mode="smoke")
+
+    def test_monitored_smoke_uses_isolated_resume_state_and_updates_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "CLI" / "run_protocols" / "monitored.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "train": {
+                            "enabled": True,
+                            "runner": "monitored",
+                            "resume_run_state": "../../production/latest_run_state.pt",
+                            "updates_output": "../../production/updates.jsonl",
+                        },
+                        "smoke": {
+                            "enabled": True,
+                            "stop_after_updates": 2,
+                            "resume_run_state": "../../smoke/latest_run_state.pt",
+                            "updates_output": "../../smoke/updates.jsonl",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            command = run_protocol.build_protocol_commands(
+                run_protocol.load_protocol_config(str(config_path)), mode="smoke"
+            )[0]
+
+            self.assertEqual(
+                command[command.index("--resume-run-state") + 1],
+                str((root / "smoke" / "latest_run_state.pt").resolve()),
+            )
+            self.assertEqual(
+                command[command.index("--updates-output") + 1],
+                str((root / "smoke" / "updates.jsonl").resolve()),
+            )
+
     def test_monitored_smoke_mode_rejects_missing_or_nonpositive_update_bound(self):
         for stop_after_updates in (None, 0, -1):
             with self.subTest(stop_after_updates=stop_after_updates):
