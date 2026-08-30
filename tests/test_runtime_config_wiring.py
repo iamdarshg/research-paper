@@ -35,6 +35,7 @@ def test_monitored_training_config_does_not_override_sparse_runtime_schedule():
         batch_size=1,
         learning_rate=2e-5,
         precision="bfloat16",
+        enable_consistency=False,
         coordinate_training_samples=65536,
         full_lattice_interval=64,
         sparse_samples_per_full=262144,
@@ -55,6 +56,7 @@ def test_monitored_training_config_does_not_override_sparse_runtime_schedule():
     training = _build_monitored_training_config(args)
 
     assert training.precision == "bfloat16"
+    assert training.enable_consistency is False
     assert training.coordinate_training_samples == 65536
     assert training.direct_solver_interval == 32
     assert training.full_lattice_interval == 64
@@ -64,6 +66,21 @@ def test_monitored_training_config_does_not_override_sparse_runtime_schedule():
     assert training.enable_pipeline_parallelism is bool(
         config_value("training", "enable_pipeline_parallelism", False)
     )
+
+
+def test_disabled_consistency_schedule_never_runs_progressive_distillation():
+    training = adc.TrainingConfig(enable_consistency=False, consistency_interval=1)
+
+    assert not adc.should_run_consistency_update(training, batch_idx=0)
+    assert not adc.should_run_consistency_update(training, batch_idx=1)
+
+
+def test_enabled_consistency_schedule_obeys_interval():
+    training = adc.TrainingConfig(enable_consistency=True, consistency_interval=3)
+
+    assert adc.should_run_consistency_update(training, batch_idx=0)
+    assert not adc.should_run_consistency_update(training, batch_idx=1)
+    assert adc.should_run_consistency_update(training, batch_idx=3)
 
 
 def test_monitored_cfd_config_uses_explicit_backend_and_stream_block_size():

@@ -72,6 +72,20 @@ def test_file_backed_store_materializes_without_retaining_voxel_tensor(tmp_path)
     assert torch.equal(store.materialize(index), torch.from_numpy(geometry))
 
 
+def test_tensor_add_deduplicates_against_file_backed_entry(tmp_path):
+    geometry = np.zeros((8, 8, 8), dtype=np.uint8)
+    geometry[2:6, 3:5, 1:7] = 1
+    path = tmp_path / "geometry.npy"
+    np.save(path, geometry, allow_pickle=False)
+    store = CompactGeometryStore()
+    first = store.add_file("file", path, content_hash="shared")
+
+    second = store.add("tensor", torch.from_numpy(geometry), content_hash="shared")
+
+    assert first == second
+    assert store.unique_count == 1
+
+
 def test_manifest_records_reference_shared_geometry_and_preserve_getitem(tmp_path):
     geometry = np.zeros((4, 4, 4), dtype=np.float32)
     geometry[1:3, :, 2] = 1

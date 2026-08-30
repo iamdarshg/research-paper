@@ -146,6 +146,7 @@ def test_build_perturbation_record_has_truthful_claim_metadata():
     assert record["split"] == "holdout"
     assert record["conditioning_mode"] == "unconditioned_source_metadata_only"
     assert record["design_family"] == "generated_perturbation"
+    assert record["canonicalization"]["permutation"] == [0, 1, 2]
     assert record["split"] == "holdout"
     assert "not independent CAD" in record["geometry_provenance"]
     assert record["preprocessing_version"] == "final-training-corpus-v1-perturbation-v1"
@@ -175,6 +176,7 @@ def test_build_procedural_record_has_truthful_claim_metadata():
     assert record["split"] == "train"
     assert record["conditioning_mode"] == "unconditioned_source_metadata_only"
     assert record["design_family"] == "generated_procedural_glider"
+    assert record["canonicalization"]["permutation"] == [0, 1, 2]
     assert "NOT real CAD" in record["geometry_provenance"]
     assert record["preprocessing_version"] == "final-training-corpus-v1-procedural-v1"
     assert record["units"] == "normalized voxel lattice; occupancy is dimensionless"

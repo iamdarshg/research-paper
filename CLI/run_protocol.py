@@ -146,6 +146,13 @@ def build_protocol_commands(
                     value = _resolve_path(config, value)
                 _add_option(train_cmd, flag, value)
             _add_option(train_cmd, "--checkpoint-every-updates", checkpoint_every_updates)
+            if "enable_consistency" in train_cfg:
+                _add_dual_flag(
+                    train_cmd,
+                    "--enable-consistency",
+                    "--no-enable-consistency",
+                    bool(train_cfg["enable_consistency"]),
+                )
             if "require_direct_solver_every_iteration" in train_cfg:
                 _add_dual_flag(
                     train_cmd,

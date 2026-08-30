@@ -35,7 +35,7 @@ class CompactGeometryStore:
         stable_hash = content_hash or self.content_hash(compact)
         existing = self._hash_to_index.get(stable_hash)
         if existing is not None:
-            canonical = self._geometries[existing]
+            canonical = self.materialize(existing)
             if canonical.shape != compact.shape or not torch.equal(canonical, compact):
                 raise ValueError(
                     f"Content hash {stable_hash!r} does not match the canonical compact geometry"

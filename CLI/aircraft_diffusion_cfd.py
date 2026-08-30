@@ -519,6 +519,7 @@ class TrainingConfig:
     """Training hyperparameters"""
     batch_size: int = int(config_value("training", "batch_size", 1))
     learning_rate: float = float(config_value("training", "learning_rate", 2e-5))
+    enable_consistency: bool = True
     converter_learning_rate: float = float(config_value("training", "converter_learning_rate", 2e-5))
     consistency_student_learning_rate: float = float(
         config_value("training", "consistency_student_learning_rate", 2e-5)
@@ -1142,6 +1143,15 @@ def combine_training_loss_terms(
     if not torch.isfinite(optimization_loss):
         raise FloatingPointError("Combined training loss is nonfinite")
     return optimization_loss
+
+
+def should_run_consistency_update(
+    training_config: TrainingConfig, batch_idx: int
+) -> bool:
+    """Return whether progressive-distillation work is due for this batch."""
+    return bool(training_config.enable_consistency) and (
+        int(batch_idx) % max(1, int(training_config.consistency_interval)) == 0
+    )
 
 
 def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -7216,7 +7226,7 @@ class OptimizedDiffusionTrainer:
 
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
-            if batch_idx % max(1, int(self.training_config.consistency_interval)) == 0:
+            if should_run_consistency_update(self.training_config, batch_idx):
                 consistency_loss = self._compute_consistency_loss(latent, condition=condition)
 
             # Random timestep for diffusion training
@@ -9987,6 +9997,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         num_epochs=num_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        enable_consistency=enable_consistency,
         disconnection_penalty=disconnection_penalty,
         precision=precision,
         checkpoint_dir=save_dir,

@@ -245,6 +245,7 @@ class TestProtocolRunner(unittest.TestCase):
             self.assertEqual(command[command.index(flag) + 1], value)
 
         self.assertIn("--no-require-direct-solver-every-iteration", command)
+        self.assertIn("--no-enable-consistency", command)
         self.assertIn("--enable-compile", command)
         self.assertIn("--enable-gradient-checkpointing", command)
         self.assertNotIn("--stop-after-updates", command)

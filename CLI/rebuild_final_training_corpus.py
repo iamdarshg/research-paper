@@ -418,6 +418,15 @@ def _null_conditioning_metadata(reason: str) -> dict[str, Any]:
     }
 
 
+def _identity_canonicalization(status: str) -> dict[str, Any]:
+    """Declare that persisted geometry already uses the corpus canonical axes."""
+    return {
+        "permutation": [0, 1, 2],
+        "status": status,
+        "method": "identity; geometry generated or resampled in canonical z-y-x frame",
+    }
+
+
 def _is_http_url(value: str) -> bool:
     return value.lower().startswith(("http://", "https://"))
 
@@ -576,6 +585,8 @@ def _build_original_record(
     output = _strip_local_path_fields(dict(parent))
     if not isinstance(output, dict):
         raise ValueError("source record metadata must be a JSON object")
+    if isinstance(parent.get("canonicalization"), Mapping):
+        output["source_canonicalization"] = dict(parent["canonicalization"])
     source_units = parent.get("units")
     if source_units and source_units != NORMALIZED_VOXEL_UNITS:
         output["source_units"] = source_units
@@ -592,6 +603,9 @@ def _build_original_record(
             "voxel_sha256": voxel_file_hash or content_hash,
             "units": NORMALIZED_VOXEL_UNITS,
             "conditioning_mode": "unconditioned_source_metadata_only",
+            "canonicalization": _identity_canonicalization(
+                "resampled_from_source_canonical_frame"
+            ),
         }
     )
     output.update(
@@ -644,6 +658,9 @@ def build_perturbation_record(
         "preprocessing_version": PERTURBATION_METADATA_VERSION,
         "units": NORMALIZED_VOXEL_UNITS,
         "design_family": "generated_perturbation",
+        "canonicalization": _identity_canonicalization(
+            "generated_in_parent_canonical_frame"
+        ),
     }
     record.update(_null_conditioning_metadata("unavailable; not inherited or inferred for generated geometry"))
     _assert_no_absolute_paths(record, context=f"perturbation {record['source_id']}")
@@ -681,6 +698,9 @@ def build_procedural_record(
         "preprocessing_version": PROCEDURAL_METADATA_VERSION,
         "units": NORMALIZED_VOXEL_UNITS,
         "design_family": f"generated_procedural_{aircraft_type}",
+        "canonicalization": _identity_canonicalization(
+            "generated_in_procedural_canonical_frame"
+        ),
     }
     record.update(_null_conditioning_metadata("unavailable; not inherited or inferred for generated geometry"))
     _assert_no_absolute_paths(record, context=f"procedural {record['source_id']}")

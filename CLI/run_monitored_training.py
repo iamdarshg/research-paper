@@ -1004,6 +1004,7 @@ def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        enable_consistency=bool(args.enable_consistency),
         disconnection_penalty=float(
             config_value("training", "disconnection_penalty", 30.0)
         ),
@@ -1063,6 +1064,12 @@ def main() -> int:
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-5)))
     parser.add_argument("--precision", default=str(config_value("training", "precision", "float32")))
+    parser.add_argument(
+        "--enable-consistency",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable periodic progressive-distillation consistency updates.",
+    )
     parser.add_argument(
         "--enable-compile",
         action=argparse.BooleanOptionalAction,
