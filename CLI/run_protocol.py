@@ -89,6 +89,12 @@ def build_protocol_commands(
     run_id = _protocol_run_id(config)
     protocol_config_path = str(config_path)
     train_cfg = dict(config.get("train", {}))
+    if mode == "smoke" and train_cfg.get("runner") == "monitored":
+        smoke_cfg = dict(config.get("smoke", {}))
+        production_save_dir = str(train_cfg.get("save_dir", "./checkpoints_monitored"))
+        train_cfg["save_dir"] = smoke_cfg.get(
+            "save_dir", f"{production_save_dir.rstrip('/\\')}_smoke"
+        )
     manifest_cfg = dict(config.get("validate_manifest", {}))
     baseline_cfg = dict(config.get("evaluate_baselines", {}))
     condition_cfg = dict(config.get("validate_conditions", {}))
@@ -206,7 +212,6 @@ def build_protocol_commands(
                     bool(train_cfg["stop_on_promotion_pass"]),
                 )
             if mode == "smoke":
-                train_cmd.append("--no-save-final-checkpoint")
                 _add_option(
                     train_cmd,
                     "--stop-after-updates",

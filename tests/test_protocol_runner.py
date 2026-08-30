@@ -268,7 +268,44 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertEqual(command[command.index("--num-epochs") + 1], "2")
         self.assertEqual(command[command.index("--checkpoint-every-updates") + 1], "1")
         self.assertEqual(command[command.index("--stop-after-updates") + 1], "5")
-        self.assertIn("--no-save-final-checkpoint", command)
+        self.assertNotIn("--no-save-final-checkpoint", command)
+        self.assertTrue(command[command.index("--save-dir") + 1].endswith("checkpoints_128_295m_smoke"))
+
+    def test_monitored_smoke_followups_consume_isolated_smoke_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "CLI" / "run_protocols" / "monitored.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "train": {
+                            "enabled": True,
+                            "runner": "monitored",
+                            "save_dir": "../../checkpoints",
+                        },
+                        "smoke": {"enabled": True, "stop_after_updates": 2},
+                        "evaluate_baselines": {"enabled": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            train_command, baseline_command = run_protocol.build_protocol_commands(
+                run_protocol.load_protocol_config(str(config_path)), mode="smoke"
+            )
+
+            smoke_save_dir = str((root / "checkpoints_smoke").resolve())
+            smoke_checkpoint = str(
+                (root / "checkpoints_smoke" / "final_monitored_model.pt").resolve()
+            )
+            self.assertEqual(
+                train_command[train_command.index("--save-dir") + 1], smoke_save_dir
+            )
+            self.assertEqual(
+                baseline_command[baseline_command.index("--checkpoint") + 1],
+                smoke_checkpoint,
+            )
 
     def test_monitored_smoke_mode_rejects_missing_or_nonpositive_update_bound(self):
         for stop_after_updates in (None, 0, -1):
