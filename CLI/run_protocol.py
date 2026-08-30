@@ -141,6 +141,17 @@ def build_protocol_commands(
             )
             if train_cfg.get(key)
         }
+        production_save_path = production_resolved.get("save_dir")
+        if production_save_path is not None:
+            for smoke_key, smoke_path in smoke_resolved.items():
+                if (
+                    smoke_path == production_save_path
+                    or production_save_path in smoke_path.parents
+                ):
+                    raise ValueError(
+                        f"Smoke {smoke_key} is inside production save_dir; "
+                        "use an isolated path"
+                    )
         for smoke_key, smoke_path in smoke_resolved.items():
             for production_key, production_path in production_resolved.items():
                 if smoke_path != production_path:
@@ -157,7 +168,7 @@ def build_protocol_commands(
         if len(set(smoke_files.values())) != len(smoke_files):
             raise ValueError("Smoke output artifacts must use distinct paths")
         if resumable_smoke:
-            for key in resume_artifacts:
+            for key in ("resume_run_state", "updates_output"):
                 resolved = smoke_resolved[key]
                 if not resolved.is_file():
                     raise ValueError(

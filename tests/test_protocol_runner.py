@@ -451,6 +451,37 @@ class TestProtocolRunner(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not exist"):
             run_protocol.build_protocol_commands(config, mode="smoke")
 
+    def test_resumable_monitored_smoke_allows_missing_pre_epoch_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            smoke_dir = root / "smoke"
+            smoke_dir.mkdir()
+            (smoke_dir / "latest_run_state.pt").write_bytes(b"state")
+            (smoke_dir / "updates.jsonl").write_bytes(b"{}\n")
+            config = {
+                "_config_path": str(root / "CLI" / "run_protocols" / "config.yaml"),
+                "_config_dir": str(root / "CLI" / "run_protocols"),
+                "train": {
+                    "enabled": True,
+                    "runner": "monitored",
+                    "resume_run_state": "../../production/latest_run_state.pt",
+                },
+                "smoke": {
+                    "enabled": True,
+                    "stop_after_updates": 2,
+                    "resume_run_state": "../../smoke/latest_run_state.pt",
+                    "updates_output": "../../smoke/updates.jsonl",
+                    "history_output": "../../smoke/history.json",
+                },
+            }
+
+            command = run_protocol.build_protocol_commands(config, mode="smoke")[0]
+
+            self.assertEqual(
+                command[command.index("--history-output") + 1],
+                str((smoke_dir / "history.json").resolve()),
+            )
+
     def test_monitored_smoke_rejects_paths_aliasing_production_artifacts(self):
         cases = {
             "resume_run_state": {
@@ -511,6 +542,25 @@ class TestProtocolRunner(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "aliases production"):
+            run_protocol.build_protocol_commands(config, mode="smoke")
+
+    def test_monitored_smoke_rejects_artifacts_inside_production_save_dir(self):
+        config = {
+            "_config_path": str(Path(__file__).resolve()),
+            "_config_dir": str(Path(__file__).resolve().parent),
+            "train": {
+                "enabled": True,
+                "runner": "monitored",
+                "save_dir": "production",
+            },
+            "smoke": {
+                "enabled": True,
+                "stop_after_updates": 2,
+                "history_output": "production/latest_run_state.pt",
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "inside production save_dir"):
             run_protocol.build_protocol_commands(config, mode="smoke")
 
     def test_monitored_smoke_mode_rejects_missing_or_nonpositive_update_bound(self):
