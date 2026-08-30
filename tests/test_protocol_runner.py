@@ -307,22 +307,24 @@ class TestProtocolRunner(unittest.TestCase):
                 smoke_checkpoint,
             )
 
-    def test_monitored_smoke_rejects_production_resume_without_isolated_state(self):
-        config = {
-            "_config_path": str(Path(__file__).resolve()),
-            "_config_dir": str(Path(__file__).resolve().parent),
-            "train": {
-                "enabled": True,
-                "runner": "monitored",
-                "resume_run_state": "production/latest_run_state.pt",
-            },
-            "smoke": {"enabled": True, "stop_after_updates": 2},
-        }
+    def test_monitored_smoke_rejects_every_checkpoint_loading_path(self):
+        for field in ("resume_run_state", "resume_from", "warm_start_from"):
+            with self.subTest(field=field):
+                config = {
+                    "_config_path": str(Path(__file__).resolve()),
+                    "_config_dir": str(Path(__file__).resolve().parent),
+                    "train": {
+                        "enabled": True,
+                        "runner": "monitored",
+                        field: f"production/{field}.pt",
+                    },
+                    "smoke": {"enabled": True, "stop_after_updates": 2},
+                }
 
-        with self.assertRaisesRegex(
-            ValueError, "Smoke mode refuses exact resume"
-        ):
-            run_protocol.build_protocol_commands(config, mode="smoke")
+                with self.assertRaisesRegex(
+                    ValueError, "Smoke mode refuses checkpoint loading"
+                ):
+                    run_protocol.build_protocol_commands(config, mode="smoke")
 
     def test_fresh_monitored_smoke_isolates_configured_production_logs(self):
         with tempfile.TemporaryDirectory() as tmp:

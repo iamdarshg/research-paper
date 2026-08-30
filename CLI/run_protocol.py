@@ -100,10 +100,15 @@ def build_protocol_commands(
                 "updates_output",
             )
         }
-        if train_cfg.get("resume_run_state"):
+        checkpoint_loading_fields = (
+            "resume_run_state",
+            "resume_from",
+            "warm_start_from",
+        )
+        if any(train_cfg.get(key) for key in checkpoint_loading_fields):
             raise ValueError(
-                "Smoke mode refuses exact resume to protect production lineage; "
-                "use production mode for exact-resume validation"
+                "Smoke mode refuses checkpoint loading to protect production lineage; "
+                "use production mode for resume or warm-start validation"
             )
         production_save_dir = str(train_cfg.get("save_dir", "./checkpoints_monitored"))
         train_cfg["save_dir"] = smoke_cfg.get(
