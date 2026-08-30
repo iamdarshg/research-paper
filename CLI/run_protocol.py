@@ -91,23 +91,43 @@ def build_protocol_commands(
     train_cfg = dict(config.get("train", {}))
     if mode == "smoke" and train_cfg.get("runner") == "monitored":
         smoke_cfg = dict(config.get("smoke", {}))
+        production_paths = {
+            key: train_cfg.get(key)
+            for key in (
+                "save_dir",
+                "resume_run_state",
+                "history_output",
+                "updates_output",
+            )
+        }
         production_save_dir = str(train_cfg.get("save_dir", "./checkpoints_monitored"))
         train_cfg["save_dir"] = smoke_cfg.get(
             "save_dir", f"{production_save_dir.rstrip('/\\')}_smoke"
         )
+        smoke_save_dir = str(train_cfg["save_dir"])
+        train_cfg["history_output"] = smoke_cfg.get(
+            "history_output", str(Path(smoke_save_dir) / "history.json")
+        )
+        train_cfg["updates_output"] = smoke_cfg.get(
+            "updates_output", str(Path(smoke_save_dir) / "updates.jsonl")
+        )
         if train_cfg.get("resume_run_state"):
-            if not (
-                smoke_cfg.get("resume_run_state")
-                and smoke_cfg.get("updates_output")
-            ):
+            if not smoke_cfg.get("resume_run_state"):
                 raise ValueError(
                     "A resumable monitored smoke run requires isolated "
-                    "resume_run_state and updates_output paths in smoke config"
+                    "resume_run_state in smoke config"
                 )
             train_cfg["resume_run_state"] = smoke_cfg["resume_run_state"]
-            train_cfg["updates_output"] = smoke_cfg["updates_output"]
-            if smoke_cfg.get("history_output"):
-                train_cfg["history_output"] = smoke_cfg["history_output"]
+        for key, production_value in production_paths.items():
+            smoke_value = train_cfg.get(key)
+            if not production_value or not smoke_value:
+                continue
+            production_resolved = _resolve_path(config, str(production_value))
+            smoke_resolved = _resolve_path(config, str(smoke_value))
+            if Path(production_resolved).resolve() == Path(smoke_resolved).resolve():
+                raise ValueError(
+                    f"Smoke {key} aliases production {key}; use an isolated path"
+                )
     manifest_cfg = dict(config.get("validate_manifest", {}))
     baseline_cfg = dict(config.get("evaluate_baselines", {}))
     condition_cfg = dict(config.get("validate_conditions", {}))
