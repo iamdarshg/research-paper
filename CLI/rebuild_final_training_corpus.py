@@ -174,6 +174,34 @@ def canonical_content_hash(voxels: np.ndarray) -> str:
     return hashlib.sha256(canonical.tobytes(order="C")).hexdigest()
 
 
+def _stream_binary_uint8_hash(
+    voxels: np.ndarray,
+    *,
+    expected_shape: tuple[int, int, int],
+    context: str,
+    chunk_depth: int = 8,
+) -> str:
+    """Validate and hash an on-disk canonical array with bounded scratch memory."""
+    if tuple(voxels.shape) != tuple(expected_shape):
+        raise ValueError(f"{context} shape mismatch: {tuple(voxels.shape)}")
+    if voxels.dtype != np.dtype(np.uint8):
+        raise ValueError(f"{context} dtype mismatch: {voxels.dtype}")
+    digest = hashlib.sha256()
+    depth = max(1, int(chunk_depth))
+    for start in range(0, expected_shape[0], depth):
+        chunk = np.asarray(voxels[start : start + depth])
+        if np.any((chunk != 0) & (chunk != 1)):
+            raise ValueError(f"{context} is not binary uint8")
+        digest.update(chunk.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _close_memmap(array: np.ndarray) -> None:
+    mapped = getattr(array, "_mmap", None)
+    if mapped is not None:
+        mapped.close()
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -807,18 +835,19 @@ def validate_published_corpus(
         resolved_geometry = _safe_published_geometry_path(output_root, record.get("geometry_path"))
         expected_files.add(resolved_geometry.relative_to(output_root).as_posix())
         try:
-            loaded = np.load(str(resolved_geometry), allow_pickle=False)
+            loaded = np.load(str(resolved_geometry), mmap_mode="r", allow_pickle=False)
         except (OSError, ValueError) as exc:
             raise ValueError(f"record {index} geometry cannot be loaded: {resolved_geometry}: {exc}") from exc
-        if not isinstance(loaded, np.ndarray):
-            raise ValueError(f"record {index} geometry is not a numpy array: {resolved_geometry}")
-        if tuple(loaded.shape) != expected_shape:
-            raise ValueError(f"record {index} geometry shape mismatch: {tuple(loaded.shape)}")
-        if loaded.dtype != np.dtype(np.uint8):
-            raise ValueError(f"record {index} geometry dtype mismatch: {loaded.dtype}")
-        if not np.all((loaded == 0) | (loaded == 1)):
-            raise ValueError(f"record {index} geometry is not binary uint8")
-        actual_hash = canonical_content_hash(loaded)
+        try:
+            if not isinstance(loaded, np.ndarray):
+                raise ValueError(f"record {index} geometry is not a numpy array: {resolved_geometry}")
+            actual_hash = _stream_binary_uint8_hash(
+                loaded,
+                expected_shape=expected_shape,
+                context=f"record {index} geometry",
+            )
+        finally:
+            _close_memmap(loaded)
         declared_hash = _declared_canonical_hash(record)
         if declared_hash != actual_hash:
             raise ValueError(f"record {index} canonical hash mismatch: declared {declared_hash}, got {actual_hash}")
@@ -974,14 +1003,19 @@ def _replay_geometry(
 ) -> None:
     resolved_geometry = _safe_published_geometry_path(output_root, record.get("geometry_path"))
     try:
-        loaded = np.load(str(resolved_geometry), allow_pickle=False)
+        loaded = np.load(str(resolved_geometry), mmap_mode="r", allow_pickle=False)
     except (OSError, ValueError) as exc:
         raise ValueError(f"replay record {index} geometry cannot be loaded: {resolved_geometry}: {exc}") from exc
-    if not isinstance(loaded, np.ndarray) or tuple(loaded.shape) != expected_shape:
-        raise ValueError(f"replay record {index} geometry shape mismatch")
-    if loaded.dtype != np.dtype(np.uint8) or not np.all((loaded == 0) | (loaded == 1)):
-        raise ValueError(f"replay record {index} geometry is not binary uint8")
-    actual_hash = canonical_content_hash(loaded)
+    try:
+        if not isinstance(loaded, np.ndarray):
+            raise ValueError(f"replay record {index} geometry is not a numpy array")
+        actual_hash = _stream_binary_uint8_hash(
+            loaded,
+            expected_shape=expected_shape,
+            context=f"replay record {index} geometry",
+        )
+    finally:
+        _close_memmap(loaded)
     if actual_hash != expected_hash or resolved_geometry.stem != expected_hash:
         raise ValueError(
             f"replay record {index} content mismatch: expected {expected_hash}, got {actual_hash}"

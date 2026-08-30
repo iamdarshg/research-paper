@@ -56,6 +56,27 @@ def _aircraft_like(index: int = 0) -> np.ndarray:
     return voxels
 
 
+def test_streaming_binary_hash_matches_canonical_bytes_and_rejects_nonbinary():
+    builder = _builder_module()
+    voxels = _aircraft_like()
+
+    actual = builder._stream_binary_uint8_hash(
+        voxels,
+        expected_shape=voxels.shape,
+        context="test geometry",
+    )
+
+    assert actual == hashlib.sha256(voxels.tobytes(order="C")).hexdigest()
+    invalid = voxels.copy()
+    invalid[0, 0, 0] = 2
+    with pytest.raises(ValueError, match="binary uint8"):
+        builder._stream_binary_uint8_hash(
+            invalid,
+            expected_shape=invalid.shape,
+            context="invalid geometry",
+        )
+
+
 def _null_metadata():
     return {
         "design_spec": {field: None for field in DESIGN_SPEC_FIELDS},
