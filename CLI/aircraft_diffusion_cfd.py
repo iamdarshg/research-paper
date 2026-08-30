@@ -4076,6 +4076,7 @@ class AircraftDesignDataset(Dataset):
                 if record.get("latent_path")
                 else self.geometry_store.materialize(geometry_index)
             )
+
             if "condition_vector" in record:
                 condition_vector = torch.as_tensor(
                     record["condition_vector"],
@@ -6214,83 +6215,6 @@ class DirectSolverSPSALoss(nn.Module):
 # TRAINING PIPELINE WITH ALL OPTIMIZATIONS
 # ============================================================================
 
-def _copy_streamed_cpu_initialization_(
-    target: torch.Tensor,
-    initializer: Callable[[torch.Tensor], torch.Tensor],
-) -> None:
-    """Initialize one device tensor through a bounded CPU staging allocation."""
-
-    staging = torch.empty(tuple(target.shape), dtype=torch.float32, device="cpu")
-    initializer(staging)
-    with torch.no_grad():
-        target.copy_(staging)
-    del staging
-
-
-def _materialize_meta_module_streamed(
-    module: nn.Module,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    initialization: str = "default",
-) -> nn.Module:
-    """Materialize a meta module without a full host copy or CUDA RNG surge.
-
-    The largest temporary is one CPU parameter tensor.  This avoids a complete
-    295M-parameter CPU model and avoids loading CUDA RNG kernels once per layer,
-    both of which violate the bounded-RAM launch contract.
-    """
-
-    if initialization not in {"default", "xavier_student"}:
-        raise ValueError(f"Unsupported streamed initialization: {initialization}")
-    module.to(dtype=dtype)
-    module.to_empty(device=device)
-
-    initialized: set[int] = set()
-    if initialization == "xavier_student":
-        for parameter in module.parameters():
-            if parameter.ndim > 1:
-                _copy_streamed_cpu_initialization_(parameter, nn.init.xavier_uniform_)
-            else:
-                with torch.no_grad():
-                    parameter.zero_()
-            initialized.add(id(parameter))
-    else:
-        for child in module.modules():
-            if not isinstance(child, (nn.Linear, nn.Conv3d)):
-                continue
-            _copy_streamed_cpu_initialization_(
-                child.weight,
-                lambda tensor: nn.init.kaiming_uniform_(tensor, a=math.sqrt(5)),
-            )
-            initialized.add(id(child.weight))
-            if child.bias is not None:
-                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(child.weight)
-                bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
-                _copy_streamed_cpu_initialization_(
-                    child.bias,
-                    lambda tensor, bound=bound: nn.init.uniform_(tensor, -bound, bound),
-                )
-                initialized.add(id(child.bias))
-
-    missing = [
-        name
-        for name, parameter in module.named_parameters()
-        if id(parameter) not in initialized
-    ]
-    if missing:
-        raise RuntimeError(
-            "Streamed materialization has no initializer for parameters: "
-            + ", ".join(missing)
-        )
-    meta_buffers = [name for name, value in module.named_buffers() if value.is_meta]
-    if meta_buffers:
-        raise RuntimeError(
-            "Streamed materialization left meta buffers: " + ", ".join(meta_buffers)
-        )
-    return module
-
-
 class OptimizedDiffusionTrainer:
     """Main training orchestrator with all TRM/HRM optimizations"""
 
@@ -6376,41 +6300,19 @@ class OptimizedDiffusionTrainer:
             self.diffusion_model = LatentDiffusionUNet(
                 model_config, diffusion_config
             ).to(dtype=self.dtype)
-            converter_kwargs = {
-                "coordinate_decoder_threshold": training_config.coordinate_decoder_threshold,
-                "coordinate_chunk_size": model_config.coordinate_chunk_size,
-                "coordinate_decoder_width": model_config.coordinate_decoder_width,
-                "coordinate_decoder_depth": model_config.coordinate_decoder_depth,
-                "coordinate_fourier_bands": model_config.coordinate_fourier_bands,
-                "enable_coordinate_gradient_checkpointing": bool(
+            self.converter = LatentTo3DConverter(
+                model_config.latent_dim,
+                model_config.grid_resolution,
+                coordinate_decoder_threshold=training_config.coordinate_decoder_threshold,
+                coordinate_chunk_size=model_config.coordinate_chunk_size,
+                coordinate_decoder_width=model_config.coordinate_decoder_width,
+                coordinate_decoder_depth=model_config.coordinate_decoder_depth,
+                coordinate_fourier_bands=model_config.coordinate_fourier_bands,
+                enable_coordinate_gradient_checkpointing=bool(
                     config_value("model", "coordinate_gradient_checkpointing", True)
                 ),
-                "enable_decoder_compile": model_config.compile_converter_decoder,
-            }
-            if self.device.type == "cuda":
-                # The coordinate decoder owns ~268M of the 295M parameters.
-                # Constructing and randomly initializing every layer on CUDA
-                # loads enough CUDA RNG state to exceed the 800 MiB host cgroup
-                # before update 1. Build metadata only, reserve BF16 directly
-                # on-device, then initialize through one bounded CPU tensor.
-                with torch.device("meta"):
-                    self.converter = LatentTo3DConverter(
-                        model_config.latent_dim,
-                        model_config.grid_resolution,
-                        **converter_kwargs,
-                    )
-                _materialize_meta_module_streamed(
-                    self.converter,
-                    device=self.device,
-                    dtype=self.dtype,
-                    initialization="default",
-                )
-            else:
-                self.converter = LatentTo3DConverter(
-                    model_config.latent_dim,
-                    model_config.grid_resolution,
-                    **converter_kwargs,
-                ).to(dtype=self.dtype)
+                enable_decoder_compile=model_config.compile_converter_decoder,
+            ).to(dtype=self.dtype)
 
             # 4-step consistency model
             self.consistency_model = ConsistencyModel(
