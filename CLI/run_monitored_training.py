@@ -1066,6 +1066,25 @@ def _prepare_host_edt_workspace_for_runtime(
     return True
 
 
+def _release_host_allocator_cache() -> bool:
+    """Return unused glibc arenas before high-memory CUDA model construction."""
+    import gc
+
+    gc.collect()
+    if os.name != "posix":
+        return False
+    try:
+        import ctypes
+
+        allocator = ctypes.CDLL(None)
+        malloc_trim = allocator.malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        return bool(malloc_trim(0))
+    except (AttributeError, OSError):
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a GPU-monitored training sweep with stability checks.")
     parser.add_argument("--manifest", required=True, help="Grounded manifest used for training.")
@@ -1348,6 +1367,9 @@ def main() -> int:
         num_workers=0,
         collate_fn=aircraft_collate_fn,
     )
+
+    allocator_trimmed = _release_host_allocator_cache()
+    print(f"Released host allocator cache before model construction: {allocator_trimmed}")
 
     trainer = OptimizedDiffusionTrainer(model_config, diffusion_config, training_config, cfd_config, device=device)
     if args.resume_from:

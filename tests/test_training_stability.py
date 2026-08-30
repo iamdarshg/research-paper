@@ -11,6 +11,7 @@ CLI_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLI")
 if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
+import run_monitored_training as monitored_training
 from run_monitored_training import (
     ResumableEpochSampler,
     RunLocalCosineScheduler,
@@ -20,10 +21,34 @@ from run_monitored_training import (
     _geometry_promotion_metrics,
     _load_monitored_history,
     _restore_best_promotion_rank,
+    _release_host_allocator_cache,
     _sync_best_checkpoint_state,
 )
 from training_stability import compute_core_loss, summarize_stability
 from training_stability import evaluate_directional_promotion_gate
+
+
+def test_release_host_allocator_cache_uses_glibc_trim_on_posix(monkeypatch):
+    calls = []
+
+    class FakeTrim:
+        argtypes = None
+        restype = None
+
+        def __call__(self, padding):
+            calls.append(padding)
+            return 1
+
+    class FakeAllocator:
+        malloc_trim = FakeTrim()
+
+    import ctypes
+
+    monkeypatch.setattr(monitored_training.os, "name", "posix")
+    monkeypatch.setattr(ctypes, "CDLL", lambda _name: FakeAllocator())
+
+    assert _release_host_allocator_cache() is True
+    assert calls == [0]
 
 
 def test_resumable_epoch_sampler_is_deterministic_per_epoch_and_resumable():
