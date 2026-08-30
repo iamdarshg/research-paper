@@ -39,6 +39,7 @@ class _FakeStateModule:
 class _FakeConsistencyModel(_FakeStateModule):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.enable_teacher = kwargs.get("enable_teacher", True)
         self.student_model = _FakeStateModule()
 
 
@@ -301,6 +302,33 @@ class TestCLISmokePipeline(unittest.TestCase):
         self.assertEqual(generator.config.solver_type, "D3Q27")
         self.assertIsInstance(generator.config.lbm_config, LBMPhysicsConfig)
         self.assertEqual(generator.config.lbm_config.grid_spacing, 0.125)
+
+    def test_generator_loads_teacherless_monitored_checkpoint(self):
+        checkpoint = {
+            "model_config": asdict(
+                ModelConfig(latent_dim=8, base_grid_resolution=16, grid_resolution=16)
+            ),
+            "diffusion_config": asdict(DiffusionConfig()),
+            "training_config": {"enable_consistency": False},
+            "consistency_model": {"student_only": True},
+            "diffusion_model": {},
+            "converter": {},
+        }
+
+        with mock.patch.object(cli_module.torch, "load", return_value=checkpoint), \
+             mock.patch.object(cli_module, "LatentDiffusionUNet", _FakeStateModule), \
+             mock.patch.object(cli_module, "LatentTo3DConverter", _FakeStateModule), \
+             mock.patch.object(cli_module, "ConsistencyModel", _FakeConsistencyModel), \
+             mock.patch.object(cli_module, "NoiseSchedule", _FakeStateModule), \
+             mock.patch.object(cli_module.torch.cuda, "is_available", return_value=False):
+            generator = cli_module.OptimizedAircraftGenerator(
+                "fake-checkpoint.pt", device=torch.device("cpu")
+            )
+
+        self.assertFalse(generator.consistency_model.enable_teacher)
+        self.assertEqual(
+            generator.consistency_model.loaded_state, {"student_only": True}
+        )
 
     def test_generator_refuses_invalid_voxel_export_before_meshing(self):
         generator = object.__new__(cli_module.OptimizedAircraftGenerator)

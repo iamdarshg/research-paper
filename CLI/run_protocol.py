@@ -7,7 +7,7 @@ import argparse
 import shlex
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List
 
 import yaml
@@ -31,6 +31,8 @@ def _resolve_path(config: Dict[str, Any], value: str | None) -> str | None:
     path = Path(value)
     if path.is_absolute():
         return str(path)
+    if PurePosixPath(value).is_absolute():
+        return value
     return str((Path(config["_config_dir"]) / path).resolve())
 
 
@@ -230,6 +232,7 @@ def build_protocol_commands(
                 ("--direct-solver-directions", "direct_solver_directions"),
                 ("--direct-solver-batch-chunk", "direct_solver_batch_chunk"),
                 ("--stream-block-size", "stream_block_size"),
+                ("--gpu-exact-attestation", "gpu_exact_attestation"),
                 ("--save-dir", "save_dir"),
                 ("--history-output", "history_output"),
                 ("--updates-output", "updates_output"),
@@ -240,6 +243,7 @@ def build_protocol_commands(
                     "save_dir",
                     "history_output",
                     "updates_output",
+                    "gpu_exact_attestation",
                 }:
                     value = _resolve_path(config, value)
                 _add_option(train_cmd, flag, value)
@@ -256,6 +260,13 @@ def build_protocol_commands(
                     "--enable-consistency",
                     "--no-enable-consistency",
                     bool(train_cfg["enable_consistency"]),
+                )
+            if "enable_tensorboard" in train_cfg:
+                _add_dual_flag(
+                    train_cmd,
+                    "--enable-tensorboard",
+                    "--no-enable-tensorboard",
+                    bool(train_cfg["enable_tensorboard"]),
                 )
             if "require_direct_solver_every_iteration" in train_cfg:
                 _add_dual_flag(

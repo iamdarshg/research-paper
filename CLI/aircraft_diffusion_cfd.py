@@ -9127,7 +9127,18 @@ class OptimizedAircraftGenerator:
         ).to(self.device)
 
         # Load consistency model
-        self.consistency_model = ConsistencyModel(self.model_config, self.diffusion_config).to(self.device)
+        # Monitored runs with consistency updates disabled intentionally omit
+        # the teacher to fit the bounded host-RAM envelope. Reconstruct the
+        # same topology when consuming that checkpoint; legacy checkpoints
+        # without training_config retain the historical teacher-enabled shape.
+        enable_consistency_teacher = bool(
+            training_payload.get("enable_consistency", True)
+        )
+        self.consistency_model = ConsistencyModel(
+            self.model_config,
+            self.diffusion_config,
+            enable_teacher=enable_consistency_teacher,
+        ).to(self.device)
         self.consistency_model.load_state_dict(checkpoint['consistency_model'])
 
         self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])

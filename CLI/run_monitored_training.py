@@ -486,6 +486,11 @@ def _training_inputs_identity(path: str) -> str:
                 if hash_name and (record.get(hash_name) or nested_hashes.get(hash_name))
                 else None
             )
+            if expected_hash is not None and len(expected_hash) == 64 and all(
+                character.lower() in "0123456789abcdef"
+                for character in expected_hash
+            ):
+                expected_hash = expected_hash.lower()
             previous = artifacts.get(logical_path)
             candidate = (resolved, expected_hash)
             if previous is not None and previous != candidate:

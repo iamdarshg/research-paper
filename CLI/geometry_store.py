@@ -85,17 +85,19 @@ class CompactGeometryStore:
             raise ValueError(f"Unable to load geometry file {resolved}: {exc}") from exc
         if not isinstance(geometry, np.ndarray) or geometry.ndim != 3:
             raise ValueError(f"Geometry file must contain a 3D array: {resolved}")
+        stable_hash = content_hash
         if len(content_hash) == 64 and all(
-            character in "0123456789abcdef" for character in content_hash
+            character.lower() in "0123456789abcdef" for character in content_hash
         ):
+            stable_hash = content_hash.lower()
             actual_hash = file_sha256(resolved)
-            if actual_hash != content_hash:
+            if actual_hash != stable_hash:
                 raise ValueError(
                     f"Declared content hash {content_hash!r} does not match "
                     f"geometry file {resolved} ({actual_hash})"
                 )
 
-        existing = self._hash_to_index.get(content_hash)
+        existing = self._hash_to_index.get(stable_hash)
         if existing is not None:
             canonical = self.materialize(existing)
             candidate = torch.from_numpy(np.array(geometry, copy=True))
@@ -108,7 +110,7 @@ class CompactGeometryStore:
 
         index = len(self._geometries)
         self._geometries.append(resolved)
-        self._hash_to_index[content_hash] = index
+        self._hash_to_index[stable_hash] = index
         return index
 
     def materialize(self, index: int) -> torch.Tensor:

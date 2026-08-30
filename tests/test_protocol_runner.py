@@ -221,7 +221,7 @@ class TestProtocolRunner(unittest.TestCase):
 
         expected_values = {
             "--manifest": str(
-                (repo_root / "build" / "final_training_corpus_20260830_v2" / "combined_training_manifest.jsonl").resolve()
+                (repo_root / "build" / "final_training_corpus_20260830_v2" / "combined_training_manifest_pinned_latents.jsonl").resolve()
             ),
             "--num-epochs": "2",
             "--batch-size": "1",
@@ -239,6 +239,7 @@ class TestProtocolRunner(unittest.TestCase):
             "--direct-solver-directions": "8",
             "--direct-solver-batch-chunk": "4",
             "--checkpoint-every-updates": "25",
+            "--gpu-exact-attestation": "/opt/research-state/gpu-edt-attestation.json",
         }
         for flag, value in expected_values.items():
             self.assertIn(flag, command)
@@ -246,7 +247,8 @@ class TestProtocolRunner(unittest.TestCase):
 
         self.assertIn("--no-require-direct-solver-every-iteration", command)
         self.assertIn("--no-enable-consistency", command)
-        self.assertIn("--enable-compile", command)
+        self.assertIn("--no-enable-tensorboard", command)
+        self.assertIn("--no-enable-compile", command)
         self.assertIn("--enable-gradient-checkpointing", command)
         self.assertIn("--no-stop-on-promotion-pass", command)
         self.assertNotIn("--no-save-final-checkpoint", command)
