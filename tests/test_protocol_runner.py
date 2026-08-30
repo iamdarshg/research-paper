@@ -267,6 +267,23 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertEqual(command[command.index("--checkpoint-every-updates") + 1], "1")
         self.assertEqual(command[command.index("--stop-after-updates") + 1], "5")
 
+    def test_monitored_smoke_mode_rejects_missing_or_nonpositive_update_bound(self):
+        for stop_after_updates in (None, 0, -1):
+            with self.subTest(stop_after_updates=stop_after_updates):
+                config = {
+                    "_config_path": str(Path(__file__).resolve()),
+                    "_config_dir": str(Path(__file__).resolve().parent),
+                    "train": {"enabled": True, "runner": "monitored"},
+                    "smoke": {"enabled": True},
+                }
+                if stop_after_updates is not None:
+                    config["smoke"]["stop_after_updates"] = stop_after_updates
+
+                with self.assertRaisesRegex(
+                    ValueError, r"smoke\.stop_after_updates.*positive"
+                ):
+                    run_protocol.build_protocol_commands(config, mode="smoke")
+
     def test_monitored_protocol_forwards_exact_resume_and_uses_monitored_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

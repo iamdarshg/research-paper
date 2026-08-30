@@ -196,10 +196,16 @@ def restore_rng_state(state: Mapping[str, Any]) -> None:
     """Restore a snapshot produced by :func:`capture_rng_state`."""
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch_cpu"])
+    # Run-state checkpoints are loaded directly onto the training device to
+    # avoid staging the full model and optimizer in system RAM.  That also
+    # moves these tiny RNG blobs, but PyTorch's RNG restore APIs require CPU
+    # ByteTensors even when the associated generator is CUDA-backed.
+    torch.set_rng_state(state["torch_cpu"].detach().cpu())
     cuda_state = state.get("torch_cuda")
     if cuda_state is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(cuda_state)
+        torch.cuda.set_rng_state_all(
+            [generator_state.detach().cpu() for generator_state in cuda_state]
+        )
 
 
 def iter_loader_without_rng_advance(loader: DataLoader):

@@ -31,6 +31,7 @@ from aircraft_diffusion_cfd import (
     capture_data_anchor_gradients,
     grounded_threshold_margin_loss,
     resolve_run_state_path,
+    restore_rng_state,
     validate_run_state_compatibility,
     validate_direct_solver_iteration_coverage,
 )
@@ -63,6 +64,37 @@ from utils import compute_tensor_content_hash
 # Repo field-parity envelope (verbatim constant from test_task10_batched_spsa_parity /
 # test_d3q27_kernel_parity).
 FIELD_ATOL_5STEP = 4e-6
+
+
+def test_restore_rng_state_moves_device_loaded_rng_blobs_to_cpu(monkeypatch):
+    cpu_state = object()
+
+    class DeviceLoadedRngState:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return cpu_state
+
+    restored = {}
+    monkeypatch.setattr(recovery.random, "setstate", lambda value: None)
+    monkeypatch.setattr(recovery.np.random, "set_state", lambda value: None)
+    monkeypatch.setattr(
+        recovery.torch,
+        "set_rng_state",
+        lambda value: restored.setdefault("torch_cpu", value),
+    )
+
+    restore_rng_state(
+        {
+            "python": object(),
+            "numpy": object(),
+            "torch_cpu": DeviceLoadedRngState(),
+            "torch_cuda": None,
+        }
+    )
+
+    assert restored["torch_cpu"] is cpu_state
 
 
 @pytest.fixture(autouse=True)

@@ -124,6 +124,19 @@ def build_protocol_commands(
             checkpoint_every_updates = train_cfg.get("checkpoint_every_updates")
             if mode == "smoke" and not smoke_cfg.get("enabled"):
                 raise ValueError("Smoke mode requires smoke.enabled: true")
+            if mode == "smoke":
+                try:
+                    smoke_stop_after_updates = int(
+                        smoke_cfg.get("stop_after_updates", 0)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Smoke mode requires smoke.stop_after_updates to be a positive integer"
+                    ) from exc
+                if smoke_stop_after_updates <= 0:
+                    raise ValueError(
+                        "Smoke mode requires smoke.stop_after_updates to be a positive integer"
+                    )
             if mode == "smoke" and "checkpoint_every_updates" in smoke_cfg:
                 checkpoint_every_updates = smoke_cfg["checkpoint_every_updates"]
             for flag, key in (
@@ -189,7 +202,7 @@ def build_protocol_commands(
                 _add_option(
                     train_cmd,
                     "--stop-after-updates",
-                    smoke_cfg.get("stop_after_updates"),
+                    smoke_stop_after_updates,
                 )
         else:
             train_cmd = [python_exe, cli_script, "train"]
