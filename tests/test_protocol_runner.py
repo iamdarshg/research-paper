@@ -320,7 +320,7 @@ class TestProtocolRunner(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(
-            ValueError, "isolated resume_run_state"
+            ValueError, "complete isolated artifact set"
         ):
             run_protocol.build_protocol_commands(config, mode="smoke")
 
@@ -362,6 +362,10 @@ class TestProtocolRunner(unittest.TestCase):
     def test_monitored_smoke_uses_isolated_resume_state_and_updates_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            smoke_dir = root / "smoke"
+            smoke_dir.mkdir()
+            for filename in ("latest_run_state.pt", "updates.jsonl", "history.json"):
+                (smoke_dir / filename).write_bytes(b"")
             config_path = root / "CLI" / "run_protocols" / "monitored.yaml"
             config_path.parent.mkdir(parents=True)
             config_path.write_text(
@@ -378,6 +382,7 @@ class TestProtocolRunner(unittest.TestCase):
                             "stop_after_updates": 2,
                             "resume_run_state": "../../smoke/latest_run_state.pt",
                             "updates_output": "../../smoke/updates.jsonl",
+                            "history_output": "../../smoke/history.json",
                         },
                     }
                 ),
@@ -398,14 +403,53 @@ class TestProtocolRunner(unittest.TestCase):
             )
             self.assertEqual(
                 command[command.index("--history-output") + 1],
-                str(
-                    (
-                        config_path.parent
-                        / "checkpoints_monitored_smoke"
-                        / "history.json"
-                    ).resolve()
-                ),
+                str((smoke_dir / "history.json").resolve()),
             )
+
+    def test_resumable_monitored_smoke_requires_complete_existing_artifact_set(self):
+        required = ("resume_run_state", "updates_output", "history_output")
+        for missing in required:
+            with self.subTest(missing=missing):
+                smoke = {
+                    "enabled": True,
+                    "stop_after_updates": 2,
+                    "resume_run_state": "smoke/latest_run_state.pt",
+                    "updates_output": "smoke/updates.jsonl",
+                    "history_output": "smoke/history.json",
+                }
+                smoke.pop(missing)
+                config = {
+                    "_config_path": str(Path(__file__).resolve()),
+                    "_config_dir": str(Path(__file__).resolve().parent),
+                    "train": {
+                        "enabled": True,
+                        "runner": "monitored",
+                        "resume_run_state": "production/latest_run_state.pt",
+                    },
+                    "smoke": smoke,
+                }
+
+                with self.assertRaisesRegex(ValueError, "complete isolated artifact set"):
+                    run_protocol.build_protocol_commands(config, mode="smoke")
+
+        config = {
+            "_config_path": str(Path(__file__).resolve()),
+            "_config_dir": str(Path(__file__).resolve().parent),
+            "train": {
+                "enabled": True,
+                "runner": "monitored",
+                "resume_run_state": "production/latest_run_state.pt",
+            },
+            "smoke": {
+                "enabled": True,
+                "stop_after_updates": 2,
+                "resume_run_state": "missing-smoke/latest_run_state.pt",
+                "updates_output": "missing-smoke/updates.jsonl",
+                "history_output": "missing-smoke/history.json",
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            run_protocol.build_protocol_commands(config, mode="smoke")
 
     def test_monitored_smoke_rejects_paths_aliasing_production_artifacts(self):
         cases = {
@@ -449,6 +493,25 @@ class TestProtocolRunner(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, "aliases production"):
                     run_protocol.build_protocol_commands(config, mode="smoke")
+
+    def test_monitored_smoke_rejects_cross_artifact_aliases(self):
+        config = {
+            "_config_path": str(Path(__file__).resolve()),
+            "_config_dir": str(Path(__file__).resolve().parent),
+            "train": {
+                "enabled": True,
+                "runner": "monitored",
+                "history_output": "production/history.json",
+            },
+            "smoke": {
+                "enabled": True,
+                "stop_after_updates": 2,
+                "updates_output": "production/history.json",
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "aliases production"):
+            run_protocol.build_protocol_commands(config, mode="smoke")
 
     def test_monitored_smoke_mode_rejects_missing_or_nonpositive_update_bound(self):
         for stop_after_updates in (None, 0, -1):

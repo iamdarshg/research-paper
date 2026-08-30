@@ -111,23 +111,58 @@ def build_protocol_commands(
         train_cfg["updates_output"] = smoke_cfg.get(
             "updates_output", str(Path(smoke_save_dir) / "updates.jsonl")
         )
-        if train_cfg.get("resume_run_state"):
-            if not smoke_cfg.get("resume_run_state"):
+        resumable_smoke = bool(train_cfg.get("resume_run_state"))
+        if resumable_smoke:
+            resume_artifacts = (
+                "resume_run_state",
+                "updates_output",
+                "history_output",
+            )
+            if not all(smoke_cfg.get(key) for key in resume_artifacts):
                 raise ValueError(
-                    "A resumable monitored smoke run requires isolated "
-                    "resume_run_state in smoke config"
+                    "A resumable monitored smoke run requires a complete isolated "
+                    "artifact set: resume_run_state, updates_output, and history_output"
                 )
-            train_cfg["resume_run_state"] = smoke_cfg["resume_run_state"]
-        for key, production_value in production_paths.items():
-            smoke_value = train_cfg.get(key)
-            if not production_value or not smoke_value:
-                continue
-            production_resolved = _resolve_path(config, str(production_value))
-            smoke_resolved = _resolve_path(config, str(smoke_value))
-            if Path(production_resolved).resolve() == Path(smoke_resolved).resolve():
+            for key in resume_artifacts:
+                train_cfg[key] = smoke_cfg[key]
+
+        production_resolved = {
+            key: Path(_resolve_path(config, str(value))).resolve()
+            for key, value in production_paths.items()
+            if value
+        }
+        smoke_resolved = {
+            key: Path(_resolve_path(config, str(train_cfg[key]))).resolve()
+            for key in (
+                "save_dir",
+                "resume_run_state",
+                "history_output",
+                "updates_output",
+            )
+            if train_cfg.get(key)
+        }
+        for smoke_key, smoke_path in smoke_resolved.items():
+            for production_key, production_path in production_resolved.items():
+                if smoke_path != production_path:
+                    continue
                 raise ValueError(
-                    f"Smoke {key} aliases production {key}; use an isolated path"
+                    f"Smoke {smoke_key} aliases production {production_key}; "
+                    "use an isolated path"
                 )
+        smoke_files = {
+            key: value
+            for key, value in smoke_resolved.items()
+            if key != "save_dir"
+        }
+        if len(set(smoke_files.values())) != len(smoke_files):
+            raise ValueError("Smoke output artifacts must use distinct paths")
+        if resumable_smoke:
+            for key in resume_artifacts:
+                resolved = smoke_resolved[key]
+                if not resolved.is_file():
+                    raise ValueError(
+                        f"Resumable smoke {key} does not exist as a file: {resolved}"
+                    )
     manifest_cfg = dict(config.get("validate_manifest", {}))
     baseline_cfg = dict(config.get("evaluate_baselines", {}))
     condition_cfg = dict(config.get("validate_conditions", {}))
