@@ -4020,7 +4020,16 @@ class AircraftDesignDataset(Dataset):
                     content_hash=str(content_hash) if content_hash else None,
                 )
             self.geometry_indices.append(geometry_index)
-            geometry = self.geometry_store.materialize(geometry_index)
+            # A pinned latent sidecar makes manifest loading independent of the
+            # 128^3 voxel payload. Materializing every geometry here solely to
+            # derive its latent grows the CPU allocator's high-water RSS by
+            # hundreds of MiB before update 1. The geometry remains lazy and is
+            # materialized by __getitem__ when the sample is actually trained.
+            geometry = (
+                None
+                if record.get("latent_path")
+                else self.geometry_store.materialize(geometry_index)
+            )
 
             if "condition_vector" in record:
                 condition_vector = torch.as_tensor(
@@ -4098,20 +4107,34 @@ class AircraftDesignDataset(Dataset):
         record: Dict[str, Any],
         base_dir: Path,
         design_spec: DesignSpec,
-        geometry: torch.Tensor,
+        geometry: Optional[torch.Tensor],
         condition_vector: torch.Tensor,
         include_design_proxies: bool = True,
     ) -> torch.Tensor:
         latent_path = record.get("latent_path")
         if latent_path:
             path = (base_dir / str(latent_path)).resolve()
-            latent_np = np.load(path)
-            latent = torch.as_tensor(latent_np, dtype=torch.float32).flatten()
+            latent_np = np.load(path, mmap_mode="r", allow_pickle=False)
+            latent_index = record.get("latent_index")
+            if latent_index is not None:
+                if latent_np.ndim != 2:
+                    raise ValueError(
+                        "latent_index requires latent_path to contain a 2D latent matrix"
+                    )
+                row = int(latent_index)
+                if row < 0 or row >= int(latent_np.shape[0]):
+                    raise ValueError(
+                        f"latent_index {row} is outside latent matrix rows {latent_np.shape[0]}"
+                    )
+                latent_np = latent_np[row]
+            latent = torch.from_numpy(np.array(latent_np, dtype=np.float32, copy=True)).flatten()
             if int(latent.numel()) != int(self.latent_dim):
                 raise ValueError(
                     f"latent_path must contain {self.latent_dim} values, got {latent.numel()}"
                 )
             return latent
+        if geometry is None:
+            raise ValueError("geometry is required when latent_path is not provided")
         return build_structured_latent_code(
             design_spec,
             geometry,

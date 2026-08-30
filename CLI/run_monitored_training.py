@@ -1238,6 +1238,7 @@ def main() -> int:
         grid_size=args.grid_size,
         latent_dim=args.latent_dim,
         manifest_path=args.manifest,
+        seed=args.subset_seed,
     )
     resolved_grid_size = resolve_grounded_grid_size(
         args.grid_size,
@@ -1290,6 +1291,7 @@ def main() -> int:
             grid_size=resolved_grid_size,
             latent_dim=model_config.latent_dim,
             manifest_path=args.manifest,
+            seed=args.subset_seed,
         )
     epoch_dataset = _build_epoch_dataset(
         dataset,

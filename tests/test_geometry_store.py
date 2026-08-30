@@ -176,6 +176,47 @@ def test_jsonl_dataset_streams_records_instead_of_building_a_full_manifest_list(
     assert dataset.metadata["split_assignments"] == ["train"]
 
 
+def test_manifest_shared_latent_matrix_avoids_geometry_materialization_during_init(
+    tmp_path, monkeypatch
+):
+    geometry = np.zeros((4, 4, 4), dtype=np.uint8)
+    geometry[1:3, 1:3, 1:3] = 1
+    geometry_path = tmp_path / "geometry.npy"
+    np.save(geometry_path, geometry, allow_pickle=False)
+    latents = np.arange(16, dtype=np.float32).reshape(2, 8)
+    np.save(tmp_path / "latents.npy", latents, allow_pickle=False)
+    records = [
+        {
+            "source_id": f"sample-{index}",
+            "geometry_path": geometry_path.name,
+            "voxel_sha256": f"unique-{index}",
+            "latent_path": "latents.npy",
+            "latent_index": index,
+            "conditioning_mode": "unconditioned_source_metadata_only",
+            "split": "train",
+        }
+        for index in range(2)
+    ]
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    original_materialize = CompactGeometryStore.materialize
+
+    def reject_init_materialization(store, index):
+        raise AssertionError("precomputed latents must not materialize geometry at init")
+
+    monkeypatch.setattr(CompactGeometryStore, "materialize", reject_init_materialization)
+    dataset = AircraftDesignDataset(
+        manifest_path=str(manifest_path), latent_dim=8, seed=0
+    )
+    monkeypatch.setattr(CompactGeometryStore, "materialize", original_materialize)
+
+    assert torch.equal(dataset.latent_codes, torch.from_numpy(latents))
+    assert torch.equal(dataset[1]["geometry"], torch.from_numpy(geometry))
+
+
 def test_manifest_npy_loader_does_not_eagerly_expand_uint8_geometry(tmp_path):
     geometry = np.zeros((4, 4, 4), dtype=np.uint8)
     np.save(tmp_path / "geometry.npy", geometry)
