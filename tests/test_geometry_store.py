@@ -18,6 +18,7 @@ from aircraft_diffusion_cfd import (  # noqa: E402
     transfer_training_batch_to_device,
 )
 from geometry_store import CompactGeometryStore  # noqa: E402
+import geometry_store as geometry_store_module  # noqa: E402
 import aircraft_diffusion_cfd as aircraft_module  # noqa: E402
 
 
@@ -103,6 +104,32 @@ def test_file_backed_store_rejects_false_mixed_case_sha256(tmp_path):
 
     with pytest.raises(ValueError, match="does not match"):
         store.add_file("bad-mixed", path, content_hash=false_hash)
+
+
+def test_streaming_hash_releases_linux_file_cache(tmp_path, monkeypatch):
+    path = tmp_path / "large-sidecar.bin"
+    path.write_bytes(b"sidecar" * 1024)
+    calls = []
+    monkeypatch.setattr(
+        geometry_store_module.os,
+        "posix_fadvise",
+        lambda fd, offset, length, advice: calls.append(
+            (fd, offset, length, advice)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        geometry_store_module.os,
+        "POSIX_FADV_DONTNEED",
+        4,
+        raising=False,
+    )
+
+    digest = geometry_store_module.file_sha256(path, force=True)
+
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert len(calls) == 1
+    assert calls[0][1:] == (0, 0, 4)
 
 
 def test_tensor_add_deduplicates_against_file_backed_entry(tmp_path):

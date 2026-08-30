@@ -1,6 +1,7 @@
 """Compact, content-addressed storage for voxel geometries."""
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +10,18 @@ import torch
 
 
 _FILE_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _release_streamed_file_cache(handle) -> None:
+    """Keep corpus integrity scans from pinning clean pages in a RAM cgroup."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    advice = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or advice is None:
+        return
+    try:
+        fadvise(handle.fileno(), 0, 0, advice)
+    except OSError:
+        pass
 
 
 def file_sha256(path: str | Path, *, force: bool = False) -> str:
@@ -21,8 +34,11 @@ def file_sha256(path: str | Path, *, force: bool = False) -> str:
         return cached
     digest = hashlib.sha256()
     with resolved.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+        try:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        finally:
+            _release_streamed_file_cache(handle)
     value = digest.hexdigest()
     _FILE_SHA256_CACHE[key] = value
     return value
