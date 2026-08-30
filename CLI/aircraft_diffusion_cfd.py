@@ -43,14 +43,9 @@ from torch.utils.data._utils.collate import default_collate
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.tensorboard import SummaryWriter
 
 from tqdm import tqdm
 import yaml
-from scipy.ndimage import label, binary_dilation, zoom
-from scipy.stats import pearsonr
-from skimage import measure
-import trimesh
 from advanced_lbm_solver import D3Q27CascadedSolver
 from sdf_utils import compute_all_link_distances, compute_sdf, gpu_exact_available
 from utils import compute_tensor_content_hash
@@ -76,6 +71,36 @@ from multiobjective_gradients import (
 from validate_manifest import validate_manifest_file
 
 warnings.filterwarnings('ignore')
+
+
+class _NullSummaryWriter:
+    """No-op metrics sink for RAM-constrained monitored runs using JSONL."""
+
+    def add_scalar(self, *args, **kwargs) -> None:
+        return None
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _make_summary_writer(log_dir: str):
+    if os.environ.get("RESEARCH_DISABLE_TENSORBOARD", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return _NullSummaryWriter()
+    # Keep TensorBoard and its optional TensorFlow compatibility imports out of
+    # the process entirely when disabled. The monitored runner retains every
+    # scalar in its durable JSONL update stream, so this only removes duplicate
+    # event-file output and a substantial host-RAM tax.
+    from torch.utils.tensorboard import SummaryWriter
+
+    return SummaryWriter(log_dir=log_dir)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -2363,6 +2388,8 @@ def _procedural_aircraft_geometry(
 
 
 def _condition_response_metrics(geometry: torch.Tensor, design_spec: DesignSpec) -> Dict[str, float]:
+    from scipy.ndimage import binary_dilation
+
     binary = (geometry.detach().cpu().numpy() > 0.5).astype(np.uint8)
     occupancy_ratio = float(binary.mean())
     coords = np.argwhere(binary)
@@ -3798,6 +3825,9 @@ class AdvancedCFDSimulator:
     def _voxel_to_stl_path(self, voxel_grid: torch.Tensor) -> Optional[str]:
         """Convert voxel grid to STL file path"""
         try:
+            from skimage import measure
+            import trimesh
+
             voxel_np = voxel_grid.cpu().numpy()
             binary_grid = (voxel_np > 0.5).astype(np.float32)
             vertices, faces, _, _ = measure.marching_cubes(
@@ -4147,6 +4177,8 @@ class AircraftDesignDataset(Dataset):
     def _voxelize_stl(self, stl_path: str, grid_size: int) -> torch.Tensor:
         """Voxelize a grounded STL file preserving aspect ratio (Issue #30)."""
         try:
+            import trimesh
+
             mesh = trimesh.load(stl_path)
             # Center and scale such that the largest extent fits in 0.8 of the grid
             mesh.apply_translation(-mesh.centroid)
@@ -4273,6 +4305,8 @@ class ConnectivityLoss(nn.Module):
 
     def forward(self, voxel_grid: torch.Tensor) -> torch.Tensor:
         """Compute connectivity penalty for batch of voxel grids"""
+        from scipy.ndimage import label
+
         batch_size = voxel_grid.shape[0]
         total_penalty = 0.0
 
@@ -4353,6 +4387,8 @@ class AerodynamicLoss(nn.Module):
 
 def _largest_component_fraction_from_binary(binary_geometry: np.ndarray) -> float:
     """Return the occupied-voxel fraction belonging to the largest component."""
+    from scipy.ndimage import label
+
     occupied = binary_geometry.astype(bool, copy=False)
     total_occupied = int(occupied.sum())
     if total_occupied <= 0:
@@ -6357,7 +6393,7 @@ class OptimizedDiffusionTrainer:
         self.pipeline = PipelineParallelism(training_config)
 
         # Logging
-        self.writer = SummaryWriter(log_dir='./runs')
+        self.writer = _make_summary_writer('./runs')
         self.global_step = 0
         self.consistency_update_step = 0
         self.last_consistency_metrics: Dict[str, float] = {}
@@ -9157,6 +9193,8 @@ class OptimizedAircraftGenerator:
 
     def voxels_to_stl(self, voxel_grid: torch.Tensor, output_path: str, use_marching_cubes: bool = True):
         """Convert voxel grid to STL file using marching cubes with optimizations"""
+        from skimage import measure
+        import trimesh
 
         # Convert to numpy
         voxel_np = voxel_grid.cpu().numpy()
@@ -10403,6 +10441,8 @@ def evaluate_baselines(solver, grid_size, steps, output, baseline_config, manife
 @click.option('--output', default='./condition_validation.json', help='Output validation report')
 def validate_conditions(checkpoint, num_seeds, grid_size, output):
     """Run a multi-seed condition-response sweep and compute Pearson correlations (Issue #32)."""
+    from scipy.stats import pearsonr
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = OptimizedAircraftGenerator(checkpoint, device=device)
 

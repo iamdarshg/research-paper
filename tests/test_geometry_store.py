@@ -1,5 +1,6 @@
 import json
 import hashlib
+import builtins
 import os
 import sys
 
@@ -215,6 +216,23 @@ def test_manifest_shared_latent_matrix_avoids_geometry_materialization_during_in
 
     assert torch.equal(dataset.latent_codes, torch.from_numpy(latents))
     assert torch.equal(dataset[1]["geometry"], torch.from_numpy(geometry))
+
+
+def test_disabled_tensorboard_does_not_import_tensorboard(monkeypatch):
+    monkeypatch.setenv("RESEARCH_DISABLE_TENSORBOARD", "1")
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "torch.utils.tensorboard" or name.startswith("tensorboard"):
+            raise AssertionError("disabled training must not import tensorboard")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    writer = aircraft_module._make_summary_writer("unused")
+
+    writer.add_scalar("loss", 1.0, 1)
+    writer.flush()
+    writer.close()
 
 
 def test_manifest_npy_loader_does_not_eagerly_expand_uint8_geometry(tmp_path):
