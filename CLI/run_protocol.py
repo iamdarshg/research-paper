@@ -100,6 +100,11 @@ def build_protocol_commands(
                 "updates_output",
             )
         }
+        if train_cfg.get("resume_run_state"):
+            raise ValueError(
+                "Smoke mode refuses exact resume to protect production lineage; "
+                "use production mode for exact-resume validation"
+            )
         production_save_dir = str(train_cfg.get("save_dir", "./checkpoints_monitored"))
         train_cfg["save_dir"] = smoke_cfg.get(
             "save_dir", f"{production_save_dir.rstrip('/\\')}_smoke"
@@ -111,21 +116,6 @@ def build_protocol_commands(
         train_cfg["updates_output"] = smoke_cfg.get(
             "updates_output", str(Path(smoke_save_dir) / "updates.jsonl")
         )
-        resumable_smoke = bool(train_cfg.get("resume_run_state"))
-        if resumable_smoke:
-            resume_artifacts = (
-                "resume_run_state",
-                "updates_output",
-                "history_output",
-            )
-            if not all(smoke_cfg.get(key) for key in resume_artifacts):
-                raise ValueError(
-                    "A resumable monitored smoke run requires a complete isolated "
-                    "artifact set: resume_run_state, updates_output, and history_output"
-                )
-            for key in resume_artifacts:
-                train_cfg[key] = smoke_cfg[key]
-
         production_resolved = {
             key: Path(_resolve_path(config, str(value))).resolve()
             for key, value in production_paths.items()
@@ -167,13 +157,6 @@ def build_protocol_commands(
         }
         if len(set(smoke_files.values())) != len(smoke_files):
             raise ValueError("Smoke output artifacts must use distinct paths")
-        if resumable_smoke:
-            for key in ("resume_run_state", "updates_output"):
-                resolved = smoke_resolved[key]
-                if not resolved.is_file():
-                    raise ValueError(
-                        f"Resumable smoke {key} does not exist as a file: {resolved}"
-                    )
     manifest_cfg = dict(config.get("validate_manifest", {}))
     baseline_cfg = dict(config.get("evaluate_baselines", {}))
     condition_cfg = dict(config.get("validate_conditions", {}))

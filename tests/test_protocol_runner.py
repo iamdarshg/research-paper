@@ -320,7 +320,7 @@ class TestProtocolRunner(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(
-            ValueError, "complete isolated artifact set"
+            ValueError, "Smoke mode refuses exact resume"
         ):
             run_protocol.build_protocol_commands(config, mode="smoke")
 
@@ -359,135 +359,8 @@ class TestProtocolRunner(unittest.TestCase):
                 str((smoke_dir / "updates.jsonl").resolve()),
             )
 
-    def test_monitored_smoke_uses_isolated_resume_state_and_updates_log(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            smoke_dir = root / "smoke"
-            smoke_dir.mkdir()
-            for filename in ("latest_run_state.pt", "updates.jsonl", "history.json"):
-                (smoke_dir / filename).write_bytes(b"")
-            config_path = root / "CLI" / "run_protocols" / "monitored.yaml"
-            config_path.parent.mkdir(parents=True)
-            config_path.write_text(
-                yaml.safe_dump(
-                    {
-                        "train": {
-                            "enabled": True,
-                            "runner": "monitored",
-                            "resume_run_state": "../../production/latest_run_state.pt",
-                            "updates_output": "../../production/updates.jsonl",
-                        },
-                        "smoke": {
-                            "enabled": True,
-                            "stop_after_updates": 2,
-                            "resume_run_state": "../../smoke/latest_run_state.pt",
-                            "updates_output": "../../smoke/updates.jsonl",
-                            "history_output": "../../smoke/history.json",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            command = run_protocol.build_protocol_commands(
-                run_protocol.load_protocol_config(str(config_path)), mode="smoke"
-            )[0]
-
-            self.assertEqual(
-                command[command.index("--resume-run-state") + 1],
-                str((root / "smoke" / "latest_run_state.pt").resolve()),
-            )
-            self.assertEqual(
-                command[command.index("--updates-output") + 1],
-                str((root / "smoke" / "updates.jsonl").resolve()),
-            )
-            self.assertEqual(
-                command[command.index("--history-output") + 1],
-                str((smoke_dir / "history.json").resolve()),
-            )
-
-    def test_resumable_monitored_smoke_requires_complete_existing_artifact_set(self):
-        required = ("resume_run_state", "updates_output", "history_output")
-        for missing in required:
-            with self.subTest(missing=missing):
-                smoke = {
-                    "enabled": True,
-                    "stop_after_updates": 2,
-                    "resume_run_state": "smoke/latest_run_state.pt",
-                    "updates_output": "smoke/updates.jsonl",
-                    "history_output": "smoke/history.json",
-                }
-                smoke.pop(missing)
-                config = {
-                    "_config_path": str(Path(__file__).resolve()),
-                    "_config_dir": str(Path(__file__).resolve().parent),
-                    "train": {
-                        "enabled": True,
-                        "runner": "monitored",
-                        "resume_run_state": "production/latest_run_state.pt",
-                    },
-                    "smoke": smoke,
-                }
-
-                with self.assertRaisesRegex(ValueError, "complete isolated artifact set"):
-                    run_protocol.build_protocol_commands(config, mode="smoke")
-
-        config = {
-            "_config_path": str(Path(__file__).resolve()),
-            "_config_dir": str(Path(__file__).resolve().parent),
-            "train": {
-                "enabled": True,
-                "runner": "monitored",
-                "resume_run_state": "production/latest_run_state.pt",
-            },
-            "smoke": {
-                "enabled": True,
-                "stop_after_updates": 2,
-                "resume_run_state": "missing-smoke/latest_run_state.pt",
-                "updates_output": "missing-smoke/updates.jsonl",
-                "history_output": "missing-smoke/history.json",
-            },
-        }
-        with self.assertRaisesRegex(ValueError, "does not exist"):
-            run_protocol.build_protocol_commands(config, mode="smoke")
-
-    def test_resumable_monitored_smoke_allows_missing_pre_epoch_history(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            smoke_dir = root / "smoke"
-            smoke_dir.mkdir()
-            (smoke_dir / "latest_run_state.pt").write_bytes(b"state")
-            (smoke_dir / "updates.jsonl").write_bytes(b"{}\n")
-            config = {
-                "_config_path": str(root / "CLI" / "run_protocols" / "config.yaml"),
-                "_config_dir": str(root / "CLI" / "run_protocols"),
-                "train": {
-                    "enabled": True,
-                    "runner": "monitored",
-                    "resume_run_state": "../../production/latest_run_state.pt",
-                },
-                "smoke": {
-                    "enabled": True,
-                    "stop_after_updates": 2,
-                    "resume_run_state": "../../smoke/latest_run_state.pt",
-                    "updates_output": "../../smoke/updates.jsonl",
-                    "history_output": "../../smoke/history.json",
-                },
-            }
-
-            command = run_protocol.build_protocol_commands(config, mode="smoke")[0]
-
-            self.assertEqual(
-                command[command.index("--history-output") + 1],
-                str((smoke_dir / "history.json").resolve()),
-            )
-
     def test_monitored_smoke_rejects_paths_aliasing_production_artifacts(self):
         cases = {
-            "resume_run_state": {
-                "train": "production/latest_run_state.pt",
-                "smoke": "production/latest_run_state.pt",
-            },
             "updates_output": {
                 "train": "production/updates.jsonl",
                 "smoke": "production/updates.jsonl",
@@ -502,14 +375,12 @@ class TestProtocolRunner(unittest.TestCase):
                 train = {
                     "enabled": True,
                     "runner": "monitored",
-                    "resume_run_state": "production/latest_run_state.pt",
                     "updates_output": "production/updates.jsonl",
                     "history_output": "production/history.json",
                 }
                 smoke = {
                     "enabled": True,
                     "stop_after_updates": 2,
-                    "resume_run_state": "smoke/latest_run_state.pt",
                     "updates_output": "smoke/updates.jsonl",
                     "history_output": "smoke/history.json",
                 }
