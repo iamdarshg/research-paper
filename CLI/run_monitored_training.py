@@ -43,7 +43,7 @@ from training_stability import (
     evaluate_directional_promotion_gate,
     summarize_stability,
 )
-from sdf_utils import prepare_edt_workspace
+from sdf_utils import gpu_exact_available, prepare_edt_workspace
 
 
 _JSONL_RECORD_COUNTS: Dict[str, int] = {}
@@ -1055,6 +1055,17 @@ def _apply_monitored_model_runtime_config(
     return model_config
 
 
+def _prepare_host_edt_workspace_for_runtime(
+    device: torch.device, resolved_grid_size: int
+) -> bool:
+    """Reserve a CPU EDT workspace only when the runtime will consume it."""
+
+    if device.type == "cuda" and gpu_exact_available(device):
+        return False
+    prepare_edt_workspace((int(resolved_grid_size),) * 3)
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a GPU-monitored training sweep with stability checks.")
     parser.add_argument("--manifest", required=True, help="Grounded manifest used for training.")
@@ -1235,7 +1246,12 @@ def main() -> int:
         source_label=args.manifest,
     )
     args.resolved_grid_size = resolved_grid_size
-    prepare_edt_workspace((resolved_grid_size,) * 3)
+    # A 128^3 SciPy EDT workspace is ~56 MiB. Reserving it before constructing
+    # the 295M-parameter CUDA model pushed the final 800 MiB host-RAM cgroup to
+    # OOM before update 1. When the parity-approved exact CuPy backend is live,
+    # direct-objective SDFs stay on the GPU and this CPU workspace is never
+    # consumed; only preallocate it for the actual CPU fallback.
+    _prepare_host_edt_workspace_for_runtime(device, resolved_grid_size)
 
     observed_unique_geometry_count = int(
         dataset.metadata.get("unique_geometry_count", len(dataset))

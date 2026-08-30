@@ -17,6 +17,7 @@ from aircraft_diffusion_cfd import (  # noqa: E402
     transfer_training_batch_to_device,
 )
 from geometry_store import CompactGeometryStore  # noqa: E402
+import aircraft_diffusion_cfd as aircraft_module  # noqa: E402
 
 
 def test_store_deduplicates_content_and_keeps_canonical_uint8_tensor():
@@ -142,6 +143,37 @@ def test_hashed_manifest_geometry_remains_file_backed(tmp_path):
     assert dataset.geometry_store._geometries == [geometry_path.resolve()]
     assert dataset[0]["geometry"].dtype == torch.uint8
     assert torch.equal(dataset[0]["geometry"], torch.from_numpy(geometry))
+
+
+def test_jsonl_dataset_streams_records_instead_of_building_a_full_manifest_list(
+    tmp_path, monkeypatch
+):
+    geometry = np.zeros((4, 4, 4), dtype=np.uint8)
+    geometry[1:3, 1:3, 1:3] = 1
+    geometry_path = tmp_path / "geometry.npy"
+    np.save(geometry_path, geometry, allow_pickle=False)
+    record = {
+        "source_id": "streamed",
+        "geometry_path": geometry_path.name,
+        "voxel_sha256": hashlib.sha256(geometry_path.read_bytes()).hexdigest(),
+        "conditioning_mode": "unconditioned_source_metadata_only",
+        "split": "train",
+    }
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        aircraft_module,
+        "load_grounded_manifest_records",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("JSONL dataset loading must not materialize every record")
+        ),
+    )
+
+    dataset = AircraftDesignDataset(manifest_path=str(manifest_path), latent_dim=8)
+
+    assert len(dataset) == 1
+    assert dataset.metadata["split_assignments"] == ["train"]
 
 
 def test_manifest_npy_loader_does_not_eagerly_expand_uint8_geometry(tmp_path):

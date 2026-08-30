@@ -1826,6 +1826,37 @@ def load_grounded_manifest_records(manifest_path: str) -> List[Dict[str, Any]]:
     return _load_structured_records(path)
 
 
+def _iter_grounded_manifest_records(
+    manifest_path: str,
+) -> Iterable[Dict[str, Any]]:
+    """Stream line-oriented manifests while preserving legacy file support.
+
+    The final 8,027-record JSONL is tens of megabytes and each record contains
+    deeply nested provenance. Materializing the entire document as Python
+    dictionaries before constructing the compact dataset creates a several-
+    hundred-megabyte transient and leaves allocator arenas resident. That is
+    enough to breach the final run's 800 MiB host-RAM cgroup during CUDA model
+    construction. JSONL is inherently streamable, so keep only one record
+    alive at a time; JSON/YAML retain the existing structured loader behavior.
+    """
+
+    path = Path(manifest_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset manifest not found: {manifest_path}")
+    if path.suffix.lower() not in {".jsonl", ".ndjson"}:
+        yield from _load_structured_records(path)
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path}:{line_number} must be a JSON object")
+            yield payload
+
+
 def validate_dataset_artifact_payload(
     payload: Dict[str, Any],
     *,
@@ -3926,10 +3957,6 @@ class AircraftDesignDataset(Dataset):
             self.latent_codes = torch.zeros((0, latent_dim))
 
     def _load_manifest_dataset(self, manifest_path: Path) -> None:
-        records = load_grounded_manifest_records(str(manifest_path))
-        if not records:
-            raise ValueError(f"Dataset manifest {manifest_path} contains no samples")
-
         base_dir = manifest_path.parent
         self.geometry_store = CompactGeometryStore()
         self.geometry_indices: List[int] = []
@@ -3938,7 +3965,11 @@ class AircraftDesignDataset(Dataset):
         latent_codes: List[torch.Tensor] = []
         explicit_splits: List[str] = []
 
-        for idx, record in enumerate(records):
+        record_count = 0
+        for idx, record in enumerate(
+            _iter_grounded_manifest_records(str(manifest_path))
+        ):
+            record_count += 1
             if "design_spec" in record and isinstance(record["design_spec"], dict):
                 design_spec = DesignSpec(**_normalize_manifest_design_spec(record["design_spec"]))
             else:
@@ -4025,6 +4056,9 @@ class AircraftDesignDataset(Dataset):
             condition_vectors.append(condition_vector.float())
             if "split" in record:
                 explicit_splits.append(str(record["split"]))
+
+        if record_count == 0:
+            raise ValueError(f"Dataset manifest {manifest_path} contains no samples")
 
         self.num_samples = len(self.geometry_indices)
         self.design_specs = design_specs

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import torch
+
 import CLI.aircraft_diffusion_cfd as adc
 from CLI.aircraft_diffusion_cfd import config_value
 import CLI.run_monitored_training as monitored_training
@@ -120,6 +122,39 @@ def test_monitored_model_config_uses_explicit_compile_and_checkpoint_flags():
     assert configured is model
     assert configured.use_torch_compile is True
     assert configured.enable_gradient_checkpointing is True
+
+
+def test_gpu_exact_runtime_skips_unused_host_edt_workspace(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(monitored_training, "gpu_exact_available", lambda _device: True)
+    monkeypatch.setattr(
+        monitored_training,
+        "prepare_edt_workspace",
+        lambda shape: prepared.append(shape),
+    )
+
+    reserved = monitored_training._prepare_host_edt_workspace_for_runtime(
+        torch.device("cuda"), 128
+    )
+
+    assert reserved is False
+    assert prepared == []
+
+
+def test_cpu_runtime_keeps_reference_edt_workspace_prewarm(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(
+        monitored_training,
+        "prepare_edt_workspace",
+        lambda shape: prepared.append(shape),
+    )
+
+    reserved = monitored_training._prepare_host_edt_workspace_for_runtime(
+        torch.device("cpu"), 128
+    )
+
+    assert reserved is True
+    assert prepared == [(128, 128, 128)]
 
 
 def test_train_command_defaults_follow_config():
