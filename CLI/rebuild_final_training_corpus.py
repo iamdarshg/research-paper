@@ -1197,9 +1197,11 @@ def replay_published_corpus(
                 seen_hashes.add(child_hash)
 
     procedural_stats: dict[str, Any] = {}
+    procedural_seen_hashes = set(seen_hashes)
     for sample in iter_procedural_samples(
         procedural_count,
         procedural_seed,
+        seen_hashes=procedural_seen_hashes,
         stats=procedural_stats,
     ):
         procedural_voxels = resample_cubic_voxels(sample["voxels"], target_grid_size)
@@ -1409,9 +1411,11 @@ def rebuild_final_training_corpus(
             batch_counts[batch_key] = batch_stats
 
         procedural_stats: dict[str, Any] = {}
+        procedural_seen_hashes = set(seen_hashes)
         for sample in iter_procedural_samples(
             procedural_count,
             procedural_seed,
+            seen_hashes=procedural_seen_hashes,
             stats=procedural_stats,
         ):
             procedural_voxels = resample_cubic_voxels(sample["voxels"], target_grid_size)

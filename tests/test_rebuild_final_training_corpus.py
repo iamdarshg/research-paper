@@ -607,6 +607,54 @@ def test_seed_42_procedural_stream_has_each_declared_family(tmp_path):
     assert all(stats["per_type"][aircraft_type] >= 1 for aircraft_type in generator.AIRCRAFT_TYPES)
 
 
+def test_procedural_generation_is_seeded_with_already_admitted_hashes(tmp_path, monkeypatch):
+    source_voxels = _aircraft_like()
+    source_manifest = _write_source_manifest(tmp_path, [source_voxels])
+    output_dir = tmp_path / "published"
+    builder = _builder_module()
+    source_hash = _semantic_hash(source_voxels)
+    generated_voxels = _aircraft_like(1)
+    generated_hash = _semantic_hash(generated_voxels)
+
+    def fake_procedural_samples(count, seed, *, seen_hashes=None, stats=None):
+        assert count == 1
+        assert source_hash in seen_hashes
+        seen_hashes.add(generated_hash)
+        stats.update(
+            {
+                "target": 1,
+                "attempts": 2,
+                "generated": 2,
+                "accepted": 1,
+                "rejected_invalid": 0,
+                "rejected_duplicate": 1,
+                "per_type": {aircraft_type: 0 for aircraft_type in builder.AIRCRAFT_TYPES},
+            }
+        )
+        stats["per_type"]["glider"] = 1
+        yield {
+            "aircraft_type": "glider",
+            "accepted_index": 0,
+            "attempt": 2,
+            "seed": seed,
+            "canonical_content_sha256": generated_hash,
+            "voxels": generated_voxels,
+        }
+
+    monkeypatch.setattr(builder, "iter_procedural_samples", fake_procedural_samples)
+
+    report = _run_small_build(
+        source_manifest,
+        output_dir,
+        procedural_count=1,
+        expected_procedural_count=1,
+        expected_total_count=2,
+    )
+
+    assert report["record_count"] == 2
+    assert report["procedural"]["rejected_duplicate"] == 1
+
+
 def test_standalone_perturbation_cli_emits_claim_bearing_records(tmp_path, monkeypatch):
     source_manifest = _write_source_manifest(tmp_path, [_aircraft_like()])
     output_dir = tmp_path / "perturb-output"

@@ -51,7 +51,12 @@ def _add_dual_flag(command: List[str], enable_flag: str, disable_flag: str, valu
 
 def _default_checkpoint(config: Dict[str, Any], train_cfg: Dict[str, Any]) -> str:
     save_dir = _resolve_path(config, train_cfg.get("save_dir", "./checkpoints"))
-    return str((Path(save_dir) / "final_optimized_model.pt").resolve())
+    filename = (
+        "final_monitored_model.pt"
+        if train_cfg.get("runner") == "monitored"
+        else "final_optimized_model.pt"
+    )
+    return str((Path(save_dir) / filename).resolve())
 
 
 def _protocol_run_id(config: Dict[str, Any]) -> str:
@@ -145,6 +150,12 @@ def build_protocol_commands(
                 if key in {"dataset_manifest", "save_dir"}:
                     value = _resolve_path(config, value)
                 _add_option(train_cmd, flag, value)
+            for flag, key in (
+                ("--resume-from", "resume_from"),
+                ("--resume-run-state", "resume_run_state"),
+                ("--warm-start-from", "warm_start_from"),
+            ):
+                _add_option(train_cmd, flag, _resolve_path(config, train_cfg.get(key)))
             _add_option(train_cmd, "--checkpoint-every-updates", checkpoint_every_updates)
             if "enable_consistency" in train_cfg:
                 _add_dual_flag(

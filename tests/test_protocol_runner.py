@@ -266,3 +266,45 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertEqual(command[command.index("--num-epochs") + 1], "2")
         self.assertEqual(command[command.index("--checkpoint-every-updates") + 1], "1")
         self.assertEqual(command[command.index("--stop-after-updates") + 1], "5")
+
+    def test_monitored_protocol_forwards_exact_resume_and_uses_monitored_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            protocol_dir = repo_root / "CLI" / "run_protocols"
+            protocol_dir.mkdir(parents=True)
+            config_path = protocol_dir / "monitored.yaml"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "train": {
+                            "enabled": True,
+                            "runner": "monitored",
+                            "dataset_manifest": "../../build/corpus/manifest.jsonl",
+                            "save_dir": "../../checkpoints",
+                            "resume_run_state": "../../checkpoints/latest_run_state.pt",
+                        },
+                        "evaluate_baselines": {"enabled": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            commands = run_protocol.build_protocol_commands(
+                run_protocol.load_protocol_config(str(config_path))
+            )
+
+            train_command, baseline_command = commands
+            expected_state = str(
+                (repo_root / "checkpoints" / "latest_run_state.pt").resolve()
+            )
+            expected_checkpoint = str(
+                (repo_root / "checkpoints" / "final_monitored_model.pt").resolve()
+            )
+            self.assertEqual(
+                train_command[train_command.index("--resume-run-state") + 1],
+                expected_state,
+            )
+            self.assertEqual(
+                baseline_command[baseline_command.index("--checkpoint") + 1],
+                expected_checkpoint,
+            )
