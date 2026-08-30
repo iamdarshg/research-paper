@@ -37,6 +37,7 @@ train:
   direct_solver_batch_chunk: 4
   require_direct_solver_every_iteration: false
   checkpoint_every_updates: 25
+  stop_on_promotion_pass: false
 
 smoke:
   enabled: true

@@ -198,7 +198,15 @@ def build_protocol_commands(
                     "--no-enable-gradient-checkpointing",
                     bool(train_cfg["enable_checkpointing"]),
                 )
+            if "stop_on_promotion_pass" in train_cfg:
+                _add_dual_flag(
+                    train_cmd,
+                    "--stop-on-promotion-pass",
+                    "--no-stop-on-promotion-pass",
+                    bool(train_cfg["stop_on_promotion_pass"]),
+                )
             if mode == "smoke":
+                train_cmd.append("--no-save-final-checkpoint")
                 _add_option(
                     train_cmd,
                     "--stop-after-updates",

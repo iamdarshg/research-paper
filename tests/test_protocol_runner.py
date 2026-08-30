@@ -248,6 +248,8 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertIn("--no-enable-consistency", command)
         self.assertIn("--enable-compile", command)
         self.assertIn("--enable-gradient-checkpointing", command)
+        self.assertIn("--no-stop-on-promotion-pass", command)
+        self.assertNotIn("--no-save-final-checkpoint", command)
         self.assertNotIn("--stop-after-updates", command)
 
     def test_gcp_128_smoke_mode_is_explicitly_bounded(self):
@@ -266,6 +268,7 @@ class TestProtocolRunner(unittest.TestCase):
         self.assertEqual(command[command.index("--num-epochs") + 1], "2")
         self.assertEqual(command[command.index("--checkpoint-every-updates") + 1], "1")
         self.assertEqual(command[command.index("--stop-after-updates") + 1], "5")
+        self.assertIn("--no-save-final-checkpoint", command)
 
     def test_monitored_smoke_mode_rejects_missing_or_nonpositive_update_bound(self):
         for stop_after_updates in (None, 0, -1):
