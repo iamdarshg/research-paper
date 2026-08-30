@@ -8,6 +8,26 @@ import numpy as np
 import torch
 
 
+_FILE_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def file_sha256(path: str | Path, *, force: bool = False) -> str:
+    """Hash a file without retaining its payload, caching only unchanged stats."""
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    key = (str(resolved), int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _FILE_SHA256_CACHE.get(key)
+    if cached is not None and not force:
+        return cached
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    _FILE_SHA256_CACHE[key] = value
+    return value
+
+
 class CompactGeometryStore:
     """Keep one canonical CPU uint8 tensor for each geometry content hash."""
 
@@ -65,6 +85,15 @@ class CompactGeometryStore:
             raise ValueError(f"Unable to load geometry file {resolved}: {exc}") from exc
         if not isinstance(geometry, np.ndarray) or geometry.ndim != 3:
             raise ValueError(f"Geometry file must contain a 3D array: {resolved}")
+        if len(content_hash) == 64 and all(
+            character in "0123456789abcdef" for character in content_hash
+        ):
+            actual_hash = file_sha256(resolved)
+            if actual_hash != content_hash:
+                raise ValueError(
+                    f"Declared content hash {content_hash!r} does not match "
+                    f"geometry file {resolved} ({actual_hash})"
+                )
 
         existing = self._hash_to_index.get(content_hash)
         if existing is not None:

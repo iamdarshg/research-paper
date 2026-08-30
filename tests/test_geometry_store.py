@@ -74,6 +74,15 @@ def test_file_backed_store_materializes_without_retaining_voxel_tensor(tmp_path)
     assert torch.equal(store.materialize(index), torch.from_numpy(geometry))
 
 
+def test_file_backed_store_rejects_incorrect_declared_hash(tmp_path):
+    path = tmp_path / "geometry.npy"
+    np.save(path, np.zeros((2, 2, 2), dtype=np.uint8), allow_pickle=False)
+    store = CompactGeometryStore()
+
+    with pytest.raises(ValueError, match="does not match"):
+        store.add_file("bad", path, content_hash="0" * 64)
+
+
 def test_tensor_add_deduplicates_against_file_backed_entry(tmp_path):
     geometry = np.zeros((8, 8, 8), dtype=np.uint8)
     geometry[2:6, 3:5, 1:7] = 1

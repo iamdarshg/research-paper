@@ -1,5 +1,10 @@
+import hashlib
+import json
+import os
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
 
 import CLI.aircraft_diffusion_cfd as adc
@@ -139,6 +144,78 @@ def test_gpu_exact_runtime_skips_unused_host_edt_workspace(monkeypatch):
 
     assert reserved is False
     assert prepared == []
+
+
+def test_monitored_runtime_requires_valid_requested_gpu_edt_attestation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        monitored_training,
+        "approve_gpu_exact_attestation",
+        lambda path, device: calls.append((path, device)) or True,
+    )
+
+    assert monitored_training._approve_gpu_exact_runtime(
+        "attestation.json", torch.device("cuda")
+    ) is True
+    assert calls == [("attestation.json", torch.device("cuda"))]
+
+    monkeypatch.setattr(
+        monitored_training,
+        "approve_gpu_exact_attestation",
+        lambda _path, _device: False,
+    )
+    with pytest.raises(RuntimeError, match="attestation"):
+        monitored_training._approve_gpu_exact_runtime(
+            "stale.json", torch.device("cuda")
+        )
+
+
+def test_monitored_runtime_disables_tensorboard_by_default(monkeypatch):
+    monkeypatch.delenv("RESEARCH_DISABLE_TENSORBOARD", raising=False)
+
+    monitored_training._configure_tensorboard_runtime(False)
+
+    assert os.environ["RESEARCH_DISABLE_TENSORBOARD"] == "1"
+
+
+def test_monitored_runtime_can_explicitly_enable_tensorboard(monkeypatch):
+    monkeypatch.setenv("RESEARCH_DISABLE_TENSORBOARD", "1")
+
+    monitored_training._configure_tensorboard_runtime(True)
+
+    assert "RESEARCH_DISABLE_TENSORBOARD" not in os.environ
+
+
+def test_training_input_identity_binds_manifest_and_sidecar_bytes(tmp_path):
+    geometry_path = tmp_path / "geometry.npy"
+    latent_path = tmp_path / "latents.npy"
+    np.save(geometry_path, np.zeros((2, 2, 2), dtype=np.uint8), allow_pickle=False)
+    np.save(latent_path, np.zeros((1, 4), dtype=np.float32), allow_pickle=False)
+    geometry_sha256 = hashlib.sha256(geometry_path.read_bytes()).hexdigest()
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "geometry_path": geometry_path.name,
+                "voxel_sha256": geometry_sha256,
+                "latent_path": latent_path.name,
+                "latent_index": 0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    initial = monitored_training._training_inputs_identity(str(manifest_path))
+    np.save(latent_path, np.ones((1, 4), dtype=np.float32), allow_pickle=False)
+    changed_latent = monitored_training._training_inputs_identity(str(manifest_path))
+    np.save(latent_path, np.zeros((1, 4), dtype=np.float32), allow_pickle=False)
+    changed_geometry = np.ones((2, 2, 2), dtype=np.uint8)
+    np.save(geometry_path, changed_geometry, allow_pickle=False)
+
+    assert changed_latent != initial
+    with pytest.raises(ValueError, match="geometry_path"):
+        monitored_training._training_inputs_identity(str(manifest_path))
 
 
 def test_cpu_runtime_keeps_reference_edt_workspace_prewarm(monkeypatch):

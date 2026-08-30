@@ -18,6 +18,7 @@ from aircraft_diffusion_cfd import (
     DesignSpec,
     DiffusionConfig,
     ModelConfig,
+    MONITORED_EXACT_RESUME_SCHEMA,
     OptimizedDiffusionTrainer,
     TrainingConfig,
     balanced_voxel_bce_with_logits,
@@ -199,7 +200,8 @@ def test_monitored_exact_resume_requires_every_expected_nested_identity_key():
     }
     expected = {
         **base,
-        "compatibility_schema": "monitored-exact-resume-v1",
+        "compatibility_schema": MONITORED_EXACT_RESUME_SCHEMA,
+        "input_artifacts_identity": "inputs-a",
         "configuration": {
             "training_config": {
                 "learning_rate": 0.00002,
@@ -212,6 +214,7 @@ def test_monitored_exact_resume_requires_every_expected_nested_identity_key():
 
     assert validate_run_state_compatibility(actual, expected) == [
         "compatibility_schema",
+        "input_artifacts_identity",
         "configuration.direct_solver_batch_chunk",
         "configuration.experiment_flags",
         "configuration.training_config.precision",

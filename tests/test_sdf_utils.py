@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 
 import numpy as np
 import pytest
@@ -12,7 +13,13 @@ if CLI_DIR not in sys.path:
     sys.path.insert(0, CLI_DIR)
 
 import sdf_utils
-from sdf_utils import _edt_workspace, compute_sdf, prepare_edt_workspace
+from sdf_utils import (
+    _edt_workspace,
+    approve_gpu_exact_attestation,
+    compute_sdf,
+    gpu_exact_available,
+    prepare_edt_workspace,
+)
 
 
 def test_reusable_edt_workspace_preserves_exact_signed_distance():
@@ -46,6 +53,67 @@ def test_gpu_exact_backend_fails_closed_when_cupy_is_unavailable(monkeypatch):
     monkeypatch.setattr(sdf_utils, "_cupy_available", lambda: False)
     with pytest.raises(RuntimeError, match="gpu_exact"):
         compute_sdf(torch.zeros((8, 8, 8)), backend="gpu_exact")
+
+
+def test_version_bound_attestation_avoids_duplicate_cupy_import(tmp_path, monkeypatch):
+    device = torch.device("cuda")
+    attestation = tmp_path / "gpu-edt.json"
+    attestation.write_text(
+        json.dumps(
+            {
+                "schema": "gpu-exact-edt-attestation-v1",
+                "parity": True,
+                "torch_version": str(torch.__version__),
+                "torch_cuda": str(torch.version.cuda),
+                "cupy_distribution": "cupy-cuda12x",
+                "cupy_version": "13.6.0",
+                "device_name": "NVIDIA L4",
+                "device_capability": [8, 9],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA L4")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 9))
+    monkeypatch.setattr(sdf_utils.importlib_metadata, "version", lambda _name: "13.6.0")
+    monkeypatch.setattr(
+        sdf_utils,
+        "_cupy_available",
+        lambda: (_ for _ in ()).throw(AssertionError("CuPy must stay lazy")),
+    )
+    sdf_utils._GPU_EXACT_PARITY.clear()
+
+    assert approve_gpu_exact_attestation(attestation, device) is True
+    assert gpu_exact_available(device) is True
+
+
+def test_gpu_exact_attestation_fails_closed_on_runtime_mismatch(tmp_path, monkeypatch):
+    device = torch.device("cuda")
+    attestation = tmp_path / "gpu-edt.json"
+    attestation.write_text(
+        json.dumps(
+            {
+                "schema": "gpu-exact-edt-attestation-v1",
+                "parity": True,
+                "torch_version": "different",
+                "torch_cuda": str(torch.version.cuda),
+                "cupy_distribution": "cupy-cuda12x",
+                "cupy_version": "13.6.0",
+                "device_name": "NVIDIA L4",
+                "device_capability": [8, 9],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA L4")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 9))
+    monkeypatch.setattr(sdf_utils.importlib_metadata, "version", lambda _name: "13.6.0")
+    sdf_utils._GPU_EXACT_PARITY.clear()
+
+    assert approve_gpu_exact_attestation(attestation, device) is False
+    assert str(device) not in sdf_utils._GPU_EXACT_PARITY
 
 
 @pytest.mark.skipif(

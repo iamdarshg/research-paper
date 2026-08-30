@@ -1,7 +1,9 @@
 import threading
+import json
+from importlib import metadata as importlib_metadata
+from pathlib import Path
 import torch
 import numpy as np
-from scipy.ndimage import distance_transform_edt
 from typing import Dict, Tuple
 
 
@@ -14,6 +16,7 @@ from typing import Dict, Tuple
 # before high-memory model construction.
 _THREAD_EDT_WORKSPACES = threading.local()
 _GPU_EXACT_PARITY: Dict[str, bool] = {}
+_GPU_EXACT_ATTESTATION_SCHEMA = "gpu-exact-edt-attestation-v1"
 
 
 def _cupy_available() -> bool:
@@ -71,6 +74,8 @@ def prepare_edt_workspace(shape) -> None:
     _edt_workspace(normalized_shape)
 
 def _compute_sdf_scipy(voxel_grid: torch.Tensor) -> torch.Tensor:
+    from scipy.ndimage import distance_transform_edt
+
     """Compute the exact reference SDF with SciPy's established semantics.
 
     SciPy owns the EDT calculation. CUDA inputs are copied back only after the
@@ -162,9 +167,54 @@ def gpu_exact_available(device: torch.device | None = None) -> bool:
     """Return whether exact GPU EDT is installed and parity-approved."""
     if device is None:
         device = torch.device("cuda")
-    if device.type != "cuda" or not torch.cuda.is_available() or not _cupy_available():
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    cached = _GPU_EXACT_PARITY.get(str(device))
+    if cached is not None:
+        return cached
+    if not _cupy_available():
         return False
     return _gpu_exact_parity_probe(device)
+
+
+def approve_gpu_exact_attestation(
+    attestation_path: str | Path,
+    device: torch.device | None = None,
+) -> bool:
+    """Trust a successful preflight only when its live runtime identity matches.
+
+    The deployment worker runs the expensive CuPy-vs-SciPy parity probe before
+    starting the memory-capped trainer. This validator lets the trainer reuse
+    that same-machine result without importing CuPy before CUDA model
+    construction. Any malformed, stale, or mismatched field fails closed and
+    leaves the normal in-process parity probe available.
+    """
+    if device is None:
+        device = torch.device("cuda")
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    try:
+        payload = json.loads(Path(attestation_path).read_text(encoding="utf-8"))
+        distribution = str(payload["cupy_distribution"])
+        capability = tuple(int(value) for value in payload["device_capability"])
+        matches = (
+            payload.get("schema") == _GPU_EXACT_ATTESTATION_SCHEMA
+            and payload.get("parity") is True
+            and str(payload.get("torch_version")) == str(torch.__version__)
+            and str(payload.get("torch_cuda")) == str(torch.version.cuda)
+            and distribution == "cupy-cuda12x"
+            and str(payload.get("cupy_version"))
+            == str(importlib_metadata.version(distribution))
+            and str(payload.get("device_name"))
+            == str(torch.cuda.get_device_name(device))
+            and capability == tuple(torch.cuda.get_device_capability(device))
+        )
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, importlib_metadata.PackageNotFoundError):
+        return False
+    if not matches:
+        return False
+    _GPU_EXACT_PARITY[str(device)] = True
+    return True
 
 
 def compute_sdf(

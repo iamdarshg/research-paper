@@ -38,12 +38,17 @@ from aircraft_diffusion_cfd import (
     resolve_run_state_path,
 )
 from experiment_config import GLOBAL_CONFIG_PATH, config_value
+from geometry_store import file_sha256
 from training_stability import (
     compute_core_loss,
     evaluate_directional_promotion_gate,
     summarize_stability,
 )
-from sdf_utils import gpu_exact_available, prepare_edt_workspace
+from sdf_utils import (
+    approve_gpu_exact_attestation,
+    gpu_exact_available,
+    prepare_edt_workspace,
+)
 
 
 _JSONL_RECORD_COUNTS: Dict[str, int] = {}
@@ -453,6 +458,70 @@ def _manifest_identity(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _training_inputs_identity(path: str) -> str:
+    """Bind exact resume to the manifest and every referenced input sidecar."""
+    manifest_path = Path(path).resolve()
+    base_dir = manifest_path.parent
+    artifacts: dict[str, tuple[Path, Optional[str]]] = {}
+    for record in _aircraft_diffusion_cfd._iter_grounded_manifest_records(
+        str(manifest_path)
+    ):
+        nested_hashes = record.get("hashes", {})
+        if not isinstance(nested_hashes, Mapping):
+            nested_hashes = {}
+        for field_name, hash_name in (
+            ("geometry_path", "voxel_sha256"),
+            ("stl_path", "geometry_sha256"),
+            ("latent_path", None),
+        ):
+            declared_path = record.get(field_name)
+            if not declared_path:
+                continue
+            logical_path = f"{field_name}:{Path(str(declared_path)).as_posix()}"
+            resolved = (base_dir / str(declared_path)).resolve()
+            expected_hash = (
+                str(record.get(hash_name) or nested_hashes.get(hash_name))
+                if hash_name and (record.get(hash_name) or nested_hashes.get(hash_name))
+                else None
+            )
+            previous = artifacts.get(logical_path)
+            candidate = (resolved, expected_hash)
+            if previous is not None and previous != candidate:
+                raise ValueError(
+                    f"Manifest gives conflicting identities for {logical_path}"
+                )
+            artifacts[logical_path] = candidate
+
+    digest = hashlib.sha256()
+    digest.update(b"monitored-training-inputs-v1\0")
+    digest.update(_manifest_identity(str(manifest_path)).encode("ascii"))
+    for logical_path in sorted(artifacts):
+        resolved, expected_hash = artifacts[logical_path]
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Training input sidecar does not exist: {resolved}")
+        # Exact-resume identity must detect replacement even on filesystems
+        # whose timestamp granularity permits same-size, same-mtime rewrites.
+        actual_hash = file_sha256(resolved, force=True)
+        if expected_hash is not None and actual_hash != expected_hash:
+            raise ValueError(
+                f"Manifest {logical_path} {expected_hash!r} does not match "
+                f"actual sidecar sha256 {actual_hash}"
+            )
+        digest.update(logical_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(actual_hash.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _configure_tensorboard_runtime(enable_tensorboard: bool) -> None:
+    """Make monitored launches opt in to TensorBoard's host-RAM overhead."""
+    if enable_tensorboard:
+        os.environ.pop("RESEARCH_DISABLE_TENSORBOARD", None)
+    else:
+        os.environ["RESEARCH_DISABLE_TENSORBOARD"] = "1"
 
 
 def _dataset_sample_order(dataset: Dataset) -> list[int]:
@@ -1066,6 +1135,18 @@ def _prepare_host_edt_workspace_for_runtime(
     return True
 
 
+def _approve_gpu_exact_runtime(
+    attestation_path: Optional[str], device: torch.device
+) -> bool:
+    if not attestation_path:
+        return False
+    if not approve_gpu_exact_attestation(attestation_path, device):
+        raise RuntimeError(
+            "Exact GPU EDT attestation does not match the live training runtime"
+        )
+    return True
+
+
 def _release_host_allocator_cache() -> bool:
     """Return unused glibc arenas before high-memory CUDA model construction."""
     import gc
@@ -1088,6 +1169,12 @@ def _release_host_allocator_cache() -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a GPU-monitored training sweep with stability checks.")
     parser.add_argument("--manifest", required=True, help="Grounded manifest used for training.")
+    parser.add_argument(
+        "--enable-tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable TensorBoard logging; disabled by default for bounded-RAM runs.",
+    )
     parser.add_argument("--num-epochs", type=int, default=int(config_value("training", "num_epochs", 200)))
     parser.add_argument("--batch-size", type=int, default=int(config_value("training", "batch_size", 1)))
     parser.add_argument("--latent-dim", type=int, default=int(config_value("model", "latent_dim", 192)))
@@ -1128,6 +1215,14 @@ def main() -> int:
         ),
     )
     parser.add_argument("--stream-block-size", type=int, default=int(config_value("cfd", "stream_block_size", 512)))
+    parser.add_argument(
+        "--gpu-exact-attestation",
+        default=None,
+        help=(
+            "Same-machine parity attestation generated immediately before launch; "
+            "mismatches fail closed."
+        ),
+    )
     parser.add_argument("--save-dir", default="./checkpoints_monitored")
     parser.add_argument("--resume-from", default=None)
     parser.add_argument(
@@ -1211,6 +1306,7 @@ def main() -> int:
         default=bool(config_value("training", "require_direct_solver_every_iteration", False)),
     )
     args = parser.parse_args()
+    _configure_tensorboard_runtime(args.enable_tensorboard)
     if sum(bool(value) for value in (args.resume_from, args.resume_run_state, args.warm_start_from)) > 1:
         parser.error("--resume-run-state, --resume-from, and --warm-start-from are mutually exclusive")
     if not 0.0 < float(args.lr_min_ratio) <= 1.0:
@@ -1252,6 +1348,8 @@ def main() -> int:
     np.random.seed(0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _approve_gpu_exact_runtime(args.gpu_exact_attestation, device)
+    input_artifacts_identity = _training_inputs_identity(args.manifest)
     dataset = AircraftDesignDataset(
         num_samples=0,
         grid_size=args.grid_size,
@@ -1398,6 +1496,7 @@ def main() -> int:
     run_compatibility = {
         "compatibility_schema": MONITORED_EXACT_RESUME_SCHEMA,
         "manifest_identity": _manifest_identity(args.manifest),
+        "input_artifacts_identity": input_artifacts_identity,
         "grid_size": int(resolved_grid_size),
         "latent_dim": int(model_config.latent_dim),
         "split": str(args.training_split),

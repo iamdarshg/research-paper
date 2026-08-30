@@ -25,6 +25,7 @@ from aircraft_diffusion_cfd import (
     DirectSolverSPSALoss,
     DiffusionConfig,
     ModelConfig,
+    MONITORED_EXACT_RESUME_SCHEMA,
     OptimizedDiffusionTrainer,
     TrainingConfig,
     atomic_save_run_state,
@@ -926,7 +927,7 @@ def test_runner_main_restores_saved_threshold_and_resets_cadence(tmp_path, monke
         def load_run_state(self, path, *, expected_compatibility):
             assert (
                 expected_compatibility.get("compatibility_schema")
-                == "monitored-exact-resume-v1"
+                == MONITORED_EXACT_RESUME_SCHEMA
             )
             assert expected_compatibility["configuration"][
                 "geometry_materialization_threshold"

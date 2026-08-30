@@ -124,7 +124,7 @@ _WEIGHTS_ONLY_FALLBACK_EXCEPTIONS = (
 # fallback. These are trusted local artifacts from our own runs at explicit
 # paths, never untrusted input.
 _TRUSTED_CHECKPOINT_ROOT = REPO_ROOT / "build"
-MONITORED_EXACT_RESUME_SCHEMA = "monitored-exact-resume-v1"
+MONITORED_EXACT_RESUME_SCHEMA = "monitored-exact-resume-v2"
 
 
 def _is_trusted_checkpoint_path(path) -> bool:
@@ -288,6 +288,7 @@ def validate_run_state_compatibility(
     fields_to_compare = (
         *(("compatibility_schema",) if strict_monitored else ()),
         "manifest_identity",
+        *(("input_artifacts_identity",) if strict_monitored else ()),
         "grid_size",
         "latent_dim",
         "split",

@@ -17,7 +17,6 @@ from typing import Any, Dict, Iterable, List
 
 import numpy as np
 import torch
-from scipy.ndimage import label as connected_component_labels
 
 from report_metadata import apply_report_metadata
 
@@ -72,6 +71,8 @@ def _band_bounds(length: int, start_ratio: float, end_ratio: float) -> tuple[int
 
 
 def _heuristic_metrics(grid: torch.Tensor) -> Dict[str, float]:
+    from scipy.ndimage import label as connected_component_labels
+
     occupied = float(grid.sum().item())
     total = float(grid.numel())
     occupancy_ratio = occupied / max(total, 1.0)
@@ -528,6 +529,8 @@ def _bbox_component_fraction(bbox_crop_cpu: torch.Tensor, occupied: float) -> fl
     local-connectivity labeling, and the crop shrinks the label work to the
     aircraft occupancy instead of the full lattice. Pure CPU and pool-safe.
     """
+    from scipy.ndimage import label as connected_component_labels
+
     occupied_mask = bbox_crop_cpu.numpy() > 0.5
     labeled, component_count = connected_component_labels(occupied_mask)
     if component_count == 0:

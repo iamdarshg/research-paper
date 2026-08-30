@@ -1,8 +1,6 @@
 
 import torch
-import trimesh
 import numpy as np
-from mesh_utils import normalize_stl_mesh
 
 def get_vram_limit_resolution(max_usage=0.9, target_res=1024):
     """Estimate max LBM resolution based on available VRAM"""
@@ -25,6 +23,8 @@ def get_vram_limit_resolution(max_usage=0.9, target_res=1024):
 def get_stl_adaptive_resolution(stl_path):
     """Determine optimal resolution based on STL complexity"""
     try:
+        import trimesh
+
         mesh = trimesh.load(stl_path)
         complexity_res = int((len(mesh.faces) / 2) ** (1/3) * 5)
         vram_res = get_vram_limit_resolution()
