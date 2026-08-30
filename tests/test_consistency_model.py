@@ -355,6 +355,30 @@ def test_consistency_add_noise_preserves_latent_shape():
     assert noised.shape == latent.shape
 
 
+def test_disabled_consistency_omits_teacher_but_keeps_student_inference():
+    config = ModelConfig(
+        latent_dim=4,
+        encoder_channels=[8, 8, 8],
+        decoder_channels=[8, 8, 8],
+        conditioning_dim=0,
+        use_torch_compile=False,
+    )
+    model = ConsistencyModel(
+        config,
+        DiffusionConfig(timesteps=8, student_steps=2),
+        enable_teacher=False,
+    )
+
+    assert model.teacher_model is None
+    assert torch.isfinite(model.fast_inference((1, 4), num_steps=2)).all()
+    with pytest.raises(RuntimeError, match="teacher is disabled"):
+        model.consistency_loss(
+            torch.zeros((1, 4)),
+            torch.tensor([1]),
+            torch.tensor([1]),
+        )
+
+
 def test_consistency_add_noise_matches_primary_noise_schedule():
     config = ModelConfig(
         latent_dim=4,

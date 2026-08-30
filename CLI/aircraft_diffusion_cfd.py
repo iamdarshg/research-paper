@@ -2619,7 +2619,14 @@ class GradientCheckpointingWrapper(nn.Module):
 class ConsistencyModel(nn.Module):
     """4-step consistency model replacing 1000-step diffusion"""
 
-    def __init__(self, config: ModelConfig, diffusion_config: DiffusionConfig, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        config: ModelConfig,
+        diffusion_config: DiffusionConfig,
+        dtype: torch.dtype = torch.float32,
+        *,
+        enable_teacher: bool = True,
+    ):
         super().__init__()
         self.config = config
         self.diffusion_config = diffusion_config
@@ -2652,7 +2659,11 @@ class ConsistencyModel(nn.Module):
             enable_gradient_checkpointing=config.enable_gradient_checkpointing,
             use_torch_compile=False  # Disable torch.compile for teacher to avoid overflow errors
         )
-        self.teacher_model = LatentDiffusionUNet(teacher_config, diffusion_config).to(dtype)
+        self.teacher_model = (
+            LatentDiffusionUNet(teacher_config, diffusion_config).to(dtype)
+            if enable_teacher
+            else None
+        )
 
         # Student model (small, fast)
         student_config = ModelConfig(
@@ -2693,6 +2704,8 @@ class ConsistencyModel(nn.Module):
         huber_delta: float = 1.0,
     ) -> torch.Tensor:
         """Consistency training loss between teacher and student models"""
+        if self.teacher_model is None:
+            raise RuntimeError("Consistency teacher is disabled for this training run")
         if not torch.equal(t_student, t_teacher):
             raise ValueError("Consistency teacher and student must evaluate the same diffusion timestep")
         if loss_type not in {"mse", "huber"}:
@@ -2749,6 +2762,8 @@ class ConsistencyModel(nn.Module):
 
     def progressive_distillation(self, dataloader: DataLoader, num_distillation_steps: int = 10) -> Dict[str, float]:
         """Compute progressive distillation losses (no optimization - caller handles training)"""
+        if self.teacher_model is None:
+            raise RuntimeError("Consistency teacher is disabled for this training run")
         step_counts = self.diffusion_config.progressive_distillation
         device = next(self.student_model.parameters()).device
 
@@ -6300,7 +6315,10 @@ class OptimizedDiffusionTrainer:
 
             # 4-step consistency model
             self.consistency_model = ConsistencyModel(
-                model_config, diffusion_config, self.dtype
+                model_config,
+                diffusion_config,
+                self.dtype,
+                enable_teacher=bool(training_config.enable_consistency),
             )
 
         # Initialize EMA model
