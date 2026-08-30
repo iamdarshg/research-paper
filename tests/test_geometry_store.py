@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sys
 
@@ -56,6 +57,21 @@ def test_store_rejects_supplied_hash_hit_with_different_shape():
         store.add("b", torch.zeros((1, 2, 4)), content_hash="declared")
 
 
+def test_file_backed_store_materializes_without_retaining_voxel_tensor(tmp_path):
+    geometry = np.zeros((8, 8, 8), dtype=np.uint8)
+    geometry[2:6, 3:5, 1:7] = 1
+    path = tmp_path / "geometry.npy"
+    np.save(path, geometry, allow_pickle=False)
+    file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    store = CompactGeometryStore()
+
+    index = store.add_file("a", path, content_hash=file_hash)
+
+    assert store._geometries == [path.resolve()]
+    assert store.materialize(index).dtype == torch.uint8
+    assert torch.equal(store.materialize(index), torch.from_numpy(geometry))
+
+
 def test_manifest_records_reference_shared_geometry_and_preserve_getitem(tmp_path):
     geometry = np.zeros((4, 4, 4), dtype=np.float32)
     geometry[1:3, :, 2] = 1
@@ -90,6 +106,28 @@ def test_manifest_records_reference_shared_geometry_and_preserve_getitem(tmp_pat
     assert first["condition_vector"].ndim == 1
     first["geometry"].zero_()
     assert int(dataset[1]["geometry"].sum()) == int(np.count_nonzero(geometry))
+
+
+def test_hashed_manifest_geometry_remains_file_backed(tmp_path):
+    geometry = np.zeros((8, 8, 8), dtype=np.uint8)
+    geometry[2:6, 3:5, 1:7] = 1
+    geometry_path = tmp_path / "geometry.npy"
+    np.save(geometry_path, geometry, allow_pickle=False)
+    record = {
+        "source_id": "lazy-a",
+        "geometry_path": geometry_path.name,
+        "voxel_sha256": hashlib.sha256(geometry_path.read_bytes()).hexdigest(),
+        "conditioning_mode": "unconditioned_source_metadata_only",
+        "split": "train",
+    }
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    dataset = AircraftDesignDataset(manifest_path=str(manifest_path), latent_dim=8)
+
+    assert dataset.geometry_store._geometries == [geometry_path.resolve()]
+    assert dataset[0]["geometry"].dtype == torch.uint8
+    assert torch.equal(dataset[0]["geometry"], torch.from_numpy(geometry))
 
 
 def test_manifest_npy_loader_does_not_eagerly_expand_uint8_geometry(tmp_path):

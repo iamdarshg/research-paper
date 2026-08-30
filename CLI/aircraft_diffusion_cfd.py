@@ -3928,8 +3928,30 @@ class AircraftDesignDataset(Dataset):
             else:
                 design_spec = sample_design_spec(self.rng)
 
-            loaded_geometry = self._load_manifest_geometry(record, base_dir)
-            resolved_grid_size = int(loaded_geometry.shape[-1])
+            content_hash = record.get("voxel_sha256")
+            if content_hash is None and isinstance(record.get("hashes"), dict):
+                content_hash = record["hashes"].get("voxel_sha256")
+            geometry_path = record.get("geometry_path")
+            lazy_geometry_path: Optional[Path] = None
+            if geometry_path:
+                candidate = (base_dir / str(geometry_path)).resolve()
+                if candidate.suffix.lower() == ".npy" and content_hash:
+                    lazy_geometry_path = candidate
+
+            if lazy_geometry_path is not None:
+                shape_probe = np.load(lazy_geometry_path, mmap_mode="r", allow_pickle=False)
+                if not isinstance(shape_probe, np.ndarray) or shape_probe.ndim != 3:
+                    raise ValueError(
+                        f"geometry_path must resolve to a 3D array, got {getattr(shape_probe, 'shape', None)}"
+                    )
+                resolved_grid_size = int(shape_probe.shape[-1])
+                if tuple(shape_probe.shape) != (resolved_grid_size,) * 3:
+                    raise ValueError(
+                        f"geometry_path must resolve to a cubic array, got shape {tuple(shape_probe.shape)}"
+                    )
+            else:
+                loaded_geometry = self._load_manifest_geometry(record, base_dir)
+                resolved_grid_size = int(loaded_geometry.shape[-1])
             if idx == 0:
                 self.grid_size = resolved_grid_size
             elif resolved_grid_size != self.grid_size:
@@ -3937,14 +3959,19 @@ class AircraftDesignDataset(Dataset):
                     f"Dataset manifest {manifest_path} mixes grid sizes {self.grid_size} and {resolved_grid_size}"
                 )
 
-            content_hash = record.get("voxel_sha256")
-            if content_hash is None and isinstance(record.get("hashes"), dict):
-                content_hash = record["hashes"].get("voxel_sha256")
-            geometry_index = self.geometry_store.add(
-                str(record.get("source_id", record.get("sample_id", idx))),
-                loaded_geometry,
-                content_hash=str(content_hash) if content_hash else None,
-            )
+            source_id = str(record.get("source_id", record.get("sample_id", idx)))
+            if lazy_geometry_path is not None:
+                geometry_index = self.geometry_store.add_file(
+                    source_id,
+                    lazy_geometry_path,
+                    content_hash=str(content_hash),
+                )
+            else:
+                geometry_index = self.geometry_store.add(
+                    source_id,
+                    loaded_geometry,
+                    content_hash=str(content_hash) if content_hash else None,
+                )
             self.geometry_indices.append(geometry_index)
             geometry = self.geometry_store.materialize(geometry_index)
 
@@ -6136,26 +6163,36 @@ class OptimizedDiffusionTrainer:
         if bool(getattr(self.model_config, "compiled_autograd", False)):
             torch._dynamo.config.compiled_autograd = True
 
-        self.noise_schedule = NoiseSchedule(diffusion_config).to(self.device, self.dtype)
+        # Construct directly on the target device.  A 295M-parameter model
+        # transiently exceeds a sub-GiB host-RAM service cap if PyTorch first
+        # allocates every parameter on CPU and then copies it to CUDA.
+        with torch.device(self.device):
+            self.noise_schedule = NoiseSchedule(diffusion_config).to(
+                self.device, self.dtype
+            )
 
-        # Models with optimizations
-        self.diffusion_model = LatentDiffusionUNet(model_config, diffusion_config).to(self.device).to(self.dtype)
-        self.converter = LatentTo3DConverter(
-            model_config.latent_dim,
-            model_config.grid_resolution,
-            coordinate_decoder_threshold=training_config.coordinate_decoder_threshold,
-            coordinate_chunk_size=model_config.coordinate_chunk_size,
-            coordinate_decoder_width=model_config.coordinate_decoder_width,
-            coordinate_decoder_depth=model_config.coordinate_decoder_depth,
-            coordinate_fourier_bands=model_config.coordinate_fourier_bands,
-            enable_coordinate_gradient_checkpointing=bool(
-                config_value("model", "coordinate_gradient_checkpointing", True)
-            ),
-            enable_decoder_compile=model_config.compile_converter_decoder,
-        ).to(self.device).to(self.dtype)
+            # Models with optimizations
+            self.diffusion_model = LatentDiffusionUNet(
+                model_config, diffusion_config
+            ).to(dtype=self.dtype)
+            self.converter = LatentTo3DConverter(
+                model_config.latent_dim,
+                model_config.grid_resolution,
+                coordinate_decoder_threshold=training_config.coordinate_decoder_threshold,
+                coordinate_chunk_size=model_config.coordinate_chunk_size,
+                coordinate_decoder_width=model_config.coordinate_decoder_width,
+                coordinate_decoder_depth=model_config.coordinate_decoder_depth,
+                coordinate_fourier_bands=model_config.coordinate_fourier_bands,
+                enable_coordinate_gradient_checkpointing=bool(
+                    config_value("model", "coordinate_gradient_checkpointing", True)
+                ),
+                enable_decoder_compile=model_config.compile_converter_decoder,
+            ).to(dtype=self.dtype)
 
-        # 4-step consistency model
-        self.consistency_model = ConsistencyModel(model_config, diffusion_config, self.dtype).to(self.device)
+            # 4-step consistency model
+            self.consistency_model = ConsistencyModel(
+                model_config, diffusion_config, self.dtype
+            )
 
         # Initialize EMA model
         self.ema_model = self._copy_model(self.diffusion_model)
@@ -6373,6 +6410,7 @@ class OptimizedDiffusionTrainer:
         # weights_only=False fallback; unrelated paths still fail closed.
         state = _load_checkpoint_metadata(
             resolved_path,
+            map_location=getattr(self, "device", "cpu"),
             authorized_paths=(resolved_path,),
         )
         # C1: the config-fixed threshold is authoritative and must NOT be
