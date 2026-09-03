@@ -32,6 +32,7 @@ from aircraft_diffusion_cfd import (
     _load_checkpoint_metadata,
     aircraft_collate_fn,
     capture_rng_state,
+    evaluate_promotion_collapse,
     infer_conditioning_dim,
     restore_rng_state,
     resolve_grounded_grid_size,
@@ -1031,6 +1032,40 @@ def _build_history_payload(
                 "geometry_threshold_calibration",
                 None,
             ),
+            "collapse_watchdog": {
+                "enabled": bool(
+                    config_value("training", "collapse_watchdog_enabled", True)
+                ),
+                "warmup_updates": int(
+                    getattr(
+                        args,
+                        "collapse_watchdog_warmup_updates",
+                        config_value("training", "collapse_watchdog_warmup_updates", 128),
+                    )
+                ),
+                "patience": int(
+                    config_value("training", "collapse_watchdog_patience", 2)
+                ),
+                "probability_std_floor": float(
+                    config_value(
+                        "training",
+                        "collapse_watchdog_probability_std_floor",
+                        1.0e-4,
+                    )
+                ),
+                "probability_span_floor": float(
+                    config_value(
+                        "training",
+                        "collapse_watchdog_probability_span_floor",
+                        1.0e-3,
+                    )
+                ),
+                "max_converter_step_lag": int(
+                    config_value(
+                        "training", "collapse_watchdog_max_converter_step_lag", 1
+                    )
+                ),
+            },
         },
         "device": str(device),
         "checkpoint_path": (
@@ -1091,6 +1126,7 @@ def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig
         coordinate_training_samples=int(args.coordinate_training_samples),
         full_lattice_interval=int(args.full_lattice_interval),
         sparse_samples_per_full=int(args.sparse_samples_per_full),
+        collapse_watchdog_warmup_updates=int(args.collapse_watchdog_warmup_updates),
         direct_solver_interval=int(args.direct_solver_interval),
         direct_solver_steps=args.direct_solver_steps,
         direct_solver_directions=args.direct_solver_directions,
@@ -1185,7 +1221,6 @@ def main() -> int:
     parser.add_argument("--latent-dim", type=int, default=int(config_value("model", "latent_dim", 192)))
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=float(config_value("training", "learning_rate", 2e-5)))
-    parser.add_argument("--precision", default=str(config_value("training", "precision", "float32")))
     parser.add_argument(
         "--enable-consistency",
         action=argparse.BooleanOptionalAction,
@@ -1201,6 +1236,17 @@ def main() -> int:
         "--enable-gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=bool(config_value("model", "enable_gradient_checkpointing", True)),
+    )
+    parser.add_argument(
+        "--precision",
+        choices=("float32", "float16", "bfloat16"),
+        default=str(config_value("training", "precision", "float32")),
+    )
+    parser.add_argument(
+        "--collapse-watchdog-warmup-updates",
+        type=int,
+        default=int(config_value("training", "collapse_watchdog_warmup_updates", 128)),
+        help="Optimizer updates before geometric collapse symptoms become fatal.",
     )
     parser.add_argument(
         "--lr-min-ratio",
@@ -1340,6 +1386,8 @@ def main() -> int:
         parser.error("--stream-block-size must be greater than 0")
 
     _aircraft_diffusion_cfd._DIRECT_SOLVER_BATCH_CHUNK = int(args.direct_solver_batch_chunk)
+    if args.collapse_watchdog_warmup_updates < 0:
+        parser.error("--collapse-watchdog-warmup-updates must be nonnegative")
     os.environ["OMP_NUM_THREADS"] = str(args.cpu_threads)
     os.environ["MKL_NUM_THREADS"] = str(args.cpu_threads)
     torch.set_num_threads(args.cpu_threads)
@@ -1615,7 +1663,23 @@ def main() -> int:
         )
         return str(run_state_target)
 
+    def force_save_collapse_run_state(
+        completed_in_epoch: int,
+        total_in_epoch: int,
+    ) -> Optional[str]:
+        """Persist the exact post-update state before a fail-closed pause."""
+        _drain_updates_log_for_save()
+        trainer.save_run_state(
+            run_state_target,
+            epoch_index=current_epoch_index,
+            completed_in_epoch=int(completed_in_epoch),
+            sample_order=sample_order,
+            compatibility=run_compatibility,
+        )
+        return str(run_state_target)
+
     trainer.run_state_checkpoint_callback = maybe_save_run_state
+    trainer.collapse_checkpoint_callback = force_save_collapse_run_state
     trainer.resumed_from_update = int(trainer.global_step) if args.resume_run_state else 0
     trainer.stop_after_updates = (
         int(trainer.global_step) + int(args.stop_after_updates)
@@ -1764,6 +1828,16 @@ def main() -> int:
             # re-derived identically and start_batch continues at the recorded
             # completed_in_epoch offset.
             train_sampler.set_epoch(epoch)
+            if (
+                isinstance(getattr(trainer, "stop_decision", None), dict)
+                and trainer.stop_decision.get("kind") == "model_collapse"
+            ):
+                print(
+                    "Refusing to silently resume a run-state already paused for "
+                    "model collapse; review the checkpoint and use a reviewed "
+                    "warm-start after correcting the cause."
+                )
+                break
             metrics = trainer.train_epoch(
                 train_loader,
                 grid_size=resolved_grid_size,
@@ -1776,6 +1850,15 @@ def main() -> int:
                 print(
                     "Stopped at the requested bounded interruption point after writing "
                     f"{run_state_target}"
+                )
+                break
+            if (
+                isinstance(getattr(trainer, "stop_decision", None), dict)
+                and trainer.stop_decision.get("kind") == "model_collapse"
+            ):
+                print(
+                    "Training paused by the model-collapse watchdog after the "
+                    f"durable run-state checkpoint: {run_state_target}"
                 )
                 break
             _reset_epoch_checkpoint_segment(
@@ -1834,6 +1917,40 @@ def main() -> int:
                 metrics["promotion_report"] = dict(promotion)
                 metrics["promotion_non_regression_report"] = dict(non_regression)
                 metrics["promotion_directional_gate"] = dict(directional_gate)
+                promotion_collapse = evaluate_promotion_collapse(
+                    promotion,
+                    training_config,
+                    global_step=trainer.global_step,
+                )
+                metrics["promotion_collapse_watchdog"] = dict(promotion_collapse)
+                if promotion_collapse["triggered"]:
+                    trainer.stop_decision = {
+                        "kind": "model_collapse",
+                        "reason": "promotion_model_collapse_watchdog",
+                        "global_step": int(trainer.global_step),
+                        "reason_codes": list(
+                            promotion_collapse["reason_codes"]
+                        ),
+                        "watchdog": dict(promotion_collapse),
+                    }
+                    trainer.run_state_metadata["collapse_watchdog"] = dict(
+                        promotion_collapse
+                    )
+                    trainer.run_state_metadata[
+                        "collapse_watchdog_stop"
+                    ] = dict(trainer.stop_decision)
+                    trainer.run_state_metadata[
+                        "collapse_checkpoint_path"
+                    ] = str(run_state_target)
+                    force_save_collapse_run_state(
+                        len(train_loader),
+                        len(train_loader),
+                    )
+                    print(
+                        "PAUSING after promotion: model-collapse watchdog "
+                        f"triggered at global_step={trainer.global_step}; "
+                        f"reasons={', '.join(promotion_collapse['reason_codes'])}"
+                    )
                 # Only gate the best-checkpoint save on the lexicographic
                 # promotion rank improving over the best seen so far; every
                 # passing promotion otherwise overwrites the best checkpoint
@@ -1903,6 +2020,16 @@ def main() -> int:
             if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
                 checkpoint_path = save_dir / f"checkpoint_monitored_ep{epoch + 1}.pt"
                 trainer.save_checkpoint(str(checkpoint_path))
+
+            if (
+                isinstance(getattr(trainer, "stop_decision", None), dict)
+                and trainer.stop_decision.get("kind") == "model_collapse"
+            ):
+                print(
+                    "Training paused by the model-collapse watchdog after the "
+                    f"durable run-state checkpoint: {run_state_target}"
+                )
+                break
 
             if args.stop_on_promotion_pass and promotion_passed:
                 print(

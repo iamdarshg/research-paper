@@ -64,6 +64,51 @@ class ManifoldHyperConnection(nn.Module):
     def routing(self) -> torch.Tensor:
         return sinkhorn_doubly_stochastic(self.routing_logits, self.sinkhorn_iterations)
 
+    def routing_telemetry(self) -> dict[str, float]:
+        """Return numerical routing health metrics without changing routing."""
+
+        with torch.no_grad():
+            routing = self.routing().float()
+            if not bool(torch.isfinite(routing).all().item()):
+                raise FloatingPointError("mHC routing contains non-finite values")
+            row_residual = (routing.sum(dim=-1) - 1.0).abs().max()
+            column_residual = (routing.sum(dim=-2) - 1.0).abs().max()
+            stream_mass = routing.mean(dim=0)
+            stream_mass = stream_mass / stream_mass.sum().clamp_min(1.0e-12)
+            entropy = -(stream_mass * stream_mass.clamp_min(1.0e-12).log()).sum()
+            singular_values = torch.linalg.svdvals(routing.double())
+            singular_mass = singular_values / singular_values.sum().clamp_min(1.0e-12)
+            effective_rank = torch.exp(
+                -(singular_mass * singular_mass.clamp_min(1.0e-12).log()).sum()
+            )
+            previous = getattr(self, "_last_routing_telemetry_map", None)
+            movement = (
+                0.0
+                if previous is None
+                else float(torch.linalg.vector_norm(routing - previous).item())
+            )
+            self._last_routing_telemetry_map = routing.detach().clone()
+            gradient = self.routing_logits.grad
+            if gradient is not None and not bool(torch.isfinite(gradient).all().item()):
+                raise FloatingPointError("mHC routing gradient contains non-finite values")
+            return {
+                "routing_entropy": float(entropy.item()),
+                "effective_active_stream_count": float(torch.exp(entropy).item()),
+                "max_stream_utilization": float(stream_mass.max().item()),
+                "routing_logit_norm": float(
+                    torch.linalg.vector_norm(self.routing_logits.float()).item()
+                ),
+                "routing_gradient_norm": (
+                    float(torch.linalg.vector_norm(gradient.float()).item())
+                    if gradient is not None
+                    else 0.0
+                ),
+                "sinkhorn_row_residual": float(row_residual.item()),
+                "sinkhorn_column_residual": float(column_residual.item()),
+                "routing_effective_rank": float(effective_rank.item()),
+                "routing_functional_movement": movement,
+            }
+
     def forward(self, update: torch.Tensor) -> torch.Tensor:
         if not self.enabled or self.streams == 1:
             return update
@@ -126,3 +171,13 @@ def load_state_dict_mhc_compatible(
             details.append(f"unexpected={unexpected_non_mhc}")
         raise RuntimeError("Incompatible checkpoint state: " + "; ".join(details))
     return result
+
+
+def collect_mhc_telemetry(module: nn.Module) -> dict[str, dict[str, float]]:
+    """Collect routing telemetry for every enabled mHC block in a module."""
+
+    return {
+        name: child.routing_telemetry()
+        for name, child in module.named_modules()
+        if isinstance(child, ManifoldHyperConnection)
+    }

@@ -344,7 +344,14 @@ def build_trainer_and_loader(
 # Modes
 # ---------------------------------------------------------------------------
 def _profile_grid_size(trainer) -> int:
-    """Return the common model/solver resolution used by this profiler."""
+    """Return the solver/model grid used by this profiler.
+
+    The profiler used to hard-code 96^3 for its fields and ``train_epoch``
+    call.  That silently disagreed with a trainer built from a 128^3 model
+    config, so the first CFD access indexed a 128^3 solver tensor with a
+    96^3 mask.  The trainer is the source of truth here: the model and solver
+    must agree before any measurement is attempted.
+    """
     model_size = getattr(getattr(trainer, "model_config", None), "grid_resolution", None)
     solver_size = getattr(getattr(trainer, "cfd_simulator", None), "resolution", None)
     sizes = [int(value) for value in (model_size, solver_size) if value is not None]

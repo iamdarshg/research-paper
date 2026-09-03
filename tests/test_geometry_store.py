@@ -20,6 +20,7 @@ from aircraft_diffusion_cfd import (  # noqa: E402
 from geometry_store import CompactGeometryStore  # noqa: E402
 import geometry_store as geometry_store_module  # noqa: E402
 import aircraft_diffusion_cfd as aircraft_module  # noqa: E402
+from geometry_store import LazyNpyGeometryStore  # noqa: E402
 
 
 def test_store_deduplicates_content_and_keeps_canonical_uint8_tensor():
@@ -172,6 +173,7 @@ def test_manifest_records_reference_shared_geometry_and_preserve_getitem(tmp_pat
     second = dataset[1]
 
     assert dataset.geometry_indices == [0, 0]
+    assert isinstance(dataset.geometry_store, LazyNpyGeometryStore)
     assert dataset.geometry_store.unique_count == 1
     assert first["geometry"].data_ptr() != second["geometry"].data_ptr()
     assert first["geometry"].dtype == torch.uint8
@@ -304,6 +306,66 @@ def test_manifest_npy_loader_does_not_eagerly_expand_uint8_geometry(tmp_path):
     )
 
     assert loaded.dtype == torch.uint8
+
+
+def test_manifest_records_select_rows_from_shared_latent_matrix(tmp_path):
+    geometry = np.zeros((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "geometry.npy", geometry)
+    np.save(
+        tmp_path / "latents.npy",
+        np.stack(
+            (
+                np.arange(8, dtype=np.float32),
+                np.arange(8, dtype=np.float32) + 100,
+            )
+        ),
+    )
+    records = [
+        {
+            "source_id": "a",
+            "geometry_path": "geometry.npy",
+            "latent_path": "latents.npy",
+            "latent_index": 1,
+        },
+        {
+            "source_id": "b",
+            "geometry_path": "geometry.npy",
+            "latent_path": "latents.npy",
+            "latent_index": 0,
+        },
+    ]
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(records), encoding="utf-8")
+
+    dataset = AircraftDesignDataset(manifest_path=str(manifest_path), latent_dim=8)
+
+    assert torch.equal(dataset[0]["latent"], torch.arange(8, dtype=torch.float32) + 100)
+    assert torch.equal(dataset[1]["latent"], torch.arange(8, dtype=torch.float32))
+    assert len(dataset._manifest_latent_arrays) == 1
+    assert isinstance(dataset.geometry_store, LazyNpyGeometryStore)
+    assert not hasattr(dataset.geometry_store, "_geometries")
+
+
+def test_manifest_shared_latent_matrix_requires_valid_index(tmp_path):
+    geometry = np.zeros((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "geometry.npy", geometry)
+    np.save(tmp_path / "latents.npy", np.zeros((2, 8), dtype=np.float32))
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            [
+                {
+                    "geometry_path": "geometry.npy",
+                    "latent_path": "latents.npy",
+                    "latent_index": 2,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="outside latent matrix row range"):
+        AircraftDesignDataset(manifest_path=str(manifest_path), latent_dim=8)
 
 
 def test_collate_keeps_geometry_uint8():

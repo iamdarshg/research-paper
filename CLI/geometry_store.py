@@ -143,3 +143,57 @@ class CompactGeometryStore:
     @property
     def unique_count(self) -> int:
         return len(self._geometries)
+
+
+class LazyNpyGeometryStore:
+    """Keep manifest NPY references and materialize one compact geometry on demand."""
+
+    def __init__(self) -> None:
+        self._paths: list[Path] = []
+        self._shapes: list[tuple[int, int, int]] = []
+        self._hash_to_index: dict[str, int] = {}
+
+    def add_path(
+        self,
+        source_id: str,
+        path: Path,
+        *,
+        content_hash: Optional[str] = None,
+    ) -> int:
+        del source_id
+        resolved_path = path.resolve()
+        geometry_np = np.load(resolved_path, mmap_mode="r")
+        shape = tuple(int(value) for value in np.squeeze(geometry_np).shape)
+        if len(shape) != 3:
+            raise ValueError(f"geometry_path must resolve to a 3D array, got shape {shape}")
+
+        stable_key = content_hash or f"path:{resolved_path}"
+        existing = self._hash_to_index.get(stable_key)
+        if existing is not None:
+            if self._shapes[existing] != shape:
+                raise ValueError(
+                    f"Content hash {stable_key!r} does not match the canonical geometry shape"
+                )
+            return existing
+
+        index = len(self._paths)
+        self._paths.append(resolved_path)
+        self._shapes.append(shape)
+        self._hash_to_index[stable_key] = index
+        return index
+
+    def shape(self, index: int) -> tuple[int, int, int]:
+        return self._shapes[index]
+
+    def materialize(self, index: int) -> torch.Tensor:
+        geometry_np = np.load(self._paths[index], mmap_mode="r")
+        geometry_np = np.squeeze(geometry_np)
+        compact = np.asarray(geometry_np > 0.5, dtype=np.uint8)
+        return torch.from_numpy(compact)
+
+    def get(self, index: int) -> torch.Tensor:
+        return self.materialize(index)
+
+    @property
+    def unique_count(self) -> int:
+        return len(self._paths)

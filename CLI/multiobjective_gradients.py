@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -213,6 +213,27 @@ def _gradient_dot_product(
             "is nonfinite"
         )
     return dot
+
+
+def gradient_dot_product(
+    first: Sequence[Optional[torch.Tensor]],
+    second: Sequence[Optional[torch.Tensor]],
+    *,
+    first_name: str = "first",
+    second_name: str = "second",
+) -> float:
+    """Return the finite FP64 dot product for two aligned gradient buffers.
+
+    Keep the public helper available for the trainer's guard-replay path while
+    retaining the private implementation used by the projection routines.
+    """
+
+    return _gradient_dot_product(
+        first,
+        second,
+        first_name=first_name,
+        second_name=second_name,
+    )
 
 
 def project_conflicting_gradient(
@@ -655,6 +676,8 @@ def combine_gradient_branches(
     final_guard_branches: Optional[
         Mapping[str, Sequence[Optional[torch.Tensor]]]
     ] = None,
+    direct_gradient_trust_region: Optional[Mapping[str, float]] = None,
+    direct_gradient_trust_region_telemetry: Optional[MutableMapping[str, float]] = None,
 ) -> dict[str, BranchGradientTelemetry]:
     """Independently limit branches and enforce final parameter-space guards.
 
@@ -743,6 +766,37 @@ def combine_gradient_branches(
                 conflict_projected=was_projected,
                 projection_norm=projection_norm,
             )
+
+    # Apply the relative CFD budget only after the direct branch has undergone
+    # its conflict projection. This ordering keeps the max-norm, conflict,
+    # and relative trust-region safeguards distinct and auditable.
+    if direct_gradient_trust_region is not None:
+        if "direct" not in applied_branches:
+            raise ValueError(
+                "direct_gradient_trust_region requires a direct gradient branch"
+            )
+        if "data" not in applied_branches:
+            raise ValueError(
+                "direct_gradient_trust_region requires a data gradient branch"
+            )
+        from recovery_safeguards import apply_direct_gradient_trust_region
+
+        direct_budget, trust_telemetry = apply_direct_gradient_trust_region(
+            applied_branches["data"],
+            applied_branches["direct"],
+            norm_ratio=float(direct_gradient_trust_region["norm_ratio"]),
+            epsilon=float(direct_gradient_trust_region["epsilon"]),
+        )
+        applied_branches["direct"] = direct_budget
+        if direct_gradient_trust_region_telemetry is not None:
+            direct_gradient_trust_region_telemetry.clear()
+            direct_gradient_trust_region_telemetry.update(trust_telemetry)
+        telemetry["direct"] = replace(
+            telemetry["direct"],
+            applied_norm=gradient_l2_norm(direct_budget, branch_name="direct"),
+            scale=telemetry["direct"].scale
+            * trust_telemetry["direct_gradient_scale"],
+        )
 
     for branch_name in branches:
         applied = applied_branches[branch_name]

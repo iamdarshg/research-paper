@@ -22,3 +22,5 @@ deprecated/
 /.ramcheck.ps1
 /.ramwatch.sh
 /MERGE-REPORT.md
+.env
+.env.*

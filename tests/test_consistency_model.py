@@ -31,6 +31,7 @@ from aircraft_diffusion_cfd import (
     LatentDiffusionUNet,
     LatentTo3DConverter,
     GroupedQueryAttention,
+    extract_checkpoint_model_state,
     load_width_expanded_state_dict,
     move_optimizer_state,
     atomic_save_run_state,
@@ -670,6 +671,27 @@ def test_width_expansion_preserves_overlap_and_initializes_new_channels_softly()
     assert float(target.bias[4:].detach().abs().max()) < 0.01
 
 
+def test_checkpoint_model_state_extracts_monitored_run_state():
+    model_state = {
+        "diffusion_model": {"a": 1},
+        "consistency_model": {"b": 2},
+        "converter": {"c": 3},
+        "ema_model": {"d": 4},
+    }
+
+    extracted, schema = extract_checkpoint_model_state(
+        {"run_state_version": 1, "model": model_state}
+    )
+
+    assert extracted is model_state
+    assert schema == "monitored_run_state"
+
+
+def test_checkpoint_model_state_rejects_incomplete_schema():
+    with pytest.raises(ValueError, match="missing required model state keys"):
+        extract_checkpoint_model_state({"model": {"diffusion_model": {}}})
+
+
 def test_optimizer_state_offload_moves_adam_moments():
     parameter = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
     optimizer = torch.optim.AdamW([parameter], lr=0.1)
@@ -1004,6 +1026,8 @@ def test_corpus_scaling_law_increases_capacity_only_with_distinct_geometries():
     assert small.coordinate_decoder_width < target.coordinate_decoder_width <= large.coordinate_decoder_width
     assert target.coordinate_fourier_bands == 6
     assert target.grid_resolution == 96
+    assert large.coordinate_decoder_width == 2048
+    assert large.coordinate_decoder_depth == 5
 
 
 def test_six_hundred_geometry_configuration_uses_global_latent_width():

@@ -27,8 +27,9 @@ import tempfile
 import threading
 import multiprocessing as mp
 import random
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence, Iterable
+from typing import Callable, Dict, List, Tuple, Optional, Any, Union, Mapping, Sequence, Iterable, MutableMapping
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
@@ -57,8 +58,12 @@ from aircraft_validity import (
 )
 from condition_feasibility import validate_condition_feasibility
 from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
-from mhc import ManifoldHyperConnection, load_state_dict_mhc_compatible
-from geometry_store import CompactGeometryStore
+from mhc import (
+    ManifoldHyperConnection,
+    collect_mhc_telemetry,
+    load_state_dict_mhc_compatible,
+)
+from geometry_store import CompactGeometryStore, LazyNpyGeometryStore
 from multiobjective_gradients import (
     capture_gradients,
     clear_gradients,
@@ -66,8 +71,13 @@ from multiobjective_gradients import (
     combine_gradient_branches,
     combine_constrained_measured_gradients,
     gradient_l2_norm,
+    gradient_dot_product,
     gradient_cosine_similarity,
     project_improvement_gradients_against_guards,
+)
+from recovery_safeguards import (
+    TransactionalOptimizerStep,
+    effective_rank,
 )
 from validate_manifest import validate_manifest_file
 
@@ -340,9 +350,12 @@ def validate_run_state_compatibility(
     return mismatches
 
 
-def _make_grad_scaler(device_type: str):
-    """Use the modern AMP GradScaler API when available without breaking older torch versions."""
-    enabled = device_type == "cuda"
+def _make_grad_scaler(
+    device_type: str,
+    compute_dtype: torch.dtype = torch.float32,
+):
+    """Create a scaler only for CUDA FP16; BF16 does not need loss scaling."""
+    enabled = device_type == "cuda" and compute_dtype == torch.float16
     amp_namespace = getattr(torch, "amp", None)
     grad_scaler_cls = getattr(amp_namespace, "GradScaler", None) if amp_namespace else None
     if grad_scaler_cls is not None:
@@ -358,6 +371,23 @@ def _make_grad_scaler(device_type: str):
 
     from torch.cuda.amp import GradScaler as CudaGradScaler
     return CudaGradScaler(enabled=enabled)
+
+
+def _model_autocast_context(
+    module: nn.Module,
+    device: torch.device,
+):
+    """Use BF16/FP16 for CUDA model arithmetic without changing parameter storage."""
+    compute_dtype = getattr(module, "compute_dtype", torch.float32)
+    if (
+        device.type == "cuda"
+        and compute_dtype in (torch.float16, torch.bfloat16)
+    ):
+        return torch.autocast(
+            device_type="cuda",
+            dtype=compute_dtype,
+        )
+    return nullcontext()
 
 
 def _configure_console_output() -> None:
@@ -530,13 +560,18 @@ class ModelConfig:
             max(48, round_to_multiple(channel_anchor * scale, 8)),
         )
         channel_step = int(scaling.get("high_resolution_channel_step", 48))
-        decoder_width = min(
-            int(scaling.get("maximum_high_resolution_decoder_width", 1024)),
-            max(384, round_to_multiple(decoder_anchor * scale, 64)),
+        large_corpus = unique_geometry_count >= int(scaling["large_corpus_threshold"])
+        decoder_width = (
+            int(scaling["large_corpus_high_resolution_decoder_width"])
+            if large_corpus and "large_corpus_high_resolution_decoder_width" in scaling
+            else min(
+                int(scaling.get("maximum_high_resolution_decoder_width", 1024)),
+                max(384, round_to_multiple(decoder_anchor * scale, 64)),
+            )
         )
         decoder_depth = (
             int(scaling["high_resolution_decoder_depth"])
-            if unique_geometry_count < int(scaling["large_corpus_threshold"])
+            if not large_corpus
             else int(scaling["high_resolution_decoder_depth_large_corpus"])
         )
         return cls(
@@ -586,6 +621,17 @@ class TrainingConfig:
     student_direct_gradient_max_norm: float = float(
         config_value("training", "student_direct_gradient_max_norm", 0.25)
     )
+    # Relative CFD budget: the grounded/data gradient remains the anchor and
+    # the direct branch can contribute at most this fraction of its norm.
+    direct_gradient_norm_ratio: float = float(
+        config_value("training", "direct_gradient_norm_ratio", 0.10)
+    )
+    direct_gradient_norm_epsilon: float = float(
+        config_value("training", "direct_gradient_norm_epsilon", 1.0e-12)
+    )
+    transactional_optimizer_steps: bool = bool(
+        config_value("training", "transactional_optimizer_steps", True)
+    )
     project_conflicting_direct_gradient: bool = bool(
         config_value("training", "project_conflicting_direct_gradient", True)
     )
@@ -620,17 +666,76 @@ class TrainingConfig:
     freeze_decoder_for_generated_paths: bool = bool(
         config_value("training", "freeze_decoder_for_generated_paths", True)
     )
+    # Fail-closed protection for silent geometry/model collapse.  The warm-up
+    # is intentional: a fresh randomly initialized decoder is expected to be
+    # close to an unmaterialized 0.5 field, so it must not be mistaken for a
+    # post-training collapse before the first useful updates have landed.
+    collapse_watchdog_enabled: bool = bool(
+        config_value("training", "collapse_watchdog_enabled", True)
+    )
+    collapse_watchdog_warmup_updates: int = int(
+        config_value("training", "collapse_watchdog_warmup_updates", 128)
+    )
+    collapse_watchdog_patience: int = int(
+        config_value("training", "collapse_watchdog_patience", 2)
+    )
+    collapse_watchdog_probability_std_floor: float = float(
+        config_value("training", "collapse_watchdog_probability_std_floor", 1.0e-4)
+    )
+    collapse_watchdog_probability_span_floor: float = float(
+        config_value("training", "collapse_watchdog_probability_span_floor", 1.0e-3)
+    )
+    collapse_watchdog_min_occupied_fraction: float = float(
+        config_value("training", "collapse_watchdog_min_occupied_fraction", 1.0e-6)
+    )
+    collapse_watchdog_max_occupied_fraction: float = float(
+        config_value("training", "collapse_watchdog_max_occupied_fraction", 0.999999)
+    )
+    collapse_watchdog_min_converter_gradient_norm: float = float(
+        config_value("training", "collapse_watchdog_min_converter_gradient_norm", 1.0e-10)
+    )
+    collapse_watchdog_max_converter_step_lag: int = int(
+        config_value("training", "collapse_watchdog_max_converter_step_lag", 1)
+    )
+    collapse_watchdog_min_unique_fraction: float = float(
+        config_value("training", "collapse_watchdog_min_unique_fraction", 0.50)
+    )
     geometry_reconstruction_weight: float = 1.0
     generation_reconstruction_weight: float = 1.0
+    # One-sided anti-collapse objective on free-running geometry probabilities.
+    # It stops contributing once the requested spread is reached, avoiding the
+    # unbounded noise incentive produced by simply subtracting standard deviation.
+    geometry_probability_std_weight: float = float(
+        config_value("training", "geometry_probability_std_weight", 0.25)
+    )
+    geometry_probability_std_target: float = float(
+        config_value("training", "geometry_probability_std_target", 0.20)
+    )
     coordinate_training_samples: int = int(config_value("training", "coordinate_training_samples", 32768))
-    full_lattice_interval: int = int(config_value("training", "full_lattice_interval", 1))
-    sparse_samples_per_full: int = int(config_value("training", "sparse_samples_per_full", 262144))
     coordinate_positive_fraction: float = float(config_value("training", "coordinate_positive_fraction", 0.5))
+    # A sparse coordinate decoder may use a larger interval only when its
+    # generated paths are allowed to train the decoder. With
+    # freeze_decoder_for_generated_paths enabled, every optimizer update must
+    # carry the exact grounded decoder gradient; otherwise global_step can run
+    # far ahead of the coordinate-converter Adam state and silently freeze
+    # geometry learning.
+    full_lattice_interval: int = int(
+        config_value("training", "full_lattice_interval", 1)
+    )
+    sparse_samples_per_full: int = int(
+        config_value("training", "sparse_samples_per_full", 0)
+    )
     coordinate_decoder_threshold: int = int(config_value("model", "coordinate_decoder_threshold", 96))
     direct_solver_loss_weight: float = float(config_value("training", "direct_solver_loss_weight", 1.0))
     direct_solver_interval: int = int(config_value("training", "direct_solver_interval", 1))
     direct_solver_steps: int = int(config_value("training", "direct_solver_steps", 5))
     direct_solver_directions: int = int(config_value("training", "direct_solver_directions", 16))
+    direct_solver_signal_test_enabled: bool = bool(
+        config_value("training", "direct_solver_signal_test_enabled", True)
+    )
+    direct_solver_min_split_cosine: float = float(
+        config_value("training", "direct_solver_min_split_cosine", 0.2)
+    )
     direct_solver_perturbation: float = float(config_value("training", "direct_solver_perturbation", 0.15))
     direct_solver_perturbation_grid_size: int = int(config_value("training", "direct_solver_perturbation_grid_size", 12))
     direct_solver_gradient_clip: float = float(
@@ -756,10 +861,317 @@ class TrainingConfig:
     )  # CFD + Diffusion stages
 
 
+def evaluate_model_collapse(
+    *,
+    global_step: int,
+    training_config: TrainingConfig,
+    state: Optional[MutableMapping[str, Any]] = None,
+    probabilities: Optional[torch.Tensor] = None,
+    probability_source: str = "sampled_geometry",
+    nonfinite_observed: bool = False,
+    losses: Optional[Mapping[str, Any]] = None,
+    gradient_norms: Optional[Mapping[str, Any]] = None,
+    optimizer_steps: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a fail-closed decision for numerical or geometric collapse.
+
+    This is deliberately a pure-ish, serializable boundary around the live
+    trainer.  It consumes already-computed tensors/scalars and returns a JSON
+    safe record, which lets the same policy be exercised in unit tests and
+    persisted in the durable run-state.  The detector is strict after
+    warm-up, but uses a short persistence window for geometry-shape symptoms
+    so one noisy update cannot stop a healthy run.  Nonfinite values and a
+    stalled required optimizer group are hard failures and stop immediately.
+    """
+    if state is None:
+        state = {}
+    checks = int(state.get("checks", 0)) + 1
+    state["checks"] = checks
+    step = int(global_step)
+    warmup = max(0, int(training_config.collapse_watchdog_warmup_updates))
+    after_warmup = step >= warmup
+    reason_codes: List[str] = []
+    hard_failure_codes: List[str] = []
+    stats: Dict[str, Any] = {
+        "global_step": step,
+        "probability_source": str(probability_source),
+        "warmup_complete": bool(after_warmup),
+    }
+
+    def add_reason(code: str, *, hard: bool = False) -> None:
+        if code not in reason_codes:
+            reason_codes.append(code)
+        if hard and code not in hard_failure_codes:
+            hard_failure_codes.append(code)
+
+    if nonfinite_observed:
+        add_reason("nonfinite_forward_or_solver_value", hard=True)
+
+    for mapping_name, values in (("losses", losses), ("gradient_norms", gradient_norms)):
+        for name, value in (values or {}).items():
+            try:
+                finite = bool(np.isfinite(float(value)))
+            except (TypeError, ValueError):
+                finite = False
+            if not finite:
+                add_reason(f"nonfinite_{mapping_name}_{name}", hard=True)
+
+    if optimizer_steps and after_warmup:
+        converter_step = optimizer_steps.get("coordinate_converter")
+        if converter_step is None:
+            add_reason("missing_coordinate_converter_optimizer_step", hard=True)
+            stats["coordinate_converter_optimizer_step"] = None
+        else:
+            try:
+                converter_step_float = float(converter_step)
+                converter_step_int = int(converter_step_float)
+                finite = bool(np.isfinite(converter_step_float))
+            except (TypeError, ValueError):
+                converter_step_float = float("nan")
+                converter_step_int = -1
+                finite = False
+            stats["coordinate_converter_optimizer_step"] = (
+                converter_step_int if finite else None
+            )
+            expected_lag = max(
+                0, int(training_config.collapse_watchdog_max_converter_step_lag)
+            )
+            if not finite:
+                add_reason("nonfinite_coordinate_converter_optimizer_step", hard=True)
+            elif converter_step_int < step - expected_lag:
+                stats["coordinate_converter_optimizer_step_lag"] = (
+                    step - converter_step_int
+                )
+                add_reason("coordinate_converter_optimizer_step_stalled", hard=True)
+
+    if gradient_norms and after_warmup:
+        converter_gradient = gradient_norms.get("coordinate_converter")
+        if converter_gradient is not None:
+            try:
+                converter_gradient_float = float(converter_gradient)
+            except (TypeError, ValueError):
+                converter_gradient_float = float("nan")
+            stats["coordinate_converter_gradient_norm"] = (
+                converter_gradient_float
+                if np.isfinite(converter_gradient_float)
+                else None
+            )
+            if not np.isfinite(converter_gradient_float):
+                add_reason("nonfinite_coordinate_converter_gradient", hard=True)
+            elif converter_gradient_float < float(
+                training_config.collapse_watchdog_min_converter_gradient_norm
+            ):
+                add_reason("coordinate_converter_gradient_missing", hard=True)
+
+    if probabilities is not None:
+        if not torch.is_tensor(probabilities):
+            add_reason("invalid_probability_observation", hard=True)
+        else:
+            observed = probabilities.detach().float()
+            if observed.numel() == 0:
+                add_reason("empty_probability_observation", hard=True)
+            elif not bool(torch.isfinite(observed).all().item()):
+                add_reason("nonfinite_probability_observation", hard=True)
+            else:
+                flat = observed.reshape(-1)
+                probability_min = float(flat.min().item())
+                probability_max = float(flat.max().item())
+                probability_mean = float(flat.mean().item())
+                probability_std = float(flat.std(unbiased=False).item())
+                probability_span = probability_max - probability_min
+                threshold = float(training_config.geometry_materialization_threshold)
+                occupied_fraction = float(
+                    (flat >= threshold).float().mean().item()
+                )
+                stats.update(
+                    {
+                        "probability_min": probability_min,
+                        "probability_max": probability_max,
+                        "probability_mean": probability_mean,
+                        "probability_std": probability_std,
+                        "probability_span": probability_span,
+                        "occupied_fraction": occupied_fraction,
+                        "probability_count": int(flat.numel()),
+                    }
+                )
+                if after_warmup:
+                    std_floor = max(
+                        0.0,
+                        float(
+                            training_config.collapse_watchdog_probability_std_floor
+                        ),
+                    )
+                    span_floor = max(
+                        0.0,
+                        float(
+                            training_config.collapse_watchdog_probability_span_floor
+                        ),
+                    )
+                    if probability_std <= std_floor and probability_span <= span_floor:
+                        add_reason("geometry_probability_signal_constant")
+                    if occupied_fraction <= float(
+                        training_config.collapse_watchdog_min_occupied_fraction
+                    ):
+                        add_reason("geometry_materialization_blank")
+                    elif occupied_fraction >= float(
+                        training_config.collapse_watchdog_max_occupied_fraction
+                    ):
+                        add_reason("geometry_materialization_solid")
+
+    hard_failure = bool(hard_failure_codes)
+    geometry_failure = bool(
+        set(reason_codes)
+        - set(hard_failure_codes)
+    )
+    if hard_failure:
+        consecutive_failures = 0
+    elif geometry_failure:
+        consecutive_failures = int(state.get("consecutive_failures", 0)) + 1
+    else:
+        consecutive_failures = 0
+    state["consecutive_failures"] = consecutive_failures
+
+    patience = max(1, int(training_config.collapse_watchdog_patience))
+    triggered = bool(
+        training_config.collapse_watchdog_enabled
+        and (
+            hard_failure
+            or (geometry_failure and consecutive_failures >= patience)
+        )
+    )
+    decision = {
+        **stats,
+        "enabled": bool(training_config.collapse_watchdog_enabled),
+        "triggered": triggered,
+        "reason_codes": reason_codes,
+        "hard_failure_codes": hard_failure_codes,
+        "consecutive_failures": consecutive_failures,
+        "patience": patience,
+        "warmup_updates": warmup,
+    }
+    if triggered:
+        state["last_triggered_step"] = step
+        state["last_reason_codes"] = list(reason_codes)
+    return decision
+
+
+def evaluate_promotion_collapse(
+    metrics: Mapping[str, Any],
+    training_config: TrainingConfig,
+    *,
+    global_step: int,
+) -> Dict[str, Any]:
+    """Detect collapse in the multi-seed geometry promotion evaluation."""
+    decision: Dict[str, Any] = {
+        "enabled": bool(training_config.collapse_watchdog_enabled),
+        "global_step": int(global_step),
+        "triggered": False,
+        "reason_codes": [],
+    }
+    if not training_config.collapse_watchdog_enabled:
+        return decision
+    if int(global_step) < int(training_config.collapse_watchdog_warmup_updates):
+        decision["warmup_complete"] = False
+        return decision
+    decision["warmup_complete"] = True
+    reasons: List[str] = []
+    evaluation_count = int(metrics.get("generated_evaluation_count", 0) or 0)
+    unique_fraction = float(metrics.get("generated_unique_fraction", 0.0))
+    valid_fraction = float(metrics.get("generated_aircraft_valid_fraction", 0.0))
+    occupied_fraction = float(metrics.get("generated_mean_occupied_fraction", 0.0))
+    if evaluation_count <= 0:
+        reasons.append("promotion_evaluation_empty")
+    for name, value in (
+        ("generated_unique_fraction", unique_fraction),
+        ("generated_aircraft_valid_fraction", valid_fraction),
+        ("generated_mean_occupied_fraction", occupied_fraction),
+    ):
+        if not np.isfinite(value):
+            reasons.append(f"nonfinite_promotion_{name}")
+    if unique_fraction < float(training_config.collapse_watchdog_min_unique_fraction):
+        reasons.append("promotion_outputs_non_unique")
+    if valid_fraction <= 0.0 and (
+        occupied_fraction <= float(training_config.collapse_watchdog_min_occupied_fraction)
+        or occupied_fraction >= float(training_config.collapse_watchdog_max_occupied_fraction)
+    ):
+        reasons.append("promotion_outputs_blank_or_solid")
+    decision["reason_codes"] = list(dict.fromkeys(reasons))
+    decision["triggered"] = bool(decision["reason_codes"])
+    return decision
+
+
+def validate_collapse_watchdog_config(training_config: TrainingConfig) -> None:
+    """Validate fail-closed watchdog settings even for non-CFD runs."""
+    errors: List[str] = []
+    if int(training_config.collapse_watchdog_warmup_updates) < 0:
+        errors.append("collapse_watchdog_warmup_updates must be nonnegative")
+    if int(training_config.collapse_watchdog_patience) <= 0:
+        errors.append("collapse_watchdog_patience must be greater than 0")
+    if float(training_config.collapse_watchdog_probability_std_floor) < 0.0:
+        errors.append("collapse_watchdog_probability_std_floor must be nonnegative")
+    if float(training_config.collapse_watchdog_probability_span_floor) < 0.0:
+        errors.append("collapse_watchdog_probability_span_floor must be nonnegative")
+    if not (
+        0.0 <= float(training_config.collapse_watchdog_min_occupied_fraction)
+        < float(training_config.collapse_watchdog_max_occupied_fraction)
+        <= 1.0
+    ):
+        errors.append(
+            "collapse watchdog occupied-fraction bounds must satisfy "
+            "0 <= minimum < maximum <= 1"
+        )
+    if float(training_config.collapse_watchdog_min_converter_gradient_norm) < 0.0:
+        errors.append(
+            "collapse_watchdog_min_converter_gradient_norm must be nonnegative"
+        )
+    if int(training_config.collapse_watchdog_max_converter_step_lag) < 0:
+        errors.append(
+            "collapse_watchdog_max_converter_step_lag must be nonnegative"
+        )
+    if not 0.0 <= float(training_config.collapse_watchdog_min_unique_fraction) <= 1.0:
+        errors.append("collapse_watchdog_min_unique_fraction must be in [0, 1]")
+    if float(training_config.geometry_probability_std_weight) < 0.0:
+        errors.append("geometry_probability_std_weight must be nonnegative")
+    if not 0.0 < float(training_config.geometry_probability_std_target) <= 0.5:
+        errors.append("geometry_probability_std_target must be in (0, 0.5]")
+    if errors:
+        raise ValueError(
+            "Collapse watchdog configuration safeguard failed: " + "; ".join(errors)
+        )
+
+
+def validate_decoder_gradient_cadence(training_config: TrainingConfig) -> None:
+    """Reject sparse full-lattice cadence when the decoder is intentionally frozen."""
+    errors: List[str] = []
+    if int(training_config.full_lattice_interval) <= 0:
+        errors.append("full_lattice_interval must be greater than 0")
+    if int(training_config.sparse_samples_per_full) < 0:
+        errors.append("sparse_samples_per_full must be nonnegative")
+    if (
+        bool(training_config.freeze_decoder_for_generated_paths)
+        and int(training_config.full_lattice_interval) != 1
+    ):
+        errors.append(
+            "full_lattice_interval must be 1 while "
+            "freeze_decoder_for_generated_paths is enabled; sparse full-lattice "
+            "updates otherwise starve the required coordinate-converter optimizer"
+        )
+    if errors:
+        raise ValueError(
+            "Decoder gradient-cadence safeguard failed: " + "; ".join(errors)
+        )
+
+
 def validate_solver_integrated_training_config(training_config: TrainingConfig) -> None:
     """Fail closed when a run claims solver integration but can skip measured terms."""
+    validate_collapse_watchdog_config(training_config)
+    if training_config.require_direct_solver_every_iteration:
+        validate_decoder_gradient_cadence(training_config)
     errors: List[str] = []
-    if float(training_config.direct_solver_loss_weight) <= 0.0:
+    if (
+        training_config.require_direct_solver_every_iteration
+        and float(training_config.direct_solver_loss_weight) <= 0.0
+    ):
         errors.append("direct_solver_loss_weight must be greater than 0")
     if int(training_config.direct_solver_interval) < 1:
         errors.append("direct_solver_interval must be >= 1")
@@ -772,6 +1184,10 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
         errors.append("direct_solver_steps must be greater than 0")
     if int(training_config.direct_solver_directions) <= 0:
         errors.append("direct_solver_directions must be greater than 0")
+    if not np.isfinite(float(training_config.direct_solver_min_split_cosine)) or not (
+        -1.0 <= float(training_config.direct_solver_min_split_cosine) <= 1.0
+    ):
+        errors.append("direct_solver_min_split_cosine must be finite and in [-1, 1]")
     if float(training_config.direct_connectivity_weight) <= 0.0:
         errors.append("direct_connectivity_weight must be greater than 0")
     if float(training_config.direct_aircraft_validity_weight) <= 0.0:
@@ -827,6 +1243,14 @@ def validate_solver_integrated_training_config(training_config: TrainingConfig) 
     ):
         if float(getattr(training_config, field_name)) <= 0.0:
             errors.append(f"{field_name} must be greater than 0")
+    if not np.isfinite(float(training_config.direct_gradient_norm_ratio)) or not (
+        0.0 <= float(training_config.direct_gradient_norm_ratio) <= 1.0
+    ):
+        errors.append("direct_gradient_norm_ratio must be finite and in [0, 1]")
+    if not np.isfinite(float(training_config.direct_gradient_norm_epsilon)) or float(
+        training_config.direct_gradient_norm_epsilon
+    ) <= 0.0:
+        errors.append("direct_gradient_norm_epsilon must be finite and greater than 0")
     if training_config.consistency_timestep_sampling not in {
         "inference_stratified",
         "random",
@@ -1125,6 +1549,25 @@ def load_width_expanded_state_dict(
     return {"exact": exact, "expanded": expanded, "skipped": skipped}
 
 
+def extract_checkpoint_model_state(
+    checkpoint: Mapping[str, Any],
+) -> Tuple[Mapping[str, Any], str]:
+    """Normalize legacy weight checkpoints and monitored run-state checkpoints."""
+    if isinstance(checkpoint.get("model"), Mapping):
+        model_state = checkpoint["model"]
+        schema = "monitored_run_state"
+    else:
+        model_state = checkpoint
+        schema = "legacy_weight_checkpoint"
+    required = {"diffusion_model", "consistency_model", "converter", "ema_model"}
+    missing = sorted(required.difference(model_state))
+    if missing:
+        raise ValueError(
+            f"Checkpoint {schema} is missing required model state keys: {missing}"
+        )
+    return model_state, schema
+
+
 def move_optimizer_state(
     optimizer: torch.optim.Optimizer,
     device: Union[str, torch.device],
@@ -1150,6 +1593,7 @@ def combine_training_loss_terms(
     clean_geometry_loss_val: Optional[torch.Tensor] = None,
     denoising_geometry_confidence: Optional[torch.Tensor] = None,
     latent_reconstruction_loss_val: Optional[torch.Tensor] = None,
+    geometry_probability_std_loss_val: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Return the complete loss used for every optimizer update."""
     zero = mse_loss_val.new_tensor(0.0)
@@ -1158,6 +1602,11 @@ def combine_training_loss_terms(
     latent_reconstruction_loss_val = (
         latent_reconstruction_loss_val
         if latent_reconstruction_loss_val is not None
+        else zero
+    )
+    geometry_probability_std_loss_val = (
+        geometry_probability_std_loss_val
+        if geometry_probability_std_loss_val is not None
         else zero
     )
     denoising_geometry_confidence = (
@@ -1176,6 +1625,8 @@ def combine_training_loss_terms(
         * generation_geometry_loss_val
         + consistency_loss
         + training_config.latent_reconstruction_weight * latent_reconstruction_loss_val
+        + training_config.geometry_probability_std_weight
+        * geometry_probability_std_loss_val
         + training_config.direct_solver_loss_weight * direct_solver_loss_val
     )
     if not torch.isfinite(optimization_loss):
@@ -1190,6 +1641,27 @@ def should_run_consistency_update(
     return bool(training_config.enable_consistency) and (
         int(batch_idx) % max(1, int(training_config.consistency_interval)) == 0
     )
+
+
+def geometry_probability_standard_deviation_loss(
+    logits: torch.Tensor,
+    *,
+    target_standard_deviation: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return a one-sided probability-spread deficit and observed batch spread.
+
+    The squared hinge is zero at or above the target. This directly rewards
+    escaping a near-constant probability field without continuing to reward
+    arbitrarily noisy or binary output after adequate spread is present.
+    """
+    probabilities = torch.sigmoid(logits.float())
+    flattened = probabilities.reshape(probabilities.shape[0], -1)
+    observed = flattened.std(dim=1, unbiased=False).mean()
+    target = observed.new_tensor(float(target_standard_deviation))
+    loss = torch.square(torch.relu(target - observed))
+    if not bool(torch.isfinite(loss).item()) or not bool(torch.isfinite(observed).item()):
+        raise FloatingPointError("Geometry probability standard-deviation loss is nonfinite")
+    return loss, observed
 
 
 def balanced_voxel_bce_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -2633,10 +3105,13 @@ class ConsistencyModel(nn.Module):
         dtype: torch.dtype = torch.float32,
         *,
         enable_teacher: bool = True,
+        compute_dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
         self.config = config
         self.diffusion_config = diffusion_config
+        self.parameter_dtype = dtype
+        self.compute_dtype = compute_dtype or dtype
         self.student_steps = diffusion_config.student_steps  # 4 steps
         self.teacher_steps = diffusion_config.teacher_steps  # 1000 steps
         self.noise_schedule = NoiseSchedule(diffusion_config)
@@ -2674,6 +3149,8 @@ class ConsistencyModel(nn.Module):
             if enable_teacher
             else None
         )
+        if self.teacher_model is not None:
+            self.teacher_model.compute_dtype = self.compute_dtype
 
         # Student model (small, fast)
         student_config = ModelConfig(
@@ -2691,6 +3168,7 @@ class ConsistencyModel(nn.Module):
             use_torch_compile=False  # Disable torch.compile for student to avoid overflow errors
         )
         self.student_model = LatentDiffusionUNet(student_config, diffusion_config).to(dtype)
+        self.student_model.compute_dtype = self.compute_dtype
         self.last_consistency_metrics: Dict[str, float] = {}
 
         # Initialize student with teacher weights
@@ -2985,6 +3463,8 @@ class ResidualBlock3D(nn.Module):
         )
 
         self.out_channels = out_channels
+
+        self.res_conv = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
         self.mhc = (
             ManifoldHyperConnection(
                 out_channels,
@@ -2994,8 +3474,6 @@ class ResidualBlock3D(nn.Module):
             if mhc_enabled
             else None
         )
-
-        self.res_conv = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
         # Use grouped-query attention with memory optimization
         if use_attention:
@@ -3158,6 +3636,13 @@ class LatentDiffusionUNet(nn.Module):
         pass
 
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
+        # Keep persistent parameters in FP32 while allowing the trainer to
+        # select BF16/FP16 CUDA arithmetic through the module attribute.  The
+        # wrapper also covers activation-checkpoint recomputation.
+        with _model_autocast_context(self, x.device):
+            return self._forward_impl(x, timestep, condition)
+
+    def _forward_impl(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass with memory optimizations.
         x: [B, latent_dim] - noisy latent codes
@@ -3414,7 +3899,6 @@ class LatentTo3DConverter(nn.Module):
     def _decode_latent_coordinate_chunk(
         self,
         latent: torch.Tensor,
-
         encoded_coordinates: torch.Tensor,
         latent_expanded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -3480,6 +3964,10 @@ class LatentTo3DConverter(nn.Module):
         return min(configured, 8192)
 
     def forward_flat_indices(self, latent: torch.Tensor, flat_indices: torch.Tensor) -> torch.Tensor:
+        with _model_autocast_context(self, latent.device):
+            return self._forward_flat_indices_impl(latent, flat_indices)
+
+    def _forward_flat_indices_impl(self, latent: torch.Tensor, flat_indices: torch.Tensor) -> torch.Tensor:
         """Decode logits at selected flat voxel indices for high-resolution training."""
         batch_size = latent.shape[0]
         if self.decoder_mode == "dense":
@@ -3532,6 +4020,10 @@ class LatentTo3DConverter(nn.Module):
         return torch.cat(chunks, dim=1)
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        with _model_autocast_context(self, latent.device):
+            return self._forward_impl(latent)
+
+    def _forward_impl(self, latent: torch.Tensor) -> torch.Tensor:
         """Convert latent code to voxel grid"""
         batch_size = latent.shape[0]
         if self.decoder_mode == "dense":
@@ -3551,6 +4043,14 @@ class LatentTo3DConverter(nn.Module):
         return voxels
 
     def forward_voxel_mask(
+        self,
+        latent: torch.Tensor,
+        selected_chunks: Sequence[int],
+    ) -> torch.Tensor:
+        with _model_autocast_context(self, latent.device):
+            return self._forward_voxel_mask_impl(latent, selected_chunks)
+
+    def _forward_voxel_mask_impl(
         self,
         latent: torch.Tensor,
         selected_chunks: Sequence[int],
@@ -4086,12 +4586,23 @@ class AircraftDesignDataset(Dataset):
 
     def _load_manifest_dataset(self, manifest_path: Path) -> None:
         base_dir = manifest_path.parent
-        self.geometry_store = CompactGeometryStore()
+        probe_records: Optional[List[Dict[str, Any]]] = None
+        if manifest_path.suffix.lower() not in {".jsonl", ".ndjson"}:
+            probe_records = load_grounded_manifest_records(str(manifest_path))
+        use_lazy_npy_geometry = bool(probe_records) and all(
+            record.get("geometry_path")
+            and str(record["geometry_path"]).lower().endswith(".npy")
+            for record in (probe_records or [])
+        )
+        self.geometry_store = (
+            LazyNpyGeometryStore() if use_lazy_npy_geometry else CompactGeometryStore()
+        )
         self.geometry_indices: List[int] = []
         design_specs: List[DesignSpec] = []
         condition_vectors: List[torch.Tensor] = []
         latent_codes: List[torch.Tensor] = []
         explicit_splits: List[str] = []
+        self._manifest_latent_arrays: Dict[Path, np.ndarray] = {}
 
         record_count = 0
         for idx, record in enumerate(
@@ -4108,25 +4619,56 @@ class AircraftDesignDataset(Dataset):
                 content_hash = record["hashes"].get("voxel_sha256")
             geometry_path = record.get("geometry_path")
             lazy_geometry_path: Optional[Path] = None
-            if geometry_path:
-                candidate = (base_dir / str(geometry_path)).resolve()
-                if candidate.suffix.lower() == ".npy" and content_hash:
-                    lazy_geometry_path = candidate
+            if geometry_path and str(geometry_path).lower().endswith(".npy") and content_hash:
+                lazy_geometry_path = (base_dir / str(geometry_path)).resolve()
 
-            if lazy_geometry_path is not None:
-                shape_probe = np.load(lazy_geometry_path, mmap_mode="r", allow_pickle=False)
+            if use_lazy_npy_geometry:
+                geometry_path = (base_dir / str(record["geometry_path"])).resolve()
+                geometry_index = self.geometry_store.add_path(
+                    str(record.get("source_id", record.get("sample_id", idx))),
+                    geometry_path,
+                    content_hash=str(content_hash) if content_hash else None,
+                )
+                resolved_grid_size = int(self.geometry_store.shape(geometry_index)[-1])
+                geometry = (
+                    None
+                    if record.get("latent_path")
+                    else self.geometry_store.materialize(geometry_index)
+                )
+            elif lazy_geometry_path is not None:
+                shape_probe = np.load(
+                    lazy_geometry_path, mmap_mode="r", allow_pickle=False
+                )
                 if not isinstance(shape_probe, np.ndarray) or shape_probe.ndim != 3:
                     raise ValueError(
-                        f"geometry_path must resolve to a 3D array, got {getattr(shape_probe, 'shape', None)}"
+                        "geometry_path must resolve to a 3D array, got shape "
+                        f"{getattr(shape_probe, 'shape', None)}"
                     )
                 resolved_grid_size = int(shape_probe.shape[-1])
                 if tuple(shape_probe.shape) != (resolved_grid_size,) * 3:
                     raise ValueError(
-                        f"geometry_path must resolve to a cubic array, got shape {tuple(shape_probe.shape)}"
+                        "geometry_path must resolve to a cubic array, got shape "
+                        f"{tuple(shape_probe.shape)}"
                     )
+                geometry_index = self.geometry_store.add_file(
+                    str(record.get("source_id", record.get("sample_id", idx))),
+                    lazy_geometry_path,
+                    content_hash=str(content_hash),
+                )
+                geometry = (
+                    None
+                    if record.get("latent_path")
+                    else self.geometry_store.materialize(geometry_index)
+                )
             else:
                 loaded_geometry = self._load_manifest_geometry(record, base_dir)
                 resolved_grid_size = int(loaded_geometry.shape[-1])
+                geometry_index = self.geometry_store.add(
+                    str(record.get("source_id", record.get("sample_id", idx))),
+                    loaded_geometry,
+                    content_hash=str(content_hash) if content_hash else None,
+                )
+                geometry = self.geometry_store.materialize(geometry_index)
             if idx == 0:
                 self.grid_size = resolved_grid_size
             elif resolved_grid_size != self.grid_size:
@@ -4134,30 +4676,7 @@ class AircraftDesignDataset(Dataset):
                     f"Dataset manifest {manifest_path} mixes grid sizes {self.grid_size} and {resolved_grid_size}"
                 )
 
-            source_id = str(record.get("source_id", record.get("sample_id", idx)))
-            if lazy_geometry_path is not None:
-                geometry_index = self.geometry_store.add_file(
-                    source_id,
-                    lazy_geometry_path,
-                    content_hash=str(content_hash),
-                )
-            else:
-                geometry_index = self.geometry_store.add(
-                    source_id,
-                    loaded_geometry,
-                    content_hash=str(content_hash) if content_hash else None,
-                )
             self.geometry_indices.append(geometry_index)
-            # A pinned latent sidecar makes manifest loading independent of the
-            # 128^3 voxel payload. Materializing every geometry here solely to
-            # derive its latent grows the CPU allocator's high-water RSS by
-            # hundreds of MiB before update 1. The geometry remains lazy and is
-            # materialized by __getitem__ when the sample is actually trained.
-            geometry = (
-                None
-                if record.get("latent_path")
-                else self.geometry_store.materialize(geometry_index)
-            )
 
             if "condition_vector" in record:
                 condition_vector = torch.as_tensor(
@@ -4242,27 +4761,45 @@ class AircraftDesignDataset(Dataset):
         latent_path = record.get("latent_path")
         if latent_path:
             path = (base_dir / str(latent_path)).resolve()
-            latent_np = np.load(path, mmap_mode="r", allow_pickle=False)
+            latent_np = self._manifest_latent_arrays.get(path)
+            if latent_np is None:
+                latent_np = np.load(path, mmap_mode="r")
+                self._manifest_latent_arrays[path] = latent_np
+
             latent_index = record.get("latent_index")
-            if latent_index is not None:
-                if latent_np.ndim != 2:
+            if latent_np.ndim == 1:
+                if latent_index is not None:
                     raise ValueError(
-                        "latent_index requires latent_path to contain a 2D latent matrix"
+                        "latent_index is only valid when latent_path contains a 2D latent matrix"
                     )
-                row = int(latent_index)
-                if row < 0 or row >= int(latent_np.shape[0]):
+                selected_latent = latent_np
+            elif latent_np.ndim == 2:
+                if latent_index is None:
                     raise ValueError(
-                        f"latent_index {row} is outside latent matrix rows {latent_np.shape[0]}"
+                        "latent_index is required when latent_path contains a 2D latent matrix"
                     )
-                latent_np = latent_np[row]
-            latent = torch.from_numpy(np.array(latent_np, dtype=np.float32, copy=True)).flatten()
+                latent_index = int(latent_index)
+                if latent_index < 0 or latent_index >= int(latent_np.shape[0]):
+                    raise ValueError(
+                        f"latent_index {latent_index} is outside latent matrix row range "
+                        f"[0, {latent_np.shape[0]})"
+                    )
+                selected_latent = latent_np[latent_index]
+            else:
+                raise ValueError(
+                    f"latent_path must contain a 1D vector or 2D matrix, got shape {latent_np.shape}"
+                )
+
+            latent = torch.from_numpy(
+                np.asarray(selected_latent, dtype=np.float32).reshape(-1).copy()
+            )
             if int(latent.numel()) != int(self.latent_dim):
                 raise ValueError(
-                    f"latent_path must contain {self.latent_dim} values, got {latent.numel()}"
+                    f"selected latent must contain {self.latent_dim} values, got {latent.numel()}"
                 )
             return latent
         if geometry is None:
-            raise ValueError("geometry is required when latent_path is not provided")
+            raise ValueError("geometry is required when a manifest record has no latent_path")
         return build_structured_latent_code(
             design_spec,
             geometry,
@@ -4633,13 +5170,16 @@ _SDF_WARM_TARGET_INFLIGHT = 8
 # validity (scipy label) slows 2-6x (7.83 / 14.63 / 23.75 s/u at C=1/2/4). The
 # batched path stays available and parity-gated for boxes with >= 16 GiB VRAM
 # (isolated probe win: C=4 1.12x real / 1.09-1.10x isolated).
-_DIRECT_SOLVER_BATCH_CHUNK = int(
-    __import__("experiment_config", fromlist=["config_value"]).config_value(
-        "training", "direct_solver_batch_chunk", 1
-    )
-)
+def _direct_solver_batch_chunk_from_environment() -> int:
+    """Read the optional probe-batch size while retaining a safe default."""
+    try:
+        configured = int(os.environ.get("RESEARCH_DIRECT_SOLVER_BATCH_CHUNK", "1"))
+    except (TypeError, ValueError):
+        configured = 1
+    return max(1, min(configured, 4))
 
-_FULL_VOXEL_COUNT_128 = 128 ** 3
+
+_DIRECT_SOLVER_BATCH_CHUNK = _direct_solver_batch_chunk_from_environment()
 
 # EXPERIMENTAL (branch experiment/kernel-fusion-launch): route the
 # coordinate-decoder chunk MLP forward through a CUDA-graph capture/replay
@@ -5329,6 +5869,12 @@ def _direct_measured_objectives_batch(
             threshold=threshold,
             target_occupancy=None,
         )
+        # Low-level parity fixtures may retain a singleton channel/batch axis
+        # around an individual [Z,Y,X] field.  The solver and validity paths
+        # operate on one canonical 3-D geometry per probe, so normalize that
+        # representation before the ZYX->XYZ conversion.
+        if geometry_cpu.ndim == 4 and geometry_cpu.shape[0] == 1:
+            geometry_cpu = geometry_cpu[0]
         geometries_cpu.append(geometry_cpu)
         solver_geometries.append(
             _canonical_training_geometry_to_solver_xyz(geometry_cpu).to(solver_device)
@@ -5607,8 +6153,28 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         directions: int,
         seed: int,
         input_is_logits: bool,
-        component_sink: Dict[str, Any],
+        *safeguard_args: Any,
     ) -> torch.Tensor:
+        # Keep the low-level autograd primitive compatible with older parity
+        # harnesses that passed only ``component_sink`` after ``input_is_logits``.
+        # The production wrapper passes the signal-test controls explicitly.
+        if len(safeguard_args) == 1:
+            spsa_signal_test_enabled = False
+            spsa_min_split_cosine = 0.2
+            component_sink = safeguard_args[0]
+        elif len(safeguard_args) == 3:
+            (
+                spsa_signal_test_enabled,
+                spsa_min_split_cosine,
+                component_sink,
+            ) = safeguard_args
+        else:
+            raise TypeError(
+                "DirectSolverSPSAFunction expects component_sink or the "
+                "signal-test controls followed by component_sink"
+            )
+        if not isinstance(component_sink, dict):
+            raise TypeError("component_sink must be a dict")
         original_ndim = voxel_grid.ndim
         fields = voxel_grid.detach().float()
         if not input_is_logits:
@@ -5656,6 +6222,8 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
         generator = torch.Generator(device=fields.device)
         generator.manual_seed(int(seed) % (2**63 - 1))
         direction_count = max(1, int(directions))
+        signal_test_enabled = bool(spsa_signal_test_enabled)
+        min_split_cosine = float(spsa_min_split_cosine)
         component_names = (
             "aero_loss",
             "connectivity_loss",
@@ -5783,16 +6351,24 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                             if input_is_logits
                             else minus_field.clamp(0.0, 1.0)
                         )
-                    chunk_components = _direct_measured_objectives_batch(
-                        probe_grids,
-                        sample_design_spec,
-                        cfd_simulator,
-                        cfd_steps,
-                        connectivity_weight,
-                        aircraft_validity_weight,
-                        threshold,
-                        sample_target,
-                    )
+                    try:
+                        chunk_components = _direct_measured_objectives_batch(
+                            probe_grids,
+                            sample_design_spec,
+                            cfd_simulator,
+                            cfd_steps,
+                            connectivity_weight,
+                            aircraft_validity_weight,
+                            threshold,
+                            sample_target,
+                        )
+                    finally:
+                        # A solver exception must not leave the private batched
+                        # populations or per-geometry caches resident for the
+                        # next update or for a fail-closed checkpoint/status
+                        # path.
+                        _clear_direct_solver_geometry_caches(cfd_simulator)
+                        _clear_direct_solver_batch_workspace(cfd_simulator)
                     # chunk_components is indexed exactly like probe_grids
                     # (interleaved plus/minus per direction); extending in chunk
                     # order reproduces the sequential global order.
@@ -5821,8 +6397,6 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                                 )
                                 * delta
                             )
-                    _clear_direct_solver_geometry_caches(cfd_simulator)
-                    _clear_direct_solver_batch_workspace(cfd_simulator)
             else:
                 if _DEFERRED_SOLVER_READS and _direct_solver_supports_deferred_reads(cfd_simulator):
                     # Lever 1: enqueue all 32 probe solves with NO host scalar
@@ -5948,6 +6522,55 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
             legacy_total_grad.div_(direction_count)
             for component_grad in raw_component_grads.values():
                 component_grad.div_(direction_count)
+
+            # Compare two independent halves of the antithetic SPSA estimate.
+            # This consumes no extra solver calls and uses the already-recorded
+            # probe values, so a noisy CFD direction can be skipped while the
+            # grounded/data branch continues normally.
+            split_signal_cosine = 1.0
+            split_signal_norm_ratio = 1.0
+            split_signal_relative_disagreement = 0.0
+            split_signal_rejected = False
+            if signal_test_enabled and direction_count >= 4 and direction_count % 2 == 0:
+                half = direction_count // 2
+                first_half = torch.zeros_like(sample_field)
+                second_half = torch.zeros_like(sample_field)
+                for direction_index, delta in enumerate(deltas):
+                    plus_components = probe_component_records[2 * direction_index]
+                    minus_components = probe_component_records[2 * direction_index + 1]
+                    direction_gradient = (
+                        (plus_components["total_loss"] - minus_components["total_loss"])
+                        / (2.0 * eps)
+                    ) * delta
+                    (first_half if direction_index < half else second_half).add_(
+                        direction_gradient
+                    )
+                first_half.div_(half)
+                second_half.div_(half)
+                first_norm = float(first_half.norm().item())
+                second_norm = float(second_half.norm().item())
+                split_signal_norm_ratio = min(first_norm, second_norm) / max(
+                    max(first_norm, second_norm), 1.0e-30
+                )
+                split_signal_cosine = float(
+                    torch.sum(first_half.double() * second_half.double()).item()
+                    / max(first_norm * second_norm, 1.0e-30)
+                )
+                split_signal_cosine = float(np.clip(split_signal_cosine, -1.0, 1.0))
+                split_signal_relative_disagreement = float(
+                    (first_half - second_half).norm().item()
+                    / max((first_half.norm() + second_half.norm()).item(), 1.0e-30)
+                )
+                split_signal_rejected = (
+                    not math.isfinite(split_signal_cosine)
+                    or split_signal_cosine < min_split_cosine
+                )
+            base_components["spsa_split_cosine"] = split_signal_cosine
+            base_components["spsa_split_norm_ratio"] = split_signal_norm_ratio
+            base_components["spsa_split_relative_disagreement"] = (
+                split_signal_relative_disagreement
+            )
+            base_components["spsa_signal_rejected"] = float(split_signal_rejected)
 
             summed_raw_grad = sum(raw_component_grads.values())
             if not torch.allclose(
@@ -6156,6 +6779,8 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
                 sample_grad = sample_grad * (
                     gradient_norm_limit / grad_norm.clamp_min(1.0e-12)
                 )
+            if split_signal_rejected:
+                sample_grad.zero_()
             grad_estimate[batch_idx] = sample_grad / max(batch_size, 1)
             base_losses.append(base_loss)
             base_components["legacy_spsa_gradient_norm_unclipped"] = float(
@@ -6211,7 +6836,7 @@ class DirectSolverSPSAFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (grad_estimate,) = ctx.saved_tensors
         grad = grad_output.to(dtype=grad_estimate.dtype) * grad_estimate
-        return grad, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return (grad,) + (None,) * (len(ctx.needs_input_grad) - 1)
 
 
 class DirectSolverSPSALoss(nn.Module):
@@ -6239,6 +6864,8 @@ class DirectSolverSPSALoss(nn.Module):
         directions: int = 1,
         seed: int = 0,
         input_is_logits: bool = False,
+        spsa_signal_test_enabled: bool = True,
+        spsa_min_split_cosine: float = 0.2,
     ):
         super().__init__()
         self.cfd_steps = int(cfd_steps)
@@ -6258,6 +6885,8 @@ class DirectSolverSPSALoss(nn.Module):
         self.directions = max(1, int(directions))
         self.seed = int(seed)
         self.input_is_logits = bool(input_is_logits)
+        self.spsa_signal_test_enabled = bool(spsa_signal_test_enabled)
+        self.spsa_min_split_cosine = float(spsa_min_split_cosine)
         self.last_components: Dict[str, Any] = {}
 
     def forward(
@@ -6290,6 +6919,8 @@ class DirectSolverSPSALoss(nn.Module):
             self.directions,
             effective_seed,
             self.input_is_logits,
+            self.spsa_signal_test_enabled,
+            self.spsa_min_split_cosine,
             self.last_components,
         )
 
@@ -6327,8 +6958,28 @@ class OptimizedDiffusionTrainer:
             'bfloat16': torch.bfloat16,
             'float8': torch.float8 if hasattr(torch, 'float8') else torch.float16
         }
-        self.dtype = self.precision_dtypes.get(training_config.precision, torch.float32)
-        print(f"Using precision: {training_config.precision} ({self.dtype})")
+        self.compute_dtype = self.precision_dtypes.get(
+            training_config.precision,
+            torch.float32,
+        )
+        # BF16/FP16 are compute policies, not persistent parameter dtypes.
+        # Keeping trainable/master weights in FP32 preserves tiny recovery
+        # updates at the 2e-5 learning rate; CUDA autocast below supplies the
+        # tensor-core compute path. FP64 remains reserved for reductions.
+        self.parameter_dtype = (
+            torch.float32
+            if self.compute_dtype in (torch.float16, torch.bfloat16)
+            else self.compute_dtype
+        )
+        self.dtype = self.compute_dtype  # input/compute compatibility alias
+        print(f"Using precision: {training_config.precision} ({self.compute_dtype})")
+        print(
+            "Precision policy: "
+            f"parameter_dtype={self.parameter_dtype}, "
+            f"compute_dtype={self.compute_dtype}, "
+            "optimizer_master_dtype=torch.float32, "
+            "projection_reduction_dtype=torch.float64"
+        )
 
         # NUMERICS (branch experiment/kernel-fusion-launch): run the
         # neural-network GEMMs (coordinate decoder + diffusion encoder/attention)
@@ -6381,7 +7032,8 @@ class OptimizedDiffusionTrainer:
             # Models with optimizations
             self.diffusion_model = LatentDiffusionUNet(
                 model_config, diffusion_config
-            ).to(dtype=self.dtype)
+            ).to(self.device, dtype=self.parameter_dtype)
+            self.diffusion_model.compute_dtype = self.compute_dtype
             self.converter = LatentTo3DConverter(
                 model_config.latent_dim,
                 model_config.grid_resolution,
@@ -6397,14 +7049,16 @@ class OptimizedDiffusionTrainer:
                 mhc_enabled=model_config.mhc_enabled,
                 mhc_streams=model_config.mhc_streams,
                 mhc_sinkhorn_iterations=model_config.mhc_sinkhorn_iterations,
-            ).to(dtype=self.dtype)
+            ).to(self.device, dtype=self.parameter_dtype)
+            self.converter.compute_dtype = self.compute_dtype
 
             # 4-step consistency model
             self.consistency_model = ConsistencyModel(
                 model_config,
                 diffusion_config,
-                self.dtype,
+                self.parameter_dtype,
                 enable_teacher=bool(training_config.enable_consistency),
+                compute_dtype=self.compute_dtype,
             )
 
         # Initialize EMA model
@@ -6443,7 +7097,10 @@ class OptimizedDiffusionTrainer:
         self.scheduler_step_per_update = False
 
         # Gradient scaler for mixed precision
-        self.scaler = _make_grad_scaler(self.device.type)
+        self.scaler = _make_grad_scaler(
+            self.device.type,
+            self.compute_dtype,
+        )
 
         # Losses
         self.mse_loss = nn.MSELoss()
@@ -6475,6 +7132,8 @@ class OptimizedDiffusionTrainer:
             target_occupancy=training_config.direct_solver_target_occupancy,
             directions=training_config.direct_solver_directions,
             input_is_logits=True,
+            spsa_signal_test_enabled=training_config.direct_solver_signal_test_enabled,
+            spsa_min_split_cosine=training_config.direct_solver_min_split_cosine,
         )
 
         # Solver-integrated optimization must never consume the calibrated
@@ -6513,11 +7172,31 @@ class OptimizedDiffusionTrainer:
         self.run_state_checkpoint_callback: Optional[
             Callable[[int, int, bool], Optional[str]]
         ] = None
+        self.collapse_checkpoint_callback: Optional[
+            Callable[[int, int], Optional[str]]
+        ] = None
         self.stop_after_updates: Optional[int] = None
-        self.run_state_metadata: Dict[str, Any] = {}
+        self.run_state_metadata: Dict[str, Any] = {
+            "precision_policy": {
+                "parameter_dtype": str(self.parameter_dtype),
+                "compute_dtype": str(self.compute_dtype),
+                "optimizer_master_dtype": "torch.float32",
+                "projection_reduction_dtype": "torch.float64",
+                "autocast_enabled": bool(
+                    self.device.type == "cuda"
+                    and self.compute_dtype in (torch.float16, torch.bfloat16)
+                ),
+            }
+        }
         self.run_state_log_metadata: Dict[str, Any] = {}
         self.run_state_updates_log_path: Optional[str] = None
         self.last_gradient_lifecycle: Dict[str, Any] = {}
+        self.collapse_watchdog_state: Dict[str, Any] = {
+            "checks": 0,
+            "consecutive_failures": 0,
+        }
+        self.last_collapse_watchdog: Dict[str, Any] = {}
+        self.last_transaction: Dict[str, Any] = {}
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -6525,13 +7204,34 @@ class OptimizedDiffusionTrainer:
         import copy
         return copy.deepcopy(model)
 
+    def _normalize_optimizer_state_dtypes(self) -> None:
+        """Keep Adam moments FP32 when resuming older BF16 checkpoints."""
+        parameter_by_id = {
+            id(parameter): parameter
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        for parameter, state in self.optimizer.state.items():
+            target = parameter_by_id.get(id(parameter), parameter)
+            for key, value in list(state.items()):
+                if not isinstance(value, torch.Tensor) or not value.is_floating_point():
+                    continue
+                target_dtype = (
+                    torch.float32
+                    if target.dtype in (torch.float16, torch.bfloat16)
+                    else target.dtype
+                )
+                if value.dtype != target_dtype:
+                    state[key] = value.to(dtype=target_dtype)
+
     def _sync_consistency_teacher(self) -> None:
         """Keep the consistency teacher aligned with the stable diffusion EMA."""
         teacher_model = getattr(self.consistency_model, "teacher_model", None)
         if teacher_model is None or not hasattr(teacher_model, "load_state_dict"):
             return
         teacher_model.load_state_dict(self.ema_model.state_dict())
-        teacher_model.to(self.device).to(self.dtype)
+        teacher_model.to(self.device, dtype=self.parameter_dtype)
+        teacher_model.compute_dtype = self.compute_dtype
         teacher_model.eval()
         for parameter in teacher_model.parameters():
             parameter.requires_grad_(False)
@@ -6588,6 +7288,7 @@ class OptimizedDiffusionTrainer:
             ),
             "compatibility": dict(compatibility),
             "run_state_metadata": dict(self.run_state_metadata),
+            "collapse_watchdog_state": dict(self.collapse_watchdog_state),
             "log_reconciliation": log_reconciliation,
         }
 
@@ -6666,7 +7367,17 @@ class OptimizedDiffusionTrainer:
         load_state_dict_mhc_compatible(self.consistency_model, model_state["consistency_model"])
         load_state_dict_mhc_compatible(self.converter, model_state["converter"])
         load_state_dict_mhc_compatible(self.ema_model, model_state["ema_model"])
-        self.optimizer.load_state_dict(state["optimizer"])
+        try:
+            self.optimizer.load_state_dict(state["optimizer"])
+            self._normalize_optimizer_state_dtypes()
+        except ValueError as exc:
+            # Adding opt-in mHC routing adds optimizer parameters. Preserve the
+            # model/run counters, but start fresh Adam moments when an older
+            # run-state cannot map its parameter groups onto the new graph.
+            print(
+                "Run-state optimizer groups are incompatible with the current "
+                f"model graph; using fresh optimizer state ({exc})."
+            )
         self.scheduler.load_state_dict(state["scheduler"])
         self.scheduler_step_per_update = bool(
             state.get("scheduler_step_per_update", True)
@@ -6674,6 +7385,24 @@ class OptimizedDiffusionTrainer:
         self.scaler.load_state_dict(state.get("scaler", {}))
         self.global_step = int(state["global_step"])
         self.consistency_update_step = int(state.get("consistency_update_step", 0))
+        self.collapse_watchdog_state = dict(
+            state.get(
+                "collapse_watchdog_state",
+                {"checks": 0, "consecutive_failures": 0},
+            )
+        )
+        self.last_collapse_watchdog = dict(
+            state.get("run_state_metadata", {}).get("collapse_watchdog", {})
+        )
+        collapse_stop = state.get("run_state_metadata", {}).get(
+            "collapse_watchdog_stop"
+        )
+        if isinstance(collapse_stop, Mapping):
+            # Preserve the fail-closed state across process restarts. The
+            # monitored wrapper will refuse to silently continue this exact
+            # run-state; an operator can instead warm-start from a reviewed
+            # checkpoint after the root cause has been corrected.
+            self.stop_decision = dict(collapse_stop)
         restore_rng_state(state["rng"])
         self._sync_consistency_teacher()
         return {
@@ -7325,6 +8054,8 @@ class OptimizedDiffusionTrainer:
         total_clean_geometry = 0.0
         total_geometry = 0.0
         total_generation_geometry = 0.0
+        total_geometry_probability_std_loss = 0.0
+        total_geometry_probability_std = 0.0
         total_consistency = 0.0
         total_latent_reconstruction = 0.0
         total_denoising_geometry_confidence = 0.0
@@ -7409,6 +8140,7 @@ class OptimizedDiffusionTrainer:
             if batch_idx < start_batch:
                 continue
             processed_updates += 1
+            nonfinite_observations: List[str] = []
             batch = transfer_training_batch_to_device(
                 batch,
                 self.device,
@@ -7453,7 +8185,14 @@ class OptimizedDiffusionTrainer:
                 and self.dtype == torch.bfloat16
             )
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=_autocast_enabled):
-                pred_noise = self.diffusion_model(noisy_latent, t, condition=condition).nan_to_num(0.0)
+                pred_noise_raw = self.diffusion_model(
+                    noisy_latent,
+                    t,
+                    condition=condition,
+                )
+            if not bool(torch.isfinite(pred_noise_raw).all().item()):
+                nonfinite_observations.append("diffusion_prediction")
+            pred_noise = pred_noise_raw.nan_to_num(0.0)
             x0_pred = self.noise_schedule.predict_x0(noisy_latent, t, pred_noise).nan_to_num(0.0)
             x0_pred = bound_latent_to_corpus_support(
                 x0_pred,
@@ -7461,11 +8200,14 @@ class OptimizedDiffusionTrainer:
                 float(config_value("model", "latent_value_max", 1.0)),
             )
 
-            student_pred_noise = self.consistency_model.student_model(
+            student_pred_noise_raw = self.consistency_model.student_model(
                 noisy_latent,
                 t,
                 condition=condition,
-            ).nan_to_num(0.0)
+            )
+            if not bool(torch.isfinite(student_pred_noise_raw).all().item()):
+                nonfinite_observations.append("consistency_student_prediction")
+            student_pred_noise = student_pred_noise_raw.nan_to_num(0.0)
             generation_latent = self.noise_schedule.predict_x0(
                 noisy_latent,
                 t,
@@ -7549,10 +8291,13 @@ class OptimizedDiffusionTrainer:
                 population_positive_counts = flat_target.sum(dim=1)
                 population_negative_counts = total_voxels - population_positive_counts
                 latent_stacked = torch.cat((latent, x0_pred, generation_latent), dim=0)
-                stacked = self.converter.forward_flat_indices(
+                stacked_raw = self.converter.forward_flat_indices(
                     latent_stacked,
                     flat_indices,
-                ).nan_to_num(0.0)
+                )
+                if not bool(torch.isfinite(stacked_raw).all().item()):
+                    nonfinite_observations.append("coordinate_decoder_sample")
+                stacked = stacked_raw.nan_to_num(0.0)
                 (
                     clean_geom_logits_sample,
                     geom_logits_sample,
@@ -7626,19 +8371,34 @@ class OptimizedDiffusionTrainer:
                     # redundant no_grad decode is gone entirely. Values are
                     # bit-identical to the previous separate no_grad decode
                     # (same noise, model, steps, no optimizer step between).
-                    direct_generation_latent = self.consistency_model.fast_inference(
+                    direct_generation_latent_raw = self.consistency_model.fast_inference(
                         latent.shape,
                         num_steps=self.diffusion_config.student_steps,
                         condition=condition,
                         initial_noise=direct_initial_noise.detach(),
-                    ).nan_to_num(0.0)
-                    direct_solver_field = self.converter(
+                    )
+                    if not bool(torch.isfinite(direct_generation_latent_raw).all().item()):
+                        nonfinite_observations.append("consistency_free_running_latent")
+                    direct_generation_latent = direct_generation_latent_raw.nan_to_num(0.0)
+                    direct_solver_field_raw = self.converter(
                         direct_generation_latent
-                    ).nan_to_num(0.0)
+                    ).float()
+                    if not bool(torch.isfinite(direct_solver_field_raw).all().item()):
+                        nonfinite_observations.append("coordinate_decoder_free_running")
+                    direct_solver_field = direct_solver_field_raw.nan_to_num(0.0)
             else:
-                clean_geom_logits = self.converter(latent).nan_to_num(0.0)
-                generation_geom_logits = self.converter(generation_latent).nan_to_num(0.0)
-                geom_logits = self.converter(x0_pred).nan_to_num(0.0)
+                clean_geom_logits_raw = self.converter(latent)
+                generation_geom_logits_raw = self.converter(generation_latent)
+                geom_logits_raw = self.converter(x0_pred)
+                if not bool(torch.isfinite(clean_geom_logits_raw).all().item()):
+                    nonfinite_observations.append("dense_decoder_clean")
+                if not bool(torch.isfinite(generation_geom_logits_raw).all().item()):
+                    nonfinite_observations.append("dense_decoder_generated")
+                if not bool(torch.isfinite(geom_logits_raw).all().item()):
+                    nonfinite_observations.append("dense_decoder_denoised")
+                clean_geom_logits = clean_geom_logits_raw.nan_to_num(0.0)
+                generation_geom_logits = generation_geom_logits_raw.nan_to_num(0.0)
+                geom_logits = geom_logits_raw.nan_to_num(0.0)
                 if run_optimizer_grid_loss:
                     # Build the replay inference path once, in grad mode, BEFORE
                     # the SPSA solves. Its decode graph (checkpointed; ~small
@@ -7647,15 +8407,21 @@ class OptimizedDiffusionTrainer:
                     # redundant no_grad decode is gone entirely. Values are
                     # bit-identical to the previous separate no_grad decode
                     # (same noise, model, steps, no optimizer step between).
-                    direct_generation_latent = self.consistency_model.fast_inference(
+                    direct_generation_latent_raw = self.consistency_model.fast_inference(
                         latent.shape,
                         num_steps=self.diffusion_config.student_steps,
                         condition=condition,
                         initial_noise=direct_initial_noise.detach(),
-                    ).nan_to_num(0.0)
-                    direct_solver_field = self.converter(
+                    )
+                    if not bool(torch.isfinite(direct_generation_latent_raw).all().item()):
+                        nonfinite_observations.append("consistency_free_running_latent")
+                    direct_generation_latent = direct_generation_latent_raw.nan_to_num(0.0)
+                    direct_solver_field_raw = self.converter(
                         direct_generation_latent
-                    ).nan_to_num(0.0)
+                    ).float()
+                    if not bool(torch.isfinite(direct_solver_field_raw).all().item()):
+                        nonfinite_observations.append("dense_decoder_free_running")
+                    direct_solver_field = direct_solver_field_raw.nan_to_num(0.0)
                 clean_geometry_loss_val = sparse_voxel_reconstruction_loss(
                     clean_geom_logits.float(),
                     geometry_target.float(),
@@ -7671,6 +8437,23 @@ class OptimizedDiffusionTrainer:
                     geometry_target.float(),
                     dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
+            if direct_solver_field is not None:
+                watchdog_logits = direct_solver_field
+                watchdog_probability_source = "free_running_geometry"
+            elif getattr(self.converter, "decoder_mode", "dense") == "coordinate":
+                watchdog_logits = generation_geom_logits_sample
+                watchdog_probability_source = "sampled_generated_geometry"
+            else:
+                watchdog_logits = generation_geom_logits
+                watchdog_probability_source = "generated_geometry"
+            geometry_probability_std_loss_val, geometry_probability_std_val = (
+                geometry_probability_standard_deviation_loss(
+                    watchdog_logits,
+                    target_standard_deviation=float(
+                        self.training_config.geometry_probability_std_target
+                    ),
+                )
+            )
             direct_solver_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_evaluated = False
             run_direct_solver_loss = (
@@ -7707,6 +8490,7 @@ class OptimizedDiffusionTrainer:
                 clean_geometry_loss_val=clean_geometry_loss_val,
                 denoising_geometry_confidence=denoising_geometry_confidence,
                 latent_reconstruction_loss_val=latent_reconstruction_loss_val,
+                geometry_probability_std_loss_val=geometry_probability_std_loss_val,
             )
 
             # Backpropagate independent student branches sequentially. The
@@ -7714,7 +8498,14 @@ class OptimizedDiffusionTrainer:
             # a small finite contribution.
             clear_gradients(optimizer_parameters)
             data_optimization_loss_val.backward(
-                retain_graph=bool(self.geometry_threshold_calibrated and _run_fl)
+                # The anti-collapse standard-deviation term is evaluated on
+                # the same free-running decode graph later used to replay the
+                # measured SPSA gradient. Keep that graph alive until the
+                # replay backward; ordinary data-only batches retain the
+                # previous lower-memory behavior.
+                retain_graph=bool(
+                    self.geometry_threshold_calibrated or run_optimizer_grid_loss
+                )
             )
             ordinary_data_gradients = capture_gradients(optimizer_parameters)
             exact_generation_margin_loss_val = (
@@ -7766,6 +8557,17 @@ class OptimizedDiffusionTrainer:
                 )
             clear_gradients(optimizer_parameters)
             direct_gradients = tuple(None for _ in optimizer_parameters)
+            direct_gradient_trust_region = {
+                "data_gradient_norm": 0.0,
+                "direct_gradient_norm_raw": 0.0,
+                "direct_gradient_norm_applied": 0.0,
+                "direct_gradient_norm_ratio": float(
+                    self.training_config.direct_gradient_norm_ratio
+                ),
+                "direct_gradient_scale": 1.0,
+                "direct_gradient_clipping_fraction": 0.0,
+                "data_gradient_reduced": 0.0,
+            }
             topology_guard_gradients: Dict[
                 str, Tuple[Optional[torch.Tensor], ...]
             ] = {}
@@ -7849,18 +8651,14 @@ class OptimizedDiffusionTrainer:
                     chunk_rows = self.converter._effective_coordinate_chunk_size(
                         guard_logit_gradient.device
                     )
-                    flat_guard = guard_logit_gradient.detach().reshape(-1)
-                    if (
-                        chunk_rows > 0
-                        and flat_guard.numel() % chunk_rows == 0
-                        and flat_guard.numel() // chunk_rows >= 2
-                    ):
-                        # The field tiles exactly into chunk_rows chunks with at
-                        # least two of them (production grids: 96^3 = 54 x 16384
-                        # on GPU / 108 x 8192 on CPU). Walk the top-2 chunks.
-                        chunk_l2 = (flat_guard * flat_guard).view(
-                            -1, chunk_rows
-                        ).sum(dim=1)
+                    guard_batch = int(guard_logit_gradient.shape[0])
+                    flat_guard = guard_logit_gradient.detach().reshape(guard_batch, -1)
+                    if flat_guard.shape[1] % chunk_rows == 0 and flat_guard.shape[1] // chunk_rows >= 2:
+                        chunk_l2 = (
+                            flat_guard.view(guard_batch, -1, chunk_rows)
+                            .square()
+                            .sum(dim=(0, 2))
+                        )
                         selected_chunks = sorted(
                             torch.topk(chunk_l2, 2, sorted=False).indices.tolist()
                         )
@@ -7868,23 +8666,20 @@ class OptimizedDiffusionTrainer:
                             direct_generation_latent,
                             selected_chunks=selected_chunks,
                         )
-                        walk_guard_grad = flat_guard.view(-1, chunk_rows)[
-                            selected_chunks
-                        ].reshape(1, -1)
-                        walk_field.backward(
-                            gradient=direct_weight * walk_guard_grad,
-                            retain_graph=True,
-                        )
+                        walk_guard_grad = flat_guard.view(
+                            guard_batch, -1, chunk_rows
+                        )[:, selected_chunks].reshape(guard_batch, -1)
                     else:
-                        # The field does not tile into chunk_rows chunks (unit
-                        # tests drive tiny grids, e.g. batch 2 x 4^3 = 128
-                        # elements < 8192). Fall back to the exact full walk of
-                        # the main decode graph -- the pre-C=2 behavior the
-                        # unit-test expectations are written against.
-                        direct_optimizer_logits.backward(
-                            gradient=direct_weight * guard_logit_gradient,
-                            retain_graph=True,
-                        )
+                        # Tiny-grid review fixtures can have fewer rows than
+                        # the production chunk size. Use the exact full walk
+                        # there instead of reshaping a short guard into a
+                        # production-sized chunk.
+                        walk_field = self.converter(direct_generation_latent)
+                        walk_guard_grad = flat_guard.reshape_as(walk_field)
+                    walk_field.backward(
+                        gradient=direct_weight * walk_guard_grad,
+                        retain_graph=True,
+                    )
                     topology_guard_gradients[guard_name] = capture_gradients(
                         optimizer_parameters
                     )
@@ -7906,7 +8701,10 @@ class OptimizedDiffusionTrainer:
                 )
                 direct_optimizer_logits.backward(
                     gradient=direct_weight
-                    * (direct_logit_gradient + analytic_occupancy_gradient)
+                    * (
+                        direct_logit_gradient.reshape_as(direct_optimizer_logits)
+                        + analytic_occupancy_gradient.reshape_as(direct_optimizer_logits)
+                    )
                 )
                 direct_gradients = capture_gradients(optimizer_parameters)
                 clear_gradients(optimizer_parameters)
@@ -8053,6 +8851,17 @@ class OptimizedDiffusionTrainer:
                     "data": data_gradients,
                     **topology_guard_gradients,
                 },
+                direct_gradient_trust_region={
+                    "norm_ratio": float(
+                        self.training_config.direct_gradient_norm_ratio
+                    ),
+                    "epsilon": float(
+                        self.training_config.direct_gradient_norm_epsilon
+                    ),
+                },
+                direct_gradient_trust_region_telemetry=(
+                    direct_gradient_trust_region
+                ),
             )
             self.last_gradient_lifecycle = {
                 "replayed_guard_names": list(topology_guard_gradients),
@@ -8083,6 +8892,9 @@ class OptimizedDiffusionTrainer:
                 ),
                 "generated_path_converter_gradient_norms_after_freeze": (
                     generated_path_converter_norms_after_freeze
+                ),
+                "direct_gradient_trust_region": dict(
+                    direct_gradient_trust_region
                 ),
             }
             student_gradient_cosines = {
@@ -8123,35 +8935,19 @@ class OptimizedDiffusionTrainer:
                 parameter.grad = gradient
             step_gradients = capture_gradients(optimizer_parameters)
             # Final guard-dot sign check: the update must not be uphill on any
-            # active guard. Each dot is fp64 over the flattened concatenations
-            # (same tensors, same order). With _BATCH_GUARD_DOT_READS all dots
-            # are computed GPU-side and read back in ONE deferred .tolist();
-            # the values are bit-identical to the per-guard .item() path -- only
-            # the number of GPU->CPU syncs changes.
+            # active guard. Each dot is reduced in FP64 one parameter tensor at
+            # a time, avoiding a full-model FP64 allocation. With
+            # _BATCH_GUARD_DOT_READS all dots are read back in ONE deferred
+            # batch; only the number of GPU->CPU syncs changes.
 
             def _guard_dot(aligned_pairs):
-                # Convert to fp64 AFTER the concatenation, not per-tensor: every
-                # fp32 value is exactly representable in fp64, so
-                # cat([... .double() ...]) and cat([...]).double() are bit-identical,
-                # but the former issues one fp64 copy kernel per gradient tensor
-                # (~24k launches on the full model) while the latter issues ONE
-                # conversion per guard. detach/reshape preserve values and logical
-                # order, so the resulting fp64 dot is byte-for-byte the same.
-                return torch.dot(
-                    torch.cat(
-                        [
-                            update_gradient.detach().reshape(-1)
-                            for update_gradient, _ in aligned_pairs
-                        ]
-                    ).double(),
-                    torch.cat(
-                        [
-                            guard_gradient.detach().reshape(-1)
-                            for guard_gradient, _ in aligned_pairs
-                        ]
-                    ).double(),
+                value = gradient_dot_product(
+                    tuple(update_gradient for update_gradient, _ in aligned_pairs),
+                    tuple(guard_gradient for _, guard_gradient in aligned_pairs),
+                    first_name="step",
+                    second_name="guard",
                 )
-
+                return torch.tensor(value, device=self.device, dtype=torch.float64)
             guard_aligned_pairs = {
                 guard_name: [
                     (update_gradient, guard_gradient)
@@ -8198,14 +8994,88 @@ class OptimizedDiffusionTrainer:
                         )
             self.last_gradient_lifecycle["step_gradients"] = step_gradients
 
-            # Optimizer step
-            if self.training_config.offload_optimizer_state_between_steps:
-                move_optimizer_state(self.optimizer, self.device)
-            self.optimizer.step()
-            if self.scheduler_step_per_update:
-                self.scheduler.step()
-            if self.training_config.offload_optimizer_state_between_steps:
-                move_optimizer_state(self.optimizer, "cpu")
+            # Optimizer step.  The transaction is captured on CPU so the
+            # exact rollback image does not compete with the active 128^3
+            # neural/solver allocations for L4 VRAM.  It remains live until
+            # the cheap post-step watchdog decision has passed.
+            optimizer_transaction = None
+            if self.training_config.transactional_optimizer_steps:
+                optimizer_transaction = TransactionalOptimizerStep(
+                    self.optimizer,
+                    {
+                        "diffusion": tuple(self.diffusion_model.parameters()),
+                        "coordinate_converter": tuple(self.converter.parameters()),
+                        "consistency_student": tuple(
+                            self.consistency_model.student_model.parameters()
+                        ),
+                    },
+                    scheduler=self.scheduler,
+                    ema_model=self.ema_model,
+                    snapshot_device="cpu",
+                )
+                optimizer_transaction.capture()
+            try:
+                if self.training_config.offload_optimizer_state_between_steps:
+                    move_optimizer_state(self.optimizer, self.device)
+                self.optimizer.step()
+                if self.scheduler_step_per_update:
+                    self.scheduler.step()
+                if self.training_config.offload_optimizer_state_between_steps:
+                    move_optimizer_state(self.optimizer, "cpu")
+            except Exception:
+                if optimizer_transaction is not None:
+                    optimizer_transaction.rollback()
+                raise
+            self.last_transaction = {
+                "enabled": optimizer_transaction is not None,
+                "captured": optimizer_transaction is not None,
+                "committed": False,
+                "attempts": 1,
+            }
+            mhc_telemetry: Dict[str, Dict[str, float]] = {}
+            try:
+                for module_name, module in (
+                    ("diffusion", self.diffusion_model),
+                    ("coordinate_converter", self.converter),
+                    ("consistency_student", self.consistency_model.student_model),
+                ):
+                    mhc_telemetry[module_name] = collect_mhc_telemetry(module)
+            except Exception:
+                if optimizer_transaction is not None:
+                    optimizer_transaction.rollback()
+                    self.last_transaction.update(
+                        {"rolled_back": True, "committed": False}
+                    )
+                raise
+            representation_effective_rank = effective_rank(
+                generation_latent.detach().float()
+            )
+
+            # The coordinate decoder is a required learning path. Record the
+            # actual Adam step, rather than assuming that optimizer.step()
+            # touched the group; this catches the exact historical failure
+            # where global_step advanced thousands of times while the decoder
+            # optimizer had advanced only once per sparse full-lattice pass.
+            optimizer_steps: Dict[str, Any] = {}
+            for optimizer_group in self.optimizer.param_groups:
+                group_name = str(optimizer_group.get("name", "unnamed"))
+                step_values: List[float] = []
+                for parameter in optimizer_group["params"]:
+                    parameter_state = self.optimizer.state.get(parameter, {})
+                    step_value = parameter_state.get("step")
+                    if step_value is None:
+                        step_values.append(0.0)
+                    elif torch.is_tensor(step_value):
+                        step_values.append(float(step_value.detach().cpu().item()))
+                    else:
+                        step_values.append(float(step_value))
+                optimizer_steps[group_name] = (
+                    min(step_values) if step_values else 0.0
+                )
+            step_converter_gradient_norm = converter_gradient_norm(
+                step_gradients,
+                branch_name="step",
+            )
 
             # EMA update
             self._update_ema()
@@ -8227,6 +9097,8 @@ class OptimizedDiffusionTrainer:
                 latent_reconstruction_float,
                 denoising_confidence_float,
                 direct_solver_float,
+                geometry_probability_std_loss_float,
+                geometry_probability_std_float,
             ) = torch.stack([
                 optimization_loss_val.detach(),
                 mse_loss_val.detach(),
@@ -8237,6 +9109,8 @@ class OptimizedDiffusionTrainer:
                 latent_reconstruction_loss_val.detach(),
                 denoising_geometry_confidence.detach(),
                 direct_solver_loss_val.detach(),
+                geometry_probability_std_loss_val.detach(),
+                geometry_probability_std_val.detach(),
             ]).tolist()
 
             total_optimization_loss += optimization_loss_float
@@ -8244,6 +9118,8 @@ class OptimizedDiffusionTrainer:
             total_clean_geometry += clean_geometry_loss_float
             total_geometry += geometry_loss_float
             total_generation_geometry += generation_geometry_loss_float
+            total_geometry_probability_std_loss += geometry_probability_std_loss_float
+            total_geometry_probability_std += geometry_probability_std_float
             total_consistency += consistency_float
             data_gradient_metrics = branch_telemetry["data"]
             consistency_gradient_metrics = branch_telemetry["consistency"]
@@ -8329,6 +9205,8 @@ class OptimizedDiffusionTrainer:
                     'clean_geom': clean_geometry_loss_float,
                     'geom': geometry_loss_float,
                     'gen_geom': generation_geometry_loss_float,
+                    'prob_std': geometry_probability_std_float,
+                    'prob_std_loss': geometry_probability_std_loss_float,
                     'consistency': consistency_float,
                     'latent_recon': latent_reconstruction_float,
                     'direct_solver': direct_solver_float,
@@ -8339,6 +9217,34 @@ class OptimizedDiffusionTrainer:
                 })
 
             self.global_step += 1
+            watchdog_decision = evaluate_model_collapse(
+                global_step=self.global_step,
+                training_config=self.training_config,
+                state=self.collapse_watchdog_state,
+                probabilities=torch.sigmoid(watchdog_logits.detach().float()),
+                probability_source=watchdog_probability_source,
+                nonfinite_observed=bool(nonfinite_observations),
+                losses={
+                    "optimization": optimization_loss_float,
+                    "mse": mse_loss_float,
+                    "clean_geometry": clean_geometry_loss_float,
+                    "geometry": geometry_loss_float,
+                    "generation_geometry": generation_geometry_loss_float,
+                    "geometry_probability_std_loss": geometry_probability_std_loss_float,
+                    "consistency": consistency_float,
+                    "latent_reconstruction": latent_reconstruction_float,
+                    "direct_solver": direct_solver_float,
+                },
+                gradient_norms={
+                    "coordinate_converter": step_converter_gradient_norm,
+                },
+                optimizer_steps=optimizer_steps,
+            )
+            if nonfinite_observations:
+                watchdog_decision["nonfinite_observations"] = list(
+                    nonfinite_observations
+                )
+            self.last_collapse_watchdog = watchdog_decision
             if self.update_metrics_callback is not None:
                 direct_components = (
                     dict(self.direct_solver_loss.last_components)
@@ -8356,6 +9262,9 @@ class OptimizedDiffusionTrainer:
                 self.update_metrics_callback(
                     {
                         "kind": "optimizer_update",
+                        "precision_policy": dict(
+                            self.run_state_metadata.get("precision_policy", {})
+                        ),
                         "global_step": int(self.global_step),
                         "completed_in_epoch": int(batch_idx + 1),
                         "total_in_epoch": int(len(train_loader)),
@@ -8375,6 +9284,12 @@ class OptimizedDiffusionTrainer:
                             "geometry": float(geometry_loss_float),
                             "generation_geometry": float(
                                 generation_geometry_loss_float
+                            ),
+                            "geometry_probability_std_loss": float(
+                                geometry_probability_std_loss_float
+                            ),
+                            "geometry_probability_std": float(
+                                geometry_probability_std_float
                             ),
                             "consistency": float(consistency_float),
                             "latent_reconstruction": float(
@@ -8426,6 +9341,15 @@ class OptimizedDiffusionTrainer:
                             for branch_name, branch_metrics in branch_telemetry.items()
                         },
                         "student_gradient_cosines": student_gradient_cosines,
+                        "direct_gradient_trust_region": dict(
+                            direct_gradient_trust_region
+                        ),
+                        "mhc_telemetry": mhc_telemetry,
+                        "representation_effective_rank": float(
+                            representation_effective_rank
+                        ),
+                        "transaction": dict(self.last_transaction),
+                        "collapse_watchdog": dict(watchdog_decision),
                         "direct_solver": {
                             "evaluated": bool(direct_solver_evaluated),
                             "call_count": (
@@ -8449,6 +9373,72 @@ class OptimizedDiffusionTrainer:
                             for group in self.optimizer.param_groups
                         },
                     }
+                )
+
+            if watchdog_decision["triggered"]:
+                if optimizer_transaction is not None:
+                    optimizer_transaction.rollback()
+                    self.last_transaction.update(
+                        {"rolled_back": True, "committed": False}
+                    )
+                stop_decision = {
+                    "kind": "model_collapse",
+                    "reason": "model_collapse_watchdog",
+                    "global_step": int(self.global_step),
+                    "reason_codes": list(watchdog_decision["reason_codes"]),
+                    "watchdog": dict(watchdog_decision),
+                }
+                self.stop_decision = stop_decision
+                self.run_state_metadata["collapse_watchdog"] = dict(
+                    watchdog_decision
+                )
+                self.run_state_metadata["collapse_watchdog_stop"] = dict(
+                    stop_decision
+                )
+                configured_checkpoint_path = getattr(
+                    self,
+                    "run_state_checkpoint_path",
+                    None,
+                )
+                if configured_checkpoint_path is not None:
+                    self.run_state_metadata["collapse_checkpoint_path"] = str(
+                        configured_checkpoint_path
+                    )
+                checkpoint_path = None
+                if self.collapse_checkpoint_callback is not None:
+                    checkpoint_path = self.collapse_checkpoint_callback(
+                        batch_idx + 1,
+                        len(train_loader),
+                    )
+                else:
+                    # The standalone OptimizedDiffusionTrainer.train() API does
+                    # not install the monitored wrapper's exact run-state
+                    # callback. Still preserve a reviewable model checkpoint so
+                    # a fail-closed stop never discards the last post-update
+                    # evidence.
+                    fallback_path = (
+                        Path(self.training_config.checkpoint_dir)
+                        / f"collapse_paused_step{self.global_step}.pt"
+                    )
+                    self.save_checkpoint(str(fallback_path))
+                    checkpoint_path = str(fallback_path)
+                if checkpoint_path is not None:
+                    self.run_state_metadata["collapse_checkpoint_path"] = str(
+                        checkpoint_path
+                    )
+                print(
+                    "PAUSING training: model-collapse watchdog triggered at "
+                    f"global_step={self.global_step}; reasons="
+                    f"{', '.join(watchdog_decision['reason_codes'])}. "
+                    f"durable_checkpoint={checkpoint_path or 'not configured'}"
+                )
+                interrupted_early = True
+                break
+
+            if optimizer_transaction is not None:
+                optimizer_transaction.commit()
+                self.last_transaction.update(
+                    {"rolled_back": False, "committed": True}
                 )
 
             if self.run_state_checkpoint_callback is not None:
@@ -8534,6 +9524,10 @@ class OptimizedDiffusionTrainer:
             'clean_geometry_reconstruction': total_clean_geometry / denominator,
             'geometry_reconstruction': total_geometry / denominator,
             'generation_reconstruction': total_generation_geometry / denominator,
+            'geometry_probability_std_loss': (
+                total_geometry_probability_std_loss / denominator
+            ),
+            'geometry_probability_std': total_geometry_probability_std / denominator,
             'consistency': total_consistency / denominator,
             'consistency_raw_mse': (
                 total_consistency_raw_mse / max(consistency_eval_count, 1)
@@ -8616,6 +9610,12 @@ class OptimizedDiffusionTrainer:
             ),
             'direct_solver_iteration_coverage': (
                 direct_solver_eval_count / max(optimizer_iterations, 1)
+            ),
+            'collapse_watchdog_triggered': float(
+                bool(self.last_collapse_watchdog.get('triggered', False))
+            ),
+            'collapse_watchdog_checks': float(
+                self.collapse_watchdog_state.get('checks', 0)
             ),
         }
 
@@ -9051,6 +10051,7 @@ class OptimizedDiffusionTrainer:
         optimizer_state_loaded = True
         try:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
+            self._normalize_optimizer_state_dtypes()
         except ValueError as exc:
             optimizer_state_loaded = False
             print(
@@ -9122,25 +10123,41 @@ class OptimizedDiffusionTrainer:
             map_location=self.device,
             authorized_paths=(Path(path).resolve(),),
         )
-        load_state_dict_mhc_compatible(self.diffusion_model, checkpoint["diffusion_model"])
-        load_state_dict_mhc_compatible(self.consistency_model, checkpoint["consistency_model"])
+        model_state, checkpoint_schema = extract_checkpoint_model_state(checkpoint)
+        load_state_dict_mhc_compatible(self.diffusion_model, model_state["diffusion_model"])
+        consistency_incompatible = load_state_dict_mhc_compatible(
+            self.consistency_model,
+            model_state["consistency_model"],
+            allow_missing_prefixes=("teacher_model.",),
+        )
+        missing_non_teacher = [
+            key
+            for key in consistency_incompatible.missing_keys
+            if not key.startswith("teacher_model.") and "mhc" not in key.lower()
+        ]
+        unexpected_non_mhc = [
+            key for key in consistency_incompatible.unexpected_keys
+            if "mhc" not in key.lower()
+        ]
+        if missing_non_teacher or unexpected_non_mhc:
+            raise RuntimeError(
+                "Warm-start consistency state is incompatible: "
+                f"missing_non_teacher={missing_non_teacher}, "
+                f"unexpected={unexpected_non_mhc}"
+            )
         converter_report = load_width_expanded_state_dict(
             self.converter,
-            checkpoint["converter"],
+            model_state["converter"],
         )
-        load_state_dict_mhc_compatible(self.ema_model, checkpoint["ema_model"])
-        self.global_step = int(checkpoint.get("global_step", 0))
-        self.consistency_update_step = int(
-            checkpoint.get(
-                "consistency_update_step",
-                (
-                    self.global_step
-                    + max(1, int(self.training_config.consistency_interval))
-                    - 1
-                )
-                // max(1, int(self.training_config.consistency_interval)),
-            )
-        )
+        load_state_dict_mhc_compatible(self.ema_model, model_state["ema_model"])
+        source_global_step = int(checkpoint.get("global_step", 0))
+        # A warm start intentionally creates a new optimization lineage. Carrying
+        # the source progress counter while dropping Adam moments makes scheduler
+        # and optimizer-step telemetry inconsistent and looks exactly like a
+        # stalled optimizer to the collapse watchdog. Exact progress preservation
+        # belongs to load_checkpoint/resume-run-state, not this weights-only path.
+        self.global_step = 0
+        self.consistency_update_step = 0
         if "geometry_probability_threshold" in checkpoint:
             self._set_geometry_probability_threshold(
                 checkpoint["geometry_probability_threshold"],
@@ -9154,6 +10171,16 @@ class OptimizedDiffusionTrainer:
             "source": str(Path(path).resolve()),
             "converter": converter_report,
             "optimizer_state_loaded": False,
+            "source_global_step": source_global_step,
+            "new_global_step": 0,
+            "checkpoint_schema": checkpoint_schema,
+            "source_run_state_version": checkpoint.get("run_state_version"),
+            "consistency_teacher_resynchronized": bool(
+                consistency_incompatible.missing_keys
+            ),
+            "consistency_teacher_missing_key_count": len(
+                consistency_incompatible.missing_keys
+            ),
         }
         print(f"Warm-started widened model from {path}: {report}")
         return report
@@ -9175,9 +10202,29 @@ class OptimizedAircraftGenerator:
             authorized_paths=(checkpoint_path,),
         )
 
-        self.model_config = ModelConfig(**checkpoint['model_config'])
-        self.diffusion_config = DiffusionConfig(**checkpoint['diffusion_config'])
-        training_payload = checkpoint.get('training_config', {}) or {}
+        compatibility_configuration = (
+            checkpoint.get("compatibility", {}).get("configuration", {}) or {}
+        )
+        model_payload = checkpoint.get("model_config") or compatibility_configuration.get(
+            "model_config"
+        )
+        diffusion_payload = checkpoint.get(
+            "diffusion_config"
+        ) or compatibility_configuration.get("diffusion_config")
+        if not isinstance(model_payload, dict) or not isinstance(diffusion_payload, dict):
+            raise ValueError(
+                "Checkpoint is missing model/diffusion configuration at both the "
+                "legacy top level and compatibility.configuration"
+            )
+        model_state, _ = extract_checkpoint_model_state(checkpoint)
+
+        self.model_config = ModelConfig(**model_payload)
+        self.diffusion_config = DiffusionConfig(**diffusion_payload)
+        training_payload = (
+            checkpoint.get('training_config')
+            or compatibility_configuration.get('training_config')
+            or {}
+        )
         coordinate_decoder_threshold = int(training_payload.get('coordinate_decoder_threshold', 96))
         self.geometry_probability_threshold = float(
             checkpoint.get(
@@ -9226,11 +10273,12 @@ class OptimizedAircraftGenerator:
             self.model_config,
             self.diffusion_config,
             enable_teacher=enable_consistency_teacher,
+            compute_dtype=getattr(self, "compute_dtype", None),
         ).to(self.device)
-        load_state_dict_mhc_compatible(self.consistency_model, checkpoint['consistency_model'])
+        load_state_dict_mhc_compatible(self.consistency_model, model_state['consistency_model'])
 
-        load_state_dict_mhc_compatible(self.diffusion_model, checkpoint['diffusion_model'])
-        load_state_dict_mhc_compatible(self.converter, checkpoint['converter'])
+        load_state_dict_mhc_compatible(self.diffusion_model, model_state['diffusion_model'])
+        load_state_dict_mhc_compatible(self.converter, model_state['converter'])
 
         self.noise_schedule = NoiseSchedule(self.diffusion_config).to(self.device)
 

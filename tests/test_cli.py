@@ -33,6 +33,33 @@ class TestCLI(unittest.TestCase):
         out = model(x, t)
         self.assertEqual(out.shape, (2, 16))
 
+    def test_bfloat16_training_keeps_trainable_parameters_in_fp32(self):
+        config = TrainingConfig(
+            num_epochs=1,
+            batch_size=1,
+            precision='bfloat16',
+            direct_solver_loss_weight=0.0,
+            require_direct_solver_every_iteration=False,
+        )
+        trainer = OptimizedDiffusionTrainer(
+            self.m_config,
+            self.d_config,
+            config,
+            self.cfd_config,
+            device=self.device,
+        )
+
+        trainable = [
+            parameter
+            for group in trainer.optimizer.param_groups
+            for parameter in group['params']
+        ]
+        self.assertTrue(trainable)
+        self.assertTrue(all(parameter.dtype == torch.float32 for parameter in trainable))
+        self.assertEqual(trainer.compute_dtype, torch.bfloat16)
+        self.assertEqual(trainer.parameter_dtype, torch.float32)
+        self.assertFalse(trainer.scaler.is_enabled())
+
     def test_consistency_model(self):
         model = ConsistencyModel(self.m_config, self.d_config)
         self.assertIsInstance(model, ConsistencyModel)

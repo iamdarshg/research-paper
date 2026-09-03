@@ -24,9 +24,11 @@ model:
   mhc_streams: 8
   mhc_sinkhorn_iterations: 8
   coordinate_decoder_threshold: 96
-  coordinate_chunk_size: 8192
+  coordinate_chunk_size: 4096
   coordinate_decoder_width: 3328
   coordinate_decoder_depth: 12
+  # Selected by the 2026-09-01 128^3 bounded ablation: 4096 reduced peak
+  # allocation while retaining finite forward/backward gradients.
   coordinate_fourier_bands: 6
   coordinate_gradient_checkpointing: true
   enable_gradient_checkpointing: true
@@ -54,10 +56,13 @@ scaling:
   high_resolution_channel_base: 116
   high_resolution_channel_step: 48
   maximum_high_resolution_channel_base: 128
-  high_resolution_decoder_width: 3328
-  maximum_high_resolution_decoder_width: 3328
-  high_resolution_decoder_depth: 12
-  high_resolution_decoder_depth_large_corpus: 12
+  high_resolution_decoder_width: 928
+  maximum_high_resolution_decoder_width: 2048
+  # Real-corpus 128^3 held-out ablation (2026-09-01) selected 2048x5 over
+  # 1024x5 twice by class-balanced occupancy perplexity and top-k recall.
+  large_corpus_high_resolution_decoder_width: 2048
+  high_resolution_decoder_depth: 5
+  high_resolution_decoder_depth_large_corpus: 5
   large_corpus_threshold: 4096
 
 diffusion:
@@ -94,6 +99,15 @@ training:
   # Retain the measured branch while preventing it from canceling a unit data
   # branch during highly conflicting updates.
   student_direct_gradient_max_norm: 0.25
+  # After conflict projection, direct/CFD gradients may contribute at most
+  # this fraction of the grounded-data gradient norm. The data branch is
+  # never reduced to accommodate CFD; calibrate this from healthy traces.
+  direct_gradient_norm_ratio: 0.10
+  direct_gradient_norm_epsilon: 0.000000000001
+  # Capture an exact CPU rollback image before each risky update. A rejected
+  # sentinel/watchdog step can therefore restore parameters, Adam state,
+  # scheduler, EMA, and RNG instead of leaving a poisoned recovery checkpoint.
+  transactional_optimizer_steps: true
   # Preserve every compatible CFD gradient component, but do not let a measured
   # solver step point uphill on the grounded aircraft-data objective.
   project_conflicting_direct_gradient: true
@@ -137,16 +151,18 @@ training:
   promotion_occupancy_error_tolerance: 0.005
   promotion_valid_fraction_tolerance: 0.0
   precision: float32
+  # One-sided free-running probability-spread target. This anti-collapse term
+  # becomes zero at the target instead of rewarding indefinitely noisy fields.
+  geometry_probability_std_weight: 0.25
+  geometry_probability_std_target: 0.20
   save_interval: 25
   val_interval: 1
-  # Budget-constrained 128^3 schedule. The 65,536-row anchor is still
-  # stratified over positive/negative voxels; exact full-lattice grounding is
-  # retained every 64 updates instead of every 8. This keeps the objective
-  # unchanged on anchor updates while avoiding eight redundant full decodes.
   coordinate_training_samples: 65536
-  full_lattice_interval: 64
-  sparse_samples_per_full: 262144
   coordinate_positive_fraction: 0.5
+  # Must remain 1 while generated-path decoder gradients are frozen. A sparse
+  # interval recreates the previously observed coordinate-converter starvation.
+  full_lattice_interval: 1
+  sparse_samples_per_full: 0
   direct_solver_loss_weight: 1.0
   # The direct objective remains the same 5-step, 8-direction SPSA estimate;
   # it is evaluated every 32 updates so the bounded A100 budget is not spent
@@ -154,7 +170,11 @@ training:
   direct_solver_interval: 32
   direct_solver_steps: 5
   # 1 base solve + 16 antithetic plus/minus pairs = 33 sequential solves/loss.
-  direct_solver_directions: 8
+  direct_solver_directions: 16
+  direct_solver_signal_test_enabled: true
+  # Experimental canary floor; log and calibrate from healthy traces before
+  # treating this as a permanent scientific threshold.
+  direct_solver_min_split_cosine: 0.20
   direct_solver_perturbation: 0.15
   direct_solver_perturbation_grid_size: 12
   # Batched SPSA solve chunk. C=1 is the safe default for 8 GiB GPUs;
@@ -178,6 +198,20 @@ training:
   # 0.9752 threshold the root fragility. With calibration disabled the config
   # value is authoritative and overrides any checkpoint/saved threshold.
   geometry_materialization_threshold: 0.5
+  # Fail closed when a live run becomes numerically invalid or geometrically
+  # degenerate. Fresh random initialization is exempt only for this bounded
+  # warm-up; after that, two consecutive geometric collapse observations pause
+  # the run and force a durable latest_run_state checkpoint.
+  collapse_watchdog_enabled: true
+  collapse_watchdog_warmup_updates: 128
+  collapse_watchdog_patience: 2
+  collapse_watchdog_probability_std_floor: 0.0001
+  collapse_watchdog_probability_span_floor: 0.001
+  collapse_watchdog_min_occupied_fraction: 0.000001
+  collapse_watchdog_max_occupied_fraction: 0.999999
+  collapse_watchdog_min_converter_gradient_norm: 0.0000000001
+  collapse_watchdog_max_converter_step_lag: 1
+  collapse_watchdog_min_unique_fraction: 0.50
   calibrate_geometry_materialization_threshold: false
   geometry_threshold_calibration_samples: 16
   threshold_positive_margin: 0.05
