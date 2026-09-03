@@ -17,6 +17,12 @@ model:
   attention_groups: 8
   attention_kv_groups: 4
   num_attention_layers: 4
+  # Plain identity-initialized mHC routing is available across the production
+  # diffusion U-Net, consistency teacher/student, and voxel decoder. Keep it
+  # opt-in until a multi-fixture production-scale win is established.
+  mhc_enabled: false
+  mhc_streams: 8
+  mhc_sinkhorn_iterations: 8
   coordinate_decoder_threshold: 96
   coordinate_chunk_size: 8192
   coordinate_decoder_width: 3328

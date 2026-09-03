@@ -162,7 +162,6 @@ class AdvancedCFDSimulator:
         return None
 
     def _run_openfoam_validation(self, voxel_grid: torch.Tensor) -> Optional[Dict[str, float]]:
-        from generator import OptimizedAircraftGenerator
         print("🚀 Running independent OpenFOAM validation for PINN ground truth...")
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -292,7 +291,6 @@ class AdvancedCFDSimulator:
     def export_openfoam_case(self, voxel_grid: torch.Tensor, case_dir: str) -> Dict[str, Any]:
         # Implementation from original AdvancedCFDSimulator (moved to AdvancedCFDSimulator for consistency)
         # Re-using the same logic.
-        from generator import OptimizedAircraftGenerator
         case_path = Path(case_dir)
         tri_surface = case_path / "constant" / "triSurface"
         system = case_path / "system"

@@ -42,6 +42,11 @@ class ModelConfig:
     attention_groups: int = 8  # 4 groups instead of 8 heads (50% KV-cache reduction)
     attention_kv_groups: int = 8  # Groups for key/value
     num_attention_layers: int = 4
+    # Plain mHC-style constrained residual routing.  It is opt-in because the
+    # bounded 16^3 comparison did not establish a production-quality win.
+    mhc_enabled: bool = bool(config_value("model", "mhc_enabled", False))
+    mhc_streams: int = int(config_value("model", "mhc_streams", 8))
+    mhc_sinkhorn_iterations: int = int(config_value("model", "mhc_sinkhorn_iterations", 8))
     # Grid resolution - configurable for different lattice sizes
     base_grid_resolution: int = int(config_value("model", "grid_resolution", 96))
     grid_resolution: int = None  # Working grid resolution (defaults to base_grid_resolution if not set)

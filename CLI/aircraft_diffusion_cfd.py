@@ -57,6 +57,7 @@ from aircraft_validity import (
 )
 from condition_feasibility import validate_condition_feasibility
 from experiment_config import GLOBAL_CONFIG, GLOBAL_CONFIG_PATH, config_value
+from mhc import ManifoldHyperConnection, load_state_dict_mhc_compatible
 from geometry_store import CompactGeometryStore
 from multiobjective_gradients import (
     capture_gradients,
@@ -434,6 +435,11 @@ class ModelConfig:
     attention_groups: int = int(config_value("model", "attention_groups", 8))
     attention_kv_groups: int = int(config_value("model", "attention_kv_groups", 4))
     num_attention_layers: int = int(config_value("model", "num_attention_layers", 4))
+    # Plain mHC-style constrained residual routing.  Opt-in by default until
+    # a multi-fixture production-scale win is demonstrated.
+    mhc_enabled: bool = bool(config_value("model", "mhc_enabled", False))
+    mhc_streams: int = int(config_value("model", "mhc_streams", 8))
+    mhc_sinkhorn_iterations: int = int(config_value("model", "mhc_sinkhorn_iterations", 8))
     # Grid resolution - configurable for different lattice sizes
     base_grid_resolution: int = int(config_value("model", "grid_resolution", 96))
     grid_resolution: int = None  # Working grid resolution (defaults to base_grid_resolution if not set)
@@ -2658,6 +2664,9 @@ class ConsistencyModel(nn.Module):
             attention_kv_groups=config.attention_kv_groups,
             num_attention_layers=config.num_attention_layers,
             enable_gradient_checkpointing=config.enable_gradient_checkpointing,
+            mhc_enabled=config.mhc_enabled,
+            mhc_streams=config.mhc_streams,
+            mhc_sinkhorn_iterations=config.mhc_sinkhorn_iterations,
             use_torch_compile=False  # Disable torch.compile for teacher to avoid overflow errors
         )
         self.teacher_model = (
@@ -2676,6 +2685,9 @@ class ConsistencyModel(nn.Module):
             attention_kv_groups=student_kv_groups,
             num_attention_layers=config.num_attention_layers,
             enable_gradient_checkpointing=True,
+            mhc_enabled=config.mhc_enabled,
+            mhc_streams=config.mhc_streams,
+            mhc_sinkhorn_iterations=config.mhc_sinkhorn_iterations,
             use_torch_compile=False  # Disable torch.compile for student to avoid overflow errors
         )
         self.student_model = LatentDiffusionUNet(student_config, diffusion_config).to(dtype)
@@ -2688,7 +2700,12 @@ class ConsistencyModel(nn.Module):
         """Initialize student model - cannot copy from teacher due to different sizes"""
         # Student model has smaller channels than teacher, so we initialize randomly
         # The student will learn to match teacher outputs through consistency training
-        for param in self.student_model.parameters():
+        for name, param in self.student_model.named_parameters():
+            # The mHC routing logits are deliberately identity-initialized in
+            # ManifoldHyperConnection. Preserve that stable start while
+            # randomizing the ordinary student weights.
+            if "mhc" in name.lower():
+                continue
             if param.dim() > 1:
                 nn.init.xavier_uniform_(param)
             else:
@@ -2944,7 +2961,9 @@ class ResidualBlock3D(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int,
                  use_attention: bool = False, enable_checkpointing: bool = True,
-                 attention_groups: int = 8, attention_kv_groups: int = 4):
+                 attention_groups: int = 8, attention_kv_groups: int = 4,
+                 mhc_enabled: bool = False, mhc_streams: int = 8,
+                 mhc_sinkhorn_iterations: int = 8):
         super().__init__()
 
         self.time_mlp = nn.Sequential(
@@ -2966,6 +2985,15 @@ class ResidualBlock3D(nn.Module):
         )
 
         self.out_channels = out_channels
+        self.mhc = (
+            ManifoldHyperConnection(
+                out_channels,
+                streams=mhc_streams,
+                sinkhorn_iterations=mhc_sinkhorn_iterations,
+            )
+            if mhc_enabled
+            else None
+        )
 
         self.res_conv = nn.Conv3d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
@@ -2988,6 +3016,8 @@ class ResidualBlock3D(nn.Module):
         h = self.block1(x)
         h = h + self.time_mlp(time_emb).view(-1, self.out_channels, 1, 1, 1)
         h = self.block2(h)
+        if self.mhc is not None:
+            h = self.mhc(h)
         h = h + self.res_conv(x)
         h = self.attention(h)
         return h
@@ -3047,6 +3077,9 @@ class LatentDiffusionUNet(nn.Module):
                 enable_checkpointing=config.enable_gradient_checkpointing,
                 attention_groups=config.attention_groups,
                 attention_kv_groups=config.attention_kv_groups,
+                mhc_enabled=config.mhc_enabled,
+                mhc_streams=config.mhc_streams,
+                mhc_sinkhorn_iterations=config.mhc_sinkhorn_iterations,
             ))
             self.down_convs.append(nn.Conv3d(channels[i+1], channels[i+1], 3, stride=1, padding=1))
 
@@ -3056,6 +3089,9 @@ class LatentDiffusionUNet(nn.Module):
             enable_checkpointing=config.enable_gradient_checkpointing,
             attention_groups=config.attention_groups,
             attention_kv_groups=config.attention_kv_groups,
+            mhc_enabled=config.mhc_enabled,
+            mhc_streams=config.mhc_streams,
+            mhc_sinkhorn_iterations=config.mhc_sinkhorn_iterations,
         )
 
         self.up_convs = nn.ModuleList()
@@ -3068,6 +3104,9 @@ class LatentDiffusionUNet(nn.Module):
                 enable_checkpointing=config.enable_gradient_checkpointing,
                 attention_groups=config.attention_groups,
                 attention_kv_groups=config.attention_kv_groups,
+                mhc_enabled=config.mhc_enabled,
+                mhc_streams=config.mhc_streams,
+                mhc_sinkhorn_iterations=config.mhc_sinkhorn_iterations,
             ))
 
         self.out_conv = nn.Conv3d(channels[0], channels[0], 1)
@@ -3182,6 +3221,9 @@ class LatentTo3DConverter(nn.Module):
         coordinate_fourier_bands: int = 0,
         enable_coordinate_gradient_checkpointing: bool = True,
         enable_decoder_compile: bool = False,
+        mhc_enabled: bool = False,
+        mhc_streams: int = 8,
+        mhc_sinkhorn_iterations: int = 8,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -3194,6 +3236,9 @@ class LatentTo3DConverter(nn.Module):
         self.coordinate_fourier_bands = int(coordinate_fourier_bands)
         self.enable_coordinate_gradient_checkpointing = bool(enable_coordinate_gradient_checkpointing)
         self.enable_decoder_compile = bool(enable_decoder_compile)
+        self.mhc_enabled = bool(mhc_enabled)
+        self.mhc_streams = int(mhc_streams)
+        self.mhc_sinkhorn_iterations = int(mhc_sinkhorn_iterations)
         self._compiled_decode_features = None
         if self.enable_decoder_compile:
             # P6c FUSION-1: scope torch.compile to the coordinate-decoder MLP so
@@ -3222,6 +3267,18 @@ class LatentTo3DConverter(nn.Module):
                 nn.ReLU(),
                 nn.Linear(2048, total_voxels)
             )
+            self.mhc_dense_hidden = nn.ModuleList(
+                [
+                    ManifoldHyperConnection(
+                        width,
+                        streams=self.mhc_streams,
+                        sinkhorn_iterations=self.mhc_sinkhorn_iterations,
+                    )
+                    for width in (1024, 2048)
+                ]
+                if self.mhc_enabled
+                else []
+            )
         else:
             coordinate_dim = 3 * (1 + 2 * max(0, self.coordinate_fourier_bands))
             self.coordinate_input = nn.Sequential(
@@ -3237,6 +3294,18 @@ class LatentTo3DConverter(nn.Module):
                     )
                     for _ in range(max(1, self.coordinate_decoder_depth))
                 ]
+            )
+            self.mhc_coordinate_blocks = nn.ModuleList(
+                [
+                    ManifoldHyperConnection(
+                        self.coordinate_decoder_width,
+                        streams=self.mhc_streams,
+                        sinkhorn_iterations=self.mhc_sinkhorn_iterations,
+                    )
+                    for _ in self.coordinate_blocks
+                ]
+                if self.mhc_enabled
+                else []
             )
             self.coordinate_output = nn.Linear(self.coordinate_decoder_width, 1)
         self.register_buffer("_coordinate_grid", torch.empty(0), persistent=False)
@@ -3326,13 +3395,26 @@ class LatentTo3DConverter(nn.Module):
 
     def _decode_coordinate_features_eager(self, decoder_input: torch.Tensor) -> torch.Tensor:
         hidden = self.coordinate_input(decoder_input)
-        for block in self.coordinate_blocks:
-            hidden = F.silu(hidden + block(hidden))
+        for index, block in enumerate(self.coordinate_blocks):
+            update = block(hidden)
+            if self.mhc_coordinate_blocks:
+                update = self.mhc_coordinate_blocks[index](update)
+            hidden = F.silu(hidden + update)
         return self.coordinate_output(hidden)
+
+    def _decode_dense(self, latent: torch.Tensor) -> torch.Tensor:
+        hidden = self.decoder[1](self.decoder[0](latent))
+        if self.mhc_dense_hidden:
+            hidden = self.mhc_dense_hidden[0](hidden)
+        hidden = self.decoder[3](self.decoder[2](hidden))
+        if self.mhc_dense_hidden:
+            hidden = self.mhc_dense_hidden[1](hidden)
+        return self.decoder[4](hidden)
 
     def _decode_latent_coordinate_chunk(
         self,
         latent: torch.Tensor,
+
         encoded_coordinates: torch.Tensor,
         latent_expanded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -3401,7 +3483,7 @@ class LatentTo3DConverter(nn.Module):
         """Decode logits at selected flat voxel indices for high-resolution training."""
         batch_size = latent.shape[0]
         if self.decoder_mode == "dense":
-            dense = self.decoder(latent)
+            dense = self._decode_dense(latent)
             return dense.index_select(1, flat_indices.to(device=latent.device, dtype=torch.long))
 
         flat_indices = flat_indices.to(device=latent.device, dtype=torch.long)
@@ -3453,7 +3535,7 @@ class LatentTo3DConverter(nn.Module):
         """Convert latent code to voxel grid"""
         batch_size = latent.shape[0]
         if self.decoder_mode == "dense":
-            voxels = self.decoder(latent)
+            voxels = self._decode_dense(latent)
             return voxels.view(batch_size, *self.output_shape)
 
         coords = self._encode_full_coordinate_grid(latent.device, latent.dtype)
@@ -6312,6 +6394,9 @@ class OptimizedDiffusionTrainer:
                     config_value("model", "coordinate_gradient_checkpointing", True)
                 ),
                 enable_decoder_compile=model_config.compile_converter_decoder,
+                mhc_enabled=model_config.mhc_enabled,
+                mhc_streams=model_config.mhc_streams,
+                mhc_sinkhorn_iterations=model_config.mhc_sinkhorn_iterations,
             ).to(dtype=self.dtype)
 
             # 4-step consistency model
@@ -6577,10 +6662,10 @@ class OptimizedDiffusionTrainer:
         if int(state.get("run_state_version", 0)) != 1:
             raise ValueError("Unsupported run-state version")
         model_state = state["model"]
-        self.diffusion_model.load_state_dict(model_state["diffusion_model"])
-        self.consistency_model.load_state_dict(model_state["consistency_model"])
-        self.converter.load_state_dict(model_state["converter"])
-        self.ema_model.load_state_dict(model_state["ema_model"])
+        load_state_dict_mhc_compatible(self.diffusion_model, model_state["diffusion_model"])
+        load_state_dict_mhc_compatible(self.consistency_model, model_state["consistency_model"])
+        load_state_dict_mhc_compatible(self.converter, model_state["converter"])
+        load_state_dict_mhc_compatible(self.ema_model, model_state["ema_model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         self.scheduler_step_per_update = bool(
@@ -8958,10 +9043,10 @@ class OptimizedDiffusionTrainer:
             map_location=self.device,
             authorized_paths=(path,),
         )
-        self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
-        self.consistency_model.load_state_dict(checkpoint['consistency_model'])
-        self.converter.load_state_dict(checkpoint['converter'])
-        self.ema_model.load_state_dict(checkpoint['ema_model'])
+        load_state_dict_mhc_compatible(self.diffusion_model, checkpoint['diffusion_model'])
+        load_state_dict_mhc_compatible(self.consistency_model, checkpoint['consistency_model'])
+        load_state_dict_mhc_compatible(self.converter, checkpoint['converter'])
+        load_state_dict_mhc_compatible(self.ema_model, checkpoint['ema_model'])
         self._sync_consistency_teacher()
         optimizer_state_loaded = True
         try:
@@ -9037,13 +9122,13 @@ class OptimizedDiffusionTrainer:
             map_location=self.device,
             authorized_paths=(Path(path).resolve(),),
         )
-        self.diffusion_model.load_state_dict(checkpoint["diffusion_model"])
-        self.consistency_model.load_state_dict(checkpoint["consistency_model"])
+        load_state_dict_mhc_compatible(self.diffusion_model, checkpoint["diffusion_model"])
+        load_state_dict_mhc_compatible(self.consistency_model, checkpoint["consistency_model"])
         converter_report = load_width_expanded_state_dict(
             self.converter,
             checkpoint["converter"],
         )
-        self.ema_model.load_state_dict(checkpoint["ema_model"])
+        load_state_dict_mhc_compatible(self.ema_model, checkpoint["ema_model"])
         self.global_step = int(checkpoint.get("global_step", 0))
         self.consistency_update_step = int(
             checkpoint.get(
@@ -9124,6 +9209,9 @@ class OptimizedAircraftGenerator:
             coordinate_fourier_bands=self.model_config.coordinate_fourier_bands,
             enable_coordinate_gradient_checkpointing=False,
             enable_decoder_compile=self.model_config.compile_converter_decoder,
+            mhc_enabled=self.model_config.mhc_enabled,
+            mhc_streams=self.model_config.mhc_streams,
+            mhc_sinkhorn_iterations=self.model_config.mhc_sinkhorn_iterations,
         ).to(self.device)
 
         # Load consistency model
@@ -9139,10 +9227,10 @@ class OptimizedAircraftGenerator:
             self.diffusion_config,
             enable_teacher=enable_consistency_teacher,
         ).to(self.device)
-        self.consistency_model.load_state_dict(checkpoint['consistency_model'])
+        load_state_dict_mhc_compatible(self.consistency_model, checkpoint['consistency_model'])
 
-        self.diffusion_model.load_state_dict(checkpoint['diffusion_model'])
-        self.converter.load_state_dict(checkpoint['converter'])
+        load_state_dict_mhc_compatible(self.diffusion_model, checkpoint['diffusion_model'])
+        load_state_dict_mhc_compatible(self.converter, checkpoint['converter'])
 
         self.noise_schedule = NoiseSchedule(self.diffusion_config).to(self.device)
 
