@@ -78,6 +78,8 @@ from multiobjective_gradients import (
 from recovery_safeguards import (
     TransactionalOptimizerStep,
     effective_rank,
+    parameter_update_ratios,
+    update_ratio_limit_violations,
 )
 from validate_manifest import validate_manifest_file
 
@@ -700,6 +702,63 @@ class TrainingConfig:
     collapse_watchdog_min_unique_fraction: float = float(
         config_value("training", "collapse_watchdog_min_unique_fraction", 0.50)
     )
+    collapse_watchdog_relative_probability_std_floor: float = float(
+        config_value(
+            "training", "collapse_watchdog_relative_probability_std_floor", 0.50
+        )
+    )
+    collapse_watchdog_relative_probability_span_floor: float = float(
+        config_value(
+            "training", "collapse_watchdog_relative_probability_span_floor", 0.50
+        )
+    )
+    collapse_watchdog_relative_effective_rank_floor: float = float(
+        config_value(
+            "training", "collapse_watchdog_relative_effective_rank_floor", 0.50
+        )
+    )
+    collapse_watchdog_relative_signal_requires_occupancy_failure: bool = bool(
+        config_value(
+            "training",
+            "collapse_watchdog_relative_signal_requires_occupancy_failure",
+            True,
+        )
+    )
+    collapse_watchdog_max_mhc_functional_movement: float = float(
+        config_value(
+            "training", "collapse_watchdog_max_mhc_functional_movement", 0.10
+        )
+    )
+    module_update_ratio_enforcement: bool = bool(
+        config_value("training", "module_update_ratio_enforcement", True)
+    )
+    update_ratio_max_diffusion: float = float(
+        config_value("training", "update_ratio_max_diffusion", 0.01)
+    )
+    update_ratio_max_coordinate_converter: float = float(
+        config_value("training", "update_ratio_max_coordinate_converter", 0.01)
+    )
+    update_ratio_max_consistency_student: float = float(
+        config_value("training", "update_ratio_max_consistency_student", 0.01)
+    )
+    update_ratio_max_mhc_routing: float = float(
+        config_value("training", "update_ratio_max_mhc_routing", 0.005)
+    )
+    update_ratio_max_output_layers: float = float(
+        config_value("training", "update_ratio_max_output_layers", 0.005)
+    )
+    functional_anchor_enabled: bool = bool(
+        config_value("training", "functional_anchor_enabled", True)
+    )
+    functional_anchor_weight: float = float(
+        config_value("training", "functional_anchor_weight", 0.01)
+    )
+    functional_anchor_bank_size: int = int(
+        config_value("training", "functional_anchor_bank_size", 2)
+    )
+    functional_anchor_huber_delta: float = float(
+        config_value("training", "functional_anchor_huber_delta", 0.10)
+    )
     geometry_reconstruction_weight: float = 1.0
     generation_reconstruction_weight: float = 1.0
     # One-sided anti-collapse objective on free-running geometry probabilities.
@@ -872,6 +931,10 @@ def evaluate_model_collapse(
     losses: Optional[Mapping[str, Any]] = None,
     gradient_norms: Optional[Mapping[str, Any]] = None,
     optimizer_steps: Optional[Mapping[str, Any]] = None,
+    representation_effective_rank: Optional[float] = None,
+    module_update_ratios: Optional[Mapping[str, Mapping[str, float]]] = None,
+    module_update_ratio_limits: Optional[Mapping[str, float]] = None,
+    mhc_telemetry: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return a fail-closed decision for numerical or geometric collapse.
 
@@ -906,6 +969,17 @@ def evaluate_model_collapse(
 
     if nonfinite_observed:
         add_reason("nonfinite_forward_or_solver_value", hard=True)
+
+    if representation_effective_rank is not None:
+        try:
+            effective_rank_value = float(representation_effective_rank)
+        except (TypeError, ValueError):
+            effective_rank_value = float("nan")
+        stats["representation_effective_rank"] = (
+            effective_rank_value if np.isfinite(effective_rank_value) else None
+        )
+        if not np.isfinite(effective_rank_value):
+            add_reason("nonfinite_representation_effective_rank", hard=True)
 
     for mapping_name, values in (("losses", losses), ("gradient_norms", gradient_norms)):
         for name, value in (values or {}).items():
@@ -994,6 +1068,26 @@ def evaluate_model_collapse(
                         "probability_count": int(flat.numel()),
                     }
                 )
+                baseline = state.get("healthy_baseline")
+                if not isinstance(baseline, Mapping):
+                    baseline = {}
+                if (
+                    "probability_std" not in baseline
+                    and probability_std > 0.0
+                    and probability_span > 0.0
+                ):
+                    baseline = {
+                        **dict(baseline),
+                        "probability_std": probability_std,
+                        "probability_span": probability_span,
+                    }
+                    state["healthy_baseline"] = baseline
+                baseline_std = float(baseline.get("probability_std", 0.0) or 0.0)
+                baseline_span = float(baseline.get("probability_span", 0.0) or 0.0)
+                if baseline_std > 0.0:
+                    stats["relative_probability_std"] = probability_std / baseline_std
+                if baseline_span > 0.0:
+                    stats["relative_probability_span"] = probability_span / baseline_span
                 if after_warmup:
                     std_floor = max(
                         0.0,
@@ -1009,6 +1103,36 @@ def evaluate_model_collapse(
                     )
                     if probability_std <= std_floor and probability_span <= span_floor:
                         add_reason("geometry_probability_signal_constant")
+                    relative_std_floor = float(
+                        training_config.collapse_watchdog_relative_probability_std_floor
+                    )
+                    relative_span_floor = float(
+                        training_config.collapse_watchdog_relative_probability_span_floor
+                    )
+                    relative_std = (
+                        probability_std / baseline_std if baseline_std > 0.0 else None
+                    )
+                    relative_span = (
+                        probability_span / baseline_span if baseline_span > 0.0 else None
+                    )
+                    occupancy_failure = (
+                        occupied_fraction
+                        <= float(training_config.collapse_watchdog_min_occupied_fraction)
+                        or occupied_fraction
+                        >= float(training_config.collapse_watchdog_max_occupied_fraction)
+                    )
+                    relative_signal_collapsed = (
+                        relative_std is not None
+                        and relative_span is not None
+                        and relative_std < relative_std_floor
+                        and relative_span < relative_span_floor
+                        and (
+                            not training_config.collapse_watchdog_relative_signal_requires_occupancy_failure
+                            or occupancy_failure
+                        )
+                    )
+                    if relative_signal_collapsed:
+                        add_reason("geometry_probability_signal_collapsed_relative")
                     if occupied_fraction <= float(
                         training_config.collapse_watchdog_min_occupied_fraction
                     ):
@@ -1017,6 +1141,68 @@ def evaluate_model_collapse(
                         training_config.collapse_watchdog_max_occupied_fraction
                     ):
                         add_reason("geometry_materialization_solid")
+
+    if representation_effective_rank is not None and np.isfinite(
+        float(representation_effective_rank)
+    ):
+        rank_value = float(representation_effective_rank)
+        baseline = state.get("healthy_baseline")
+        if not isinstance(baseline, Mapping):
+            baseline = {}
+        baseline_rank = float(baseline.get("effective_rank", 0.0) or 0.0)
+        if "effective_rank" not in baseline and rank_value > 0.0:
+            baseline = {**dict(baseline), "effective_rank": rank_value}
+            state["healthy_baseline"] = baseline
+            baseline_rank = rank_value
+        if baseline_rank > 0.0:
+            rank_ratio = rank_value / baseline_rank
+            stats["relative_effective_rank"] = rank_ratio
+            if after_warmup and rank_ratio < float(
+                training_config.collapse_watchdog_relative_effective_rank_floor
+            ):
+                add_reason("representation_effective_rank_collapsed")
+
+    if module_update_ratios is not None:
+        stats["module_update_ratios"] = {
+            str(name): dict(values)
+            for name, values in module_update_ratios.items()
+        }
+    ratio_violations: Dict[str, Dict[str, float]] = {}
+    if module_update_ratio_limits is not None:
+        ratio_violations = update_ratio_limit_violations(
+            module_update_ratios or {}, module_update_ratio_limits
+        )
+        if ratio_violations:
+            stats["module_update_ratio_violations"] = ratio_violations
+            for module_name in ratio_violations:
+                add_reason(f"module_update_ratio_exceeded:{module_name}", hard=True)
+
+    movement_values: List[Tuple[str, str, float]] = []
+    for module_name, module_values in (mhc_telemetry or {}).items():
+        if not isinstance(module_values, Mapping):
+            continue
+        for block_name, block_values in module_values.items():
+            if not isinstance(block_values, Mapping):
+                continue
+            if "routing_functional_movement" not in block_values:
+                continue
+            try:
+                movement = float(block_values["routing_functional_movement"])
+            except (TypeError, ValueError):
+                movement = float("nan")
+            movement_values.append((str(module_name), str(block_name), movement))
+    if movement_values:
+        finite_movements = [value for _, _, value in movement_values if np.isfinite(value)]
+        max_movement = max(finite_movements) if finite_movements else float("nan")
+        stats["max_mhc_functional_movement"] = (
+            max_movement if np.isfinite(max_movement) else None
+        )
+        if not np.isfinite(max_movement):
+            add_reason("nonfinite_mhc_functional_movement", hard=True)
+        elif after_warmup and max_movement > float(
+            training_config.collapse_watchdog_max_mhc_functional_movement
+        ):
+            add_reason("mhc_routing_functional_movement_exceeded", hard=True)
 
     hard_failure = bool(hard_failure_codes)
     geometry_failure = bool(
@@ -1032,11 +1218,17 @@ def evaluate_model_collapse(
     state["consecutive_failures"] = consecutive_failures
 
     patience = max(1, int(training_config.collapse_watchdog_patience))
+    policy_failure = bool(ratio_violations) or (
+        "mhc_routing_functional_movement_exceeded" in hard_failure_codes
+    )
     triggered = bool(
-        training_config.collapse_watchdog_enabled
-        and (
-            hard_failure
-            or (geometry_failure and consecutive_failures >= patience)
+        policy_failure
+        or (
+            training_config.collapse_watchdog_enabled
+            and (
+                hard_failure
+                or (geometry_failure and consecutive_failures >= patience)
+            )
         )
     )
     decision = {
@@ -1130,6 +1322,43 @@ def validate_collapse_watchdog_config(training_config: TrainingConfig) -> None:
         )
     if not 0.0 <= float(training_config.collapse_watchdog_min_unique_fraction) <= 1.0:
         errors.append("collapse_watchdog_min_unique_fraction must be in [0, 1]")
+    for name in (
+        "collapse_watchdog_relative_probability_std_floor",
+        "collapse_watchdog_relative_probability_span_floor",
+        "collapse_watchdog_relative_effective_rank_floor",
+    ):
+        value = float(getattr(training_config, name))
+        if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+            errors.append(f"{name} must be finite and in [0, 1]")
+    if not np.isfinite(
+        float(training_config.collapse_watchdog_max_mhc_functional_movement)
+    ) or float(training_config.collapse_watchdog_max_mhc_functional_movement) < 0.0:
+        errors.append("collapse_watchdog_max_mhc_functional_movement must be finite and nonnegative")
+    for name in (
+        "update_ratio_max_diffusion",
+        "update_ratio_max_coordinate_converter",
+        "update_ratio_max_consistency_student",
+        "update_ratio_max_mhc_routing",
+        "update_ratio_max_output_layers",
+    ):
+        value = float(getattr(training_config, name))
+        if not np.isfinite(value) or value <= 0.0:
+            errors.append(f"{name} must be finite and positive")
+    if float(training_config.functional_anchor_weight) < 0.0:
+        errors.append("functional_anchor_weight must be nonnegative")
+    if int(training_config.functional_anchor_bank_size) < 0:
+        errors.append("functional_anchor_bank_size must be nonnegative")
+    if not np.isfinite(float(training_config.functional_anchor_huber_delta)) or float(
+        training_config.functional_anchor_huber_delta
+    ) <= 0.0:
+        errors.append("functional_anchor_huber_delta must be finite and positive")
+    if (
+        bool(training_config.module_update_ratio_enforcement)
+        and not bool(training_config.transactional_optimizer_steps)
+    ):
+        errors.append(
+            "module_update_ratio_enforcement requires transactional_optimizer_steps"
+        )
     if float(training_config.geometry_probability_std_weight) < 0.0:
         errors.append("geometry_probability_std_weight must be nonnegative")
     if not 0.0 < float(training_config.geometry_probability_std_target) <= 0.5:
@@ -1594,6 +1823,7 @@ def combine_training_loss_terms(
     denoising_geometry_confidence: Optional[torch.Tensor] = None,
     latent_reconstruction_loss_val: Optional[torch.Tensor] = None,
     geometry_probability_std_loss_val: Optional[torch.Tensor] = None,
+    functional_anchor_loss_val: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Return the complete loss used for every optimizer update."""
     zero = mse_loss_val.new_tensor(0.0)
@@ -1607,6 +1837,11 @@ def combine_training_loss_terms(
     geometry_probability_std_loss_val = (
         geometry_probability_std_loss_val
         if geometry_probability_std_loss_val is not None
+        else zero
+    )
+    functional_anchor_loss_val = (
+        functional_anchor_loss_val
+        if functional_anchor_loss_val is not None
         else zero
     )
     denoising_geometry_confidence = (
@@ -1627,6 +1862,7 @@ def combine_training_loss_terms(
         + training_config.latent_reconstruction_weight * latent_reconstruction_loss_val
         + training_config.geometry_probability_std_weight
         * geometry_probability_std_loss_val
+        + training_config.functional_anchor_weight * functional_anchor_loss_val
         + training_config.direct_solver_loss_weight * direct_solver_loss_val
     )
     if not torch.isfinite(optimization_loss):
@@ -7197,6 +7433,12 @@ class OptimizedDiffusionTrainer:
         }
         self.last_collapse_watchdog: Dict[str, Any] = {}
         self.last_transaction: Dict[str, Any] = {}
+        self.recovery_mode = False
+        self.functional_anchor_bank: Optional[Dict[str, Any]] = None
+        self.geometry_probability_std_target = float(
+            training_config.geometry_probability_std_target
+        )
+        self._geometry_probability_std_target_calibrated = False
         self._sync_consistency_teacher()
 
     def _copy_model(self, model: nn.Module) -> nn.Module:
@@ -7235,6 +7477,129 @@ class OptimizedDiffusionTrainer:
         teacher_model.eval()
         for parameter in teacher_model.parameters():
             parameter.requires_grad_(False)
+
+    def _initialize_functional_anchor_bank(
+        self,
+        latent: torch.Tensor,
+        condition: Optional[torch.Tensor],
+    ) -> None:
+        """Capture a tiny frozen warm-start function-preservation bank."""
+        if (
+            not self.recovery_mode
+            or not self.training_config.functional_anchor_enabled
+            or self.functional_anchor_bank is not None
+            or int(self.training_config.functional_anchor_bank_size) <= 0
+            or latent.shape[0] <= 0
+        ):
+            return
+        count = min(int(self.training_config.functional_anchor_bank_size), latent.shape[0])
+        anchor_latent = latent[:count].detach().to(device="cpu", dtype=torch.float32)
+        anchor_condition = (
+            condition[:count].detach().to(device="cpu", dtype=torch.float32)
+            if condition is not None
+            else None
+        )
+        anchor_t = torch.zeros(count, device=self.device, dtype=torch.long)
+        parameter_dtype = getattr(self, "parameter_dtype", latent.dtype)
+        with torch.no_grad():
+            target = self.diffusion_model(
+                anchor_latent.to(self.device, dtype=parameter_dtype),
+                anchor_t,
+                condition=(
+                    anchor_condition.to(self.device, dtype=parameter_dtype)
+                    if anchor_condition is not None
+                    else None
+                ),
+            ).detach().to(device="cpu", dtype=torch.float32)
+        self.functional_anchor_bank = {
+            "latent": anchor_latent,
+            "condition": anchor_condition,
+            "timestep": anchor_t.detach().to(device="cpu"),
+            "target": target,
+        }
+        self.run_state_metadata["functional_anchor"] = {
+            "enabled": True,
+            "bank_size": count,
+            "source": "first_warm_start_batch",
+        }
+
+    def _functional_anchor_loss(self) -> torch.Tensor:
+        """Measure weak Huber drift from the captured warm-start function."""
+        zero = next(self.diffusion_model.parameters()).new_zeros(())
+        bank = self.functional_anchor_bank
+        if (
+            bank is None
+            or not self.recovery_mode
+            or not self.training_config.functional_anchor_enabled
+        ):
+            return zero
+        parameter_dtype = getattr(self, "parameter_dtype", bank["latent"].dtype)
+        latent = bank["latent"].to(self.device, dtype=parameter_dtype)
+        condition = bank.get("condition")
+        if condition is not None:
+            condition = condition.to(
+                self.device, dtype=getattr(self, "parameter_dtype", latent.dtype)
+            )
+        timestep = bank["timestep"].to(self.device, dtype=torch.long)
+        target = bank["target"].to(self.device, dtype=torch.float32)
+        prediction = self.diffusion_model(latent, timestep, condition=condition)
+        return F.huber_loss(
+            prediction.float(),
+            target,
+            delta=float(self.training_config.functional_anchor_huber_delta),
+        )
+
+    def _calibrate_geometry_probability_std_target(
+        self, watchdog_logits: torch.Tensor
+    ) -> None:
+        """Use the pre-update warm-start output as the spread reference."""
+        if (
+            not self.recovery_mode
+            or self._geometry_probability_std_target_calibrated
+            or not bool(
+                config_value(
+                    "training", "geometry_probability_std_target_from_warm_start", True
+                )
+            )
+        ):
+            return
+        probabilities = torch.sigmoid(watchdog_logits.detach().float()).reshape(
+            watchdog_logits.shape[0], -1
+        )
+        observed = float(probabilities.std(dim=1, unbiased=False).mean().item())
+        if np.isfinite(observed) and observed > 0.0:
+            self.geometry_probability_std_target = observed
+            self._geometry_probability_std_target_calibrated = True
+            self.run_state_metadata["geometry_probability_std_target"] = observed
+
+    def _seed_warm_start_collapse_baseline(
+        self,
+        watchdog_logits: torch.Tensor,
+        representation_effective_rank: float,
+    ) -> None:
+        """Persist pre-update warm-start geometry and representation baselines."""
+        if not self.recovery_mode or "healthy_baseline" in self.collapse_watchdog_state:
+            return
+        probabilities = torch.sigmoid(watchdog_logits.detach().float()).reshape(
+            watchdog_logits.shape[0], -1
+        )
+        if probabilities.numel() == 0 or not bool(torch.isfinite(probabilities).all().item()):
+            return
+        flat = probabilities.reshape(-1)
+        probability_std = float(flat.std(unbiased=False).item())
+        probability_span = float((flat.max() - flat.min()).item())
+        baseline: Dict[str, float] = {}
+        if probability_std > 0.0 and probability_span > 0.0:
+            baseline.update(
+                {
+                    "probability_std": probability_std,
+                    "probability_span": probability_span,
+                }
+            )
+        if np.isfinite(float(representation_effective_rank)) and representation_effective_rank > 0.0:
+            baseline["effective_rank"] = float(representation_effective_rank)
+        if baseline:
+            self.collapse_watchdog_state["healthy_baseline"] = baseline
 
     def build_run_state(
         self,
@@ -7289,6 +7654,14 @@ class OptimizedDiffusionTrainer:
             "compatibility": dict(compatibility),
             "run_state_metadata": dict(self.run_state_metadata),
             "collapse_watchdog_state": dict(self.collapse_watchdog_state),
+            "functional_anchor_bank": self.functional_anchor_bank,
+            "geometry_probability_std_target": float(
+                self.geometry_probability_std_target
+            ),
+            "geometry_probability_std_target_calibrated": bool(
+                self._geometry_probability_std_target_calibrated
+            ),
+            "recovery_mode": bool(self.recovery_mode),
             "log_reconciliation": log_reconciliation,
         }
 
@@ -7391,6 +7764,28 @@ class OptimizedDiffusionTrainer:
                 {"checks": 0, "consecutive_failures": 0},
             )
         )
+        anchor_bank = state.get("functional_anchor_bank")
+        self.functional_anchor_bank = (
+            dict(anchor_bank) if isinstance(anchor_bank, Mapping) else None
+        )
+        self.geometry_probability_std_target = float(
+            state.get(
+                "geometry_probability_std_target",
+                self.training_config.geometry_probability_std_target,
+            )
+        )
+        self._geometry_probability_std_target_calibrated = bool(
+            state.get("geometry_probability_std_target_calibrated", False)
+        )
+        self.recovery_mode = bool(
+            state.get(
+                "recovery_mode",
+                state.get("run_state_metadata", {}).get("recovery_mode")
+                in {"warm_start", "recovery"},
+            )
+        )
+        if self.recovery_mode:
+            self.training_config.collapse_watchdog_warmup_updates = 0
         self.last_collapse_watchdog = dict(
             state.get("run_state_metadata", {}).get("collapse_watchdog", {})
         )
@@ -8056,6 +8451,7 @@ class OptimizedDiffusionTrainer:
         total_generation_geometry = 0.0
         total_geometry_probability_std_loss = 0.0
         total_geometry_probability_std = 0.0
+        total_functional_anchor = 0.0
         total_consistency = 0.0
         total_latent_reconstruction = 0.0
         total_denoising_geometry_confidence = 0.0
@@ -8158,6 +8554,8 @@ class OptimizedDiffusionTrainer:
                     size=(grid_size, grid_size, grid_size),
                     mode='nearest'
                 ).squeeze(1)
+
+            self._initialize_functional_anchor_bank(latent, condition)
 
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
@@ -8446,14 +8844,23 @@ class OptimizedDiffusionTrainer:
             else:
                 watchdog_logits = generation_geom_logits
                 watchdog_probability_source = "generated_geometry"
+            representation_effective_rank = effective_rank(
+                generation_latent.detach().float()
+            )
+            self._seed_warm_start_collapse_baseline(
+                watchdog_logits,
+                representation_effective_rank,
+            )
+            self._calibrate_geometry_probability_std_target(watchdog_logits)
             geometry_probability_std_loss_val, geometry_probability_std_val = (
                 geometry_probability_standard_deviation_loss(
                     watchdog_logits,
                     target_standard_deviation=float(
-                        self.training_config.geometry_probability_std_target
+                        self.geometry_probability_std_target
                     ),
                 )
             )
+            functional_anchor_loss_val = self._functional_anchor_loss()
             direct_solver_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_evaluated = False
             run_direct_solver_loss = (
@@ -8491,6 +8898,7 @@ class OptimizedDiffusionTrainer:
                 denoising_geometry_confidence=denoising_geometry_confidence,
                 latent_reconstruction_loss_val=latent_reconstruction_loss_val,
                 geometry_probability_std_loss_val=geometry_probability_std_loss_val,
+                functional_anchor_loss_val=functional_anchor_loss_val,
             )
 
             # Backpropagate independent student branches sequentially. The
@@ -8998,17 +9406,95 @@ class OptimizedDiffusionTrainer:
             # exact rollback image does not compete with the active 128^3
             # neural/solver allocations for L4 VRAM.  It remains live until
             # the cheap post-step watchdog decision has passed.
+            module_parameter_groups = {
+                "diffusion": tuple(self.diffusion_model.parameters()),
+                "coordinate_converter": tuple(self.converter.parameters()),
+                "consistency_student": tuple(
+                    self.consistency_model.student_model.parameters()
+                ),
+            }
+            routing_parameters: List[torch.nn.Parameter] = []
+            output_parameters: List[torch.nn.Parameter] = []
+            output_tokens = (
+                "out_conv",
+                "coordinate_output",
+                "output_layer",
+                "output_projection",
+            )
+            for module in (
+                self.diffusion_model,
+                self.converter,
+                self.consistency_model.student_model,
+            ):
+                for name, parameter in module.named_parameters():
+                    lowered = name.lower()
+                    if "mhc" in lowered or "routing_logits" in lowered:
+                        routing_parameters.append(parameter)
+                    if any(token in lowered for token in output_tokens):
+                        output_parameters.append(parameter)
+            module_parameter_groups["mhc_routing"] = tuple(routing_parameters)
+            module_parameter_groups["output_layers"] = tuple(output_parameters)
+            module_update_ratio_limits = {
+                "diffusion": float(
+                    self.training_config.update_ratio_max_diffusion
+                ),
+                "coordinate_converter": float(
+                    self.training_config.update_ratio_max_coordinate_converter
+                ),
+                "consistency_student": float(
+                    self.training_config.update_ratio_max_consistency_student
+                ),
+                "mhc_routing": float(
+                    self.training_config.update_ratio_max_mhc_routing
+                ),
+                "output_layers": float(
+                    self.training_config.update_ratio_max_output_layers
+                ),
+            }
+            module_update_ratio_policy = (
+                module_update_ratio_limits
+                if (
+                    self.training_config.module_update_ratio_enforcement
+                    and self.training_config.transactional_optimizer_steps
+                )
+                else None
+            )
+            module_update_ratios: Dict[str, Dict[str, float]] = {}
+            mhc_routing_snapshots: Dict[int, Optional[torch.Tensor]] = {}
+            for module in (
+                self.diffusion_model,
+                self.converter,
+                self.consistency_model.student_model,
+            ):
+                for child in module.modules():
+                    if isinstance(child, ManifoldHyperConnection):
+                        previous = getattr(
+                            child, "_last_routing_telemetry_map", None
+                        )
+                        mhc_routing_snapshots[id(child)] = (
+                            previous.detach().clone() if previous is not None else None
+                        )
+
+            def restore_mhc_routing_snapshots() -> None:
+                for module in (
+                    self.diffusion_model,
+                    self.converter,
+                    self.consistency_model.student_model,
+                ):
+                    for child in module.modules():
+                        if not isinstance(child, ManifoldHyperConnection):
+                            continue
+                        previous = mhc_routing_snapshots.get(id(child))
+                        if previous is None:
+                            if hasattr(child, "_last_routing_telemetry_map"):
+                                delattr(child, "_last_routing_telemetry_map")
+                        else:
+                            child._last_routing_telemetry_map = previous
             optimizer_transaction = None
             if self.training_config.transactional_optimizer_steps:
                 optimizer_transaction = TransactionalOptimizerStep(
                     self.optimizer,
-                    {
-                        "diffusion": tuple(self.diffusion_model.parameters()),
-                        "coordinate_converter": tuple(self.converter.parameters()),
-                        "consistency_student": tuple(
-                            self.consistency_model.student_model.parameters()
-                        ),
-                    },
+                    module_parameter_groups,
                     scheduler=self.scheduler,
                     ema_model=self.ema_model,
                     snapshot_device="cpu",
@@ -9025,7 +9511,16 @@ class OptimizedDiffusionTrainer:
             except Exception:
                 if optimizer_transaction is not None:
                     optimizer_transaction.rollback()
+                restore_mhc_routing_snapshots()
                 raise
+            if (
+                self.training_config.module_update_ratio_enforcement
+                and optimizer_transaction is not None
+            ):
+                module_update_ratios = parameter_update_ratios(
+                    optimizer_transaction._parameter_state,
+                    module_parameter_groups,
+                )
             self.last_transaction = {
                 "enabled": optimizer_transaction is not None,
                 "captured": optimizer_transaction is not None,
@@ -9043,14 +9538,11 @@ class OptimizedDiffusionTrainer:
             except Exception:
                 if optimizer_transaction is not None:
                     optimizer_transaction.rollback()
+                    restore_mhc_routing_snapshots()
                     self.last_transaction.update(
                         {"rolled_back": True, "committed": False}
                     )
                 raise
-            representation_effective_rank = effective_rank(
-                generation_latent.detach().float()
-            )
-
             # The coordinate decoder is a required learning path. Record the
             # actual Adam step, rather than assuming that optimizer.step()
             # touched the group; this catches the exact historical failure
@@ -9099,6 +9591,7 @@ class OptimizedDiffusionTrainer:
                 direct_solver_float,
                 geometry_probability_std_loss_float,
                 geometry_probability_std_float,
+                functional_anchor_loss_float,
             ) = torch.stack([
                 optimization_loss_val.detach(),
                 mse_loss_val.detach(),
@@ -9111,6 +9604,7 @@ class OptimizedDiffusionTrainer:
                 direct_solver_loss_val.detach(),
                 geometry_probability_std_loss_val.detach(),
                 geometry_probability_std_val.detach(),
+                functional_anchor_loss_val.detach(),
             ]).tolist()
 
             total_optimization_loss += optimization_loss_float
@@ -9120,6 +9614,7 @@ class OptimizedDiffusionTrainer:
             total_generation_geometry += generation_geometry_loss_float
             total_geometry_probability_std_loss += geometry_probability_std_loss_float
             total_geometry_probability_std += geometry_probability_std_float
+            total_functional_anchor += functional_anchor_loss_float
             total_consistency += consistency_float
             data_gradient_metrics = branch_telemetry["data"]
             consistency_gradient_metrics = branch_telemetry["consistency"]
@@ -9207,6 +9702,7 @@ class OptimizedDiffusionTrainer:
                     'gen_geom': generation_geometry_loss_float,
                     'prob_std': geometry_probability_std_float,
                     'prob_std_loss': geometry_probability_std_loss_float,
+                    'functional_anchor': functional_anchor_loss_float,
                     'consistency': consistency_float,
                     'latent_recon': latent_reconstruction_float,
                     'direct_solver': direct_solver_float,
@@ -9239,6 +9735,10 @@ class OptimizedDiffusionTrainer:
                     "coordinate_converter": step_converter_gradient_norm,
                 },
                 optimizer_steps=optimizer_steps,
+                representation_effective_rank=representation_effective_rank,
+                module_update_ratios=module_update_ratios,
+                module_update_ratio_limits=module_update_ratio_policy,
+                mhc_telemetry=mhc_telemetry,
             )
             if nonfinite_observations:
                 watchdog_decision["nonfinite_observations"] = list(
@@ -9290,6 +9790,9 @@ class OptimizedDiffusionTrainer:
                             ),
                             "geometry_probability_std": float(
                                 geometry_probability_std_float
+                            ),
+                            "functional_anchor": float(
+                                functional_anchor_loss_float
                             ),
                             "consistency": float(consistency_float),
                             "latent_reconstruction": float(
@@ -9345,6 +9848,7 @@ class OptimizedDiffusionTrainer:
                             direct_gradient_trust_region
                         ),
                         "mhc_telemetry": mhc_telemetry,
+                        "module_update_ratios": dict(module_update_ratios),
                         "representation_effective_rank": float(
                             representation_effective_rank
                         ),
@@ -9378,6 +9882,7 @@ class OptimizedDiffusionTrainer:
             if watchdog_decision["triggered"]:
                 if optimizer_transaction is not None:
                     optimizer_transaction.rollback()
+                    restore_mhc_routing_snapshots()
                     self.last_transaction.update(
                         {"rolled_back": True, "committed": False}
                     )
@@ -9480,6 +9985,7 @@ class OptimizedDiffusionTrainer:
             'Loss/generation_reconstruction': total_generation_geometry / denominator,
             'Loss/consistency': total_consistency / denominator,
             'Loss/direct_solver': total_direct_solver / denominator,
+            'Loss/functional_anchor': total_functional_anchor / denominator,
         }
         # _tb_direct is only built when there was a direct-solver eval this
         # epoch -- the per-division denominators would otherwise be 0.0/0.
@@ -9528,6 +10034,7 @@ class OptimizedDiffusionTrainer:
                 total_geometry_probability_std_loss / denominator
             ),
             'geometry_probability_std': total_geometry_probability_std / denominator,
+            'functional_anchor': total_functional_anchor / denominator,
             'consistency': total_consistency / denominator,
             'consistency_raw_mse': (
                 total_consistency_raw_mse / max(consistency_eval_count, 1)
@@ -10016,6 +10523,18 @@ class OptimizedDiffusionTrainer:
                     },
                 )
             ),
+            'functional_anchor_bank': getattr(self, 'functional_anchor_bank', None),
+            'geometry_probability_std_target': float(
+                getattr(
+                    self,
+                    'geometry_probability_std_target',
+                    self.training_config.geometry_probability_std_target,
+                )
+            ),
+            'geometry_probability_std_target_calibrated': bool(
+                getattr(self, '_geometry_probability_std_target_calibrated', False)
+            ),
+            'recovery_mode': bool(getattr(self, 'recovery_mode', False)),
         }
         temporary_path = checkpoint_path.with_suffix(
             checkpoint_path.suffix + ".tmp"
@@ -10106,6 +10625,14 @@ class OptimizedDiffusionTrainer:
                 // max(1, int(self.training_config.consistency_interval)),
             )
         )
+        self.recovery_mode = True
+        self.training_config.collapse_watchdog_warmup_updates = 0
+        self.run_state_metadata.update(
+            {
+                "recovery_mode": "checkpoint_resume",
+                "collapse_watchdog_warmup_override": 0,
+            }
+        )
         if 'geometry_probability_threshold' in checkpoint:
             self._set_geometry_probability_threshold(
                 checkpoint['geometry_probability_threshold'],
@@ -10114,6 +10641,22 @@ class OptimizedDiffusionTrainer:
                 ),
                 calibration=checkpoint.get('geometry_threshold_calibration'),
             )
+        anchor_bank = checkpoint.get('functional_anchor_bank')
+        self.functional_anchor_bank = (
+            dict(anchor_bank) if isinstance(anchor_bank, Mapping) else None
+        )
+        self.geometry_probability_std_target = float(
+            checkpoint.get(
+                'geometry_probability_std_target',
+                self.training_config.geometry_probability_std_target,
+            )
+        )
+        self._geometry_probability_std_target_calibrated = bool(
+            checkpoint.get('geometry_probability_std_target_calibrated', False)
+        )
+        self.recovery_mode = bool(checkpoint.get('recovery_mode', False))
+        if self.recovery_mode:
+            self.training_config.collapse_watchdog_warmup_updates = 0
         print(f"Optimized checkpoint loaded from {path}")
 
     def warm_start_checkpoint(self, path: str) -> Dict[str, Any]:
@@ -10158,6 +10701,23 @@ class OptimizedDiffusionTrainer:
         # belongs to load_checkpoint/resume-run-state, not this weights-only path.
         self.global_step = 0
         self.consistency_update_step = 0
+        self.recovery_mode = True
+        self.training_config.collapse_watchdog_warmup_updates = 0
+        self.collapse_watchdog_state = {
+            "checks": 0,
+            "consecutive_failures": 0,
+        }
+        self.functional_anchor_bank = None
+        self.geometry_probability_std_target = float(
+            self.training_config.geometry_probability_std_target
+        )
+        self._geometry_probability_std_target_calibrated = False
+        self.run_state_metadata.update(
+            {
+                "recovery_mode": "warm_start",
+                "collapse_watchdog_warmup_override": 0,
+            }
+        )
         if "geometry_probability_threshold" in checkpoint:
             self._set_geometry_probability_threshold(
                 checkpoint["geometry_probability_threshold"],

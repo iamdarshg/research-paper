@@ -1,6 +1,8 @@
 import torch
+from torch import nn
 
 from aircraft_diffusion_cfd import (
+    OptimizedDiffusionTrainer,
     TrainingConfig,
     evaluate_model_collapse,
     evaluate_promotion_collapse,
@@ -100,6 +102,90 @@ def test_diverse_geometry_does_not_trigger_watchdog():
     assert decision["occupied_fraction"] == 0.5
 
 
+def test_relative_warm_start_geometry_collapse_requires_persistence():
+    config = _watchdog_config(
+        collapse_watchdog_warmup_updates=0,
+        collapse_watchdog_relative_probability_std_floor=0.5,
+        collapse_watchdog_relative_probability_span_floor=0.5,
+    )
+    state = {}
+    healthy = torch.tensor([0.10, 0.30, 0.70, 0.90])
+    collapsed = torch.tensor([0.45, 0.46, 0.47, 0.48])
+
+    baseline = evaluate_model_collapse(
+        global_step=1,
+        training_config=config,
+        state=state,
+        probabilities=healthy,
+    )
+    first = evaluate_model_collapse(
+        global_step=2,
+        training_config=config,
+        state=state,
+        probabilities=collapsed,
+    )
+    second = evaluate_model_collapse(
+        global_step=3,
+        training_config=config,
+        state=state,
+        probabilities=collapsed,
+    )
+
+    assert baseline["triggered"] is False
+    assert first["triggered"] is False
+    assert second["triggered"] is True
+    assert "geometry_probability_signal_collapsed_relative" in second["reason_codes"]
+    assert second["relative_probability_std"] < 0.5
+    assert second["relative_probability_span"] < 0.5
+
+
+def test_effective_rank_and_mhc_movement_are_live_hard_policies():
+    config = _watchdog_config(
+        collapse_watchdog_warmup_updates=0,
+        collapse_watchdog_max_mhc_functional_movement=0.1,
+    )
+    state = {}
+    evaluate_model_collapse(
+        global_step=1,
+        training_config=config,
+        state=state,
+        probabilities=torch.linspace(0.1, 0.9, 8),
+        representation_effective_rank=4.0,
+    )
+    decision = evaluate_model_collapse(
+        global_step=2,
+        training_config=config,
+        state=state,
+        probabilities=torch.linspace(0.1, 0.9, 8),
+        representation_effective_rank=1.0,
+        mhc_telemetry={
+            "converter": {
+                "mhc_block": {"routing_functional_movement": 0.2}
+            }
+        },
+    )
+
+    assert decision["triggered"] is True
+    assert "representation_effective_rank_collapsed" in decision["reason_codes"]
+    assert "mhc_routing_functional_movement_exceeded" in decision["reason_codes"]
+
+
+def test_module_update_ratio_budget_is_a_transactional_hard_failure():
+    config = _watchdog_config(collapse_watchdog_enabled=False)
+    decision = evaluate_model_collapse(
+        global_step=1,
+        training_config=config,
+        probabilities=torch.linspace(0.1, 0.9, 8),
+        module_update_ratios={
+            "diffusion": {"update_parameter_ratio": 0.02},
+        },
+        module_update_ratio_limits={"diffusion": 0.01},
+    )
+
+    assert decision["triggered"] is True
+    assert "module_update_ratio_exceeded:diffusion" in decision["reason_codes"]
+
+
 def test_promotion_nonuniqueness_pauses_after_warmup():
     config = _watchdog_config(
         collapse_watchdog_warmup_updates=2,
@@ -164,6 +250,39 @@ def test_probability_std_loss_stops_at_target():
 
     assert observed.item() > 0.20
     assert loss.item() == 0.0
+
+
+def test_warm_start_functional_anchor_is_frozen_and_weakly_measured():
+    class TinyDiffusion(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, latent, timestep, condition=None):
+            return latent * self.scale
+
+    trainer = object.__new__(OptimizedDiffusionTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.diffusion_model = TinyDiffusion()
+    trainer.training_config = TrainingConfig(
+        functional_anchor_enabled=True,
+        functional_anchor_bank_size=2,
+        functional_anchor_huber_delta=0.10,
+    )
+    trainer.recovery_mode = True
+    trainer.functional_anchor_bank = None
+    trainer.run_state_metadata = {}
+
+    latent = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    trainer._initialize_functional_anchor_bank(latent, None)
+    initial_loss = trainer._functional_anchor_loss()
+    with torch.no_grad():
+        trainer.diffusion_model.scale.add_(0.5)
+    drift_loss = trainer._functional_anchor_loss()
+
+    assert trainer.functional_anchor_bank["target"].requires_grad is False
+    assert initial_loss.item() == 0.0
+    assert drift_loss.item() > 0.0
 
 
 def test_probability_std_config_rejects_unbounded_target_or_negative_weight():

@@ -973,6 +973,7 @@ def test_runner_main_restores_saved_threshold_and_resets_cadence(tmp_path, monke
 
         def evaluate_geometry_promotion_gate(self, loader):
             return {
+                "generated_evaluation_count": 16,
                 "status": "fail",
                 "reconstruction_recall": 0.5,
                 "generated_recall": 0.5,

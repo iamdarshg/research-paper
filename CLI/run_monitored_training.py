@@ -1037,7 +1037,13 @@ def _build_history_payload(
                     config_value("training", "collapse_watchdog_enabled", True)
                 ),
                 "warmup_updates": int(
-                    getattr(
+                    0
+                    if (
+                        getattr(args, "resume_from", None)
+                        or getattr(args, "resume_run_state", None)
+                        or getattr(args, "warm_start_from", None)
+                    )
+                    else getattr(
                         args,
                         "collapse_watchdog_warmup_updates",
                         config_value("training", "collapse_watchdog_warmup_updates", 128),
@@ -1126,7 +1132,24 @@ def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig
         coordinate_training_samples=int(args.coordinate_training_samples),
         full_lattice_interval=int(args.full_lattice_interval),
         sparse_samples_per_full=int(args.sparse_samples_per_full),
-        collapse_watchdog_warmup_updates=int(args.collapse_watchdog_warmup_updates),
+        # Fresh/random initialization gets the exploratory warm-up. Any
+        # resumed or warm-started lineage is already a known model and must be
+        # monitored immediately during recovery.
+        collapse_watchdog_warmup_updates=(
+            0
+            if (
+                getattr(args, "resume_from", None)
+                or getattr(args, "resume_run_state", None)
+                or getattr(args, "warm_start_from", None)
+            )
+            else int(
+                getattr(
+                    args,
+                    "collapse_watchdog_warmup_updates",
+                    config_value("training", "collapse_watchdog_warmup_updates", 128),
+                )
+            )
+        ),
         direct_solver_interval=int(args.direct_solver_interval),
         direct_solver_steps=args.direct_solver_steps,
         direct_solver_directions=args.direct_solver_directions,
@@ -1374,8 +1397,13 @@ def main() -> int:
         parser.error("--coordinate-training-samples must be greater than 0")
     if args.full_lattice_interval <= 0:
         parser.error("--full-lattice-interval must be greater than 0")
-    if args.sparse_samples_per_full <= 0:
-        parser.error("--sparse-samples-per-full must be greater than 0")
+    if args.sparse_samples_per_full < 0:
+        parser.error("--sparse-samples-per-full must be nonnegative")
+    if args.sparse_samples_per_full == 0 and args.full_lattice_interval != 1:
+        parser.error(
+            "--sparse-samples-per-full may be 0 only when "
+            "--full-lattice-interval is 1"
+        )
     if args.direct_solver_interval <= 0:
         parser.error("--direct-solver-interval must be greater than 0")
     if args.direct_solver_directions <= 0:
@@ -1767,6 +1795,7 @@ def main() -> int:
                 ),
             }
             trainer.run_state_metadata = {
+                **dict(trainer.run_state_metadata),
                 "promotion_baseline": dict(promotion_baseline),
                 "promotion_baseline_report": dict(initial_geometry_promotion_report),
                 "promotion_baseline_metrics": dict(baseline_metrics),

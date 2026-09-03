@@ -9,6 +9,7 @@ from recovery_safeguards import (
     apply_direct_gradient_trust_region,
     effective_rank,
     parameter_update_ratios,
+    update_ratio_limit_violations,
     validate_seed_separation,
 )
 
@@ -55,6 +56,23 @@ def test_parameter_update_ratios_are_module_specific():
     ratios = parameter_update_ratios(before, after)
     assert ratios["diffusion"]["update_parameter_ratio"] == pytest.approx(0.1)
     assert ratios["converter"]["update_parameter_ratio"] == pytest.approx(0.02)
+
+
+def test_update_ratio_limit_violations_are_explicit_and_fail_closed():
+    ratios = {
+        "diffusion": {"update_parameter_ratio": 0.004},
+        "converter": {"update_parameter_ratio": 0.020},
+        "mhc_routing": {"update_parameter_ratio": float("nan")},
+    }
+
+    violations = update_ratio_limit_violations(
+        ratios,
+        {"diffusion": 0.01, "converter": 0.01, "mhc_routing": 0.005},
+    )
+
+    assert set(violations) == {"converter", "mhc_routing"}
+    assert violations["converter"]["limit"] == pytest.approx(0.01)
+    assert np.isnan(violations["mhc_routing"]["update_parameter_ratio"])
 
 
 def test_effective_rank_distinguishes_one_dimensional_and_two_dimensional_support():

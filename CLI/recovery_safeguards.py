@@ -107,7 +107,7 @@ def parameter_update_ratios(
         update_norm_sq = 0.0
         for old, new in zip(before_values, after_values):
             old64 = old.detach().to(dtype=torch.float64)
-            new64 = new.detach().to(dtype=torch.float64)
+            new64 = new.detach().to(device=old64.device, dtype=torch.float64)
             if not bool(torch.isfinite(old64).all().item()) or not bool(
                 torch.isfinite(new64).all().item()
             ):
@@ -125,6 +125,34 @@ def parameter_update_ratios(
             "update_parameter_ratio": update_norm / (parameter_norm + epsilon),
         }
     return result
+
+
+def update_ratio_limit_violations(
+    ratios: Mapping[str, Mapping[str, float]],
+    limits: Mapping[str, float],
+) -> dict[str, dict[str, float]]:
+    """Return non-finite or over-budget module update ratios.
+
+    The caller decides how to apply the returned hard failures (the trainer
+    rolls back its transaction). Keeping this check separate makes the policy
+    directly testable without constructing the full trainer.
+    """
+
+    violations: dict[str, dict[str, float]] = {}
+    for module_name, limit in limits.items():
+        limit_value = float(limit)
+        if not math.isfinite(limit_value) or limit_value <= 0.0:
+            raise ValueError(
+                f"update-ratio limit for {module_name!r} must be finite and positive"
+            )
+        observed = ratios.get(module_name, {})
+        ratio = float(observed.get("update_parameter_ratio", float("nan")))
+        if not math.isfinite(ratio) or ratio > limit_value:
+            violations[module_name] = {
+                "update_parameter_ratio": ratio,
+                "limit": limit_value,
+            }
+    return violations
 
 
 def effective_rank(values: torch.Tensor, *, epsilon: float = 1.0e-12) -> float:

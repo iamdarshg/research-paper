@@ -151,10 +151,12 @@ training:
   promotion_occupancy_error_tolerance: 0.005
   promotion_valid_fraction_tolerance: 0.0
   precision: float32
-  # One-sided free-running probability-spread target. This anti-collapse term
-  # becomes zero at the target instead of rewarding indefinitely noisy fields.
+  # One-sided free-running probability-spread target. For warm starts the
+  # trainer replaces this generic fresh-run default with the healthy checkpoint
+  # baseline measured on the frozen anchor batch.
   geometry_probability_std_weight: 0.25
   geometry_probability_std_target: 0.20
+  geometry_probability_std_target_from_warm_start: true
   save_interval: 25
   val_interval: 1
   coordinate_training_samples: 65536
@@ -199,9 +201,8 @@ training:
   # value is authoritative and overrides any checkpoint/saved threshold.
   geometry_materialization_threshold: 0.5
   # Fail closed when a live run becomes numerically invalid or geometrically
-  # degenerate. Fresh random initialization is exempt only for this bounded
-  # warm-up; after that, two consecutive geometric collapse observations pause
-  # the run and force a durable latest_run_state checkpoint.
+  # degenerate. Fresh random initialization gets this bounded warm-up; the
+  # monitored runner overrides it to zero for warm-start/recovery lineages.
   collapse_watchdog_enabled: true
   collapse_watchdog_warmup_updates: 128
   collapse_watchdog_patience: 2
@@ -212,6 +213,23 @@ training:
   collapse_watchdog_min_converter_gradient_norm: 0.0000000001
   collapse_watchdog_max_converter_step_lag: 1
   collapse_watchdog_min_unique_fraction: 0.50
+  collapse_watchdog_relative_probability_std_floor: 0.50
+  collapse_watchdog_relative_probability_span_floor: 0.50
+  collapse_watchdog_relative_effective_rank_floor: 0.50
+  collapse_watchdog_relative_signal_requires_occupancy_failure: true
+  collapse_watchdog_max_mhc_functional_movement: 0.10
+  # Post-step budgets are enforced transactionally, not just logged.
+  module_update_ratio_enforcement: true
+  update_ratio_max_diffusion: 0.01
+  update_ratio_max_coordinate_converter: 0.01
+  update_ratio_max_consistency_student: 0.01
+  update_ratio_max_mhc_routing: 0.005
+  update_ratio_max_output_layers: 0.005
+  # Warm-start functional preservation is enabled only for a recovery lineage.
+  functional_anchor_enabled: true
+  functional_anchor_weight: 0.01
+  functional_anchor_bank_size: 2
+  functional_anchor_huber_delta: 0.10
   calibrate_geometry_materialization_threshold: false
   geometry_threshold_calibration_samples: 16
   threshold_positive_margin: 0.05
