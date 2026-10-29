@@ -52,11 +52,11 @@ class TestConfigSourceOfTruth(unittest.TestCase):
     def test_budgeted_295m_schedule_is_loaded_from_global_yaml(self):
         from experiment_config import config_value
 
-        self.assertEqual(config_value("model", "coordinate_chunk_size"), 8192)
+        self.assertEqual(config_value("model", "coordinate_chunk_size"), 4096)
         self.assertEqual(config_value("training", "coordinate_training_samples"), 65536)
-        self.assertEqual(config_value("training", "full_lattice_interval"), 64)
+        self.assertEqual(config_value("training", "full_lattice_interval"), 1)
         self.assertEqual(config_value("training", "direct_solver_interval"), 32)
-        self.assertEqual(config_value("training", "direct_solver_directions"), 8)
+        self.assertEqual(config_value("training", "direct_solver_directions"), 16)
         self.assertEqual(config_value("training", "direct_solver_batch_chunk"), 4)
         self.assertEqual(config_value("cfd", "stream_bfl_backend"), "fused_stream_bfl")
 

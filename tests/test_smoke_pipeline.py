@@ -29,8 +29,10 @@ class _FakeStateModule:
     def eval(self):
         return self
 
-    def load_state_dict(self, state):
+    def load_state_dict(self, state, strict=True):
         self.loaded_state = state
+        from torch.nn.modules.module import _IncompatibleKeys
+        return _IncompatibleKeys(missing_keys=[], unexpected_keys=[])
 
     def state_dict(self):
         return {"ok": True}

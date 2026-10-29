@@ -25,8 +25,12 @@ model:
   mhc_sinkhorn_iterations: 8
   coordinate_decoder_threshold: 96
   coordinate_chunk_size: 4096
-  coordinate_decoder_width: 3328
-  coordinate_decoder_depth: 12
+  # Informational: the executable architecture is selected by the scaling
+  # section below (large_corpus_high_resolution_decoder_width). The 2026-09-01
+  # real-corpus 128^3 ablation selected 2048x5 over 1024x5 twice by
+  # class-balanced occupancy perplexity and top-k recall.
+  coordinate_decoder_width: 2048
+  coordinate_decoder_depth: 5
   # Selected by the 2026-09-01 128^3 bounded ablation: 4096 reduced peak
   # allocation while retaining finite forward/backward gradients.
   coordinate_fourier_bands: 6
@@ -46,7 +50,7 @@ scaling:
   # This count selects the reported network widths. It is a capacity-planning
   # input, not a claim that these geometries ship in the repository.
   # Floor used by the mainline 128^3 run. The current combined corpus exceeds
-  # the saturation point, so this selects the fixed 294,719,529-parameter
+  # the saturation point, so this selects the fixed 70,081,321-parameter
   # architecture even when a filtered training split reports fewer records.
   capacity_basis_unique_geometries: 8027
   reference_unique_geometries: 600

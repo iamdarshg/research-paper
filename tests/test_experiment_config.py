@@ -42,7 +42,7 @@ def test_capacity_report_is_explicit_about_memory_limitations():
     assert "not measured peak VRAM" in report
 
 
-def test_mainline_128_preset_has_exactly_294719529_trainable_parameters():
+def test_mainline_128_preset_matches_scaled_architecture():
     config = load_global_config()
     model_config = ModelConfig.scaled_for_corpus(
         int(config["scaling"]["capacity_basis_unique_geometries"]),
@@ -51,10 +51,13 @@ def test_mainline_128_preset_has_exactly_294719529_trainable_parameters():
 
     assert model_config.grid_resolution == 128
     assert model_config.latent_dim == 512
-    assert model_config.coordinate_chunk_size == 8192
-    assert model_config.coordinate_decoder_width == 3328
-    assert model_config.coordinate_decoder_depth == 12
-    assert "Trainable parameters: `294,719,529`" in build_report()
+    assert model_config.coordinate_chunk_size == 4096
+    # The 2026-09-01 real-corpus 128^3 ablation selected 2048x5 over 1024x5
+    # (config.yaml scaling.large_corpus_high_resolution_decoder_width). The
+    # capacity report must track the scaled architecture.
+    assert model_config.coordinate_decoder_width == 2048
+    assert model_config.coordinate_decoder_depth == 5
+    assert "Trainable parameters: `70,081,321`" in build_report()
 
 
 def test_config_digest_is_independent_of_mapping_order():

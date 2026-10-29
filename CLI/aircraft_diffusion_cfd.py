@@ -1788,7 +1788,11 @@ def extract_checkpoint_model_state(
     else:
         model_state = checkpoint
         schema = "legacy_weight_checkpoint"
-    required = {"diffusion_model", "consistency_model", "converter", "ema_model"}
+    # ema_model is omitted by teacherless monitored runs (consistency disabled
+    # to fit the bounded host-RAM envelope) and by legacy weight checkpoints.
+    # It is only required when the checkpoint actually declares it; inference
+    # never needs it and warm starts treat it as optional.
+    required = {"diffusion_model", "consistency_model", "converter"}
     missing = sorted(required.difference(model_state))
     if missing:
         raise ValueError(
@@ -10692,7 +10696,8 @@ class OptimizedDiffusionTrainer:
             self.converter,
             model_state["converter"],
         )
-        load_state_dict_mhc_compatible(self.ema_model, model_state["ema_model"])
+        if "ema_model" in model_state:
+            load_state_dict_mhc_compatible(self.ema_model, model_state["ema_model"])
         source_global_step = int(checkpoint.get("global_step", 0))
         # A warm start intentionally creates a new optimization lineage. Carrying
         # the source progress counter while dropping Adam moments makes scheduler

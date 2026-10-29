@@ -6,9 +6,10 @@ This paper therefore takes a deliberately narrower position. The repository impl
 
 The key contributions of this work are:
 \begin{enumerate}
-    \item A reproducible proof-of-concept latent generative pipeline for producing aircraft-like voxel geometries and exporting them to mesh-based artifacts.
-    \item An implementation path for CFD-informed evaluation that couples an internal lattice-Boltzmann-based scorer with an external OpenFOAM benchmark route, together with a reduced sanity experiment showing that the end-to-end path executes.
-    \item An issue-driven validation framework that distinguishes code-path validation from stronger claims such as aircraft-specific validity, aerodynamic optimization, structural viability, and conditioned generation from mission or manufacturing constraints.
+    \item A reproducible proof-of-concept latent generative pipeline for producing aircraft-like voxel geometries and exporting them to mesh-based artifacts, with a dense-to-coordinate decoder split and a documented 22-slot structured-conditioning vector routed end to end.
+    \item An interruption-safe monitored training runner with run-state checkpointing, exact-resume fingerprinting, and collapse-recovery safeguards (warm-start gates, geometry-threshold preservation, and fail-closed numerical guards), together with a 642-test automated suite that pins these contracts.
+    \item An implementation path for CFD-informed evaluation that couples an internal lattice-Boltzmann-based scorer (D3Q27) with a black-box SPSA solver-in-loop training term and an external OpenFOAM benchmark route, together with reduced sanity experiments showing that the end-to-end path executes.
+    \item An issue-driven validation framework that distinguishes code-path validation from stronger claims such as aircraft-specific validity, aerodynamic optimization, structural viability, and conditioned generation from mission or manufacturing constraints, and a single documented final-run protocol whose gates the remaining claims are bound to.
 \end{enumerate}
 
 The remainder of the paper first places the repository beside 3D generative modeling, topology optimization, and CFD-driven design practice, then describes the implementation that exists in the codebase. It then reports the reduced final-protocol evidence, records the validation requirements that still block stronger claims, and closes by summarizing the present scope and the minimum future work needed for a conditioned airplane generator.

@@ -1,12 +1,15 @@
-# Mainline 128^3 / 294,719,529-trainable-parameter training protocol.
+# Mainline 128^3 training protocol.
 # Architecture values are assertions for operators and tests; the executable
-# source of truth is CLI/config.yaml.
+# source of truth is CLI/config.yaml. The 2026-09-01 real-corpus ablation
+# selected the 2048x5 decoder (70M trainable parameters) over the earlier
+# 3328x12 / 295M preset; capacity_basis_unique_geometries saturates the
+# scaling law so the fixed architecture below is what a run materializes.
 architecture:
-  expected_trainable_parameters: 294719529
+  expected_trainable_parameters: 70081321
   latent_dim: 512
   grid_size: 128
-  coordinate_decoder_width: 3328
-  coordinate_decoder_depth: 12
+  coordinate_decoder_width: 2048
+  coordinate_decoder_depth: 5
 
 train:
   enabled: true

@@ -286,4 +286,37 @@ The OpenFOAM export path now writes a plain \texttt{forces} function-object dict
 The current ground-truth foundation is therefore tiered. Internal D3Q27 LBM values can drive the direct SPSA training loss and sequential candidate selection, but they stay in the internal-label tier. The OpenFOAM/simpleFoam and sonicFoam scripts define the external PDE route: cases must complete, residual and field-export checks must pass, and the resulting labels must remain separate from internal LBM labels until they satisfy the \texttt{external\_pde} gate. This separation is important for future PDE validation because it lets the repository compare internal LBM coefficients against OpenFOAM under shared geometry, Mach, Reynolds, grid, and reference-area settings without silently upgrading the internal solver to ground truth.
 
 We also recorded one physics correction in \texttt{CLI/cascaded\_lbm.py}. The D3Q27 freestream setup now uses the lattice-consistent value \(u = Ma / \sqrt{3}\); the earlier version used arbitrary scaling. That correction is part of the benchmark history, and we are checking it against the Cd mismatch before making broader coordinate-transform changes.
+
+\begin{table}[!t]
+\centering
+\caption{Claim Gate Status and Final-Run Upgrade Contract}
+\label{tab:claim_gates}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|p{0.34\columnwidth}|p{0.16\columnwidth}|p{0.36\columnwidth}|}
+\hline
+\textbf{Claim} & \textbf{Current status} & \textbf{Final run unlocks if} \\ \hline
+Generates aircraft structures & blocked & generated samples pass validity screen at declared rate \\ \hline
+Conditioned on mission/manufacturing & blocked & grounded condition benchmark shows directional held-out signal \\ \hline
+CFD-guided training & blocked & scheduled direct SPSA objective decreases without drift \\ \hline
+Aerodynamically optimized & blocked & requires separate converged CFD vs.\ baselines (not this run) \\ \hline
+Structurally viable & blocked & requires separate structural/load-path analysis \\ \hline
+Superiority over prior methods & blocked & requires separate baseline comparison studies \\ \hline
+Compressible internal solver validated & blocked & requires separate external compressible validation \\ \hline
+\end{tabular}
+\end{table}
+
+\subsection{The Single Decisive Final Run}
+\label{sec:final_run}
+The checked-in final protocol (\texttt{CLI/run\_protocols/gcp\_128\_295m.yaml}, executed by the monitored runner) is deliberately the single experiment this paper designates as the gate for its remaining aircraft-level claims. It trains the scaled \(128^3\) architecture (512-dim latent, coordinate decoder width 2048 depth 5, 70.1M trainable parameters) in bfloat16 for two epochs at batch size 1 on the pinned-latent training corpus, checkpointing every 25 updates under the interruption-safe runner, with the fused-stream BFL solver backend and a GPU-side exact-SDF attestation so the reported geometry pipeline is the measured one. Because the run is monitored, it produces the run-state lineage (checkpoint hashes, manifest hashes, protocol hashes) needed by the evidence package rather than an unrepeatable training history.
+
+Success for this run is defined by four gates, all of which are executable in the repository today:
+\begin{enumerate}
+    \item \textbf{Generated-sample validity:} generated flight-path conditioning cases pass the aircraft-specific validity screen (currently \texttt{span\_sanity}, symmetry, planform-sparsity, and fuselage-end checks) at a declared rate.
+    \item \textbf{Condition-response signal:} the grounded condition benchmark shows directional signal on held-out records rather than condition-invariant generation.
+    \item \textbf{Solver-in-loop signal:} the scheduled direct D3Q27 SPSA objective decreases over the run instead of drifting, and the evidence package records it.
+    \item \textbf{Lineage-consistent evidence:} \texttt{CLI/final\_evidence.py} returns \texttt{pass} with matching run/checkpoint/manifest/protocol hashes.
+\end{enumerate}
+
+This one run is the paper's upgrade contract. If it passes gates 1 and 2, the claim rows \texttt{Generates aircraft structures} and \texttt{Conditioned on flight profile and manufacturing method} in Table \ref{tab:claim_gates} move from blocked to supported; if gate 3 passes, \texttt{CFD-guided training} moves to supported as well, and the corresponding fallback wording in the evidence matrix can be retired. If gates 1 or 2 fail, those claims remain blocked and this paper's allowed claims stay exactly where they are today: a reproducible proof-of-concept pipeline with a passing reduced evidence bundle. No claim in this paper depends on the final run passing; the run only decides whether the stronger claims are added. Conversely, the final run is not a shortcut: even a fully passing run does not establish structural load-path viability, superiority over mature baselines, or externally validated aerodynamic optimality, which require the separate structural, baseline, and PDE-validation studies listed in Sections \ref{sec:baselines} and \ref{sec:validation}.
 \par

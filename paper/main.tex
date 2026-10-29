@@ -23,13 +23,13 @@
 \author{Darsh Gupta, National Public School, HSR Layout, Bengaluru \\ darshgu77@gmail.com}
 
 % Preprint header metadata. Publication identifiers should be added only after acceptance.
-\markboth{Preprint, June 2026}%
+\markboth{Preprint, October 2026}%
 {Gupta: Generative Design of Aircraft-Like Structures}
 
 \maketitle
 
 \begin{abstract}
-This paper documents a proof-of-concept generative-design pipeline for aircraft-like voxel geometries. The repository combines a latent diffusion-style model, a voxel decoder, connectivity heuristics, and a CFD-informed scoring path built around an internal lattice-Boltzmann solver plus an external OpenFOAM export route. The present implementation is intentionally scoped: the public Airshow run uses a 355-record low-resolution voxel corpus, the protocol is a reduced final-evidence run, and the evidence should be read as code-path validation rather than publication-grade aerodynamic or structural validation. In addition to describing the architecture and benchmark workflow, we use the current experiments to clarify which claims the codebase supports today and which stronger claims, including validated mission-conditioned or manufacturing-conditioned aircraft generation, remain future work.
+This paper documents a reproducible latent generative-design pipeline for aircraft-like voxel geometries, with a CFD-informed scoring path and a validation framework that separates code-path evidence from stronger aerodynamic, structural, and conditioning claims. The repository combines a latent diffusion-style model, a voxel decoder (dense below \(96^3\), coordinate-based above), an interruption-safe monitored training runner with collapse-recovery safeguards, and an internal D3Q27 lattice-Boltzmann solver plus an external OpenFOAM export route. The present evidence rests on public VSP Airshow smoke runs, a deterministic reference evidence package, and a 642-test automated suite that pins the architectural and recovery contracts. Within this scope, the codebase supports a proof-of-concept claim and a reproducible reduced evidence bundle; validated mission-conditioned or manufacturing-conditioned aircraft generation, structural load-path analysis, and publication-grade aerodynamic or structural validation remain explicitly future work until the documented final-run gates pass.
 \end{abstract}
 
 \begin{IEEEkeywords}

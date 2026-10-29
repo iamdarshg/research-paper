@@ -24,3 +24,8 @@ deprecated/
 /MERGE-REPORT.md
 .env
 .env.*
+
+# Local agent/worktree state
+.claude/
+.worktrees/
+CLI/.claude/
