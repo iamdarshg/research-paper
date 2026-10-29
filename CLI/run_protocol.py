@@ -113,8 +113,9 @@ def build_protocol_commands(
                 "use production mode for resume or warm-start validation"
             )
         production_save_dir = str(train_cfg.get("save_dir", "./checkpoints_monitored"))
+        smoke_default_save_dir = production_save_dir.rstrip("/\\") + "_smoke"
         train_cfg["save_dir"] = smoke_cfg.get(
-            "save_dir", f"{production_save_dir.rstrip('/\\')}_smoke"
+            "save_dir", smoke_default_save_dir
         )
         smoke_save_dir = str(train_cfg["save_dir"])
         train_cfg["history_output"] = smoke_cfg.get(
