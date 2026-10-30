@@ -17,6 +17,7 @@ sudo -u iamdarshg python3 -m venv /home/iamdarshg/.venv-gcp
 pip install -q --upgrade pip
 pip install -q -r requirements-dev.txt
 pip install -q torch==2.3.1+cpu --index-url https://download.pytorch.org/whl/cpu
+pip install -q gsutil
 
 echo "=== DEPS INSTALLED $(date) ==="
 python --version
@@ -60,4 +61,7 @@ fi
 
 echo "=== ARTIFACTS ==="
 find /home/iamdarshg/corpus_build -maxdepth 2 -type f -name '*.json' -o -name '*.jsonl' 2>/dev/null | head -20
+
+echo "=== SELF-TERMINATE: upload artifacts to GCS then stop/delete VM ==="
+python /home/iamdarshg/research-paper/scripts/gcp/finish_upload_and_self_terminate.py
 echo "=== DONE $(date) ==="
