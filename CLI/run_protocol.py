@@ -80,11 +80,14 @@ def build_protocol_commands(
     cli_script = str((cli_dir / "aircraft_diffusion_cfd.py").resolve())
     multi_seed_script = str((cli_dir / "multi_seed_eval.py").resolve())
     manifest_validator_script = str((cli_dir / "validate_manifest.py").resolve())
+    reference_evidence_script = str((cli_dir / "build_reference_evidence.py").resolve())
+    write_run_metadata_script = str((cli_dir / "write_run_metadata.py").resolve())
     condition_benchmark_script = str((cli_dir / "run_condition_benchmark.py").resolve())
     aircraft_validity_script = str((cli_dir / "aircraft_validity.py").resolve())
     aircraft_validity_input_builder_script = str((cli_dir / "build_aircraft_validity_inputs.py").resolve())
     manufacturing_constraints_script = str((cli_dir / "condition_feasibility.py").resolve())
     final_evidence_script = str((cli_dir / "final_evidence.py").resolve())
+    baseline_statistics_script = str((cli_dir / "build_baseline_statistics.py").resolve())
     monitored_training_script = str((cli_dir / "run_monitored_training.py").resolve())
 
     commands: List[List[str]] = []
@@ -166,6 +169,9 @@ def build_protocol_commands(
         if len(set(smoke_files.values())) != len(smoke_files):
             raise ValueError("Smoke output artifacts must use distinct paths")
     manifest_cfg = dict(config.get("validate_manifest", {}))
+    reference_evidence_cfg = dict(config.get("reference_evidence", {}))
+    run_metadata_cfg = dict(config.get("run_metadata", {}))
+    baseline_statistics_cfg = dict(config.get("baseline_statistics", {}))
     baseline_cfg = dict(config.get("evaluate_baselines", {}))
     condition_cfg = dict(config.get("validate_conditions", {}))
     condition_benchmark_cfg = dict(config.get("condition_benchmark", {}))
@@ -178,6 +184,31 @@ def build_protocol_commands(
     if not checkpoint:
         checkpoint = _default_checkpoint(config, train_cfg)
 
+    if reference_evidence_cfg.get("enabled"):
+        reference_evidence_cmd = [python_exe, reference_evidence_script]
+        _add_option(
+            reference_evidence_cmd,
+            "--output-root",
+            _resolve_path(config, reference_evidence_cfg.get("output_root")),
+        )
+        _add_option(
+            reference_evidence_cmd,
+            "--sample-count",
+            reference_evidence_cfg.get("sample_count"),
+        )
+        _add_option(
+            reference_evidence_cmd,
+            "--protocol",
+            reference_evidence_cfg.get("protocol")
+            or protocol_config_path,
+        )
+        _add_option(
+            reference_evidence_cmd,
+            "--output",
+            _resolve_path(config, reference_evidence_cfg.get("output")),
+        )
+        commands.append(reference_evidence_cmd)
+
     if manifest_cfg.get("enabled"):
         manifest_path = manifest_cfg.get("manifest") or train_cfg.get("dataset_manifest")
         manifest_path = _resolve_path(config, manifest_path)
@@ -186,6 +217,7 @@ def build_protocol_commands(
 
         manifest_cmd = [python_exe, manifest_validator_script, "--manifest", manifest_path]
         _add_option(manifest_cmd, "--level", manifest_cfg.get("level", "basic"))
+        _add_option(manifest_cmd, "--unique-geometry-target", manifest_cfg.get("unique_geometry_target"))
         output_path = _resolve_path(config, manifest_cfg.get("output"))
         _add_option(manifest_cmd, "--output", output_path)
         _add_option(manifest_cmd, "--run-id", run_id)
@@ -341,6 +373,35 @@ def build_protocol_commands(
                 _add_option(train_cmd, "--enable-compile", bool(train_cfg["enable_compile"]))
         commands.append(train_cmd)
 
+    if run_metadata_cfg.get("enabled") and train_cfg.get("enabled", True):
+        run_metadata_cmd = [python_exe, write_run_metadata_script]
+        _add_option(
+            run_metadata_cmd,
+            "--checkpoint",
+            _resolve_path(config, run_metadata_cfg.get("checkpoint")),
+        )
+        _add_option(
+            run_metadata_cmd,
+            "--manifest",
+            _resolve_path(config, run_metadata_cfg.get("manifest")),
+        )
+        _add_option(
+            run_metadata_cmd,
+            "--protocol",
+            run_metadata_cfg.get("protocol") or protocol_config_path,
+        )
+        _add_option(
+            run_metadata_cmd,
+            "--output",
+            _resolve_path(config, run_metadata_cfg.get("output")),
+        )
+        _add_option(
+            run_metadata_cmd,
+            "--run-id-prefix",
+            run_metadata_cfg.get("run_id_prefix"),
+        )
+        commands.append(run_metadata_cmd)
+
     if baseline_cfg.get("enabled"):
         baseline_cmd = [python_exe, cli_script, "evaluate-baselines"]
         for flag, key in (
@@ -460,11 +521,54 @@ def build_protocol_commands(
     if manifest_cfg.get("enabled") and final_evidence_cfg.get("enabled"):
         final_manifest_cmd = [python_exe, manifest_validator_script, "--manifest", _resolve_path(config, manifest_cfg.get("manifest") or train_cfg.get("dataset_manifest"))]
         _add_option(final_manifest_cmd, "--level", manifest_cfg.get("level", "basic"))
+        _add_option(final_manifest_cmd, "--unique-geometry-target", manifest_cfg.get("unique_geometry_target"))
         _add_option(final_manifest_cmd, "--output", _resolve_path(config, manifest_cfg.get("output")))
         _add_option(final_manifest_cmd, "--run-id", run_id)
         _add_option(final_manifest_cmd, "--checkpoint", checkpoint)
         _add_option(final_manifest_cmd, "--protocol-config", protocol_config_path)
         commands.append(final_manifest_cmd)
+
+    if baseline_statistics_cfg.get("enabled"):
+        baseline_stats_cmd = [python_exe, baseline_statistics_script]
+        _add_option(
+            baseline_stats_cmd,
+            "--records-json",
+            _resolve_path(config, baseline_statistics_cfg.get("records_json")),
+        )
+        _add_option(
+            baseline_stats_cmd,
+            "--baseline-config",
+            _resolve_path(config, baseline_statistics_cfg.get("baseline_config")),
+        )
+        if baseline_statistics_cfg.get("metric_keys"):
+            baseline_stats_cmd.extend(
+                part
+                for key in baseline_statistics_cfg["metric_keys"]
+                for part in ("--metric-keys", str(key))
+            )
+        _add_option(
+            baseline_stats_cmd,
+            "--min-seeds",
+            baseline_statistics_cfg.get("min_seeds"),
+        )
+        _add_option(
+            baseline_stats_cmd,
+            "--output",
+            _resolve_path(config, baseline_statistics_cfg.get("output")),
+        )
+        _add_option(baseline_stats_cmd, "--run-id", run_id)
+        _add_option(baseline_stats_cmd, "--checkpoint", checkpoint)
+        _add_option(
+            baseline_stats_cmd,
+            "--manifest",
+            _resolve_path(
+                config,
+                baseline_statistics_cfg.get("manifest")
+                or train_cfg.get("dataset_manifest"),
+            ),
+        )
+        _add_option(baseline_stats_cmd, "--protocol-config", protocol_config_path)
+        commands.append(baseline_stats_cmd)
 
     if final_evidence_cfg.get("enabled"):
         evidence_cmd = [python_exe, final_evidence_script]

@@ -9,6 +9,10 @@ validate_manifest:
   enabled: true
   manifest: ../../build/first_training/grounded_corpus/manifest.jsonl
   level: claim-bearing
+  # The deterministic reference corpus is deliberately 20 records. This target
+  # must match the reference evidence sample_count; a publication-scale corpus
+  # would raise it toward the capacity-planning total instead.
+  unique_geometry_target: 20
   output: ../../build/first_training/manifest_validation.json
 
 train:
