@@ -19,17 +19,17 @@
 
 \begin{document}
 
-\title{Toward Generative Design of Aircraft-Like Structures with Diffusion Models and CFD-Informed Evaluation}
+\title{Aircraft-Like Voxel-Geometry Generation with a CFD-Informed Evaluation Path: Measured Validity on a Declared Held-Out Split}
 \author{Darsh Gupta, National Public School, HSR Layout, Bengaluru \\ darshgu77@gmail.com}
 
 % Preprint header metadata. Publication identifiers should be added only after acceptance.
-\markboth{Preprint, October 2026}%
-{Gupta: Generative Design of Aircraft-Like Structures}
+\markboth{Preprint, November 2026}%
+{Gupta: Aircraft-Like Voxel-Geometry Generation with a CFD-Informed Evaluation Path}
 
 \maketitle
 
 \begin{abstract}
-This paper documents a reproducible latent generative-design pipeline for aircraft-like voxel geometries, with a CFD-informed scoring path and a validation framework that separates code-path evidence from stronger aerodynamic, structural, and conditioning claims. The repository combines a latent diffusion-style model, a voxel decoder (dense below \(96^3\), coordinate-based above), an interruption-safe monitored training runner with collapse-recovery safeguards, and an internal D3Q27 lattice-Boltzmann solver plus an external OpenFOAM export route. The present evidence rests on public VSP Airshow smoke runs, a deterministic reference evidence package, and a 642-test automated suite that pins the architectural and recovery contracts. Within this scope, the codebase supports a proof-of-concept claim and a reproducible reduced evidence bundle; validated mission-conditioned or manufacturing-conditioned aircraft generation, structural load-path analysis, and publication-grade aerodynamic or structural validation remain explicitly future work until the documented final-run gates pass.
+This paper targets aircraft-like voxel-geometry generation: the repository combines a latent diffusion-style model, voxel decoders, an internal D3Q27 lattice-Boltzmann scoring path, and an OpenFOAM export route, and the goal is generated voxel geometries that pass the repository's own aircraft-specific validity checks. We report a measured repair of that capability. Five root causes of the earlier total validity failure are isolated by measurement: a procedural training corpus whose private gate admitted shapes the declared screen rejects (1 of 47 admitted samples passed), a decoder that emitted a near-constant probability field, decoder and consistency-student learning rates that never received the requested value, generation that sampled only an under-trained consistency student, and latent-capacity/corpus-scale limits. Under a declared protocol — six NASA CRM records for training, nine held out (six distinct voxel arrays), an uncalibrated 0.5 materialization threshold, and the unmodified validity screen — the retrained \(32^3\) checkpoint reconstructs 9/9 held-out records and generates 45/45 samples that pass every aircraft-specific check, re-screened by the repository's own CLI. The result is bounded and is reported as such: the 45 draws contain five near-identical voxel arrays, every emitted voxel is present in the training corpus, and a model-free constant array passes the same screen; the current heuristic gate is therefore satisfiable by a training-hull emitter, while novel, conditioned, and diverse generation are not demonstrated. The paper's measurement-integrity findings remain part of the evidence: a reference-area defect changed a formerly passing comparison row from 0.25\% to 14.2\%, the corrected frozen corpus meets the 5\% gate on 1/16 sonicFoam and 0/14 simpleFoam rows, and the condition-response study is non-significant. Aerodynamic optimization, structural viability, manufacturing validity, and physical-performance claims remain blocked.
 \end{abstract}
 
 \begin{IEEEkeywords}

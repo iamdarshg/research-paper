@@ -164,8 +164,15 @@ class OptimizedDiffusionTrainer:
 
     def train_epoch(self, train_loader, grid_size=32):
         if self.current_grid_size != grid_size:
-            self.converter.set_resolution(grid_size)
-            self.cfd_simulator.set_resolution(grid_size)
+            # The production LatentTo3DConverter (imported as
+            # ScalableLatentTo3DConverter) has no set_resolution: its decoder
+            # is fixed at construction resolution. ARCHITECTURE.md states the
+            # CLI executes one configured grid size rather than an automatic
+            # progressive schedule, so degrade safely instead of crashing.
+            if hasattr(self.converter, "set_resolution"):
+                self.converter.set_resolution(grid_size)
+            if hasattr(self.cfd_simulator, "set_resolution"):
+                self.cfd_simulator.set_resolution(grid_size)
             self.current_grid_size = grid_size
         self.diffusion_model.train()
         self.converter.train()
@@ -187,9 +194,13 @@ class OptimizedDiffusionTrainer:
             pred_noise = self.diffusion_model(noisy_latent, t, condition=condition)
             mse_loss_val = self.mse_loss(pred_noise, noise)
 
-            # Consistency loss with conditioning
-            t_student = torch.randint(0, self.consistency_model.student_steps, (batch_size,), device=self.device)
-            t_teacher = t_student * (self.consistency_model.teacher_steps // self.consistency_model.student_steps)
+            # Consistency loss with conditioning. The teacher and student must
+            # share the [0, timesteps) time axis that the UNet time embedding
+            # normalizes by; previously t_teacher = t_student *
+            # (teacher_steps // student_steps) reached 1922 while the embedding
+            # divides by timesteps=100 (normalized 19.22, far outside [0,1]).
+            t_student = torch.randint(0, self.diffusion_config.timesteps, (batch_size,), device=self.device)
+            t_teacher = t_student
             consist_loss_val = self.consistency_model.consistency_loss(latent, t_student, t_teacher, condition=condition)
 
             connectivity_loss_val = self.connectivity_loss(voxel_grid)
@@ -237,7 +248,9 @@ class OptimizedDiffusionTrainer:
                     # Register step but we backward the total_loss_val later
                     # We manually call train_step-like logic here without a separate optimizer call
                     self.surrogate.is_trained.fill_(True)
-                    self.surrogate.sample_count += batch_geoms[0].shape[0] # roughly
+                    # Count the geometries actually trained, not
+                    # batch_geoms[0].shape[0] which is the grid resolution.
+                    self.surrogate.sample_count += len(batch_geoms)
 
                     surrogate_loss_val = surr_loss
                     self.surrogate.last_val_mse.copy_(0.95 * self.surrogate.last_val_mse + 0.05 * surr_loss.detach())

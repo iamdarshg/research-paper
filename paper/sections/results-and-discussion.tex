@@ -68,7 +68,7 @@ endurance turning & 0.01245 & 0.9824 & 0.04663 & fail: span sanity \\ \hline
 \end{tabular}
 \end{table}
 
-All three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas. However, all three failed the current aircraft-specific validity screen on the span-sanity check, and the CFD report marks the D3Q27 outputs as non-claim-bearing raw LBM labels. Figures \ref{fig:airshow_flight_metrics} and \ref{fig:airshow_generated_geometry} show the raw metric spread and the generated voxel geometry/projection views. We therefore interpret this run as evidence that the public-corpus training, generator, export, heuristic-screen, and solver paths execute together; it is not evidence that the smoke checkpoint generates valid aircraft or validated aerodynamic predictions.
+For this Airshow checkpoint, all three generated cases produced nonempty voxel grids, STL exports, finite internal D3Q27 coefficients, and positive reference areas, but failed the aircraft-specific screen on span sanity; the D3Q27 outputs remain non-claim-bearing raw LBM labels. Figures \ref{fig:airshow_flight_metrics} and \ref{fig:airshow_generated_geometry} show this Airshow run. A separate CRM-trained \(32^3\) recovery is measured under a held-out protocol in Sec.~\ref{sec:generator_recovery}; it does not retroactively upgrade these Airshow checkpoints. The Airshow run therefore supports code-path execution, not valid aircraft generation from that checkpoint or validated aerodynamic predictions.
 
 \begin{figure}[!t]
 \centering
@@ -107,7 +107,7 @@ The \(32^3\) manifest hash was \texttt{7684e70b...98521f1}, the \(64^3\) manifes
 
 We then filtered the \(32^3\) corpus with the same aircraft-validity screen used for generated outputs. This kept 176 of 355 public Airshow records and produced a claim-bearing-valid manifest hash \texttt{0d149d98...d25ccc}. An initial fine-tune from the one-epoch \(32^3\) checkpoint exposed a zero-learning-rate resume issue: the run completed, but checkpoint comparison showed byte-identical model weights. After restoring the configured learning rate on resume, a three-epoch source-valid fine-tune produced checkpoint hash \texttt{657243ea...45574c}. Its three generated cases all passed occupancy and symmetry but still failed \texttt{span\_sanity}, with length-fraction values 0.25, 0.25, and 0.28125. A further three-epoch continuation regressed validity, with two cases failing both \texttt{symmetry} and \texttt{span\_sanity}. This suggests that the present objective and decoder need architectural or optimization changes, not simply more epochs.
 
-The \(96^3\) follow-up replaced the dense decoder with a coordinate decoder that evaluates sampled \((z,y,x)\) coordinates conditioned on the latent vector. The public \(96^3\) source corpus had mean occupancy 0.00565 and median occupancy 0.00458, so naive coordinate sampling either collapsed toward empty fixed-threshold grids or, when occupied coordinates were oversampled without correction, biased the decoder toward overly dense outputs. The final run used importance-weighted coordinate BCE for three epochs over all 355 records and produced checkpoint hash \texttt{1bfdcfcf...59774d3}. With the default 0.5 threshold, all three flight-path exports remained below the aircraft-validity occupancy gate. With an explicit top-k export at 0.75\% occupancy, one case, \texttt{endurance\_turning}, passed the heuristic aircraft-validity screen; \texttt{short\_takeoff\_payload} and \texttt{high\_speed\_sprint} still failed \texttt{symmetry}, \texttt{span\_sanity}, and \texttt{wing\_body\_balance}. Figures \ref{fig:airshow_flight_metrics_g96_topk} and \ref{fig:airshow_generated_geometry_g96_topk} show that calibrated export result. This is evidence that the coordinate-decoder path can train and export \(96^3\) geometry, not evidence of reliable aircraft generation or validated aerodynamic optimization.
+The \(96^3\) follow-up replaced the dense decoder with a coordinate decoder that evaluates sampled \((z,y,x)\) coordinates conditioned on the latent vector. The public \(96^3\) source corpus had mean occupancy 0.00565 and median occupancy 0.00458, so naive coordinate sampling either collapsed toward empty fixed-threshold grids or, when occupied coordinates were oversampled without correction, biased the decoder toward overly dense outputs. The final run used importance-weighted coordinate BCE for three epochs over all 355 records and produced checkpoint hash \texttt{1bfdcfcf...59774d3}. With the default 0.5 threshold, all three flight-path exports remained below the aircraft-validity occupancy gate. With a post-hoc top-k export calibrated to 0.75\% occupancy \emph{against the same heuristic screen used as the outcome}, one of three cases, \texttt{endurance\_turning}, passed; \texttt{short\_takeoff\_payload} and \texttt{high\_speed\_sprint} still failed \texttt{symmetry}, \texttt{span\_sanity}, and \texttt{wing\_body\_balance}. This is not an uncalibrated generation-rate result: it shows that the threshold can be fitted to the screen at \(N=3\), not that the model reliably generates valid aircraft. Figures \ref{fig:airshow_flight_metrics_g96_topk} and \ref{fig:airshow_generated_geometry_g96_topk} show that calibrated export result. This is evidence that the coordinate-decoder path can train and export \(96^3\) geometry, not evidence of reliable aircraft generation or validated aerodynamic optimization.
 
 The same debugging pass clarified the zero aerodynamic and connectivity observations. The exact connectivity score thresholds voxel probabilities and runs connected-component labeling through NumPy/SciPy. The raw aerodynamic score thresholds geometry, invokes the internal solver, and returns scalar solver outputs. A local gradient probe confirmed that these measured scores do not provide analytic PyTorch gradients by themselves. The training code was therefore revised to report \texttt{optimization\_loss} separately from detached monitor terms and to add a direct solver-in-loop loss that calls the internal D3Q27 LBM evaluator during training and estimates its backward signal with two-sided SPSA finite differences. This is a measured black-box gradient estimator around real solver calls, not a learned substitute for the solver.
 
@@ -130,14 +130,9 @@ The first direct-solver sweep was intentionally diagnostic. A naive 0.5 probabil
 \end{tabular}
 \end{table}
 
-Table \ref{tab:direct_solver_grid_sweep} shows both the matched two-epoch sweep and the required \(96^3\) continuation. After two epochs, the \(96^3\) optimizer loss and scheduled solver evaluation were still worse than the \(64^3\) run even though its geometry BCE was lower. Continuing from the \(96^3\) checkpoint corrected that behavior: the scheduled direct solver evaluation dropped from 180.29967 to 3.87060 on the first continuation epoch and remained much lower than the \(64^3\) value at 7.48613 on the second continuation epoch. The increase from 3.87060 to 7.48613 while the optimizer loss continued to decrease is a useful warning that the direct objective can start to overfit or drift under this short local protocol. Figure \ref{fig:airshow_grid_loss_vs_resolution} therefore uses the final continuation point for the \(96^3\) visual trend while the table preserves the non-monotone intermediate result.
+Table \ref{tab:direct_solver_grid_sweep} shows both the matched two-epoch sweep and the required \(96^3\) continuation. After two epochs, the \(96^3\) optimizer loss and scheduled solver evaluation were still worse than the \(64^3\) run even though its geometry BCE was lower. Continuing from the \(96^3\) checkpoint corrected that behavior: the scheduled direct solver evaluation dropped from 180.29967 to 3.87060 on the first continuation epoch and remained much lower than the \(64^3\) value at 7.48613 on the second continuation epoch. The increase from 3.87060 to 7.48613 while the optimizer loss continued to decrease is a useful warning that the direct objective can start to overfit or drift under this short local protocol. The table is the authoritative record; no single plotted point is selected to imply a monotone resolution trend.
 
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth]{figures/airshow_grid_loss_vs_resolution.png}
-\caption{Grid-size loss sweep with the coordinate decoder forced at \(32^3\), \(64^3\), and \(96^3\). The plotted \(96^3\) point uses the continuation run because the matched two-epoch \(96^3\) loss was still worse than \(64^3\). The right panel reports the scheduled measured D3Q27 solver objective used by the SPSA loss; it is internal solver-in-loop evidence, not external PDE validation.}
-\label{fig:airshow_grid_loss_vs_resolution}
-\end{figure}
+The grid-sweep figure was removed because a single selected continuation point would obscure the non-monotone intermediate result. Table \ref{tab:direct_solver_grid_sweep} retains all measured points.
 
 \begin{figure}[!t]
 \centering
@@ -167,64 +162,146 @@ Table \ref{tab:direct_solver_grid_sweep} shows both the matched two-epoch sweep 
 \label{fig:airshow_generated_geometry_g96_topk}
 \end{figure*}
 
+\subsection{Generator Recovery: Root Causes and Held-Out Generation Validity}
+\label{sec:generator_recovery}
+
+The preceding subsections report that the Airshow-checkpoint outputs fail the aircraft-specific screen at every tested resolution. This revision treats that failure as a defect to be diagnosed and repaired, and reports a separate CRM recovery under a declared protocol.
+
+\paragraph{Measured root causes.}
+Five causes were isolated on the recording host, each by direct measurement rather than
+inference.
+
+\emph{(i) The training corpus was largely invalid under our own screen.} The procedural
+corpus generator carried a private gate (occupancy $\ge 0.0005$, span $\ge 0.03$,
+symmetry $\ge 0.10$) that is far laxer than \texttt{CLI/aircraft\_validity.py}. Re-running
+the pre-fix generator over the eight families (seed 42), its own gate accepted 47 of 48
+draws, of which \textbf{1} passes the declared screen. A model trained on that corpus was
+therefore asked to reproduce shapes the paper itself calls invalid.
+
+\emph{(ii) The shipped checkpoint's decoder emits a near-constant field.} On the only
+checkpoint in the tree ($16^3$), four seeds give probability min/max $0.435$--$0.573$ and
+a materialised occupancy of $45.2$--$46.4\%$: a solid block with
+\texttt{geometry\_probability\_std} $\approx 0.0075$. A constant field crossing the $0.5$
+threshold fills the lattice, so \texttt{span\_sanity}, \texttt{normalization\_margin}
+and \texttt{grounded\_occupancy\_envelope} fail by construction.
+
+\emph{(iii) The decoder was trained ten times slower than the rest of the model.} The
+\texttt{train} CLI exposes \texttt{--learning-rate}, but the optimizer's three parameter
+groups take their rates from \texttt{CLI/config.yaml}, where
+\texttt{converter\_learning\_rate} and \texttt{consistency\_student\_learning\_rate} are
+both $2\times10^{-5}$; \texttt{--learning-rate} sets only the diffusion group. Holding
+everything else fixed on the $32^3$ corpus, the decoder reconstruction loss is flat at
+the legacy rate ($1.672\to1.663$ over 12 epochs, probability standard deviation
+$0.007$) and falls at $2\times10^{-4}$ ($1.666\to1.396$, standard deviation $0.188$). The
+only module that can turn a latent into occupied voxels was effectively frozen.
+
+\emph{(iv) Generation depended on an under-trained consistency student.} The shipped
+four-step path samples with \texttt{student\_model}, whose RMS drifted to $21.8$--$179$
+against a teacher RMS of $0.66$--$3.3$ during the recovery runs
+(\texttt{consistency\_raw\_mse} $465$--$32212$). The denoiser trained by the denoising
+MSE (loss $0.86$--$3.4$) was never used for sampling.
+
+\emph{(v) Two corpus-scale limits.} The structured latent pools a $180$-value multi-scale
+geometry signature into \texttt{latent\_dim} values, and the training split contains six
+records. At the shipped $\text{latent\_dim}=16$ the reconstruction of a held-out $32^3$
+record reaches IoU $0.390$ but is inflated $2.4\times$ in occupancy, failing only the
+screen's upper normalization bound.
+
+\paragraph{Repairs.}
+The procedural generator now uses the declared screen as its own gate, enforces exact
+bilateral symmetry about the screen's mid-plane, gives every aircraft an explicit
+longitudinal centre body with blunt ends, and resamples samples into a declared
+fill/occupancy band inside the screen's normalization margins. The \texttt{train} CLI
+gains \texttt{--converter-learning-rate} and
+\texttt{--consistency-student-learning-rate} with legacy defaults, and the generator
+gains a deterministic teacher-DDIM sampler (\texttt{sampler="ddim"}) alongside the
+shipped four-step consistency path. No threshold inside \texttt{aircraft\_validity.py}
+was changed.
+
+\paragraph{Held-out protocol.}
+The evaluation protocol is recorded in
+\texttt{build/recovery\_2026-11-05/PREREGISTERED\_PROTOCOL.md}. Its file timestamp does
+not establish ordering relative to the evaluation runs, so this paper calls the protocol
+\emph{declared} rather than pre-registered. Training uses the six
+NASA CRM records labelled \texttt{test}/\texttt{val}; the nine \texttt{holdout} records
+are never used for gradients, threshold selection, early stopping or checkpoint
+selection. The materialisation threshold is a fixed, uncalibrated $0.5$; the screen is
+the unmodified \texttt{evaluate\_aircraft\_validity} with canonicalization on. Three arms
+are reported separately: ground truth (the screen's ceiling on this split),
+reconstruction (decoder given the record's own latent, i.e.\ decoder capacity only), and
+generation (sampling from noise conditioned on the record's condition vector, nine
+records $\times$ five seeds).
+
+\paragraph{Results.}
+Table~\ref{tab:generator_recovery} reports the measured pass rates.
+
+\begin{table}[!t]
+\centering
+\caption{Generator recovery on the declared held-out split (9 CRM records, threshold 0.5, canonicalized screen)}
+\label{tab:generator_recovery}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|p{0.30\columnwidth}|p{0.28\columnwidth}|p{0.28\columnwidth}|}
+\hline
+\textbf{Arm} & \textbf{Before ($16^3$ smoke)} & \textbf{After ($32^3$ recovery)} \\ \hline
+Ground truth (ceiling) & 9/9 & 9/9 \\ \hline
+Reconstruction (latent given) & 0/9, IoU 0.012 & 9/9, IoU 0.441 \\ \hline
+Generation, four-step consistency & 0/45 & 45/45 \\ \hline
+Generation, teacher DDIM & n/a & 45/45 \\ \hline
+\end{tabular}
+\end{table}
+
+The recovery checkpoint ($32^3$ dense decoder, latent 16, 45 epochs, corrected
+parameter-group learning rates) passes the declared protocol: reconstruction
+9/9 and generated 45/45 under both samplers, with a failed-check histogram that is
+empty, and the same 45 artifacts re-screen as 45/45 through the shipped
+\texttt{CLI/aircraft\_validity.py}. Independent ablations show that the decisive
+change was decoder supervision density, not simply more epochs: the dense decoder
+emits a logit for every one of the 32\,768 voxels per step, whereas the coordinate
+decoder supervises 8\,192 sampled voxels with a small Fourier MLP and plateaued with a
+diffuse probability field (0/9 reconstruction at $\text{latent\_dim}=16$ and $64$).
+
+The recovery is not conditioned or diverse generation, and the paper does not report it
+as such. The 45 generated artifacts contain \emph{five} distinct voxel arrays (maximum
+pairwise Hamming distance one voxel, mean pairwise IoU 0.99905); within a condition the
+five seeds are not bit-identical, yielding 1--4 distinct arrays. The nine held-out
+records are also only six distinct voxel arrays, because four aeroelastic variants are
+sub-voxel duplicates at \(32^3\). The held-out latent codes are nearly degenerate
+(pairwise distance 0.0027 against a latent norm of 0.497), the training split holds six
+records, and the MSE objective's optimum is therefore the conditional mean.
+
+An adversarial audit of this result found two facts that bound the claim more sharply
+than the pass rate suggests. First, every occupied voxel emitted by the checkpoint is a
+voxel present in the training corpus (precision $1.000$ against the training union), so
+there are zero novel voxels. Second, a model-free constant array, the voxel-wise union
+of the six training geometries, passes the same screen 12/12 and covers 98.6--99.4\% of
+every held-out record. The screen also accepts a non-aircraft equal-arm plus sign and a
+three-box primitive. The 45/45 rate therefore demonstrates that a training-hull-like
+emitter satisfies the current heuristic gate; it does not demonstrate that the checkpoint
+generates new aircraft. A pass-rate metric cannot distinguish this from a generator,
+which is itself the paper's central measurement finding. A non-trivial gate must add a
+novelty and diversity requirement (distance from the training set, distinct-geometry
+count, and condition-response spread) and must include a negative control set that
+non-aircraft primitives fail.
+\paragraph{Status of the generation gate.}
+Gate 1 of Table~\ref{tab:claim_gates} (\emph{generates aircraft structures}) is met in
+its literal form: multiple generated samples from a held-out split pass the
+aircraft-specific checks at an uncalibrated threshold, and the artifacts re-screen
+through the repository's own CLI. The gate is \emph{not} met in its scientific form:
+the emitted voxels are all present in the training corpus, a model-free constant passes
+the same screen, and non-aircraft primitives pass as well. The
+remaining work is therefore corpus scale and conditioning, not geometric validity: the
+repository now has a working path from a trained checkpoint to aircraft-valid voxel
+geometry at $32^3$ on an 8\,GiB host, and it has a measured demonstration that validity
+alone does not imply generative diversity. Aerodynamic, structural and manufacturing
+claims remain blocked, as before.
+
 \subsection{Freeform-object Sweep: Steps vs. Shape Prior}
-We ran a compact sweep over generation step count and the shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, and computed aerodynamic metrics using the CPU CFD path. The sweep provides only a preliminary probe of how post-processing thresholds can alter the generated object before scoring; Figure \ref{fig:ld_sweep} documents the reduced coverage.
+We ran a compact sweep over generation step count and the shape-prior cleanup threshold. The sweep evaluated 12 settings: consistency steps in \{1,2,4,8\} crossed with minimum connected-component sizes in \{0,32,64\}. For each setting we generated one freeform object, applied the post-processing hook, and computed aerodynamic metrics using the CPU CFD path. The sweep provides only a preliminary probe of how post-processing thresholds can alter the generated object before scoring; the preceding textual protocol record documents the coverage.
 
-\begin{figure}[!t]
-\centering
-\begin{tikzpicture}
-\begin{axis}[
-    width=3.35in,
-    height=1.9in,
-    ybar,
-    ymin=0,
-    ymax=3,
-    bar width=8pt,
-    symbolic x coords={1,2,4,8},
-    xtick=data,
-    xlabel={consistency steps},
-    ylabel={cleanup thresholds tested},
-    ytick={0,1,2,3},
-    nodes near coords,
-    nodes near coords align={vertical},
-    every node near coord/.append style={font=\scriptsize},
-    tick label style={font=\scriptsize},
-    label style={font=\scriptsize}
-]
-\addplot coordinates {(1,3) (2,3) (4,3) (8,3)};
-\end{axis}
-\end{tikzpicture}
-\caption{Reduced sweep coverage used for code-path probing: four consistency-step settings crossed with three cleanup thresholds. Numeric aerodynamic conclusions remain limited by the one-sample-per-setting design and CPU CFD path.}
-\label{fig:ld_sweep}
-\end{figure}
+The reduced sweep covered four consistency-step settings crossed with three cleanup thresholds. Because each setting used one sample and the CPU CFD path is not externally validated, this coverage is retained as a textual protocol record rather than a results figure.
 
-\begin{figure}[!t]
-\centering
-\begin{tikzpicture}
-\begin{axis}[
-    width=3.35in,
-    height=2.05in,
-    xmin=0,
-    xmax=1,
-    ymin=0,
-    ymax=1,
-    xlabel={occupancy proxy},
-    ylabel={$L/D$ proxy},
-    xtick=\empty,
-    ytick=\empty,
-    tick label style={font=\scriptsize},
-    label style={font=\scriptsize}
-]
-\addplot[only marks, mark=*, mark size=1.6pt] coordinates {
-    (0.18,0.24) (0.24,0.42) (0.31,0.34) (0.39,0.58)
-    (0.46,0.48) (0.52,0.66) (0.61,0.55) (0.70,0.73)
-};
-\node[font=\scriptsize, align=center] at (axis cs:0.58,0.17) {schematized:\\relationship remains noisy};
-\end{axis}
-\end{tikzpicture}
-\caption{Interpretive schematic for the occupancy-versus-score question raised by the reduced sweep. The present evidence supports only a noisy code-path probe, not a validated aerodynamic relationship.}
-\label{fig:cfd_analysis}
-\end{figure}
+The occupancy-versus-score question is left as a protocol hypothesis rather than plotted with authored coordinates. No measured relationship is claimed from the one-sample-per-setting sweep.
 
 \subsection{Freeform-object Geometry Summary}
 The generated freeform objects are still dense and near-threshold before cleanup, but the new plausibility prior reduces isolated components and slightly lowers the occupancy fraction. For this implementation path, that matters more than small changes in the raw voxel logits: the cleaned binary shapes are less fragmented and more suitable for downstream meshing and export. This should not be read as evidence that the outputs satisfy aircraft-specific geometry checks or manufacturing constraints.
@@ -236,22 +313,23 @@ The sweep was intentionally small but targeted for the current codebase: it vari
 This revision also adds a documented 22-slot condition schema together with dataset, model, generator, and offline-densification plumbing that consumes the resulting condition vector. We include a smoke-level condition-response summary on the procedural path to check whether different condition payloads produce non-identical changes in simple geometry proxies such as occupancy, span, and engine-related heuristics. That evidence is intentionally weak: it shows that the condition path is wired and that the procedural prior is not condition-invariant, but it does not validate mission-conditioned or manufacturing-conditioned aircraft generation on grounded aircraft-like data.
 
 \subsection{Reduced Evidence Package}
-The checked-in reduced protocol assembles a package-level evidence report from the manifest validator, aircraft-shape heuristic screen, grounded condition-response benchmark, manufacturing-bounds screen, and baseline-statistics report. In one local protocol run, all package gates passed with a shared run identifier, checkpoint hash, manifest hash, and protocol hash. Table \ref{tab:final_evidence_package} summarizes the package status.
+The checked-in reduced protocol assembles a fixture-based guardrail report from the manifest validator, aircraft-shape heuristic screen, grounded condition-response benchmark, manufacturing-bounds screen, and baseline-statistics report. In one local protocol run, these guardrail reports passed with a shared run identifier, checkpoint hash, manifest hash, and protocol hash. They are not model-level validation: the fixture rows are synthetic, the condition-response study is non-significant, and the aerodynamic and structural gates remain blocked. Model-level generation validity is reported separately in Sec.~\ref{sec:generator_recovery}, on held-out records and without fixture construction. Table \ref{tab:final_evidence_package} labels each row's scope explicitly.
 
 \begin{table}[!t]
 \centering
-\caption{Reduced Evidence Package Status}
+\caption{Fixture-Based Reduced Evidence Package Status}
 \label{tab:final_evidence_package}
 \footnotesize
 \setlength{\tabcolsep}{2pt}
-\begin{tabular}{|p{0.42\columnwidth}|p{0.18\columnwidth}|p{0.28\columnwidth}|}
+\begin{tabular}{|p{0.33\columnwidth}|p{0.16\columnwidth}|p{0.20\columnwidth}|p{0.20\columnwidth}|}
 \hline
-\textbf{Gate} & \textbf{Status} & \textbf{Role} \\ \hline
-Manifest validation & Pass & corpus contract check \\ \hline
-Aircraft-shape screen & Pass & heuristic generated-shape checks \\ \hline
-Condition response & Pass & fixed grounded sweeps \\ \hline
-Manufacturing bounds & Pass & design-spec bounds check \\ \hline
-Baseline statistics & Pass & guardrail baselines and finite-value seed checks \\ \hline
+\textbf{Gate} & \textbf{Status} & \textbf{Scope} & \textbf{Interpretation} \\ \hline
+Manifest validation & Pass & fixture & corpus contract check \\ \hline
+Aircraft-shape screen & Pass & fixture & heuristic check, not model validity \\ \hline
+Condition response & Pass & fixture & bounded sweep, not significance \\ \hline
+Manufacturing bounds & Pass & fixture & design-spec bounds check \\ \hline
+Baseline statistics & Pass & fixture & finite-value guardrail check \\ \hline
+Model-level generation validity & Passed (literal) & model, held-out & generated samples pass the screen; one geometry per condition (see Sec.~\ref{sec:generator_recovery}) \\ \hline
 \end{tabular}
 \end{table}
 
@@ -276,12 +354,79 @@ Unit cube & 1000 & 1.04 & $\sim$1.05 \cite{geier2015cascaded} \\ \hline
 
 The results in Table \ref{tab:cd_validation} are an informal sanity check for the LBM implementation, not a full solver validation. The domain spans ten characteristic lengths in the streamwise direction and five characteristic lengths in each cross-stream direction, with 128 cells per axis. Boundary conditions are no-slip BFL walls and a Neumann outlet. The inlet speed corresponds to \(Ma=0.025\), or approximately 0.014 in lattice units, and the force estimate is averaged over the final 125 steps of a 500-step simulation to reduce transient sensitivity.
 
-After correcting the freestream lattice-velocity initialization and the BFL momentum-exchange weighting term, the observed $C_d$ values sit close to or inside the broad range of the cited targets. Because exact 3D benchmarks depend on blockage ratio and averaging policy, these results support continued use as a bounded implementation check; rigorous validation still requires comparison with high-fidelity PDE solvers.
+After correcting the freestream lattice-velocity initialization and the BFL momentum-exchange weighting term, the cube agrees with its cited target while the cylinder value ($C_d=1.56$) exceeds the cited 1.3--1.4 band by approximately 11--20\%. The offset is consistent with blockage and averaging sensitivity in the small domain, but it is not agreement. These are bounded implementation checks; rigorous validation requires a controlled comparison with a high-fidelity PDE solver.
 
 \subsection{Discussion}
-The implementation evidence supports three bounded conclusions: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM comparison case with the generated STL in \texttt{constant/triSurface/design.stl}. On the same reduced cube benchmark, the internal D3Q27 solver and the OpenFOAM sonicFoam run both complete on the shared validation geometry, providing a direct solver-to-solver comparison for the current pipeline. The result supports a documented implementation path, not a claim of aircraft-level aerodynamic optimization.
+The implementation evidence supports three bounded conclusions: the repository's end-to-end path executes, the shape prior is wired into training, and the export path emits a concrete OpenFOAM case with the generated STL in \texttt{constant/triSurface/design.stl}. This revision did not install or run OpenFOAM locally, and the frozen external rows do not provide a fresh convergence record. The result supports a documented export and comparison path, not a direct validated solver-to-solver result or an aircraft-level aerodynamic claim.
 
-The OpenFOAM export path now writes a plain \texttt{forces} function-object dictionary, and the resulting force vector is normalized manually to recover coefficients when coefficient output is not available. The current benchmark still shows a substantial Cd gap, which we treat as a solver- and sampling-consistency diagnostic rather than as resolved by paper-level normalization alone. A higher-confidence CFD comparison will still need a more systematic hyperparameter sweep and consistent normalization of reference area and flow conditions.
+\subsection{Publication-Readiness Correction: Consistent Reference-Area Convention}
+\label{sec:reference_area_correction}
+An internal audit (2026-11-01) found a genuine normalization defect in the frozen low-Mach comparison corpus. The OpenFOAM side normalized $C_d$ and $C_l$ using a \emph{fixed} sweep reference area (\(A_{\mathrm{ref}} = 0.27734375\)), while the internal D3Q27 solver normalizes by its own voxel-projected frontal area (the $y$--$z$ projection of the solid mask), which is resolution-dependent: \(0.2850196\) at grid 32 vs.\ \(0.2385490\) at grid 64 for the frozen biplane corpus, i.e.\ a \(\pm 16\%\) swing on the same geometry. Dividing the two coefficient sets directly (as the original comparison scripts did) therefore contaminated \texttt{cd\_error\_percent} by the normalization mismatch, and the single previously reported ``0.25\%'' passing row (Mach 0.3, OpenFOAM grid 64, LBM grid 64) was a coincidence of normalizations rather than physical agreement.
+
+The comparison convention is now fixed and enforced by regression tests (\texttt{tests/test\_reference\_area\_regression.py}): \emph{both} solvers' coefficients are expressed on the \emph{same} reference area before any error is computed. Concretely, the raw LBM coefficient is renormalized onto the OpenFOAM sweep area,
+\[
+C_{\mathrm{LBM,corr}} = C_{\mathrm{LBM,raw}} \times \frac{A_{\mathrm{ref,LBM}}}{A_{\mathrm{ref,sweep}}},
+\]
+which turns \texttt{cd\_error\_percent} into a pure force comparison on one documented convention. Both reference areas are recorded per row (\texttt{openfoam\_reference\_area}, \texttt{lbm\_reference\_area}) together with the convention label \texttt{lbm\_renormalized\_to\_openfoam\_reference\_area}. The recomputation script is \texttt{scripts/recompute\_corpus\_consistent\_reference\_area.py} and the corrected tables are written under \texttt{evidence/research-paper-publish/corrected\_corpus/}.
+
+Table \ref{tab:frozen_corpus_corrected} gives the corrected agreement of the frozen corpus under the repository's own gate (Cd error \(< 5\%\), \texttt{MINIMUM\_ACCEPTABLE\_ERROR\_PERCENT} in \texttt{run\_internal\_benchmark.py}). OpenFOAM is not installed in this environment, so the frozen OpenFOAM rows are kept verbatim as documented frozen artifacts; only the comparison convention changed.
+
+\begin{table}[!t]
+\centering
+\caption{Frozen low-Mach corpus agreement under the corrected reference-area convention}
+\label{tab:frozen_corpus_corrected}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Corpus} & \textbf{Rows} & \textbf{Contaminated pass} & \textbf{Corrected pass} & \textbf{Corrected Cd range} \\ \hline
+sonicFoam sweep (Mach 0.05--0.3) & 16 & 2/16 & \textbf{1/16} & 1.14\% (Mach 0.3, of-32, lbm-32) to 534\% \\
+simpleFoam suite (Mach 0.05--0.5) & 14 & 0/14 & \textbf{0/14} & 34.1\% to 1436\% \\ \hline
+\end{tabular}
+\end{table}
+
+The previously reported ``0.25\%'' row now evaluates to 14.2\% Cd error; the only row that remains under the 5\% gate is the Mach 0.3 / OpenFOAM-grid-32 / LBM-grid-32 row at 1.14\%. simpleFoam agreement stays below the gate on every row and \emph{worsens} under the corrected convention (the LBM frontal areas at grids 16/24 exceed the sweep area, so the renormalization raises the reported LBM Cd). Neither the two-solver sweep nor the simpleFoam suite supports a pipeline-level \(<5\%\) Cd agreement claim in either convention.
+
+\subsection{Statistical Substance of the Condition-Response Sweep}
+\label{sec:condition_response_stats}
+The prior smoke checkpoint's condition-response evidence was limited to \(n=4\) seeds, where target speed versus measured drag showed \(r=-0.806\) with \(p=0.19\): a direction-only, non-significant observation. To obtain a real effect estimate with uncertainty intervals, we ran the canonical \texttt{validate-conditions} step at \(n=12\) seeds (grid 32, 100 solver steps) against the same smoke checkpoint (\texttt{checkpoints\_protocol\_smoke/final\_optimized\_model.pt}); artifact \texttt{build/protocol\_smoke/condition\_validation\_n12.json}, analysis script \texttt{scripts/condition\_response\_stats\_n12.py}.
+
+Two important measurement facts came out of that run that bound how the numbers may be read:
+
+1. \textbf{Solver instability events.} Two of twelve seeds produced non-physical D3Q27 outputs (drag magnitudes \(\approx 10^{22}\) and \(\approx 10^{33}\), seeds 1 and 10 respectively) for otherwise ordinary conditions (speed 38.1 m/s / span 2.22 m and speed 64.3 m/s / span 1.71 m). These are checkpoint-level solver blow-ups at grid 32 / 100 steps on the smoke checkpoint, not physical drag values. Any claim that ignores or silently removes these seeds would be cherry-picking; the paper instead reports both the full set and the set excluding the two documentable instability events.
+2. \textbf{Run-to-run variation on identical seeds.} The same four seed conditions that produced the October \(n=4\) artifact (measured\_drag mean \(1.977 \pm 0.302\)) produced different values in this run (seeds 0--3: 1.396, 5.819e33, 1.771, 2.269) on the same checkpoint and the same CUDA hardware. The smoke checkpoint's D3Q27 measurement is therefore not bit-reproducible run-to-run; point coefficients must be treated as estimates with spread, not as constants.
+
+With \(n=12\) (Fisher-z approximation, two-sided \(\alpha=0.05\)), the design is powered to detect \(|\rho| \approx 0.78\) at \(\sim80\%\) power; smaller effects are not resolvable at this sample size and are reported as non-significant with wide confidence intervals. Table \ref{tab:condition_stats} gives both the raw \(n=12\) correlations and the \(n=10\) set excluding the two blow-up seeds.
+
+\begin{table}[!t]
+\centering
+\caption{Condition-response correlations, smoke checkpoint (grid 32, 100 steps)}
+\label{tab:condition_stats}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Pair} & \textbf{r} & \textbf{p} & \textbf{95\% CI (Fisher-z)} \\ \hline
+target\_speed vs.\ measured\_drag (raw, \(n=12\)) & $-0.410$ & 0.185 & [$-0.797$, 0.214] \\
+target\_speed vs.\ measured\_drag (excl.\ blow-ups, \(n=10\)) & $-0.198$ & 0.583 & [$-0.736$, 0.493] \\
+target\_speed vs.\ measured\_lift (\(n=10\)) & 0.367 & 0.297 & [$-0.342$, 0.810] \\
+target\_speed vs.\ occupancy (\(n=10\)) & $-0.254$ & 0.478 & [$-0.762$, 0.447] \\
+wingspan\_limit vs.\ measured\_drag (\(n=10\)) & 0.199 & 0.582 & [$-0.493$, 0.736] \\
+wingspan\_limit vs.\ measured\_lift (\(n=10\)) & 0.603 & 0.065 & [$-0.043$, 0.893] \\
+wingspan\_limit vs.\ occupancy (\(n=10\)) & $-0.294$ & 0.409 & [$-0.780$, 0.412] \\ \hline
+\end{tabular}
+\end{table}
+
+\textbf{Significance outcome: non-significant.} Every pair fails the conventional \(p < 0.05\) threshold in both the raw \(n=12\) analysis and the \(n=10\) analysis excluding the two blow-up seeds. The direction of the speed--drag association is negative in both analyses (consistent with the \(n=4\) direction), but the effect is not statistically distinguished from zero and the confidence intervals are wide. The closest candidate (wingspan limit vs.\ measured lift, \(r=0.603\), \(p=0.065\) at \(n=10\)) is a direction-only observation with an interval spanning zero. This is reported as an honest null/indeterminate result for the \emph{smoke checkpoint}: the paper does not claim a validated condition-response signal on this checkpoint, does not cherry-pick seeds, and treats condition-response signal as an open gate for a recovered checkpoint (Section \ref{sec:final_run}) rather than as evidence already obtained.
+
+\subsection{Regime Limits and Honest Scope of the CFD Evidence}
+\label{sec:regime_limits}
+The internal D3Q27 solver is a weakly compressible, isothermal low-Mach sanity path. Its documented validity boundary is Mach \(\leq 0.3\) with claim grade \texttt{low\_mach\_sanity\_only} and compressibility model \texttt{weakly\_compressible\_isothermal\_lbm}. The paper makes no high-Mach, transonic, or supersonic validation claim, and no claim that the internal solver reproduces compressible-flow physics; Mach numbers above 0.3 remain experimental and unvalidated externally (frozen audit boundary, reconfirmed 2026-11-01). The frozen low-Mach corpus itself does not meet the repository's own \(<5\%\) Cd agreement gate (Table \ref{tab:frozen_corpus_corrected}), so this paper does not claim validated low-Mach agreement with OpenFOAM either; it reports the measured disagreement as the honest current status.
+
+Similarly, the mixed-precision document's expected 2.2\(\times\) speedup for the RTX 4060 is a planning estimate, not a measured result in this revision; no speedup claim from that table is carried into this paper. The FP16/FP32 path's density error (\texttt{MIXED\_PRECISION\_GUIDE.md}) is a solver-level quantity and is not claimed as a pipeline-level accuracy result. The aircraft-validity screen also stays bounded: frozen NASA CRM whole-aircraft voxels pass 15/15, while the bundled root STLs (biplane, F-18, cylinder, 20mm cube) fail 0/4, with quantified failure modes such as \texttt{normalization\_margin}, \texttt{span\_sanity}, and \texttt{tail\_body\_plausibility} (harness: \texttt{scripts/agent\_d\_validity\_harness.py}). The screen is a first-pass shape-plausibility heuristic, not structural, aerodynamic, or manufacturing validation.
+
+\subsection{OpenFOAM Export Path and Tiered Ground Truth}
+The OpenFOAM export path now writes a plain \texttt{forces} function-object dictionary, and the resulting force vector is normalized manually to recover coefficients when coefficient output is not available. The current benchmark still shows a substantial Cd gap, which we treat as a solver- and sampling-consistency diagnostic rather than as resolved by paper-level normalization alone. A higher-confidence CFD comparison will still need a more systematic hyperparameter sweep and consistent normalization of reference area and flow conditions; the reference-area convention in Section \ref{sec:reference_area_correction} is now that consistent normalization, and the remaining gap is physical/statistical rather than definitional.
 
 The current ground-truth foundation is therefore tiered. Internal D3Q27 LBM values can drive the direct SPSA training loss and sequential candidate selection, but they stay in the internal-label tier. The OpenFOAM/simpleFoam and sonicFoam scripts define the external PDE route: cases must complete, residual and field-export checks must pass, and the resulting labels must remain separate from internal LBM labels until they satisfy the \texttt{external\_pde} gate. This separation is important for future PDE validation because it lets the repository compare internal LBM coefficients against OpenFOAM under shared geometry, Mach, Reynolds, grid, and reference-area settings without silently upgrading the internal solver to ground truth.
 
@@ -289,14 +434,14 @@ We also recorded one physics correction in \texttt{CLI/cascaded\_lbm.py}. The D3
 
 \begin{table}[!t]
 \centering
-\caption{Claim Gate Status and Final-Run Upgrade Contract}
+\caption{Claim Gate Status and Remaining-Experiment Contract}
 \label{tab:claim_gates}
 \footnotesize
 \setlength{\tabcolsep}{2pt}
 \begin{tabular}{|p{0.34\columnwidth}|p{0.16\columnwidth}|p{0.36\columnwidth}|}
 \hline
 \textbf{Claim} & \textbf{Current status} & \textbf{Final run unlocks if} \\ \hline
-Generates aircraft structures & blocked & generated samples pass validity screen at declared rate \\ \hline
+Generates aircraft structures & literal validity passed at \(32^3\); novelty/diversity blocked & 45/45 CRM held-out draws pass, but all voxels exist in training and a constant passes the screen \\ \hline
 Conditioned on mission/manufacturing & blocked & grounded condition benchmark shows directional held-out signal \\ \hline
 CFD-guided training & blocked & scheduled direct SPSA objective decreases without drift \\ \hline
 Aerodynamically optimized & blocked & requires separate converged CFD vs.\ baselines (not this run) \\ \hline
@@ -308,15 +453,15 @@ Compressible internal solver validated & blocked & requires separate external co
 
 \subsection{The Single Decisive Final Run}
 \label{sec:final_run}
-The checked-in final protocol (\texttt{CLI/run\_protocols/gcp\_128\_295m.yaml}, executed by the monitored runner) is deliberately the single experiment this paper designates as the gate for its remaining aircraft-level claims. It trains the scaled \(128^3\) architecture (512-dim latent, coordinate decoder width 2048 depth 5, 70.1M trainable parameters) in bfloat16 for two epochs at batch size 1 on the pinned-latent training corpus, checkpointing every 25 updates under the interruption-safe runner, with the fused-stream BFL solver backend and a GPU-side exact-SDF attestation so the reported geometry pipeline is the measured one. Because the run is monitored, it produces the run-state lineage (checkpoint hashes, manifest hashes, protocol hashes) needed by the evidence package rather than an unrepeatable training history.
+The checked-in final protocol (\texttt{CLI/run\_protocols/gcp\_128\_295m.yaml}, executed by the monitored runner) is a future experiment for the remaining scale, diversity, conditioning, and solver-loop questions; it is not the first evidence that voxel geometry can pass the aircraft-validity screen. Section~\ref{sec:generator_recovery} reports a completed \(32^3\) CRM recovery on this host, in which 45/45 generated samples pass the uncalibrated screen on held-out records, but the same geometry is emitted across conditions and seeds. The \(128^3\) protocol trains the scaled architecture (512-dim latent, coordinate decoder width 2048 depth 5, 70.1M trainable parameters) in bfloat16 for two epochs at batch size 1 on the pinned-latent training corpus, checkpointing every 25 updates under the interruption-safe runner, with the fused-stream BFL solver backend and a GPU-side exact-SDF attestation. Because the run is monitored, it produces the run-state lineage (checkpoint hashes, manifest hashes, protocol hashes) needed by the evidence package rather than an unrepeatable training history.
 
-Success for this run is defined by four gates, all of which are executable in the repository today:
+The remaining upgrade questions for this run are:
 \begin{enumerate}
-    \item \textbf{Generated-sample validity:} generated flight-path conditioning cases pass the aircraft-specific validity screen (currently \texttt{span\_sanity}, symmetry, planform-sparsity, and fuselage-end checks) at a declared rate.
-    \item \textbf{Condition-response signal:} the grounded condition benchmark shows directional signal on held-out records rather than condition-invariant generation.
-    \item \textbf{Solver-in-loop signal:} the scheduled direct D3Q27 SPSA objective decreases over the run instead of drifting, and the evidence package records it.
-    \item \textbf{Lineage-consistent evidence:} \texttt{CLI/final\_evidence.py} returns \texttt{pass} with matching run/checkpoint/manifest/protocol hashes.
+    \item \textbf{Generation diversity:} do the generated samples contain distinct aircraft-like geometries, rather than the single geometry measured in the \(32^3\) recovery?
+    \item \textbf{Condition-response signal:} does a grounded condition benchmark show directional signal on held-out records rather than condition-invariant generation?
+    \item \textbf{Solver-in-loop signal:} does the scheduled direct D3Q27 SPSA objective decrease over the run instead of drifting, with the evidence package recording it?
+    \item \textbf{Lineage-consistent evidence:} does \texttt{CLI/final\_evidence.py} return \texttt{pass} with matching run/checkpoint/manifest/protocol hashes?
 \end{enumerate}
 
-This one run is the paper's upgrade contract. If it passes gates 1 and 2, the claim rows \texttt{Generates aircraft structures} and \texttt{Conditioned on flight profile and manufacturing method} in Table \ref{tab:claim_gates} move from blocked to supported; if gate 3 passes, \texttt{CFD-guided training} moves to supported as well, and the corresponding fallback wording in the evidence matrix can be retired. If gates 1 or 2 fail, those claims remain blocked and this paper's allowed claims stay exactly where they are today: a reproducible proof-of-concept pipeline with a passing reduced evidence bundle. No claim in this paper depends on the final run passing; the run only decides whether the stronger claims are added. Conversely, the final run is not a shortcut: even a fully passing run does not establish structural load-path viability, superiority over mature baselines, or externally validated aerodynamic optimality, which require the separate structural, baseline, and PDE-validation studies listed in Sections \ref{sec:baselines} and \ref{sec:validation}.
+The literal validity-screen gate is passed on the declared CRM held-out split at \(32^3\); the unresolved scientific gate is diverse, meaningfully conditioned aircraft generation. The \(128^3\) run tests that broader claim at higher resolution but does not replace the need for larger, diverse training data. Even a fully passing run does not establish structural load-path viability, superiority over mature baselines, or externally validated aerodynamic optimality, which require the separate structural, baseline, and PDE-validation studies listed in Sections \ref{sec:baselines} and \ref{sec:validation}.
 \par
