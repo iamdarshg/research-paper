@@ -46,8 +46,13 @@ FIELDS = [
     "of_rough_converged",
     "lbm_cd",
     "lbm_cl",
+    "lbm_cd_corrected",
+    "lbm_cl_corrected",
     "lbm_seconds",
     "lbm_converged",
+    "openfoam_reference_area",
+    "lbm_reference_area",
+    "reference_area_convention",
     "cd_error_percent",
     "cl_error_percent",
 ]
@@ -63,6 +68,21 @@ def parse_grid_range(value: str) -> list[int]:
 
 def finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _renormalized(coef_value, from_area, to_area):
+    """Express a coefficient on ``to_area`` (force-consistent comparison).
+
+    C = F/(q*Aref); multiplying by from/to re-expresses the force at a
+    common reference area so cd_error_percent is a consistent measure
+    instead of being contaminated by resolution-dependent voxel areas.
+    """
+    if not finite(coef_value) or not finite(from_area) or not finite(to_area):
+        return None
+    f, t = float(from_area), float(to_area)
+    if f <= 0.0 or t <= 0.0:
+        return None
+    return float(coef_value) * f / t
 
 
 def load_rows(path: Path) -> list[dict[str, Any]]:
@@ -147,14 +167,23 @@ def make_row(of_result: dict[str, Any], lbm_result: dict[str, Any] | None, grid:
 
     of_cd = force.get("cd_total")
     of_cl = force.get("cl_total")
+    of_reference_area = force.get("reference_area")
     lbm_cd = lbm_result.get("cd") if lbm_result else None
     lbm_cl = lbm_result.get("cl") if lbm_result else None
+    lbm_reference_area = (
+        lbm_result.get("reference_area") if lbm_result else None
+    )
+    # Reference-area convention (fixed 2026-11-01): renormalize the LBM
+    # coefficient onto the OpenFOAM sweep reference area so the error is a
+    # force comparison on one documented convention; record both areas.
+    lbm_cd_corrected = _renormalized(lbm_cd, lbm_reference_area, of_reference_area)
+    lbm_cl_corrected = _renormalized(lbm_cl, lbm_reference_area, of_reference_area)
     cd_error = None
     cl_error = None
-    if finite(of_cd) and finite(lbm_cd) and abs(float(of_cd)) > 1e-12:
-        cd_error = abs(float(lbm_cd) - float(of_cd)) / abs(float(of_cd)) * 100.0
-    if finite(of_cl) and finite(lbm_cl) and abs(float(of_cl)) > 1e-12:
-        cl_error = abs(float(lbm_cl) - float(of_cl)) / abs(float(of_cl)) * 100.0
+    if finite(of_cd) and finite(lbm_cd_corrected) and abs(float(of_cd)) > 1e-12:
+        cd_error = abs(float(lbm_cd_corrected) - float(of_cd)) / abs(float(of_cd)) * 100.0
+    if finite(of_cl) and finite(lbm_cl_corrected) and abs(float(of_cl)) > 1e-12:
+        cl_error = abs(float(lbm_cl_corrected) - float(of_cl)) / abs(float(of_cl)) * 100.0
 
     convergence = parse_simplefoam_convergence(Path(of_result.get("case_dir", "")))
     return {
@@ -172,8 +201,17 @@ def make_row(of_result: dict[str, Any], lbm_result: dict[str, Any] | None, grid:
         **convergence,
         "lbm_cd": lbm_cd,
         "lbm_cl": lbm_cl,
+        "lbm_cd_corrected": lbm_cd_corrected,
+        "lbm_cl_corrected": lbm_cl_corrected,
         "lbm_seconds": (lbm_result or {}).get("timings", {}).get("total_seconds"),
         "lbm_converged": (lbm_result or {}).get("lbm_converged"),
+        "openfoam_reference_area": of_reference_area,
+        "lbm_reference_area": lbm_reference_area,
+        "reference_area_convention": (
+            "lbm_renormalized_to_openfoam_reference_area"
+            if finite(of_reference_area) and finite(lbm_reference_area)
+            else "unavailable"
+        ),
         "cd_error_percent": cd_error,
         "cl_error_percent": cl_error,
         "openfoam_case_dir": of_result.get("case_dir"),

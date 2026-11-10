@@ -2037,6 +2037,12 @@ class D3Q27CascadedSolver:
         macroscopic fields. This mirrors the interface used by the training
         CFD simulator.
         """
+        # Mirror collide_stream's device handling: the caller may hand us a
+        # grid on a different device (e.g. evaluate-baselines voxelizes STLs on
+        # CPU while the solver lives on CUDA). Every reduction below stacks
+        # geometry-derived scalars with solver state, so they must share a
+        # device. `to` is a no-op when devices already match.
+        geometry_mask = geometry_mask.to(self.device, non_blocking=True)
         # conservative reference area and freestream speed
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         solid = geometry_mask > 0.5
@@ -2109,6 +2115,11 @@ class D3Q27CascadedSolver:
         them back from ``self``.
         """
         # conservative reference area and freestream speed
+        # Mirror collide_stream's device handling (see
+        # compute_aerodynamic_coefficients): the caller may hand us a grid on
+        # a different device; every reduction stacks geometry-derived scalars
+        # with solver state, so they must share a device.
+        geometry_mask = geometry_mask.to(self.device, non_blocking=True)
         h = getattr(self.config.lbm_config, 'grid_spacing', 0.01)
         solid = geometry_mask > 0.5
 

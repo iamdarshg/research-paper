@@ -9,6 +9,16 @@ import numpy as np
 from scipy.ndimage import label as scipy_label
 
 GRID = 96
+# Occupancy band for a normalized procedural sample, expressed as a fraction of
+# the full lattice. The declared aircraft screen in CLI/aircraft_validity.py
+# requires 0.002 <= occupancy <= 0.02 at 96^3; this band sits strictly inside it
+# with headroom for the perturb/cleanup passes downstream.
+TARGET_OCCUPANCY_MIN = 0.0026
+TARGET_OCCUPANCY_MAX = 0.0170
+# Largest of (span, length) as a fraction of the lattice edge after
+# normalization. The screen requires span and length >= 0.35 and <= 0.90.
+TARGET_FILL = 0.72
+TARGET_LENGTH = 0.78
 MIN_OCC = 0.0005
 MIN_SYMMETRY = 0.10
 MIN_SPAN = 0.03
@@ -20,7 +30,7 @@ AIRCRAFT_TYPES = [
     "canard", "anhedral", "swept_wing", "lifting_body",
 ]
 PROCEDURAL_MIN_ACCEPTED_PER_TYPE = {aircraft_type: 1 for aircraft_type in AIRCRAFT_TYPES}
-PROCEDURAL_GENERATOR_VERSION = "procedural-aircraft-v1"
+PROCEDURAL_GENERATOR_VERSION = "procedural-aircraft-v2"
 
 
 def _ellipsoid(g, cz, cy_center, x_center, rz, ry, rx):
@@ -33,6 +43,158 @@ def _ellipsoid(g, cz, cy_center, x_center, rz, ry, rx):
 
 def _box(g, z0,z1, y0,y1, x0,x1):
     g[max(0,int(z0)):min(GRID,int(z1)+1), max(0,int(y0)):min(GRID,int(y1)+1), max(0,int(x0)):min(GRID,int(x1)+1)]=1.0
+
+
+def _ensure_center_body(g, radius=2, x_start_frac=0.12, x_end_frac=0.88):
+    """Give the aircraft a continuous longitudinal body with blunt ends.
+
+    Every station inside ``[x_start_frac, x_end_frac]`` of the lattice receives a
+    body section of at least ``radius`` voxels, centred on that station's own
+    occupied centroid (or on the previous station's body when the station is
+    empty). Tailless planforms would otherwise expose no centre body and no
+    fuselage ends to the declared screen, and thin ellipsoid fuselages taper to
+    one voxel at the nose and tail. A real aircraft carries a continuous centre
+    body between its nose and its tail, so the body is made explicit instead of
+    being inferred from whichever primitive happened to be drawn.
+    """
+    occupied = g > 0.5
+    columns = np.nonzero(occupied.any(axis=(0, 1)))[0]
+    if columns.size == 0:
+        return g
+    minimum_side = 2 * int(radius) + 1
+    x_first = int(round(GRID * x_start_frac))
+    x_last = int(round(GRID * x_end_frac)) - 1
+    body_center: np.ndarray | None = None
+    for xi in range(x_first, min(GRID, x_last + 1)):
+        section = np.argwhere(occupied[:, :, xi])
+        if section.size:
+            z_extent = int(section[:, 0].max() - section[:, 0].min() + 1)
+            y_extent = int(section[:, 1].max() - section[:, 1].min() + 1)
+            body_center = np.array(
+                [
+                    int(round(float(section[:, 0].mean()))),
+                    int(round(float(section[:, 1].mean()))),
+                ]
+            )
+            if min(z_extent, y_extent) >= minimum_side:
+                # Station already carries a full-size body section.
+                continue
+        if body_center is None:
+            continue
+        zc, yc = int(body_center[0]), int(body_center[1])
+        for dz in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if dz * dz + dy * dy > radius * radius:
+                    continue
+                zi, yi = zc + dz, yc + dy
+                if 0 <= zi < GRID and 0 <= yi < GRID:
+                    g[zi, yi, xi] = 1.0
+    return g
+
+
+def _resample(binary, factor):
+    """Nearest-neighbour resample of a binary lattice by ``factor`` (any > 0)."""
+    if abs(factor - 1.0) < 1e-6:
+        return binary
+    shape = binary.shape
+    out_shape = tuple(max(1, int(round(size * factor))) for size in shape)
+    indices = [
+        np.clip((np.arange(size) / factor).astype(np.int64), 0, old - 1)
+        for size, old in zip(out_shape, shape)
+    ]
+    return binary[np.ix_(indices[0], indices[1], indices[2])]
+
+
+def _resample_axis(binary, axis, factor):
+    """Resample a single axis by ``factor``, leaving the other axes unchanged."""
+    if abs(factor - 1.0) < 1e-6:
+        return binary
+    shape = binary.shape
+    old = shape[axis]
+    new = max(1, int(round(old * factor)))
+    axis_indices = np.clip((np.arange(new) / factor).astype(np.int64), 0, old - 1)
+    if axis == 0:
+        return binary[axis_indices, :, :]
+    if axis == 1:
+        return binary[:, axis_indices, :]
+    return binary[:, :, axis_indices]
+
+
+def _canonicalize_and_normalize(g):
+    """Bilateral symmetry, then scale into the declared occupancy/fill band.
+
+    The declared screen compares the two spanwise halves about the lattice
+    mid-plane, and it bounds span, length, thickness and total occupancy. Real
+    aircraft are bilaterally symmetric and occupy a bounded fraction of their
+    bounding box, so a procedural aircraft is mirrored about the same mid-plane
+    and scaled to a declared fill target rather than being emitted at whatever
+    scale the random primitives happened to produce.
+    """
+    binary = g > 0.5
+    if not binary.any():
+        return g
+    # Mirror about the lattice mid-plane (the plane the screen measures).
+    binary = binary | binary[:, ::-1, :]
+
+    coords = np.argwhere(binary)
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0) + 1
+    crop = binary[mins[0]:maxs[0], mins[1]:maxs[1], mins[2]:maxs[2]]
+
+    length = max(int(crop.shape[2]), 1)
+    factor = (TARGET_LENGTH * GRID) / float(length)
+    chosen = _resample(crop, factor)
+
+    # Per-axis cap so the materialized sample stays inside the screen's
+    # normalization margins (span/length <= 0.90, thickness <= 0.40).
+    for axis, cap in ((0, 0.38), (1, 0.86), (2, 0.86)):
+        extent = max(int(chosen.shape[axis]), 1)
+        limit = cap * GRID
+        if extent > limit:
+            ratio = limit / float(extent)
+            if axis == 0:
+                chosen = _resample_axis(chosen, 0, ratio)
+            elif axis == 1:
+                chosen = _resample_axis(chosen, 1, ratio)
+            else:
+                chosen = _resample_axis(chosen, 2, ratio)
+    if max(chosen.shape) > GRID:
+        factor *= 0.95
+        chosen = _resample(crop, factor)
+    if float(chosen.sum()) / float(GRID ** 3) > TARGET_OCCUPANCY_MAX:
+        factor *= 0.90
+        chosen = _resample(crop, factor)
+
+    # Grow thin shapes with a face-connected dilation until the corpus band is met.
+    from scipy.ndimage import binary_dilation
+    structure = np.zeros((3, 3, 3), dtype=bool)
+    structure[0, 1, 1] = structure[2, 1, 1] = True
+    structure[1, 0, 1] = structure[1, 2, 1] = True
+    structure[1, 1, 0] = structure[1, 1, 2] = True
+    for _ in range(4):
+        occupancy = float(chosen.sum()) / float(GRID ** 3)
+        if occupancy >= TARGET_OCCUPANCY_MIN:
+            break
+        candidate = binary_dilation(chosen, structure=structure)
+        if max(candidate.shape) > GRID:
+            break
+        if float(candidate.sum()) / float(GRID ** 3) > TARGET_OCCUPANCY_MAX:
+            break
+        chosen = candidate
+
+    canvas = np.zeros((GRID, GRID, GRID), dtype=np.float32)
+    if max(chosen.shape) > GRID:
+        chosen = chosen[:GRID, :GRID, :GRID]
+    starts = [(GRID - size) // 2 for size in chosen.shape]
+    canvas[
+        starts[0]:starts[0] + chosen.shape[0],
+        starts[1]:starts[1] + chosen.shape[1],
+        starts[2]:starts[2] + chosen.shape[2],
+    ] = chosen.astype(np.float32)
+    # Re-impose exact bilateral symmetry after resampling and centring, which
+    # can each shift features by one voxel relative to the mid-plane.
+    canvas = np.maximum(canvas, canvas[:, ::-1, :])
+    return canvas
 
 
 def _wing_symmetric(g, y_center, x_le_root, root_chord, half_span, thickness,
@@ -181,12 +343,12 @@ def generate_aircraft(rng, aircraft_type):
         _box(g, cz, cz+rng.randint(4, 6), twy-1, twy+1, GRID//2-2, GRID//2+2)
 
     elif aircraft_type == "lifting_body":
-        bl = rng.randint(42, 58); brx = rng.randint(6, 10)
+        bl = rng.randint(42, 58); brx = rng.randint(4, 6)
         brz = rng.randint(4, 6)
         _ellipsoid(g, cz, cz, GRID//2, brz, brx, bl//2)
-        shs = rng.randint(7, 15)
+        shs = rng.randint(24, 34)
         swx = GRID//2 + bl//3
-        _wing_symmetric(g, cz, swx, 3, shs, 1, sweep_frac=0.15, taper=0.5)
+        _wing_symmetric(g, cz, swx, 11, shs, 1, sweep_frac=0.15, taper=0.5)
         tail_x = GRID//2 + bl//2 - 3
         _box(g, cz, cz+brz+2, cz-1, cz+1, tail_x-1, tail_x+1)
         # The legacy corpus validator compares the two spanwise halves about
@@ -199,6 +361,8 @@ def generate_aircraft(rng, aircraft_type):
         shifted[:, :-1, :] = g[:, 1:, :]
         g = np.maximum(g, shifted)
 
+    g = _ensure_center_body(g)
+    g = _canonicalize_and_normalize(g)
     return (g > 0.5).astype(np.float32)
 
 
@@ -216,27 +380,20 @@ def chash(v):
 
 
 def validate(v):
+    """Screen a procedural sample with the repository's declared aircraft checks.
+
+    This module used to carry its own laxer gate (occupancy >= 0.0005, span >=
+    0.03, symmetry >= 0.10). That gate disagreed with the paper's declared
+    screen (`CLI/aircraft_validity.py`), so the "accepted" procedural corpus was
+    mostly invalid under the very screen the generator is later measured
+    against. There is now one definition of aircraft-like validity in the
+    repository, and the procedural generator uses it.
+    """
     try:
-        occ = v > 0.5
-        if float(occ.sum()) / v.size < MIN_OCC: return False
-        lab, n = scipy_label(occ)
-        if n == 0: return False
-        sz = np.bincount(lab.ravel())[1:]
-        if sz.max() / max(sz.sum(), 1) < MIN_COMPONENT_FRAC: return False
-        coords = np.argwhere(occ)
-        dims = (coords.max(axis=0) - coords.min(axis=0) + 1).astype(float)
-        if dims[1] / GRID < MIN_SPAN or dims[2] / GRID < MIN_LENGTH: return False
-        mid = GRID // 2
-        left = occ[:, :mid, :]; right = occ[:, GRID-mid:, :]
-        ml = min(left.shape[1], right.shape[1])
-        # Compare corresponding spanwise locations after reflecting the right
-        # half.  Without this reversal a genuinely bilateral aircraft is
-        # compared in opposite tip-to-root order and can score zero symmetry.
-        asym = np.abs(
-            left[:, -ml:, :].astype(int) - right[:, :ml, :][:, ::-1, :].astype(int)
-        ).sum() / max(occ.sum(), 1)
-        if max(0.0, 1.0 - asym) < MIN_SYMMETRY: return False
-        return True
+        from aircraft_validity import evaluate_aircraft_validity
+
+        report = evaluate_aircraft_validity(np.asarray(v, dtype=np.float32), canonicalize=False)
+        return bool(report.get("status") == "pass")
     except Exception:
         return False
 

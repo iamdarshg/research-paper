@@ -103,6 +103,8 @@ def run_lbm_case(
         "device": str(device),
         "cd": float(coeffs.get("drag_coefficient", float("nan"))),
         "cl": float(coeffs.get("lift_coefficient", float("nan"))),
+        "reference_area": float(coeffs.get("reference_area", float("nan"))),
+        "reference_area_source": coeffs.get("reference_area_source"),
         "lbm_converged": bool(coeffs.get("lbm_converged", False)),
         "training_drag_source": coeffs.get("training_drag_source"),
         "force_stability": coeffs.get("force_stability"),
@@ -141,6 +143,7 @@ def summarize_openfoam(result: dict[str, Any], grid: int) -> dict[str, Any]:
         "speed_mps": result.get("speed_mps"),
         "cd": force.get("cd_total"),
         "cl": force.get("cl_total"),
+        "reference_area": force.get("reference_area"),
         "mesh_ok": result.get("mesh_ok"),
         "failed": result.get("failed"),
         "latest_time": result.get("latest_time"),
@@ -154,6 +157,22 @@ def finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
 
 
+def renormalize_coefficient(value: Any, source_area: Any, target_area: Any) -> float | None:
+    """Express a coefficient on ``target_area`` before comparing solvers.
+
+    Since C = F/(q*A), converting from source to target multiplies by
+    source_area/target_area.  This makes the comparison a force comparison
+    rather than a comparison contaminated by resolution-dependent voxel area.
+    """
+    if not finite(value) or not finite(source_area) or not finite(target_area):
+        return None
+    source = float(source_area)
+    target = float(target_area)
+    if source <= 0.0 or target <= 0.0:
+        return None
+    return float(value) * source / target
+
+
 def compare_cases(openfoam_cases: list[dict[str, Any]], lbm_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for of_case in openfoam_cases:
@@ -164,12 +183,29 @@ def compare_cases(openfoam_cases: list[dict[str, Any]], lbm_cases: list[dict[str
             lbm_cd = lbm_case.get("cd")
             of_cl = of_case.get("cl")
             lbm_cl = lbm_case.get("cl")
+            # Reference-area convention (FIXED 2026-11-01): the internal LBM
+            # solver normalizes C_d/C_l by its own voxel-projected frontal area
+            # (resolution-dependent), while OpenFOAM normalizes by the fixed
+            # sweep reference area (--reference-area). Comparing raw
+            # coefficients therefore mixes two reference areas and contaminates
+            # cd_error_percent by up to +/-16%. We now renormalize the LBM
+            # coefficients onto the OpenFOAM reference area so the error is a
+            # pure force comparison on one documented convention. Both areas
+            # are recorded per row.
+            of_ref_area = of_case.get("reference_area")
+            lbm_ref_area = lbm_case.get("reference_area")
+            lbm_cd_corrected = renormalize_coefficient(
+                lbm_cd, lbm_ref_area, of_ref_area
+            )
+            lbm_cl_corrected = renormalize_coefficient(
+                lbm_cl, lbm_ref_area, of_ref_area
+            )
             cd_error = None
             cl_error = None
-            if finite(of_cd) and finite(lbm_cd) and abs(float(of_cd)) > 1e-12:
-                cd_error = abs(float(lbm_cd) - float(of_cd)) / abs(float(of_cd)) * 100.0
-            if finite(of_cl) and finite(lbm_cl) and abs(float(of_cl)) > 1e-12:
-                cl_error = abs(float(lbm_cl) - float(of_cl)) / abs(float(of_cl)) * 100.0
+            if finite(of_cd) and finite(lbm_cd_corrected) and abs(float(of_cd)) > 1e-12:
+                cd_error = abs(float(lbm_cd_corrected) - float(of_cd)) / abs(float(of_cd)) * 100.0
+            if finite(of_cl) and finite(lbm_cl_corrected) and abs(float(of_cl)) > 1e-12:
+                cl_error = abs(float(lbm_cl_corrected) - float(of_cl)) / abs(float(of_cl)) * 100.0
             rows.append(
                 {
                     "mach": of_case["mach"],
@@ -182,12 +218,21 @@ def compare_cases(openfoam_cases: list[dict[str, Any]], lbm_cases: list[dict[str
                     "openfoam_seconds": of_case["timings"]["total_seconds"],
                     "lbm_cd": lbm_cd,
                     "lbm_cl": lbm_cl,
+                    "corrected_lbm_cd": lbm_cd_corrected,
+                    "corrected_lbm_cl": lbm_cl_corrected,
                     "lbm_seconds": lbm_case["timings"]["total_seconds"],
                     "lbm_converged": lbm_case.get("lbm_converged"),
                     "lbm_validity": lbm_case.get("validity"),
                     "lbm_claim_grade": lbm_case.get("claim_grade"),
                     "lbm_compressibility_model": lbm_case.get("compressibility_model"),
                     "lbm_thermal_model": lbm_case.get("thermal_model"),
+                    "openfoam_reference_area": of_ref_area,
+                    "lbm_reference_area": lbm_ref_area,
+                    "reference_area_convention": (
+                        "lbm_renormalized_to_openfoam_reference_area"
+                        if finite(of_ref_area) and finite(lbm_ref_area)
+                        else "unavailable"
+                    ),
                     "cd_error_percent": cd_error,
                     "cl_error_percent": cl_error,
                 }
@@ -208,12 +253,17 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "openfoam_seconds",
         "lbm_cd",
         "lbm_cl",
+        "corrected_lbm_cd",
+        "corrected_lbm_cl",
         "lbm_seconds",
         "lbm_converged",
         "lbm_validity",
         "lbm_claim_grade",
         "lbm_compressibility_model",
         "lbm_thermal_model",
+        "openfoam_reference_area",
+        "lbm_reference_area",
+        "reference_area_convention",
         "cd_error_percent",
         "cl_error_percent",
     ]
