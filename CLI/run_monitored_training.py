@@ -1160,6 +1160,9 @@ def _build_monitored_training_config(args: argparse.Namespace) -> TrainingConfig
         overfit_geometry_gate_samples=args.promotion_evaluation_samples,
         promotion_generation_seeds=args.promotion_generation_seeds,
         require_direct_solver_every_iteration=bool(args.require_direct_solver_every_iteration),
+        geometry_occupancy_mean_weight=float(
+            getattr(args, "geometry_occupancy_mean_weight", 0.0)
+        ),
     )
 
 
@@ -1374,6 +1377,17 @@ def main() -> int:
     parser.add_argument("--direct-aircraft-validity-weight", type=float, default=float(config_value("training", "direct_aircraft_validity_weight", 1.0)))
     parser.add_argument("--direct-solver-perturbation", type=float, default=float(config_value("training", "direct_solver_perturbation", 0.15)))
     parser.add_argument("--direct-solver-perturbation-grid-size", type=int, default=int(config_value("training", "direct_solver_perturbation_grid_size", 12)))
+    parser.add_argument(
+        "--geometry-occupancy-mean-weight",
+        type=float,
+        default=float(config_value("training", "geometry_occupancy_mean_weight", 0.0)),
+        help=(
+            "Weight for the data-dependent occupancy matching loss (per-sample "
+            "target occupancy taken from the training geometry; 0 = legacy "
+            "objective). Exposed here so monitored runs can train the same "
+            "objective the `train` CLI already supports."
+        ),
+    )
     parser.add_argument(
         "--require-direct-solver-every-iteration",
         action=argparse.BooleanOptionalAction,

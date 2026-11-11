@@ -17,6 +17,6 @@ Verification checks that the implemented steps are executed as intended. In this
 \end{itemize}
 
 \subsection{Validation}
-Validation is now runnable on a single local machine with OpenFOAM installed. The built-in CFD path is exercised on the reduced CPU pipeline, and the OpenFOAM sonicFoam benchmark is run on the shared centered-cube validation object. The comparison uses the lower-level \texttt{forces} output when available, with a manual pressure integration fallback only if the function-object output is missing.
+The OpenFOAM export path is runnable in principle, but OpenFOAM was not installed on the host used for this revision. External comparison numbers therefore come from a frozen, dated corpus and are reported as inherited artifacts, not as a fresh local solver run. The corrected comparison convention is documented, but the corpus does not establish external agreement: only 1/16 sonicFoam rows and 0/14 simpleFoam rows meet the repository's 5\% threshold. A fresh OpenFOAM comparison must report residual histories, force-history stability, convergence, boundary conditions, and the post-fix solver version before it can support a validation claim.
 
-The paper therefore claims the following and nothing more: the export path is concrete, the benchmark comparison is measurable, and the shared validation geometry is documented explicitly so the solver-to-solver check can be repeated without ambiguity.
+The paper therefore claims only that the export path and comparison tooling exist, and that the measurement-integrity audit exposes the current disagreement and its normalization sensitivity. It does not claim a direct validated solver-to-solver result from this revision.

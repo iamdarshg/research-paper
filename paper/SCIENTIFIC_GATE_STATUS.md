@@ -13,13 +13,50 @@ mistaken for experimental validation.
 | Runnable executable/reporting entrypoint implemented | 13 / 13 | The repo has runnable code, protocol hooks, or dedicated fail-closed scaffold reports for every gate. |
 | Solver-side support implemented | 12 / 13 | CFD results now expose normalized metrics, provenance, quality checks, and solver-gate support for all solver-relevant gates; manifest validation is not solver-applicable. |
 | Deterministic reference evidence | 8 / 13 | `CLI/build_reference_evidence.py` now produces a NASA/TMR-cited 20-record reference corpus, checkpoint card, and report bundle that supports the scoped gates listed below. |
-| Public-corpus trained smoke evidence | 1 run | A 355-record public VSP Airshow manifest was built and used for a three-epoch training smoke run; the generated flight-path checks execute but fail aircraft span-sanity validity. |
+| Public-corpus trained smoke evidence | Airshow + CRM recovery | The 355-record VSP Airshow smoke samples still fail span-sanity. A separate 32^3 CRM recovery run passes the literal aircraft-validity screen on 45/45 generated draws from 9 held-out records (uncalibrated threshold), but collapses to one geometry and does not demonstrate conditioning/diversity. |
 | Publication-scale trained-model evidence | 0 / 13 | No publication-scale trained generative checkpoint with matched CFD ablation, converged CFD study, structural load-path study, or prior-method superiority package exists yet. |
 
-The current branch is therefore strong on documented, fail-closed gate coverage,
-and now includes a small reproducible reference evidence package plus a
-public-corpus Airshow training smoke run. It is still blocked for
-publication-scale aircraft-generation and superiority claims.
+The current branch is strong on documented, fail-closed gate coverage and now includes a small deterministic reference package, a public-corpus Airshow smoke run, and a measured 32^3 aircraft-valid geometry-emission path on a declared held-out CRM split. Gate 7 is met in its literal geometric-validity form (45/45 generated samples pass the uncalibrated screen), but not in the scientific sense of diverse or meaningfully conditioned generation: the 45 draws contain only two distinct voxel arrays. Aerodynamic, structural, manufacturing, diversity/conditioning, and superiority claims remain blocked.
+
+## Publish-Readiness Addendum (2026-11-01)
+
+A publish-readiness pass (report:
+`evidence/research-paper-publish/PUBLISH_READY.md`) fixed a measurement defect
+and re-audited the evidence; it did not upgrade any gate. Highlights:
+
+- Reference-area normalization of LBM-vs-OpenFOAM comparisons is fixed in code
+  with 9 new regression tests (the single 0.25% "passing" row is a
+  normalization coincidence and now evaluates to 14.2% Cd error).
+- Corrected frozen-corpus agreement under the repo's <5% gate: sonicFoam 1/16
+  rows, simpleFoam 0/14 rows (was 2/16 and 0/14).
+- Condition-response sweep at n=12 seeds is non-significant on every pair;
+  reported honestly with CIs, including two documented D3Q27 blow-up seeds.
+- Validity screen re-audited: NASA CRM 15/15 pass, bundled STLs 0/4 fail.
+- No claim gate in the table below changed status; all publication-scale
+  evidence remains blocked as recorded.
+
+## Generator-Recovery Addendum (2026-11-05/06)
+
+The summary above and the historical Airshow sections below retain their original
+scope. A separate CRM-family recovery run changes gate 7 only in its literal geometric
+validity form; it does not upgrade diversity, conditioning, aerodynamics, structure,
+manufacturing, CFD-guided training or superiority. Evidence and the pre-registered
+protocol are recorded in
+`evidence/research-paper-publish/GENERATOR_RECOVERY_2026-11-05.md`.
+
+- Split: 6 corpus-labelled `test`/`val` records for training; 9 corpus-labelled
+  `holdout` records for evaluation. No held-out records used for training, selection or
+  threshold choice.
+- Materialization threshold 0.5, fixed before evaluation and not tuned to the screen;
+  aircraft-validity implementation and 12 checks unchanged.
+- Result: 9/9 held-out reconstructions and 45/45 generated draws pass; the shipped
+  `CLI/aircraft_validity.py` independently re-screens the 45 generated artifacts as
+  45/45. This is one 32³ CRM-family checkpoint on the 8 GiB host.
+- Caveat: only two distinct voxel arrays among 45 draws; mean IoU across held-out
+  conditions 1.000. The run demonstrates aircraft-valid voxel emission, not diverse or
+  meaningfully conditioned generation. The 128³/high-compute, condition-response,
+  aerodynamic, structural, manufacturing, CFD-ablation and superiority gates remain
+  blocked.
 
 ## Gate Table
 
@@ -31,7 +68,7 @@ publication-scale aircraft-generation and superiority claims.
 | 4 | Manufacturing and structural condition feasibility | mapped | implemented: `CLI/condition_feasibility.py` payload report scaffold | reference pass: all generated design specs pass feasibility screening; geometry-aware structural validation still absent |
 | 5 | Baseline statistics | mapped | implemented: `CLI/multi_seed_eval.py` policy/stat summary helpers | reference pass: deterministic records cover required baselines and seeds |
 | 6 | Final evidence package | mapped | implemented: `CLI/final_evidence.py` consistency-aware aggregator | reference pass: required reports pass with shared run/checkpoint/manifest/protocol hashes |
-| 7 | Generates aircraft structures | mapped | scaffolded: validity gate and corpus contract exist | reference pass: deterministic voxel aircraft package exists and passes validity heuristics |
+| 7 | Generates aircraft structures | mapped | implemented: validity gate, held-out recovery protocol, and generated-artifact screening | **literal pass (2026-11-05):** CRM held-out 9/9 reconstructions and 45/45 generated samples pass the uncalibrated screen, independently CLI re-screened; **scientific diversity/conditioning blocked:** only two voxel arrays among 45, mean cross-condition IoU 1.000 |
 | 8 | Aerodynamically optimized | mapped | implemented: CFD outputs include solver provenance/reference area, L/D, quality checks, and heuristic external proxies are not blended | blocked: no converged CFD comparison against baselines |
 | 9 | Structurally viable | mapped | scaffolded: feasibility guards exist | blocked: no structural analysis or load-case evidence |
 | 10 | CFD-guided training | mapped | implemented: fail-closed matched-ablation scaffold plus solver label/provenance guards | blocked: no matched ablation with and without CFD term |

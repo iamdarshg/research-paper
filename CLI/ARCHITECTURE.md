@@ -262,8 +262,16 @@ For each batch:
   6. Every 10 batches: Simulate CFD, compute aerodynamic diagnostic
   
   Optimization loss = MSE + geometry reconstruction + generation reconstruction + consistency
+                     + weights * (latent reconstruction, geometry probability std,
+                                  functional anchor, geometry occupancy mean)
   Diagnostic total = optimization loss + connectivity diagnostic + aerodynamic diagnostic
 ```
+
+`geometry_occupancy_mean` (2026-11-10) is the data-dependent occupancy term: for
+each sample it compares the mean predicted occupancy against *that sample's*
+ground-truth occupancy fraction (weight `training.geometry_occupancy_mean_weight`,
+default 0.0 = legacy objective). It has no fixed output occupancy target and does
+not change the materialisation threshold.
 
 ### Phase 3: Backpropagation
 

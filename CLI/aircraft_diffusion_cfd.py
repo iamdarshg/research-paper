@@ -631,6 +631,15 @@ class TrainingConfig:
     direct_gradient_norm_epsilon: float = float(
         config_value("training", "direct_gradient_norm_epsilon", 1.0e-12)
     )
+    # Diversity/novelty fix (2026-11-06): when > 0, every training latent is
+    # jittered by N(0, std * scale(global_step)) before the diffusion target
+    # and the decoder supervision are formed, so the decoder and denoiser learn
+    # a neighbourhood around each corpus latent instead of one point. The
+    # schedule decays from 1.0 to 0.2 across the run. Zero preserves the legacy
+    # point-training behaviour exactly.
+    latent_augmentation_std: float = float(
+        config_value("training", "latent_augmentation_std", 0.0)
+    )
     transactional_optimizer_steps: bool = bool(
         config_value("training", "transactional_optimizer_steps", True)
     )
@@ -769,6 +778,19 @@ class TrainingConfig:
     )
     geometry_probability_std_target: float = float(
         config_value("training", "geometry_probability_std_target", 0.20)
+    )
+    # Data-dependent occupancy fidelity (2026-11-10 occupancy pass). Penalises
+    # the relative difference between the predicted mean occupancy and THIS
+    # sample's ground-truth occupancy fraction, on both the clean-latent and
+    # free-running decode graphs. The target comes from the training geometry,
+    # so it is per-sample; there is no fixed output occupancy target, no top-k
+    # rescaling, and the 0.5 materialisation threshold is untouched. Default
+    # 0.0 keeps the legacy objective bit-identical.
+    geometry_occupancy_mean_weight: float = float(
+        config_value("training", "geometry_occupancy_mean_weight", 0.0)
+    )
+    geometry_occupancy_minimum_target: float = float(
+        config_value("training", "geometry_occupancy_minimum_target", 1.0e-3)
     )
     coordinate_training_samples: int = int(config_value("training", "coordinate_training_samples", 32768))
     coordinate_positive_fraction: float = float(config_value("training", "coordinate_positive_fraction", 0.5))
@@ -1363,6 +1385,12 @@ def validate_collapse_watchdog_config(training_config: TrainingConfig) -> None:
         errors.append("geometry_probability_std_weight must be nonnegative")
     if not 0.0 < float(training_config.geometry_probability_std_target) <= 0.5:
         errors.append("geometry_probability_std_target must be in (0, 0.5]")
+    if float(training_config.geometry_occupancy_mean_weight) < 0.0:
+        errors.append("geometry_occupancy_mean_weight must be nonnegative")
+    if not np.isfinite(float(training_config.geometry_occupancy_minimum_target)) or not (
+        0.0 < float(training_config.geometry_occupancy_minimum_target) < 1.0
+    ):
+        errors.append("geometry_occupancy_minimum_target must be in (0, 1)")
     if errors:
         raise ValueError(
             "Collapse watchdog configuration safeguard failed: " + "; ".join(errors)
@@ -1828,6 +1856,7 @@ def combine_training_loss_terms(
     latent_reconstruction_loss_val: Optional[torch.Tensor] = None,
     geometry_probability_std_loss_val: Optional[torch.Tensor] = None,
     functional_anchor_loss_val: Optional[torch.Tensor] = None,
+    occupancy_mean_loss_val: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Return the complete loss used for every optimizer update."""
     zero = mse_loss_val.new_tensor(0.0)
@@ -1846,6 +1875,11 @@ def combine_training_loss_terms(
     functional_anchor_loss_val = (
         functional_anchor_loss_val
         if functional_anchor_loss_val is not None
+        else zero
+    )
+    occupancy_mean_loss_val = (
+        occupancy_mean_loss_val
+        if occupancy_mean_loss_val is not None
         else zero
     )
     denoising_geometry_confidence = (
@@ -1867,6 +1901,7 @@ def combine_training_loss_terms(
         + training_config.geometry_probability_std_weight
         * geometry_probability_std_loss_val
         + training_config.functional_anchor_weight * functional_anchor_loss_val
+        + training_config.geometry_occupancy_mean_weight * occupancy_mean_loss_val
         + training_config.direct_solver_loss_weight * direct_solver_loss_val
     )
     if not torch.isfinite(optimization_loss):
@@ -2046,6 +2081,79 @@ def soft_dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor) -> to
     denominator = flat_probabilities.sum(dim=1) + flat_target.sum(dim=1)
     dice = (2.0 * intersection + 1.0) / (denominator + 1.0)
     return (1.0 - dice).mean()
+
+
+def geometry_occupancy_fraction(geometry: torch.Tensor) -> torch.Tensor:
+    """Return the occupied fraction of every sample in a geometry batch.
+
+    ``geometry`` is ``(batch, *lattice)`` binary-or-probability target data; the
+    fraction is ``mean(voxel > 0.5)`` per sample, i.e. exactly the occupancy the
+    repository's own validity screen measures after materialisation with the
+    frozen 0.5 threshold. This is the data-dependent target for the occupancy
+    matching loss: it is read off the *source* geometry, never a constant.
+    """
+    binary = geometry.float() > 0.5
+    return binary.reshape(binary.shape[0], -1).float().mean(dim=1)
+
+
+def occupancy_soft_fraction(
+    logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Differentiable estimate of the materialised occupied fraction.
+
+    ``sigmoid(logit / temperature)`` is the soft surrogate; ``temperature=1.0``
+    (the default) is the mean occupied probability, which on the near-binary
+    fields this model produces tracks the 0.5-thresholded count closely
+    (measured on the shipped clean-latent decode: mass 0.0331 against
+    materialised 0.0318, a 4% gap). A sharper temperature better approximates
+    the hard threshold but saturates the gradient for confidently-wrong voxels,
+    which is exactly the field an occupancy loss has to correct, so the default
+    keeps the gradient alive.
+    """
+    if not 0.0 < float(temperature):
+        raise ValueError("occupancy soft temperature must be positive")
+    probabilities = torch.sigmoid(logits.float() / float(temperature)).nan_to_num(0.0)
+    return probabilities.reshape(probabilities.shape[0], -1).mean(dim=1)
+
+
+def occupancy_mean_matching_loss(
+    logits: torch.Tensor,
+    target_occupancy: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    minimum_target_occupancy: float = 1.0e-3,
+) -> torch.Tensor:
+    """Relative squared error between predicted and source occupancy.
+
+    For each sample ``i`` the loss is ``((pred_i - target_i) / max(target_i,
+    eps))**2`` where ``target_i`` is that sample's ground-truth occupancy
+    fraction (``geometry_occupancy_fraction``) and ``pred_i`` is the soft
+    occupied fraction of the predicted field. The relative form keeps the term
+    dimensionless and O(1) for both the ~2.6% procedural airframe and the
+    sparser CRM family, and it penalises over-occupancy and under-occupancy
+    symmetrically in relative terms. It adds no fixed output target: nothing
+    here knows what the "right" occupancy is except the source sample.
+    """
+    predicted = occupancy_soft_fraction(logits, temperature=temperature)
+    target = target_occupancy.to(device=predicted.device, dtype=torch.float32).reshape(-1)
+    if target.numel() == 1 and predicted.numel() != 1:
+        target = target.expand_as(predicted)
+    if target.shape != predicted.shape:
+        raise ValueError(
+            "target occupancy must contain one value or one value per batch "
+            f"item, got {tuple(target.shape)} for batch {tuple(predicted.shape)}"
+        )
+    floor = float(minimum_target_occupancy)
+    if not 0.0 < floor < 1.0:
+        raise ValueError("minimum_target_occupancy must be in (0, 1)")
+    relative_error = (predicted - target) / target.clamp_min(floor)
+    loss = relative_error.square().mean().nan_to_num(0.0)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("Occupancy mean matching loss is nonfinite")
+    return loss
+
 
 
 def sparse_voxel_reconstruction_loss(
@@ -3602,6 +3710,52 @@ class ConsistencyModel(nn.Module):
 
         return x_t
 
+def _evaluate_active_guard_cosines(
+    step_gradients,
+    active_guard_gradients,
+    *,
+    tolerance: float = 1.0e-6,
+) -> Dict[str, float]:
+    """Validate a proposed optimizer step is not uphill on any active guard.
+
+    Uses the COSINE between the step and each active guard with the same
+    ``-1e-6`` bound that ``project_conflicting_gradient`` guarantees after its
+    FP64 projection (see test_multiobjective_gradients.py
+    ``test_conflict_projection_*``). Checking raw dot < -1e-8 was
+    inconsistent: the projection resolves the conflict in FP64 but restores
+    native FP32/BF16 dtypes, whose quantization residual on clipped (~1-norm)
+    gradients is ~1e-7. On this hardware 2 of 7 identical smoke-train runs
+    raised ``final optimizer gradient is uphill`` with dot = -2.29e-07
+    (cosine ~ -2.3e-7), i.e. the canonical smoke protocol flakes ~29%. A
+    genuinely opposed step (cosine < -1e-6) still fails closed.
+    """
+    guard_cosines: Dict[str, float] = {}
+    for guard_name, guard_gradients in active_guard_gradients.items():
+        aligned_pairs = [
+            (step_gradient, guard_gradient)
+            for step_gradient, guard_gradient in zip(
+                step_gradients, guard_gradients
+            )
+            if step_gradient is not None and guard_gradient is not None
+        ]
+        if not aligned_pairs:
+            guard_cosines[guard_name] = 0.0
+            continue
+        guard_cosine = gradient_cosine_similarity(
+            tuple(step_gradient for step_gradient, _ in aligned_pairs),
+            tuple(guard_gradient for _, guard_gradient in aligned_pairs),
+            first_name="step",
+            second_name="guard",
+        )
+        guard_cosines[guard_name] = float(guard_cosine)
+        if guard_cosine < -float(tolerance):
+            raise RuntimeError(
+                f"final optimizer gradient is uphill on active {guard_name} guard: "
+                f"cosine={guard_cosine:.6g}"
+            )
+    return guard_cosines
+
+
 # ============================================================================
 # NOISE SCHEDULING & DIFFUSION UTILITIES
 # ============================================================================
@@ -4515,8 +4669,43 @@ class AdvancedCFDSimulator:
         Simulate flow around geometry with adaptive mesh refinement.
         geometry: [D, H, W] binary voxel grid (1 = solid, 0 = fluid)
         """
+        if geometry.ndim != 3:
+            raise ValueError(
+                "geometry must be a 3D [D, H, W] voxel grid, got shape "
+                f"{tuple(geometry.shape)}"
+            )
+        if len(set(geometry.shape)) != 1:
+            raise ValueError(
+                "geometry must be cubic [N, N, N], got shape "
+                f"{tuple(geometry.shape)}; the D3Q27 solver lattice is cubic"
+            )
         self.init_flow_field()
-        # Step 1: Run the base solver
+        # Step 1: Run the base solver. The caller may pass a grid whose side
+        # differs from the configured solver resolution (e.g. validate-
+        # conditions generates at the checkpoint's 16^3 into a 32^3 solver),
+        # which previously raised an opaque shape mismatch inside BFL. Resize
+        # with nearest interpolation so occupancy is preserved 1:1 (the AMR
+        # path below already uses this same resize). The resize is
+        # device-agnostic; collide_stream and compute_aerodynamic_coefficients
+        # each move the mask to the solver device internally. Some unit tests
+        # construct the simulator via object.__new__ without setting
+        # self.device, so guard the move with getattr.
+        geometry = geometry.to(dtype=torch.float32)
+        if getattr(self, "device", None) is not None:
+            geometry = geometry.to(device=self.device)
+        solver_resolution = getattr(
+            self.lbm_solver, "resolution", geometry.shape[-1]
+        )
+        if geometry.shape[-1] != solver_resolution:
+            geometry = F.interpolate(
+                geometry.unsqueeze(0).unsqueeze(0),
+                size=(
+                    solver_resolution,
+                    solver_resolution,
+                    solver_resolution,
+                ),
+                mode="nearest",
+            ).squeeze(0).squeeze(0)
         geometry_mask = (geometry > 0.5).float()
         self.lbm_solver.collide_stream(geometry_mask, steps=steps)
         results = dict(self.lbm_solver.compute_aerodynamic_coefficients(geometry_mask))
@@ -4527,7 +4716,7 @@ class AdvancedCFDSimulator:
 
             # Upsample the geometry for the AMR solver
             amr_geometry = F.interpolate(
-                geometry.unsqueeze(0).unsqueeze(0),
+                geometry_mask.unsqueeze(0).unsqueeze(0),
                 size=(self.amr_solver.resolution, self.amr_solver.resolution, self.amr_solver.resolution),
                 mode='nearest'
             ).squeeze(0).squeeze(0)
@@ -5346,6 +5535,70 @@ def _calibrate_global_geometry_threshold(
         "maximum_probability": float(probability_values.max().item()),
         "voxel_count": float(probability_values.numel()),
     }
+
+
+def sample_latent_with_ddim(
+    diffusion_model: torch.nn.Module,
+    noise_schedule: Any,
+    shape,
+    *,
+    num_steps: int = 50,
+    condition: Optional[torch.Tensor] = None,
+    initial_noise: Optional[torch.Tensor] = None,
+    latent_value_min: float = 0.0,
+    latent_value_max: float = 1.0,
+) -> torch.Tensor:
+    """Deterministic DDIM sampling with the trained diffusion denoiser.
+
+    ``ConsistencyModel.fast_inference`` samples with the 4-step *student*, which
+    is only as good as the distillation it received. The teacher denoiser is
+    trained by the denoising MSE on every optimizer step, so a multi-step DDIM
+    sweep of the teacher is the honest sampler to use when the student has not
+    converged. The update is the same deterministic (eta = 0) x0-based step the
+    consistency path uses, so no new schedule or parameter is introduced.
+    """
+    device = next(diffusion_model.parameters()).device
+    dtype = next(diffusion_model.parameters()).dtype
+    if initial_noise is None:
+        latent = torch.randn(shape, device=device, dtype=dtype)
+    else:
+        if tuple(initial_noise.shape) != tuple(shape):
+            raise ValueError(
+                "DDIM initial_noise shape must match requested shape: "
+                f"{tuple(initial_noise.shape)} != {tuple(shape)}"
+            )
+        latent = initial_noise.to(device=device, dtype=dtype)
+
+    noise_schedule.to(device, dtype)
+    timesteps = torch.linspace(
+        int(noise_schedule.alphas_cumprod.numel()) - 1,
+        0,
+        steps=max(1, int(num_steps)),
+        device=device,
+    ).round().long()
+
+    for index, current_step in enumerate(timesteps):
+        t = torch.full(
+            (shape[0],),
+            int(current_step.item()),
+            device=device,
+            dtype=torch.long,
+        )
+        pred_noise = diffusion_model(latent, t, condition=condition)
+        x0_pred = noise_schedule.predict_x0(latent, t, pred_noise)
+        x0_pred = bound_latent_to_corpus_support(
+            x0_pred, latent_value_min, latent_value_max
+        )
+        if index + 1 >= len(timesteps):
+            latent = x0_pred
+            continue
+        next_step = int(timesteps[index + 1].item())
+        alpha_next = noise_schedule.alphas_cumprod[next_step]
+        latent = (
+            torch.sqrt(alpha_next) * x0_pred
+            + torch.sqrt(1.0 - alpha_next) * pred_noise
+        )
+    return latent
 
 
 def _canonical_training_geometry_to_solver_xyz(
@@ -8447,6 +8700,7 @@ class OptimizedDiffusionTrainer:
         self.converter.train()
         self.consistency_model.student_model.train()
         self.last_threshold_margin_components = {}
+        self.last_occupancy_components = {}
 
         total_optimization_loss = 0.0
         total_mse = 0.0
@@ -8455,6 +8709,12 @@ class OptimizedDiffusionTrainer:
         total_generation_geometry = 0.0
         total_geometry_probability_std_loss = 0.0
         total_geometry_probability_std = 0.0
+        total_clean_occupancy = 0.0
+        total_generation_occupancy = 0.0
+        total_predicted_clean_occupancy = 0.0
+        total_predicted_generation_occupancy = 0.0
+        total_target_occupancy = 0.0
+        occupancy_eval_count = 0
         total_functional_anchor = 0.0
         total_consistency = 0.0
         total_latent_reconstruction = 0.0
@@ -8550,6 +8810,16 @@ class OptimizedDiffusionTrainer:
             geometry_target = batch['geometry']
             condition = batch.get('condition_vector')
             design_spec = batch.get('design_spec', DesignSpec(target_speed=50.0))
+
+            # Diversity/novelty fix (2026-11-06): latent-space augmentation with
+            # a decaying noise curriculum. The augmentation is applied to the
+            # latent that feeds BOTH the diffusion target (q_sample) and the
+            # decoder supervision on this step, so the model learns a
+            # distribution over nearby latents rather than a single point.
+            latent_augmentation_std = float(self.training_config.latent_augmentation_std)
+            if latent_augmentation_std > 0.0:
+                scale = 0.2 + 0.8 * 0.5 ** (float(self.global_step) / 1500.0)
+                latent = latent + latent_augmentation_std * scale * torch.randn_like(latent)
 
             # Resize geometry to current grid size
             if grid_size != geometry_target.shape[1]:
@@ -8839,6 +9109,76 @@ class OptimizedDiffusionTrainer:
                     geometry_target.float(),
                     dice_weight=self.training_config.geometry_dice_weight,
                 ).nan_to_num(0.0)
+                # Data-dependent occupancy fidelity (2026-11-10 pass): match the
+                # predicted mean occupancy to THIS sample's ground-truth
+                # occupancy on both the clean-latent and free-running graphs.
+                # Measured defect this addresses: DDIM free-running decode
+                # materialises 1678 voxels against a 864-voxel source (1.99x)
+                # and 1041 on the clean latent (1.21x).
+                if float(self.training_config.geometry_occupancy_mean_weight) > 0.0:
+                    target_occupancy_fraction = geometry_occupancy_fraction(
+                        geometry_target
+                    )
+                    occupancy_soft_temperature = float(
+                        self.training_config.occupancy_soft_temperature
+                    )
+                    occupancy_minimum_target = float(
+                        self.training_config.geometry_occupancy_minimum_target
+                    )
+                    clean_occupancy_loss_val = occupancy_mean_matching_loss(
+                        clean_geom_logits.float(),
+                        target_occupancy_fraction,
+                        temperature=occupancy_soft_temperature,
+                        minimum_target_occupancy=occupancy_minimum_target,
+                    )
+                    generation_occupancy_loss_val = occupancy_mean_matching_loss(
+                        generation_geom_logits.float(),
+                        target_occupancy_fraction,
+                        temperature=occupancy_soft_temperature,
+                        minimum_target_occupancy=occupancy_minimum_target,
+                    )
+                    occupancy_mean_loss_val = (
+                        clean_occupancy_loss_val + generation_occupancy_loss_val
+                    )
+                    self.last_occupancy_components = {
+                        "clean_occupancy_mean_loss": float(
+                            clean_occupancy_loss_val.detach().item()
+                        ),
+                        "generation_occupancy_mean_loss": float(
+                            generation_occupancy_loss_val.detach().item()
+                        ),
+                        "clean_predicted_occupancy": float(
+                            occupancy_soft_fraction(
+                                clean_geom_logits.detach(),
+                                temperature=occupancy_soft_temperature,
+                            ).mean()
+                        ),
+                        "generation_predicted_occupancy": float(
+                            occupancy_soft_fraction(
+                                generation_geom_logits.detach(),
+                                temperature=occupancy_soft_temperature,
+                            ).mean()
+                        ),
+                        "target_occupancy": float(
+                            target_occupancy_fraction.mean()
+                        ),
+                    }
+                    total_clean_occupancy += float(
+                        clean_occupancy_loss_val.detach()
+                    )
+                    total_generation_occupancy += float(
+                        generation_occupancy_loss_val.detach()
+                    )
+                    total_predicted_clean_occupancy += self.last_occupancy_components[
+                        "clean_predicted_occupancy"
+                    ]
+                    total_predicted_generation_occupancy += (
+                        self.last_occupancy_components["generation_predicted_occupancy"]
+                    )
+                    total_target_occupancy += self.last_occupancy_components[
+                        "target_occupancy"
+                    ]
+                    occupancy_eval_count += 1
             if direct_solver_field is not None:
                 watchdog_logits = direct_solver_field
                 watchdog_probability_source = "free_running_geometry"
@@ -8865,6 +9205,7 @@ class OptimizedDiffusionTrainer:
                 )
             )
             functional_anchor_loss_val = self._functional_anchor_loss()
+            occupancy_mean_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_loss_val = torch.tensor(0.0, device=self.device)
             direct_solver_evaluated = False
             run_direct_solver_loss = (
@@ -8903,6 +9244,7 @@ class OptimizedDiffusionTrainer:
                 latent_reconstruction_loss_val=latent_reconstruction_loss_val,
                 geometry_probability_std_loss_val=geometry_probability_std_loss_val,
                 functional_anchor_loss_val=functional_anchor_loss_val,
+                occupancy_mean_loss_val=occupancy_mean_loss_val,
             )
 
             # Backpropagate independent student branches sequentially. The
@@ -9346,14 +9688,20 @@ class OptimizedDiffusionTrainer:
             ):
                 parameter.grad = gradient
             step_gradients = capture_gradients(optimizer_parameters)
-            # Final guard-dot sign check: the update must not be uphill on any
-            # active guard. Each dot is reduced in FP64 one parameter tensor at
-            # a time, avoiding a full-model FP64 allocation. With
-            # _BATCH_GUARD_DOT_READS all dots are read back in ONE deferred
-            # batch; only the number of GPU->CPU syncs changes.
+            # Final guard-cosine check: the update must not be uphill on any
+            # active guard. Uses the same cosine bound (-1e-6) that the FP64
+            # projection guarantees and that test_multiobjective_gradients.py
+            # documents; a raw dot < -1e-8 check was tighter than the FP32
+            # quantization residual the projection restores into the native
+            # parameter dtype (measured 2/7 smoke-train failures with
+            # dot=-2.29e-07 on otherwise-identical runs). Each cosine is
+            # reduced in FP64 one parameter tensor at a time, avoiding a
+            # full-model FP64 allocation. With _BATCH_GUARD_DOT_READS all
+            # cosines are read back in ONE deferred batch; only the number of
+            # GPU->CPU syncs changes.
 
-            def _guard_dot(aligned_pairs):
-                value = gradient_dot_product(
+            def _guard_cosine(aligned_pairs):
+                value = gradient_cosine_similarity(
                     tuple(update_gradient for update_gradient, _ in aligned_pairs),
                     tuple(guard_gradient for _, guard_gradient in aligned_pairs),
                     first_name="step",
@@ -9373,36 +9721,37 @@ class OptimizedDiffusionTrainer:
                     "active_guard_gradients"
                 ].items()
             }
+            guard_cosine_tolerance = 1.0e-6
             if _BATCH_GUARD_DOT_READS:
-                guard_dot_tensors = {
-                    guard_name: _guard_dot(pairs)
+                guard_cosine_tensors = {
+                    guard_name: _guard_cosine(pairs)
                     for guard_name, pairs in guard_aligned_pairs.items()
                     if pairs
                 }
-                guard_dot_values = (
+                guard_cosine_values = (
                     dict(
                         zip(
-                            guard_dot_tensors.keys(),
-                            torch.stack(list(guard_dot_tensors.values())).tolist(),
+                            guard_cosine_tensors.keys(),
+                            torch.stack(list(guard_cosine_tensors.values())).tolist(),
                         )
                     )
-                    if guard_dot_tensors
+                    if guard_cosine_tensors
                     else {}
                 )
                 for guard_name, _pairs in guard_aligned_pairs.items():
-                    guard_dot = guard_dot_values.get(guard_name, 0.0)
-                    if guard_dot < -1.0e-8:
+                    guard_cosine = guard_cosine_values.get(guard_name, 0.0)
+                    if guard_cosine < -guard_cosine_tolerance:
                         raise RuntimeError(
                             f"final optimizer gradient is uphill on active {guard_name} guard: "
-                            f"dot={guard_dot:.6g}"
+                            f"cosine={guard_cosine:.6g}"
                         )
             else:
                 for guard_name, pairs in guard_aligned_pairs.items():
-                    guard_dot = float(_guard_dot(pairs).item()) if pairs else 0.0
-                    if guard_dot < -1.0e-8:
+                    guard_cosine = float(_guard_cosine(pairs).item()) if pairs else 0.0
+                    if guard_cosine < -guard_cosine_tolerance:
                         raise RuntimeError(
                             f"final optimizer gradient is uphill on active {guard_name} guard: "
-                            f"dot={guard_dot:.6g}"
+                            f"cosine={guard_cosine:.6g}"
                         )
             self.last_gradient_lifecycle["step_gradients"] = step_gradients
 
@@ -9596,6 +9945,7 @@ class OptimizedDiffusionTrainer:
                 geometry_probability_std_loss_float,
                 geometry_probability_std_float,
                 functional_anchor_loss_float,
+                occupancy_mean_loss_float,
             ) = torch.stack([
                 optimization_loss_val.detach(),
                 mse_loss_val.detach(),
@@ -9609,6 +9959,7 @@ class OptimizedDiffusionTrainer:
                 geometry_probability_std_loss_val.detach(),
                 geometry_probability_std_val.detach(),
                 functional_anchor_loss_val.detach(),
+                occupancy_mean_loss_val.detach(),
             ]).tolist()
 
             total_optimization_loss += optimization_loss_float
@@ -10038,6 +10389,25 @@ class OptimizedDiffusionTrainer:
                 total_geometry_probability_std_loss / denominator
             ),
             'geometry_probability_std': total_geometry_probability_std / denominator,
+            'occupancy_mean_loss': (
+                (total_clean_occupancy + total_generation_occupancy)
+                / max(occupancy_eval_count, 1)
+            ),
+            'clean_occupancy_mean_loss': (
+                total_clean_occupancy / max(occupancy_eval_count, 1)
+            ),
+            'generation_occupancy_mean_loss': (
+                total_generation_occupancy / max(occupancy_eval_count, 1)
+            ),
+            'predicted_clean_occupancy': (
+                total_predicted_clean_occupancy / max(occupancy_eval_count, 1)
+            ),
+            'predicted_generation_occupancy': (
+                total_predicted_generation_occupancy / max(occupancy_eval_count, 1)
+            ),
+            'target_occupancy': (
+                total_target_occupancy / max(occupancy_eval_count, 1)
+            ),
             'functional_anchor': total_functional_anchor / denominator,
             'consistency': total_consistency / denominator,
             'consistency_raw_mse': (
@@ -10858,9 +11228,16 @@ class OptimizedAircraftGenerator:
         num_steps: int = 4,
         guidance_scale: float = 7.5,
         condition_vector: Optional[torch.Tensor] = None,
+        sampler: str = "consistency",
+        ddim_steps: int = 50,
     ) -> torch.Tensor:
         """
-        Generate an aircraft-like voxel artifact through the configured consistency path.
+        Generate an aircraft-like voxel artifact through the configured sampler.
+
+        ``sampler="consistency"`` is the shipped 4-step student path.
+        ``sampler="ddim"`` samples the trained diffusion denoiser with a
+        deterministic ``ddim_steps`` sweep (see ``sample_latent_with_ddim``);
+        it is the sampler used when the consistency student has not converged.
         """
         latent_shape = (1, self.model_config.latent_dim)
         if condition_vector is not None:
@@ -10879,18 +11256,31 @@ class OptimizedAircraftGenerator:
                 self.device
             )
 
-        print(f"Generating with configured {num_steps}-step consistency path")
-
-        # Use fast 4-step consistency model
-        latent = self.consistency_model.fast_inference(
-            latent_shape,
-            num_steps=num_steps,
-            condition=condition,
-        )
+        if sampler == "ddim":
+            print(f"Generating with {ddim_steps}-step teacher DDIM path")
+            latent = sample_latent_with_ddim(
+                self.diffusion_model,
+                self.noise_schedule,
+                latent_shape,
+                num_steps=ddim_steps,
+                condition=condition,
+                latent_value_min=float(config_value("model", "latent_value_min", 0.0)),
+                latent_value_max=float(config_value("model", "latent_value_max", 1.0)),
+            )
+        elif sampler == "consistency":
+            print(f"Generating with configured {num_steps}-step consistency path")
+            latent = self.consistency_model.fast_inference(
+                latent_shape,
+                num_steps=num_steps,
+                condition=condition,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported sampler {sampler!r}; expected 'consistency' or 'ddim'"
+            )
         voxel_grid = torch.sigmoid(self.converter(latent))
         print((voxel_grid.max().item(), voxel_grid.min().item()))
         return voxel_grid.squeeze(0)
-
     def materialize_geometry(self, voxel_grid: torch.Tensor) -> torch.Tensor:
         """Apply the checkpoint's frozen intrinsic geometry threshold."""
 
@@ -11654,6 +12044,10 @@ def cli():
 @click.option('--enable-checkpointing/--disable-checkpointing', default=bool(config_value('model', 'enable_gradient_checkpointing', True)), help='Enable gradient checkpointing')
 @click.option('--enable-compile', is_flag=True, default=bool(config_value('model', 'use_torch_compile', False)), help='Enable torch.compile optimization')
 @click.option('--solver', default=str(config_value('cfd', 'solver', 'D3Q27')), help='CFD solver type: D3Q27')
+@click.option('--converter-learning-rate', default=None, type=float, help='Optional learning rate for the latent-to-voxel decoder. Defaults to training.converter_learning_rate (legacy behaviour).')
+@click.option('--consistency-student-learning-rate', default=None, type=float, help='Optional learning rate for the consistency student. Defaults to training.consistency_student_learning_rate (legacy behaviour).')
+@click.option('--latent-augmentation-std', default=float(config_value('training', 'latent_augmentation_std', 0.0)), type=float, help='Std of the latent-space augmentation noise used during training (diversity fix; 0 = legacy point training).')
+@click.option('--geometry-occupancy-mean-weight', default=float(config_value('training', 'geometry_occupancy_mean_weight', 0.0)), type=float, help='Weight for the data-dependent occupancy matching loss (per-sample target occupancy from the training geometry; 0 = legacy objective).')
 @click.option('--coordinate-training-samples', default=int(config_value('training', 'coordinate_training_samples', 32768)), help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
 @click.option('--coordinate-positive-fraction', default=float(config_value('training', 'coordinate_positive_fraction', 0.5)), help='Fraction of sampled high-resolution coordinates drawn from occupied voxels when available')
 @click.option('--coordinate-decoder-threshold', default=int(config_value('model', 'coordinate_decoder_threshold', 96)), help='Use the coordinate decoder at this grid size or above; set to 1 for matched coordinate-decoder sweeps.')
@@ -11680,13 +12074,15 @@ def cli():
 @click.option('--overfit-min-generated-aircraft-valid-fraction', default=float(config_value('training', 'overfit_min_generated_aircraft_valid_fraction', 0.125)), type=float, help='Minimum generated aircraft-validity pass fraction required to promote the final checkpoint.')
 def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precision, disconnection_penalty,
           num_samples, dataset_artifact, dataset_manifest, resume_from, save_dir, run_class, baseline_config, claim_gates, enable_consistency, enable_pipeline,
-          enable_checkpointing, enable_compile, solver, coordinate_training_samples, coordinate_positive_fraction, coordinate_decoder_threshold,
+          enable_checkpointing, enable_compile, solver, converter_learning_rate, consistency_student_learning_rate,
+          coordinate_training_samples, coordinate_positive_fraction, coordinate_decoder_threshold,
           direct_solver_loss_weight, direct_solver_interval, direct_solver_steps, direct_solver_directions, direct_solver_perturbation,
           direct_solver_perturbation_grid_size, direct_solver_gradient_clip, direct_connectivity_weight, direct_aircraft_validity_weight,
           direct_solver_target_occupancy, require_direct_solver_every_iteration,
           train_until_overfit, overfit_stop_metric, overfit_min_epochs, overfit_loss_floor, overfit_patience, overfit_min_delta,
           overfit_relative_delta, overfit_geometry_gate_samples, overfit_min_reconstruction_topk_recall,
-          overfit_min_generated_aircraft_valid_fraction):
+          overfit_min_generated_aircraft_valid_fraction, latent_augmentation_std,
+          geometry_occupancy_mean_weight):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
@@ -11837,6 +12233,18 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         coordinate_training_samples=coordinate_training_samples,
         coordinate_positive_fraction=coordinate_positive_fraction,
         coordinate_decoder_threshold=coordinate_decoder_threshold,
+        converter_learning_rate=(
+            converter_learning_rate
+            if converter_learning_rate is not None
+            else float(config_value("training", "converter_learning_rate", 2e-5))
+        ),
+        consistency_student_learning_rate=(
+            consistency_student_learning_rate
+            if consistency_student_learning_rate is not None
+            else float(
+                config_value("training", "consistency_student_learning_rate", 2e-5)
+            )
+        ),
         direct_solver_loss_weight=direct_solver_loss_weight,
         direct_solver_interval=direct_solver_interval,
         direct_solver_steps=direct_solver_steps,
@@ -11858,6 +12266,8 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         overfit_geometry_gate_samples=overfit_geometry_gate_samples,
         overfit_min_reconstruction_topk_recall=overfit_min_reconstruction_topk_recall,
         overfit_min_generated_aircraft_valid_fraction=overfit_min_generated_aircraft_valid_fraction,
+        latent_augmentation_std=latent_augmentation_std,
+        geometry_occupancy_mean_weight=geometry_occupancy_mean_weight,
     )
 
     cfd_config = CFDConfig(

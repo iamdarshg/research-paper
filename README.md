@@ -1,6 +1,6 @@
 # Aircraft Diffusion CFD - Research Repo
 
-> Current status: a proof-of-concept research codebase for synthetic voxel generation, CFD-informed scoring, reproducible smoke checks, and structured conditioning plumbing. It is not yet a validated aircraft-design system or a scientifically supported mission/manufacturing-conditioned airplane generator.
+> Current status (2026-11-04): an evidence-backed reproducibility and measurement-integrity study of a proof-of-concept voxel-generation pipeline. The manuscript now builds locally (16-page PDF; 665 passed, 4 skipped), but the hostile review found that it must be framed as a negative-results/reproducibility paper rather than a validated aircraft-design contribution. It does not establish aircraft validity, aerodynamic optimization, structural viability, high-Mach validation, or superiority over baselines.
 
 ## Overview
 

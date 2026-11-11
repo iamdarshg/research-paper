@@ -2,6 +2,18 @@
 
 This document outlines future validation work. It should not be treated as evidence already satisfied by the current repository. The current codebase has a reduced sanity benchmark and a solver cross-check path, but the experiments below remain future gates until they are executed and tied to explicit claim IDs in the paper audit.
 
+## Publish-Readiness Updates (2026-11-01)
+
+- The reference-area normalization defect in the frozen low-Mach corpus is
+  **fixed in the comparison scripts** (see `CLAIMS_EVIDENCE_MATRIX.md` C11) and
+  no longer belongs on the validation TODO; the corrected gate table
+  (sonicFoam 1/16, simpleFoam 0/14 rows < 5%) is the current honest status.
+- The condition-response statistical question is **partially advanced**: an
+  n=12 sweep was run and is non-significant (see `CLAIMS_EVIDENCE_MATRIX.md`
+  C12). What remains future work is a *significant* condition-response signal
+  from a recovered checkpoint — not running more seeds of the smoke checkpoint.
+- The TODO items below remain open exactly as written and are not downgraded.
+
 ## 1. Experimental Plan
 
 ### 1.1. Component Validation Experiments

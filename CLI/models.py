@@ -418,8 +418,12 @@ class ConsistencyModel(nn.Module):
         return F.mse_loss(pred_student, pred_teacher.detach())
 
     def _add_noise(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        # Vectorized noise calculation
-        alpha_cumprod = 0.5 ** (t.to(x_0.dtype) / self.teacher_steps)
+        # Vectorized noise calculation. Alpha is indexed on the SAME timestep
+        # axis the UNet time embedding normalizes by (t / diffusion_config.timesteps)
+        # and that fast_inference uses (alpha = 0.5 ** (t / timesteps)).
+        # Previously this referenced teacher_steps, so training noise levels
+        # and inference noise levels disagreed by a factor of 2**18 at t=99.
+        alpha_cumprod = 0.5 ** (t.to(x_0.dtype) / self.diffusion_config.timesteps)
         # Handle arbitrary rank
         view_shape = [-1] + [1] * (x_0.dim() - 1)
         alpha_cumprod = alpha_cumprod.view(*view_shape)
@@ -442,7 +446,13 @@ class ConsistencyModel(nn.Module):
             pred_noise = self.student_model(x_t, t, condition=condition)
             alpha_t = torch.pow(torch.tensor(0.5, device=device, dtype=torch.float32), (current_step / self.diffusion_config.timesteps)).to(dtype)
             sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
-            x_t = (x_t - (1 - alpha_t) * pred_noise) / sqrt_alpha_t
+            # Standard DDPM epsilon-prediction x0 estimate:
+            # x_t = sqrt(alpha) x0 + sqrt(1-alpha) eps  =>
+            # x0 = (x_t - sqrt(1-alpha) eps) / sqrt(alpha).
+            # Using (1 - alpha) here (as before) is a genuine math error: at
+            # alpha=0.5, sqrt(1-alpha)=0.707 while (1-alpha)=0.5.
+            sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t + 1e-8)
+            x_t = (x_t - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
         return x_t
 
 class AeroSurrogate(nn.Module):
@@ -454,6 +464,9 @@ class AeroSurrogate(nn.Module):
         # Metadata for quality gating (Review Feedback Fix 2)
         self.register_buffer("sample_count", torch.tensor(0, dtype=torch.long))
         self.register_buffer("train_loss_ema", torch.tensor(1.0, dtype=torch.float32))
+        # Validation-loss EMA read by the offline trainer surrogate branch
+        # (CLI/trainer.py train_epoch). Mirrors train_loss_ema below.
+        self.register_buffer("last_val_mse", torch.tensor(1.0, dtype=torch.float32))
         self.register_buffer("tier_counts", torch.zeros(3, dtype=torch.long)) # raw, calibrated, external
 
         # Simple 3D CNN to extract features from voxel grid
