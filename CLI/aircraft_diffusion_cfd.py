@@ -2678,6 +2678,37 @@ def load_grounded_manifest_records(manifest_path: str) -> List[Dict[str, Any]]:
     return _load_structured_records(path)
 
 
+# Split labels that evaluation treats as held out. ``train`` builds its loader
+# from every manifest record, so a manifest carrying any of these labels would
+# silently train on evaluation data (2026-11-12 audit: the diversity corpus
+# builder writes train and holdout records into one manifest).
+HELD_OUT_SPLIT_LABELS = ("holdout", "test")
+
+
+def reject_held_out_training_records(
+    records: Iterable[Mapping[str, Any]],
+    manifest_path: str,
+) -> None:
+    """Fail closed when a training manifest contains held-out records."""
+    held_out = sorted(
+        {
+            str(record.get("split"))
+            for record in records
+            if str(record.get("split", "")).strip().lower() in HELD_OUT_SPLIT_LABELS
+        }
+    )
+    if held_out:
+        count = sum(
+            1
+            for record in records
+            if str(record.get("split", "")).strip().lower() in HELD_OUT_SPLIT_LABELS
+        )
+        raise ValueError(
+            f"Training manifest {manifest_path} contains {count} held-out records "
+            f"(split labels {held_out}); train would fit them. Pass a train-only manifest."
+        )
+
+
 def _iter_grounded_manifest_records(
     manifest_path: str,
 ) -> Iterable[Dict[str, Any]]:
@@ -12109,6 +12140,10 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     _validate_run_class_inputs(run_class, dataset_artifact, dataset_manifest, baseline_config, claim_gates)
+    if dataset_manifest:
+        reject_held_out_training_records(
+            load_grounded_manifest_records(dataset_manifest), dataset_manifest
+        )
     print(f"Using device: {device}")
 
     if torch.cuda.is_available():
