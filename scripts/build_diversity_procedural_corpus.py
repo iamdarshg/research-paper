@@ -10,9 +10,10 @@ pods, vertical tail), so a corpus of screen-valid distinct aircraft with
 per-record condition vectors is available on this 8 GiB host.
 
 Every record passes the declared screen (old 12-check heuristic) at 32^3, is
-distinct at the voxel level, and carries a NORMALIZED condition vector so the
-diffusion model sees all 22 slots on comparable scales (Fix C; previously raw
-slots spanned 9 -> 1.6e5 in magnitude).
+distinct at the voxel level, and carries its RAW condition vector. The model
+normalizes conditions itself (LatentDiffusionUNet); the earlier "Fix C" stored
+pre-normalized vectors, which the model then normalized a second time
+(2026-11-12 audit).
 """
 from __future__ import annotations
 
@@ -37,13 +38,24 @@ from aircraft_diffusion_cfd import (  # noqa: E402
     _normalize_manifest_design_spec,
     _procedural_aircraft_geometry,
     build_condition_vector,
-    normalize_condition_vector_tensor,
     sample_design_spec,
 )
 from aircraft_validity import evaluate_aircraft_validity  # noqa: E402
 from diversity_novelty_gate import structural_report  # noqa: E402
 
 GRID = 32
+
+
+def corpus_condition_vector(spec) -> list:
+    """Raw condition vector for a manifest record.
+
+    Manifests carry raw vectors: the dataset loader passes a stored vector
+    through unchanged, and LatentDiffusionUNet / the structured-latent condition
+    signature apply normalize_condition_vector_tensor themselves. Storing a
+    pre-normalized vector divided every scalar slot by its scale twice
+    (2026-11-12 audit; scalar-slot std 4e-6..0.04 as seen by the model).
+    """
+    return build_condition_vector(spec).tolist()
 HOLDOUT_SEED_OFFSET = 1_000_000
 
 
@@ -112,9 +124,7 @@ def build_corpus(
 
             seen.add(content_hash)
             record_id = f"proc_{split}_{accepted:04d}"
-            condition_vector = normalize_condition_vector_tensor(
-                build_condition_vector(spec)
-            ).tolist()
+            condition_vector = corpus_condition_vector(spec)
             voxel_path = f"voxels/{content_hash}.npy"
             file_path = voxel_dir / f"{content_hash}.npy"
             file_sha = ""
