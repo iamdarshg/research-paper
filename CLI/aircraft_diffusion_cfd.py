@@ -792,6 +792,14 @@ class TrainingConfig:
     geometry_occupancy_minimum_target: float = float(
         config_value("training", "geometry_occupancy_minimum_target", 1.0e-3)
     )
+    # Diffuse a per-dimension standardized latent (statistics from the training
+    # split, stored in the checkpoint). False keeps the legacy raw-latent path.
+    latent_standardization: bool = bool(
+        config_value("training", "latent_standardization", False)
+    )
+    latent_standardization_floor: float = float(
+        config_value("training", "latent_standardization_floor", 1.0e-3)
+    )
     coordinate_training_samples: int = int(config_value("training", "coordinate_training_samples", 32768))
     coordinate_positive_fraction: float = float(config_value("training", "coordinate_positive_fraction", 0.5))
     # A sparse coordinate decoder may use a larger interval only when its
@@ -2235,6 +2243,97 @@ def bound_latent_to_corpus_support(
     return latent + (bounded - latent).detach()
 
 
+# Latent standardization for the diffusion path (2026-11-12 audit).
+#
+# Measured defect: the structured training latents of the 660-record
+# procedural corpus span [0, 0.389] with per-dimension standard deviation
+# 0.0003-0.043 (mean 0.019), while the DDPM schedule adds unit-variance noise.
+# At that signal-to-noise ratio the denoiser cannot predict the noise (training
+# noise-MSE 2.4-3.2, worse than the all-zero predictor's 1.0), x0 estimates
+# divide large residuals by small sqrt(alpha_bar), and DDIM samples clamp into
+# corners of the [0, 1] support (3.93 L2 from the nearest training latent in
+# the 2026-11-10 diagnosis, against a 4.0 diagonal).  The decoder answers such
+# off-manifold latents with dense blobs, which is the occupancy-envelope
+# failure.  Standard latent-diffusion practice is to diffuse a standardized
+# latent; the decoder, latent bounds and every loss keep working in raw space.
+#
+# Statistics come from the training split only and are stored in the
+# checkpoint.  Identity statistics (mean 0, scale 1) reproduce the legacy path
+# exactly, so checkpoints without them behave as before.
+def compute_latent_standardization(
+    latents: torch.Tensor,
+    *,
+    floor: float = 1.0e-3,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return per-dimension (mean, scale) of training latents, scale floored."""
+    if latents.ndim != 2 or latents.shape[0] < 2:
+        raise ValueError(
+            "latent standardization needs a (num_samples>=2, latent_dim) tensor, "
+            f"got {tuple(latents.shape)}"
+        )
+    if not float(floor) > 0.0:
+        raise ValueError("latent standardization floor must be positive")
+    values = latents.detach().double()
+    if not torch.isfinite(values).all():
+        raise FloatingPointError("training latents contain nonfinite values")
+    mean = values.mean(dim=0)
+    scale = values.std(dim=0, unbiased=True).clamp_min(float(floor))
+    return mean.float(), scale.float()
+
+
+def standardize_latent(
+    latent: torch.Tensor,
+    mean: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Map a raw latent into the diffusion space; identity when stats are None."""
+    if mean is None or scale is None:
+        return latent
+    mean = mean.to(device=latent.device, dtype=latent.dtype)
+    scale = scale.to(device=latent.device, dtype=latent.dtype)
+    return (latent - mean) / scale
+
+
+def destandardize_latent(
+    latent: torch.Tensor,
+    mean: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Map a diffusion-space latent back to raw space; identity when stats are None."""
+    if mean is None or scale is None:
+        return latent
+    mean = mean.to(device=latent.device, dtype=latent.dtype)
+    scale = scale.to(device=latent.device, dtype=latent.dtype)
+    return latent * scale + mean
+
+
+def latent_standardization_from_payload(
+    payload: Any,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Read checkpoint latent statistics; (None, None) for legacy checkpoints."""
+    if not payload:
+        return None, None
+    mean = torch.as_tensor(payload["mean"], dtype=torch.float32).reshape(-1)
+    scale = torch.as_tensor(payload["scale"], dtype=torch.float32).reshape(-1)
+    if mean.shape != scale.shape:
+        raise ValueError("latent standardization mean/scale shapes differ")
+    if not bool((scale > 0).all()):
+        raise ValueError("latent standardization scale must be positive")
+    return mean, scale
+
+
+def latent_standardization_payload(
+    mean: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+) -> Optional[Dict[str, List[float]]]:
+    if mean is None or scale is None:
+        return None
+    return {
+        "mean": [float(v) for v in mean.detach().cpu().reshape(-1).tolist()],
+        "scale": [float(v) for v in scale.detach().cpu().reshape(-1).tolist()],
+    }
+
+
 def select_training_timesteps(
     *,
     global_step: int,
@@ -3496,6 +3595,10 @@ class ConsistencyModel(nn.Module):
         self.noise_schedule = NoiseSchedule(diffusion_config)
         self.latent_value_min = float(config_value("model", "latent_value_min", 0.0))
         self.latent_value_max = float(config_value("model", "latent_value_max", 1.0))
+        # Diffusion-space statistics (None = legacy identity); set by the
+        # trainer from the training split or by the generator from a checkpoint.
+        self.latent_standardization_mean: Optional[torch.Tensor] = None
+        self.latent_standardization_scale: Optional[torch.Tensor] = None
         student_encoder_channels = [c // 2 for c in config.encoder_channels]
         student_decoder_channels = [c // 2 for c in config.decoder_channels]
         student_attention_groups = int(config.attention_groups)
@@ -3722,16 +3825,27 @@ class ConsistencyModel(nn.Module):
             )
             pred_noise = self.student_model(x_t, t, condition=condition)
             x0_pred = self.noise_schedule.predict_x0(x_t, t, pred_noise)
-            x0_pred = bound_latent_to_corpus_support(
-                x0_pred,
+            # x_t lives in the (optionally standardized) diffusion space; the
+            # corpus-support bound applies to the raw latent the decoder reads.
+            x0_raw = bound_latent_to_corpus_support(
+                destandardize_latent(
+                    x0_pred,
+                    self.latent_standardization_mean,
+                    self.latent_standardization_scale,
+                ),
                 self.latent_value_min,
                 self.latent_value_max,
             )
 
             if index + 1 >= len(timesteps):
-                x_t = x0_pred
+                x_t = x0_raw
                 continue
 
+            x0_pred = standardize_latent(
+                x0_raw,
+                self.latent_standardization_mean,
+                self.latent_standardization_scale,
+            )
             next_step = int(timesteps[index + 1].item())
             alpha_next = self.noise_schedule.alphas_cumprod[next_step]
             x_t = (
@@ -5578,6 +5692,8 @@ def sample_latent_with_ddim(
     initial_noise: Optional[torch.Tensor] = None,
     latent_value_min: float = 0.0,
     latent_value_max: float = 1.0,
+    latent_standardization_mean: Optional[torch.Tensor] = None,
+    latent_standardization_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Deterministic DDIM sampling with the trained diffusion denoiser.
 
@@ -5617,12 +5733,21 @@ def sample_latent_with_ddim(
         )
         pred_noise = diffusion_model(latent, t, condition=condition)
         x0_pred = noise_schedule.predict_x0(latent, t, pred_noise)
-        x0_pred = bound_latent_to_corpus_support(
-            x0_pred, latent_value_min, latent_value_max
+        # ``latent`` is in diffusion space (standardized when statistics are
+        # given); the support bound and the returned value are raw latents.
+        x0_raw = bound_latent_to_corpus_support(
+            destandardize_latent(
+                x0_pred, latent_standardization_mean, latent_standardization_scale
+            ),
+            latent_value_min,
+            latent_value_max,
         )
         if index + 1 >= len(timesteps):
-            latent = x0_pred
+            latent = x0_raw
             continue
+        x0_pred = standardize_latent(
+            x0_raw, latent_standardization_mean, latent_standardization_scale
+        )
         next_step = int(timesteps[index + 1].item())
         alpha_next = noise_schedule.alphas_cumprod[next_step]
         latent = (
@@ -7588,6 +7713,11 @@ class OptimizedDiffusionTrainer:
         # Initialize EMA model
         self.ema_model = self._copy_model(self.diffusion_model)
 
+        # Diffusion-space latent statistics; None = legacy identity. Computed
+        # from the training split in train() or restored by load_checkpoint().
+        self.latent_standardization_mean: Optional[torch.Tensor] = None
+        self.latent_standardization_scale: Optional[torch.Tensor] = None
+
         # Optimizer
         self.optimizer = AdamW(
             [
@@ -8865,7 +8995,9 @@ class OptimizedDiffusionTrainer:
             # Progressive distillation training
             consistency_loss = torch.tensor(0.0, device=self.device)
             if should_run_consistency_update(self.training_config, batch_idx):
-                consistency_loss = self._compute_consistency_loss(latent, condition=condition)
+                consistency_loss = self._compute_consistency_loss(
+                    self._to_diffusion_space(latent), condition=condition
+                )
 
             # Random timestep for diffusion training
             t = select_training_timesteps(
@@ -8880,7 +9012,8 @@ class OptimizedDiffusionTrainer:
 
             # Forward diffusion
             noise = torch.randn_like(latent)
-            noisy_latent = self.noise_schedule.q_sample(latent, t, noise).nan_to_num(0.0)
+            diffusion_latent = self._to_diffusion_space(latent)
+            noisy_latent = self.noise_schedule.q_sample(diffusion_latent, t, noise).nan_to_num(0.0)
 
             # Model prediction
             _autocast_enabled = (
@@ -8896,7 +9029,9 @@ class OptimizedDiffusionTrainer:
             if not bool(torch.isfinite(pred_noise_raw).all().item()):
                 nonfinite_observations.append("diffusion_prediction")
             pred_noise = pred_noise_raw.nan_to_num(0.0)
-            x0_pred = self.noise_schedule.predict_x0(noisy_latent, t, pred_noise).nan_to_num(0.0)
+            x0_pred = self._from_diffusion_space(
+                self.noise_schedule.predict_x0(noisy_latent, t, pred_noise)
+            ).nan_to_num(0.0)
             x0_pred = bound_latent_to_corpus_support(
                 x0_pred,
                 float(config_value("model", "latent_value_min", 0.0)),
@@ -8911,10 +9046,12 @@ class OptimizedDiffusionTrainer:
             if not bool(torch.isfinite(student_pred_noise_raw).all().item()):
                 nonfinite_observations.append("consistency_student_prediction")
             student_pred_noise = student_pred_noise_raw.nan_to_num(0.0)
-            generation_latent = self.noise_schedule.predict_x0(
-                noisy_latent,
-                t,
-                student_pred_noise,
+            generation_latent = self._from_diffusion_space(
+                self.noise_schedule.predict_x0(
+                    noisy_latent,
+                    t,
+                    student_pred_noise,
+                )
             ).nan_to_num(0.0)
             generation_latent = bound_latent_to_corpus_support(
                 generation_latent,
@@ -10531,6 +10668,53 @@ class OptimizedDiffusionTrainer:
             ),
         }
 
+    def _set_latent_standardization(
+        self,
+        mean: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+    ) -> None:
+        if mean is not None and scale is not None:
+            mean = mean.to(self.device, dtype=torch.float32)
+            scale = scale.to(self.device, dtype=torch.float32)
+        self.latent_standardization_mean = mean
+        self.latent_standardization_scale = scale
+        if getattr(self, "consistency_model", None) is not None:
+            self.consistency_model.latent_standardization_mean = mean
+            self.consistency_model.latent_standardization_scale = scale
+
+    def _initialize_latent_standardization(self, train_loader: Any) -> None:
+        """Fit diffusion-space statistics on the training split (once)."""
+        if not bool(self.training_config.latent_standardization):
+            return
+        if self.latent_standardization_mean is not None:
+            return  # restored from a checkpoint; never refit on resume
+        dataset = getattr(train_loader, "dataset", None)
+        latents = getattr(dataset, "latent_codes", None)
+        if latents is None:
+            collected = [batch["latent"].detach().cpu() for batch in train_loader]
+            latents = torch.cat(collected, dim=0)
+        mean, scale = compute_latent_standardization(
+            latents.reshape(latents.shape[0], -1).float(),
+            floor=float(self.training_config.latent_standardization_floor),
+        )
+        self._set_latent_standardization(mean, scale)
+        print(
+            "Latent standardization fitted on "
+            f"{int(latents.shape[0])} training latents: "
+            f"scale min {float(scale.min()):.4g} / median {float(scale.median()):.4g} / "
+            f"max {float(scale.max()):.4g}"
+        )
+
+    def _to_diffusion_space(self, latent: torch.Tensor) -> torch.Tensor:
+        return standardize_latent(
+            latent, self.latent_standardization_mean, self.latent_standardization_scale
+        )
+
+    def _from_diffusion_space(self, latent: torch.Tensor) -> torch.Tensor:
+        return destandardize_latent(
+            latent, self.latent_standardization_mean, self.latent_standardization_scale
+        )
+
     def _compute_consistency_loss(
         self,
         latent: torch.Tensor,
@@ -10810,6 +10994,7 @@ class OptimizedDiffusionTrainer:
         """Train at the model's configured voxel resolution."""
         grid_sizes = [self.model_config.grid_resolution]
         history: List[Dict[str, Any]] = []
+        self._initialize_latent_standardization(train_loader)
 
         for grid_size in grid_sizes:
             print(f"\n{'='*60}")
@@ -10907,6 +11092,10 @@ class OptimizedDiffusionTrainer:
             'model_config': asdict(self.model_config),
             'diffusion_config': asdict(self.diffusion_config),
             'training_config': asdict(self.training_config),
+            'latent_standardization': latent_standardization_payload(
+                getattr(self, 'latent_standardization_mean', None),
+                getattr(self, 'latent_standardization_scale', None),
+            ),
             'cfd_config': asdict(self.cfd_config),
             'geometry_probability_threshold': float(
                 getattr(
@@ -11019,6 +11208,9 @@ class OptimizedDiffusionTrainer:
                     f"{offloaded_bytes / (1024 ** 2):.1f} MiB"
                 )
         self.global_step = checkpoint['global_step']
+        self._set_latent_standardization(
+            *latent_standardization_from_payload(checkpoint.get('latent_standardization'))
+        )
         self.consistency_update_step = int(
             checkpoint.get(
                 'consistency_update_step',
@@ -11247,6 +11439,16 @@ class OptimizedAircraftGenerator:
         load_state_dict_mhc_compatible(self.converter, model_state['converter'])
 
         self.noise_schedule = NoiseSchedule(self.diffusion_config).to(self.device)
+        latent_mean, latent_scale = latent_standardization_from_payload(
+            checkpoint.get("latent_standardization")
+        )
+        if latent_mean is not None:
+            latent_mean = latent_mean.to(self.device)
+            latent_scale = latent_scale.to(self.device)
+        self.latent_standardization_mean = latent_mean
+        self.latent_standardization_scale = latent_scale
+        self.consistency_model.latent_standardization_mean = latent_mean
+        self.consistency_model.latent_standardization_scale = latent_scale
 
         self.diffusion_model.eval()
         self.converter.eval()
@@ -11297,6 +11499,8 @@ class OptimizedAircraftGenerator:
                 condition=condition,
                 latent_value_min=float(config_value("model", "latent_value_min", 0.0)),
                 latent_value_max=float(config_value("model", "latent_value_max", 1.0)),
+                latent_standardization_mean=self.latent_standardization_mean,
+                latent_standardization_scale=self.latent_standardization_scale,
             )
         elif sampler == "consistency":
             print(f"Generating with configured {num_steps}-step consistency path")
@@ -12078,6 +12282,7 @@ def cli():
 @click.option('--converter-learning-rate', default=None, type=float, help='Optional learning rate for the latent-to-voxel decoder. Defaults to training.converter_learning_rate (legacy behaviour).')
 @click.option('--consistency-student-learning-rate', default=None, type=float, help='Optional learning rate for the consistency student. Defaults to training.consistency_student_learning_rate (legacy behaviour).')
 @click.option('--latent-augmentation-std', default=float(config_value('training', 'latent_augmentation_std', 0.0)), type=float, help='Std of the latent-space augmentation noise used during training (diversity fix; 0 = legacy point training).')
+@click.option('--latent-standardization/--no-latent-standardization', default=bool(config_value('training', 'latent_standardization', False)), help='Diffuse a per-dimension standardized latent (statistics fitted on the training split and stored in the checkpoint).')
 @click.option('--geometry-occupancy-mean-weight', default=float(config_value('training', 'geometry_occupancy_mean_weight', 0.0)), type=float, help='Weight for the data-dependent occupancy matching loss (per-sample target occupancy from the training geometry; 0 = legacy objective).')
 @click.option('--coordinate-training-samples', default=int(config_value('training', 'coordinate_training_samples', 32768)), help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
 @click.option('--coordinate-positive-fraction', default=float(config_value('training', 'coordinate_positive_fraction', 0.5)), help='Fraction of sampled high-resolution coordinates drawn from occupied voxels when available')
@@ -12113,7 +12318,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
           train_until_overfit, overfit_stop_metric, overfit_min_epochs, overfit_loss_floor, overfit_patience, overfit_min_delta,
           overfit_relative_delta, overfit_geometry_gate_samples, overfit_min_reconstruction_topk_recall,
           overfit_min_generated_aircraft_valid_fraction, latent_augmentation_std,
-          geometry_occupancy_mean_weight):
+          geometry_occupancy_mean_weight, latent_standardization):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
@@ -12303,6 +12508,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         overfit_min_generated_aircraft_valid_fraction=overfit_min_generated_aircraft_valid_fraction,
         latent_augmentation_std=latent_augmentation_std,
         geometry_occupancy_mean_weight=geometry_occupancy_mean_weight,
+        latent_standardization=bool(latent_standardization),
     )
 
     cfd_config = CFDConfig(
