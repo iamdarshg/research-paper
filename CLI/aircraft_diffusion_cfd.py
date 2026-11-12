@@ -2770,6 +2770,13 @@ def _load_structured_records(path: Path) -> List[Dict[str, Any]]:
     return records
 
 
+def training_completion_status(stop_decision: Optional[Mapping[str, Any]]) -> str:
+    """Label a finished ``train`` call; a collapse pause is not a completion."""
+    if isinstance(stop_decision, Mapping) and stop_decision.get("kind") == "model_collapse":
+        return "paused_model_collapse"
+    return "complete"
+
+
 def load_grounded_manifest_records(manifest_path: str) -> List[Dict[str, Any]]:
     path = Path(manifest_path)
     if not path.exists():
@@ -11026,6 +11033,20 @@ class OptimizedDiffusionTrainer:
 
                 print(f"Epoch {epoch} Metrics: {metrics}")
 
+                # Fail closed: train_epoch already saved a collapse checkpoint
+                # and recorded the stop. Continuing would re-trip the watchdog
+                # every epoch on the uncommitted converter step and the CLI
+                # would then report a paused run as complete (2026-11-12 audit).
+                collapse_stop = getattr(self, "stop_decision", None)
+                if isinstance(collapse_stop, Mapping) and collapse_stop.get("kind") == "model_collapse":
+                    epoch_record["collapse_watchdog_stop"] = dict(collapse_stop)
+                    print(
+                        "Stopping training: model-collapse watchdog paused the run at "
+                        f"global_step={collapse_stop.get('global_step')} "
+                        f"({', '.join(collapse_stop.get('reason_codes', []))})."
+                    )
+                    break
+
                 stop_decision = evaluate_overfit_stop(history, self.training_config)
                 if stop_decision is not None:
                     if self.training_config.overfit_geometry_gate_enabled:
@@ -12569,6 +12590,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         "cfd_config": asdict(cfd_config),
         "history": history,
         "stop_decision": stop_decision,
+        "training_status": training_completion_status(stop_decision),
         "claim_boundary": (
             "optimization_loss is the backpropagated scalar. Exact connectivity and raw CFD scores "
             "are measured monitors unless included through direct_solver_loss with a nonzero "
@@ -12588,6 +12610,19 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
             raise RuntimeError(
                 "Refusing to promote final checkpoint because the geometry quality gate did not pass."
             )
+    if training_completion_status(stop_decision) == "paused_model_collapse":
+        # The collapse checkpoint written by train_epoch is the evidence; do not
+        # mint a "final" checkpoint that reads as a completed run.
+        paused_path = (getattr(trainer, "run_state_metadata", {}) or {}).get(
+            "collapse_checkpoint_path"
+        )
+        print(
+            "\nTraining PAUSED by the model-collapse watchdog at global_step="
+            f"{stop_decision.get('global_step')} "
+            f"({', '.join(stop_decision.get('reason_codes', []))}). "
+            f"Collapse checkpoint: {paused_path}. No final checkpoint was written."
+        )
+        raise SystemExit(3)
     final_checkpoint = os.path.join(save_dir, 'final_optimized_model.pt')
     trainer.save_checkpoint(final_checkpoint)
     print(f"\nTraining complete. Final checkpoint saved to {final_checkpoint}")
