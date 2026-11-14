@@ -800,6 +800,11 @@ class TrainingConfig:
     latent_standardization_floor: float = float(
         config_value("training", "latent_standardization_floor", 1.0e-3)
     )
+    # Classifier-free guidance: probability of dropping the condition per sample
+    # in the diffusion loss. 0 keeps the legacy always-conditional training.
+    condition_dropout: float = float(
+        config_value("training", "condition_dropout", 0.0)
+    )
     coordinate_training_samples: int = int(config_value("training", "coordinate_training_samples", 32768))
     coordinate_positive_fraction: float = float(config_value("training", "coordinate_positive_fraction", 0.5))
     # A sparse coordinate decoder may use a larger interval only when its
@@ -4181,19 +4186,34 @@ class LatentDiffusionUNet(nn.Module):
         # Keep original forward function - no functionality lost
         pass
 
-    def forward(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        condition: torch.Tensor = None,
+        condition_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # Keep persistent parameters in FP32 while allowing the trainer to
         # select BF16/FP16 CUDA arithmetic through the module attribute.  The
         # wrapper also covers activation-checkpoint recomputation.
         with _model_autocast_context(self, x.device):
-            return self._forward_impl(x, timestep, condition)
+            return self._forward_impl(x, timestep, condition, condition_mask)
 
-    def _forward_impl(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        condition: torch.Tensor = None,
+        condition_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Forward pass with memory optimizations.
         x: [B, latent_dim] - noisy latent codes
         timestep: [B] - diffusion timesteps
         condition: [B, conditioning_dim] - optional structured conditioning
+        condition_mask: [B] - optional 1/0 per sample; 0 removes the condition
+            contributions, reproducing the ``condition=None`` path exactly
+            (classifier-free guidance null condition).
         """
         b = x.shape[0]
 
@@ -4201,8 +4221,13 @@ class LatentDiffusionUNet(nn.Module):
         condition_embedding = None
         if condition is not None and self.conditioning_dim > 0 and condition.ndim == 2:
             condition = normalize_condition_vector_tensor(condition.to(self.time_embedding[0].weight.dtype))
-            t_emb = t_emb + self.condition_time_projection(condition)
+            condition_time = self.condition_time_projection(condition)
             condition_embedding = self.condition_projection(condition)
+            if condition_mask is not None:
+                keep = condition_mask.to(condition_time.dtype).reshape(b, 1)
+                condition_time = condition_time * keep
+                condition_embedding = condition_embedding * keep
+            t_emb = t_emb + condition_time
 
         # Expand latent to 3D spatial (2x2x2)
         h = self.encoder(x)
@@ -5689,6 +5714,53 @@ def _calibrate_global_geometry_threshold(
     }
 
 
+def condition_dropout_mask(
+    batch_size: int,
+    probability: float,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> Optional[torch.Tensor]:
+    """Per-sample keep mask for classifier-free-guidance training.
+
+    Returns ``None`` when ``probability`` is 0 so the legacy conditional path is
+    untouched; otherwise a float tensor of 1 (keep) / 0 (drop condition).
+    """
+    probability = float(probability)
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"condition dropout must be in [0, 1], got {probability}")
+    if probability == 0.0:
+        return None
+    draw = torch.rand((int(batch_size),), generator=generator)
+    return (draw >= probability).to(device=device, dtype=torch.float32)
+
+
+def resolve_guidance_scale(
+    requested: Optional[float],
+    *,
+    trained_condition_dropout: float,
+    configured: float,
+) -> float:
+    """Guidance scale to use for a checkpoint, failing closed.
+
+    A checkpoint trained without condition dropout has never trained its
+    unconditional branch, so guidance other than 1 would extrapolate from an
+    untrained prediction: the default resolves to 1 and an explicit request
+    raises. With dropout, the default is the configured scale.
+    """
+    if float(trained_condition_dropout) <= 0.0:
+        if requested is None or float(requested) == 1.0:
+            return 1.0
+        raise ValueError(
+            "guidance_scale != 1 requires a checkpoint trained with condition "
+            "dropout (training_config.condition_dropout > 0); this checkpoint "
+            "has none, so its unconditional prediction is untrained"
+        )
+    scale = float(configured if requested is None else requested)
+    if not scale > 0.0:
+        raise ValueError(f"guidance_scale must be > 0, got {scale}")
+    return scale
+
+
 def sample_latent_with_ddim(
     diffusion_model: torch.nn.Module,
     noise_schedule: Any,
@@ -5701,8 +5773,14 @@ def sample_latent_with_ddim(
     latent_value_max: float = 1.0,
     latent_standardization_mean: Optional[torch.Tensor] = None,
     latent_standardization_scale: Optional[torch.Tensor] = None,
+    guidance_scale: float = 1.0,
 ) -> torch.Tensor:
     """Deterministic DDIM sampling with the trained diffusion denoiser.
+
+    ``guidance_scale`` = 1 is the plain conditional sampler. Other values apply
+    classifier-free guidance, eps = eps_u + w (eps_c - eps_u), with eps_u from
+    ``condition=None``; use only with checkpoints trained with condition
+    dropout (see ``resolve_guidance_scale``).
 
     ``ConsistencyModel.fast_inference`` samples with the 4-step *student*, which
     is only as good as the distillation it received. The teacher denoiser is
@@ -5739,6 +5817,9 @@ def sample_latent_with_ddim(
             dtype=torch.long,
         )
         pred_noise = diffusion_model(latent, t, condition=condition)
+        if condition is not None and float(guidance_scale) != 1.0:
+            pred_uncond = diffusion_model(latent, t, condition=None)
+            pred_noise = pred_uncond + float(guidance_scale) * (pred_noise - pred_uncond)
         x0_pred = noise_schedule.predict_x0(latent, t, pred_noise)
         # ``latent`` is in diffusion space (standardized when statistics are
         # given); the support bound and the returned value are raw latents.
@@ -9028,10 +9109,20 @@ class OptimizedDiffusionTrainer:
                 and self.dtype == torch.bfloat16
             )
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=_autocast_enabled):
+                _cfg_mask = (
+                    condition_dropout_mask(
+                        latent.shape[0],
+                        self.training_config.condition_dropout,
+                        self.device,
+                    )
+                    if condition is not None
+                    else None
+                )
                 pred_noise_raw = self.diffusion_model(
                     noisy_latent,
                     t,
                     condition=condition,
+                    condition_mask=_cfg_mask,
                 )
             if not bool(torch.isfinite(pred_noise_raw).all().item()):
                 nonfinite_observations.append("diffusion_prediction")
@@ -11405,6 +11496,7 @@ class OptimizedAircraftGenerator:
             or {}
         )
         coordinate_decoder_threshold = int(training_payload.get('coordinate_decoder_threshold', 96))
+        self.trained_condition_dropout = float(training_payload.get('condition_dropout', 0.0) or 0.0)
         self.geometry_probability_threshold = float(
             checkpoint.get(
                 "geometry_probability_threshold",
@@ -11480,7 +11572,7 @@ class OptimizedAircraftGenerator:
         self,
         design_spec: Optional[DesignSpec] = None,
         num_steps: int = 4,
-        guidance_scale: float = 7.5,
+        guidance_scale: Optional[float] = None,
         condition_vector: Optional[torch.Tensor] = None,
         sampler: str = "consistency",
         ddim_steps: int = 50,
@@ -11492,6 +11584,11 @@ class OptimizedAircraftGenerator:
         ``sampler="ddim"`` samples the trained diffusion denoiser with a
         deterministic ``ddim_steps`` sweep (see ``sample_latent_with_ddim``);
         it is the sampler used when the consistency student has not converged.
+
+        ``guidance_scale`` (DDIM only): ``None`` resolves via
+        ``resolve_guidance_scale`` -- 1 for checkpoints trained without
+        condition dropout, else ``diffusion_config.guidance_scale``. Before the
+        2026-11-15 audit this argument was accepted and silently ignored.
         """
         latent_shape = (1, self.model_config.latent_dim)
         if condition_vector is not None:
@@ -11511,7 +11608,12 @@ class OptimizedAircraftGenerator:
             )
 
         if sampler == "ddim":
-            print(f"Generating with {ddim_steps}-step teacher DDIM path")
+            resolved_guidance = resolve_guidance_scale(
+                guidance_scale,
+                trained_condition_dropout=float(getattr(self, "trained_condition_dropout", 0.0)),
+                configured=float(self.diffusion_config.guidance_scale),
+            )
+            print(f"Generating with {ddim_steps}-step teacher DDIM path (guidance {resolved_guidance:g})")
             latent = sample_latent_with_ddim(
                 self.diffusion_model,
                 self.noise_schedule,
@@ -11522,8 +11624,13 @@ class OptimizedAircraftGenerator:
                 latent_value_max=float(config_value("model", "latent_value_max", 1.0)),
                 latent_standardization_mean=self.latent_standardization_mean,
                 latent_standardization_scale=self.latent_standardization_scale,
+                guidance_scale=resolved_guidance,
             )
         elif sampler == "consistency":
+            if guidance_scale is not None and float(guidance_scale) != 1.0:
+                raise ValueError(
+                    "classifier-free guidance is implemented for the DDIM sampler only"
+                )
             print(f"Generating with configured {num_steps}-step consistency path")
             latent = self.consistency_model.fast_inference(
                 latent_shape,
@@ -12303,6 +12410,7 @@ def cli():
 @click.option('--converter-learning-rate', default=None, type=float, help='Optional learning rate for the latent-to-voxel decoder. Defaults to training.converter_learning_rate (legacy behaviour).')
 @click.option('--consistency-student-learning-rate', default=None, type=float, help='Optional learning rate for the consistency student. Defaults to training.consistency_student_learning_rate (legacy behaviour).')
 @click.option('--latent-augmentation-std', default=float(config_value('training', 'latent_augmentation_std', 0.0)), type=float, help='Std of the latent-space augmentation noise used during training (diversity fix; 0 = legacy point training).')
+@click.option('--condition-dropout', default=float(config_value('training', 'condition_dropout', 0.0)), type=float, help='Classifier-free guidance training: probability of dropping the condition per sample in the diffusion loss (0 = legacy always-conditional).')
 @click.option('--latent-standardization/--no-latent-standardization', default=bool(config_value('training', 'latent_standardization', False)), help='Diffuse a per-dimension standardized latent (statistics fitted on the training split and stored in the checkpoint).')
 @click.option('--geometry-occupancy-mean-weight', default=float(config_value('training', 'geometry_occupancy_mean_weight', 0.0)), type=float, help='Weight for the data-dependent occupancy matching loss (per-sample target occupancy from the training geometry; 0 = legacy objective).')
 @click.option('--coordinate-training-samples', default=int(config_value('training', 'coordinate_training_samples', 32768)), help='Voxel-coordinate samples per batch for high-resolution coordinate decoders')
@@ -12339,7 +12447,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
           train_until_overfit, overfit_stop_metric, overfit_min_epochs, overfit_loss_floor, overfit_patience, overfit_min_delta,
           overfit_relative_delta, overfit_geometry_gate_samples, overfit_min_reconstruction_topk_recall,
           overfit_min_generated_aircraft_valid_fraction, latent_augmentation_std,
-          geometry_occupancy_mean_weight, latent_standardization):
+          geometry_occupancy_mean_weight, condition_dropout, latent_standardization):
     """Train the proof-of-concept model under smoke or final-eval guardrails."""
     import os
     import logging
@@ -12530,6 +12638,7 @@ def train(num_epochs, batch_size, learning_rate, latent_dim, grid_size, precisio
         latent_augmentation_std=latent_augmentation_std,
         geometry_occupancy_mean_weight=geometry_occupancy_mean_weight,
         latent_standardization=bool(latent_standardization),
+        condition_dropout=float(condition_dropout),
     )
 
     cfd_config = CFDConfig(

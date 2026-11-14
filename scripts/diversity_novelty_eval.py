@@ -113,6 +113,8 @@ def main() -> int:
     parser.add_argument("--seeds", type=int, default=6)
     parser.add_argument("--sampler", default="ddim")
     parser.add_argument("--ddim-steps", type=int, default=50)
+    parser.add_argument("--guidance-scale", type=float, default=None,
+                        help="DDIM classifier-free guidance; default resolves per checkpoint (1 without condition dropout).")
     parser.add_argument("--run-id", default="diversity-novelty-2026-11-06")
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
@@ -145,6 +147,7 @@ def main() -> int:
         "latent_dim": latent_dim,
         "threshold": args.threshold,
         "sampler": args.sampler,
+        "guidance_scale_requested": args.guidance_scale,
         "seeds": args.seeds,
         "gate_spec_sha256": GATE_SPEC_HASH,
         "generated_samples": [],
@@ -182,6 +185,7 @@ def main() -> int:
                     condition_vector=condition_tensor,
                     sampler=args.sampler,
                     ddim_steps=args.ddim_steps,
+                    guidance_scale=args.guidance_scale,
                 )
                 binary = _materialize(probability, args.threshold)
                 if artifact_dir:
