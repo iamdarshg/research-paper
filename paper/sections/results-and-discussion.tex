@@ -219,9 +219,14 @@ shipped four-step consistency path. No threshold inside \texttt{aircraft\_validi
 was changed.
 
 \paragraph{Held-out protocol.}
-The evaluation protocol is recorded in
-\texttt{build/recovery\_2026-11-05/PREREGISTERED\_PROTOCOL.md}. Its file timestamp does
-not establish ordering relative to the evaluation runs, so this paper calls the protocol
+The run recorded its evaluation protocol in
+\texttt{build/recovery\_2026-11-05/PREREGISTERED\_PROTOCOL.md}, and its full report in
+\texttt{evidence/research-paper-publish/GENERATOR\_RECOVERY\_2026-11-05.md}; neither file
+is in the repository, and no copy is available. The protocol described here is also
+written out in
+\texttt{paper/CLAIMS\_EVIDENCE\_MATRIX.md} (C09, generator recovery addendum) and
+implemented by \texttt{scripts/recovery\_generator\_eval.py}. Neither establishes when the
+protocol was fixed relative to the evaluation runs, so this paper calls the protocol
 \emph{declared} rather than pre-registered. Training uses the six
 NASA CRM records labelled \texttt{test}/\texttt{val}; the nine \texttt{holdout} records
 are never used for gradients, threshold selection, early stopping or checkpoint
@@ -251,8 +256,13 @@ Generation, teacher DDIM & n/a & 45/45 \\ \hline
 \end{tabular}
 \end{table}
 
-The recovery checkpoint ($32^3$ dense decoder, latent 16, 45 epochs, corrected
-parameter-group learning rates) passes the declared protocol: reconstruction
+The recovery checkpoint and its raw artifacts (\texttt{build/recovery\_2026-11-05/}: the
+checkpoint, the generated voxel arrays and the evaluation reports) are not committed to
+the repository. Its configuration as recorded by the run ($32^3$ dense decoder, latent 16,
+45 epochs, corrected parameter-group learning rates) and every figure in this subsection
+that depends on the checkpoint or its outputs, including the ``After'' column of
+Table~\ref{tab:generator_recovery}, are therefore self-reported and cannot be re-derived
+from the repository. As reported, the checkpoint passes the declared protocol: reconstruction
 9/9 and generated 45/45 under both samplers, with a failed-check histogram that is
 empty, and the same 45 artifacts re-screen as 45/45 through the shipped
 \texttt{CLI/aircraft\_validity.py}. Independent ablations show that the decisive
@@ -262,9 +272,14 @@ decoder supervises 8\,192 sampled voxels with a small Fourier MLP and plateaued 
 diffuse probability field (0/9 reconstruction at $\text{latent\_dim}=16$ and $64$).
 
 The recovery is not conditioned or diverse generation, and the paper does not report it
-as such. The 45 generated artifacts contain \emph{five} distinct voxel arrays (maximum
-pairwise Hamming distance one voxel, mean pairwise IoU 0.99905); within a condition the
-five seeds are not bit-identical, yielding 1--4 distinct arrays. The nine held-out
+as such. The 45 generated artifacts are near-identical, but the run's records disagree on
+how many distinct voxel arrays they contain: the analysis behind this subsection counted
+\emph{five} (maximum pairwise Hamming distance one voxel, mean pairwise IoU 0.99905, with
+1--4 distinct arrays among the five seeds of a condition), while the repository's gate
+records for the same run (\texttt{paper/FINAL\_RUN\_GATES.md},
+\texttt{paper/SCIENTIFIC\_GATE\_STATUS.md}) state \emph{two}. The generated arrays are not
+committed, so neither count can be re-derived from the repository; under either count
+the output is effectively one geometry. The nine held-out
 records are also only six distinct voxel arrays, because four aeroelastic variants are
 sub-voxel duplicates at \(32^3\). The held-out latent codes are nearly degenerate
 (pairwise distance 0.0027 against a latent norm of 0.497), the training split holds six
@@ -273,10 +288,13 @@ records, and the MSE objective's optimum is therefore the conditional mean.
 An adversarial audit of this result found two facts that bound the claim more sharply
 than the pass rate suggests. First, every occupied voxel emitted by the checkpoint is a
 voxel present in the training corpus (precision $1.000$ against the training union), so
-there are zero novel voxels. Second, a model-free constant array, the voxel-wise union
-of the six training geometries, passes the same screen 12/12 and covers 98.6--99.4\% of
-every held-out record. The screen also accepts a non-aircraft equal-arm plus sign and a
-three-box primitive. The 45/45 rate therefore demonstrates that a training-hull-like
+there are zero novel voxels; like the pass rates, this figure is self-reported because
+the generated arrays are not committed. Second, a model-free constant array, the
+voxel-wise union of the six training geometries, passes all 12 checks of the same screen
+and covers 98.6--99.4\% of every held-out record. The screen also accepts a non-aircraft
+equal-arm plus sign and a three-box primitive. These control results, the coverage range
+and the six distinct held-out arrays depend only on the committed corpus and screen, and
+are re-derived by \texttt{scripts/recovery\_corpus\_claims\_check.py}. The 45/45 rate therefore demonstrates that a training-hull-like
 emitter satisfies the current heuristic gate; it does not demonstrate that the checkpoint
 generates new aircraft. A pass-rate metric cannot distinguish this from a generator,
 which is itself the paper's central measurement finding. A non-trivial gate must add a
