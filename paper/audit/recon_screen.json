@@ -1,0 +1,50 @@
+{
+  "gate_spec_hash": "4eafa9488650a3604f43bfa81be7476fc3b19575aa7ee9c15db90de2125fd135",
+  "holdout_n": 96,
+  "gate": ">=0.90 screen pass and mean IoU >= 0.40",
+  "gt_control": {
+    "n": 96,
+    "screen_pass": 96,
+    "screen_pass_rate": 1.0,
+    "failed_check_counts": {}
+  },
+  "arms": {
+    "C4": {
+      "n": 96,
+      "screen_pass": 87,
+      "screen_pass_rate": 0.9062,
+      "failed_check_counts": {
+        "grounded_occupancy_envelope": 9
+      },
+      "mean_iou_vs_gt": 0.7672,
+      "median_iou": 0.7721,
+      "min_iou": 0.5678,
+      "frac_iou_ge_0p40": 1.0,
+      "rp_g6_pass": true
+    },
+    "C3": {
+      "n": 96,
+      "screen_pass": 95,
+      "screen_pass_rate": 0.9896,
+      "failed_check_counts": {
+        "grounded_occupancy_envelope": 1
+      },
+      "mean_iou_vs_gt": 0.6051,
+      "median_iou": 0.6055,
+      "min_iou": 0.3041,
+      "frac_iou_ge_0p40": 0.9688,
+      "rp_g6_pass": true
+    },
+    "D3": {
+      "n": 96,
+      "screen_pass": 96,
+      "screen_pass_rate": 1.0,
+      "failed_check_counts": {},
+      "mean_iou_vs_gt": 0.6071,
+      "median_iou": 0.6047,
+      "min_iou": 0.3065,
+      "frac_iou_ge_0p40": 0.9688,
+      "rp_g6_pass": true
+    }
+  }
+}

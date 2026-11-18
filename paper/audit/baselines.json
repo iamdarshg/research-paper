@@ -1,0 +1,47 @@
+{
+  "train_n": 660,
+  "constant_majority_thr0.5": {
+    "occupied_voxels": 762,
+    "screen_pass": true,
+    "failed_checks": [],
+    "mean_iou_vs_gt": 0.6613
+  },
+  "constant_majority_thr0.3": {
+    "occupied_voxels": 1062,
+    "screen_pass": true,
+    "failed_checks": [],
+    "mean_iou_vs_gt": 0.6433
+  },
+  "constant_majority_thr0.2": {
+    "occupied_voxels": 1266,
+    "screen_pass": true,
+    "failed_checks": [],
+    "mean_iou_vs_gt": 0.6081
+  },
+  "screen_pass_wilson95": {
+    "C4": {
+      "k": 87,
+      "n": 96,
+      "ci": [
+        0.8313,
+        0.9499
+      ]
+    },
+    "C3": {
+      "k": 95,
+      "n": 96,
+      "ci": [
+        0.9433,
+        0.9982
+      ]
+    },
+    "D3": {
+      "k": 96,
+      "n": 96,
+      "ci": [
+        0.9615,
+        1.0
+      ]
+    }
+  }
+}
