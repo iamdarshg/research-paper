@@ -14,14 +14,16 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import norm, pearsonr
 
-REPORT = Path(
-    r"C:\Users\Darsh Gupta\engineering-portfolio-audit\repos\research-paper"
-    r"\build\protocol_smoke\condition_validation_n12.json"
-)
-N4_ARTIFACT = Path(
-    r"C:\Users\Darsh Gupta\engineering-portfolio-audit\repos\research-paper"
-    r"\build\protocol_smoke\condition_validation.json"
-)
+import os
+import sys
+
+# Repo-relative defaults; override with COND_REPORT / COND_N4. Previously
+# hard-coded to a Windows checkout. NOTE: build/protocol_smoke/ is not committed
+# on any branch (checked 2026-11-18), so the n=12 statistics cannot currently be
+# re-derived from the repository.
+_REPO = Path(__file__).resolve().parents[1]
+REPORT = Path(os.environ.get("COND_REPORT", _REPO / "build" / "protocol_smoke" / "condition_validation_n12.json"))
+N4_ARTIFACT = Path(os.environ.get("COND_N4", _REPO / "build" / "protocol_smoke" / "condition_validation.json"))
 
 
 def fisher_z_ci(r, n, alpha=0.05):
@@ -42,6 +44,9 @@ def tabulate(name, xs, ys, n, notes=""):
 
 
 def main():
+    if not REPORT.exists():
+        sys.exit(f"missing input {REPORT}: the n=12 condition-validation report is not committed; "
+                 "set COND_REPORT to its path (the published statistics cannot be re-derived without it)")
     data = json.loads(REPORT.read_text(encoding="utf-8"))
     raw = data["raw_data"]
     n = len(raw["measured_drag"])
