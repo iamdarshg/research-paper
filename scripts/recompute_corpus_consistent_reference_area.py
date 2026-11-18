@@ -19,12 +19,13 @@ import math
 import os
 from pathlib import Path
 
-VALIDATION_DOCS = Path(
-    r"C:\Users\Darsh Gupta\engineering-portfolio-audit\repos\research-paper-validation\docs\benchmarks"
-)
-OUTPUT_DIR = Path(
-    r"C:\Users\Darsh Gupta\engineering-portfolio-audit\evidence\research-paper-publish"
-).parent / "research-paper-publish" / "corrected_corpus"
+# Repo-relative defaults (the frozen inputs are committed under docs/benchmarks/);
+# override with CORPUS_DOCS / CORPUS_OUT. Previously hard-coded to a Windows
+# checkout, which made the published 1/16 and 0/14 counts non-reproducible
+# elsewhere.
+_REPO = Path(__file__).resolve().parents[1]
+VALIDATION_DOCS = Path(os.environ.get("CORPUS_DOCS", _REPO / "docs" / "benchmarks"))
+OUTPUT_DIR = Path(os.environ.get("CORPUS_OUT", _REPO / "build" / "research-paper-publish" / "corrected_corpus"))
 SWEEP_REFERENCE_AREA = 0.27734375
 
 # Per-grid LBM voxel-projected frontal areas recorded in the frozen artifacts:
